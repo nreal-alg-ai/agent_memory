@@ -8,21 +8,28 @@ The system no longer treats assistant_wakeup and allday_recording as two separat
 - state: evolving long-term topic/preference/task state derived later from facts.
 - index entry: a MemPalace-style directory card used for unified recall.
 
-Your task now is to extract the episode summary and high-quality facts from the chronological assistant dialogue batch below.
+Your task now is to extract the episode summary and Hindsight-style high-quality narrative facts from the chronological assistant dialogue batch below.
 
-Requirements:
-1. Extract 0-12 facts. Do not force a fact for every turn.
-2. Each fact must be self-contained and independently retrievable.
+Core Hindsight-style narrative fact requirements:
+- Each fact should cover a complete exchange or a clear topic segment, not a single utterance. Do not mechanically split "the user raised a problem", "the assistant suggested a solution", and "the user accepted/rejected it" into separate fragments; if they respond to the same issue, merge them into one narrative fact.
+- Each fact must be understandable without reading the original dialogue and preserve the pragmatic flow of the interaction: why the user raised the issue, what the assistant suggested, how the user responded, and what preference, decision, constraint, unresolved question, or next step emerged.
+- Each fact must naturally include the five dimensions in its text: what (complete event/topic/plan/conclusion), when (conversation timestamp or explicit time anchor), where (location/setting/platform/project scope; if absent, say no specific location/setting was mentioned), who (user, assistant, and other key people/organizations with their roles), and why (explicit reason, motivation, concern, disagreement, constraint, implication, conclusion, or follow-up).
+- For a roughly five-turn dialogue batch, usually produce 1-3 facts. Only split when the batch truly contains multiple unrelated events/topics. In most cases, do not exceed 5 facts.
+
+Rules:
+1. Extract 0-5 facts. Do not force a fact for every turn.
+2. Each fact must be a complete narrative preserving the essential topic background plus the flow of user/assistant views or actions and an explicit reason, disagreement, constraint, conclusion, or next step.
 3. Preserve concrete answerable details: names, places, titles, colors, dates, weekdays, relative times, numbers, amounts, durations, products, organizations, recommendations, constraints, decisions, and user preferences.
-4. Do not drop personal events mentioned as asides, e.g. "by the way", "I also", "I just", "last Saturday", "two months ago". LongMemEval often asks about these.
-5. Split independent events instead of merging them into a broad topic. For temporal reasoning, each comparable event must keep its own time anchor.
+4. Do not drop personal events mentioned as asides, e.g. "by the way", "I also", "I just", "last Saturday", "two months ago"; but if they are context inside the same exchange, merge them into the same narrative fact instead of emitting context-free short notes.
+5. Split only truly unrelated events. Events that must be compared for temporal reasoning may be split, but every split fact must still preserve its own background and time anchor.
 6. Use only the dialogue evidence. Do not invent completion, intent, or reasons.
-7. Keep assistant recommendations when they contain concrete future-answerable items.
+7. Keep assistant recommendations that contain concrete future-answerable items inside the relevant exchange narrative, and include whether the user accepted, rejected, hesitated, or added constraints when supported.
 8. priority is 0-100. Keep only facts worth at least 60.
 9. fact_type must be semantic or episodic.
 10. fact_subject must be user, assistant, world, project, system, or other.
 11. fact_kind must be preference, decision, request, recommendation, action, commitment, open_question, risk, error, context, instruction, or other.
-12. Return JSON only. No markdown.
+12. Do not output short facts like "the user said X" or "the assistant suggested Y". If deleting the topic background, reason, disagreement, or conclusion would make the text a vague short note, add those details back; if the dialogue does not support them, omit the fact.
+13. Return JSON only. No markdown.
 
 Output schema:
 {
@@ -30,7 +37,7 @@ Output schema:
   "episode_summary": "self-contained summary of the interaction episode",
   "facts": [
     {
-      "text": "complete narrative fact",
+      "text": "self-contained narrative fact covering a complete exchange and expressing what/when/where/who/why, with background, user/assistant view or action flow, and reason/disagreement/constraint/conclusion/next step",
       "keywords": ["keyword1", "keyword2"],
       "entities": [{"name": "entity name", "type": "PERSON|ORGANIZATION|LOCATION|PRODUCT|PROJECT|TECHNOLOGY|CONCEPT|TOPIC|PREFERENCE|OTHER"}],
       "primary_topic": "stable topic string",

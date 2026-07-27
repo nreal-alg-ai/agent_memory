@@ -8,21 +8,28 @@ UNIFIED_MEMORY_EXTRACTION_PROMPT_ZH = """你是一个受 MemPalace 启发的 AI 
 - state：后续由 facts 更新出的长期主题/偏好/任务状态。
 - index entry：类似 MemPalace 目录卡片的统一召回入口。
 
-你现在需要从下面按时间顺序排列的 assistant 对话批次中提取 episode summary 和高质量 facts。
+你现在需要从下面按时间顺序排列的 assistant 对话批次中提取 episode summary 和 Hindsight 风格的高质量 narrative facts。
 
-要求：
-1. 提取 0-12 条 facts，不要为了覆盖每一轮强行生成 fact。
-2. 每条 fact 必须脱离原始对话后仍可独立理解和召回。
+Hindsight 风格 narrative fact 的核心要求：
+- 每条 fact 应覆盖一次完整 exchange 或一个清晰议题片段，而不是单个 utterance。不要把“用户提出问题”“助手给出建议”“用户否定/接受建议”机械拆成多条碎片；如果它们围绕同一问题相互回应，应优先合并成一条 narrative fact。
+- 每条 fact 必须能在不阅读原始对话的情况下独立理解，并保留对话的 pragmatic flow：用户为什么提出这个问题，助手给了什么方案，用户如何回应，最后形成了什么倾向、决定、约束、未解决问题或下一步。
+- 每条 fact 必须在 text 中自然体现五维度信息：what（完整事件/议题/方案/结论）、when（对话时间或明确时间锚点）、where（地点/场景/平台/项目范围；未提及时说明未提及具体地点/场景）、who（用户、助手和其他关键人物/组织及其角色）、why（明确原因、动机、担忧、分歧、约束、影响、结论或后续安排）。
+- 对一个 5 轮左右的对话批次，通常输出 1-3 条 facts；只有当批次中确实存在多个互不相关的事件/议题时才拆开。绝大多数情况下不要超过 5 条。
+
+提取规则：
+1. 提取 0-5 条 facts，不要为了覆盖每一轮强行生成 fact。
+2. 每条 fact 必须是一段完整叙事，至少包含“议题背景 + 用户/助手的观点或动作流动 + 理由/分歧/约束/结论/下一步”中的关键要素。
 3. 保留可被直接问到的具体细节：人名、地点、标题、颜色、日期、星期、相对时间、数量、金额、时长、产品、机构、建议、约束、决定和用户偏好。
-4. 不要丢弃 “by the way / I also / I just / last Saturday / two months ago / 顺便 / 我还” 这类附带提到的个人事件，LongMemEval 经常会问这些内容。
-5. 独立事件要拆开，不要压缩成宽泛主题。对时间推理友好：可能被比较先后/间隔的事件必须各自保留时间锚点。
+4. 不要丢弃 “by the way / I also / I just / last Saturday / two months ago / 顺便 / 我还” 这类附带提到的个人事件；但如果它们属于同一 exchange 的上下文，应合并进同一条 narrative fact，而不是拆成无背景短句。
+5. 只有真正互不相关的事件才拆开；时间推理需要比较先后/间隔的事件可以拆成多条，但每条仍必须保留完整背景和时间锚点。
 6. 只使用输入证据，不要编造完成状态、意图或原因。
-7. 如果 assistant 的推荐中包含未来可能被问到的具体条目，也要保留。
+7. 如果 assistant 的推荐中包含未来可能被问到的具体条目，要放入相关 exchange 的 narrative fact，并写清用户是否接受、拒绝、犹豫或提出约束。
 8. priority 为 0-100，只保留至少 60 分的事实。
 9. fact_type 只能是 semantic 或 episodic。
 10. fact_subject 只能是 user、assistant、world、project、system、other。
 11. fact_kind 只能是 preference、decision、request、recommendation、action、commitment、open_question、risk、error、context、instruction、other。
-12. 只返回 JSON，不要 markdown。
+12. 不要输出只有“用户说了 X”“助手建议 Y”的短 fact；如果删除议题背景、理由、分歧或结论后会变成泛泛短句，必须补回这些信息；若对话没有足够信息支撑，则不要输出该 fact。
+13. 只返回 JSON，不要 markdown。
 
 输出格式：
 {
@@ -30,7 +37,7 @@ UNIFIED_MEMORY_EXTRACTION_PROMPT_ZH = """你是一个受 MemPalace 启发的 AI 
   "episode_summary": "可独立理解的 episode 总结",
   "facts": [
     {
-      "text": "完整叙事事实",
+      "text": "覆盖完整 exchange 的自包含 narrative fact，在一段文本中体现 what/when/where/who/why，包含背景、用户/助手观点或动作流动、理由/分歧/约束/结论/下一步",
       "keywords": ["关键词1", "关键词2"],
       "entities": [{"name": "实体名", "type": "PERSON|ORGANIZATION|LOCATION|PRODUCT|PROJECT|TECHNOLOGY|CONCEPT|TOPIC|PREFERENCE|OTHER"}],
       "primary_topic": "稳定主题字符串",
