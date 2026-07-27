@@ -7,7 +7,7 @@ internal model is deliberately unified:
 1. assistant_wakeup turns and future allday transcript episodes both become
    `memory_episodes`.
 2. Extracted evidence becomes narrative `memory_facts`.
-3. Longer-running preferences/topics/tasks can become `memory_states`.
+3. Longer-running preferences/topics/constraints can become `memory_states`.
 4. Concrete decisions/tasks/commitments become `memory_actionable_items`.
 5. Every retrievable object writes a `memory_index_entries` card. Recall starts
    from this shared index instead of hard-routing between assistant/allday lines.
@@ -34,14 +34,18 @@ from .memory_database import SessionDB
 from .prompts_en import (
     RECALL_QUERY_ANALYSIS_PROMPT_EN,
     UNIFIED_ACTIONABLE_ITEM_EXTRACTION_PROMPT_EN,
+    UNIFIED_ENTITY_STATE_UPDATE_PROMPT_EN,
     UNIFIED_MEMORY_EXTRACTION_PROMPT_EN,
     UNIFIED_STATE_UPDATE_PROMPT_EN,
+    UNIFIED_TOPIC_STATE_UPDATE_PROMPT_EN,
 )
 from .prompts_zh import (
     RECALL_QUERY_ANALYSIS_PROMPT_ZH,
     UNIFIED_ACTIONABLE_ITEM_EXTRACTION_PROMPT_ZH,
+    UNIFIED_ENTITY_STATE_UPDATE_PROMPT_ZH,
     UNIFIED_MEMORY_EXTRACTION_PROMPT_ZH,
     UNIFIED_STATE_UPDATE_PROMPT_ZH,
+    UNIFIED_TOPIC_STATE_UPDATE_PROMPT_ZH,
 )
 
 logger = logging.getLogger(__name__)
@@ -212,6 +216,42 @@ class MemoryNodeManager:
         )
         self._pending_store_turns: List[Dict[str, Any]] = []
         self._embedding_client: Optional[EmbeddingClient] = None
+        self._enable_topic_state_resolution = self._config_bool(
+            self._memory_cfg.get("enable_topic_state_resolution", True),
+            True,
+        )
+        self._topic_state_max_topics_per_episode = max(
+            1,
+            int(self._memory_cfg.get("topic_state_max_topics_per_episode", 3) or 3),
+        )
+        self._topic_state_resolution_similarity_threshold = float(
+            self._memory_cfg.get("topic_state_resolution_similarity_threshold", 0.62) or 0.62
+        )
+        self._topic_state_grounding_similarity_threshold = float(
+            self._memory_cfg.get("topic_state_grounding_similarity_threshold", 0.42) or 0.42
+        )
+        self._topic_identity_embedding_similarity_threshold = float(
+            self._memory_cfg.get("topic_identity_embedding_similarity_threshold", 0.78) or 0.78
+        )
+        self._topic_identity_grounding_similarity_threshold = float(
+            self._memory_cfg.get("topic_identity_grounding_similarity_threshold", 0.64) or 0.64
+        )
+        self._pending_unresolved_topic_max = max(
+            1,
+            int(self._memory_cfg.get("pending_unresolved_topic_max", 200) or 200),
+        )
+        self._pending_unresolved_topics: List[Dict[str, Any]] = []
+        self._enable_entity_scoped_state_resolution = self._config_bool(
+            self._memory_cfg.get("enable_entity_scoped_state_resolution", True),
+            True,
+        )
+        self._entity_state_max_entities_per_fact = max(
+            1,
+            int(self._memory_cfg.get("entity_state_max_entities_per_fact", 4) or 4),
+        )
+        self._entity_state_resolution_similarity_threshold = float(
+            self._memory_cfg.get("entity_state_resolution_similarity_threshold", 0.72) or 0.72
+        )
 
     @staticmethod
     def _config_bool(value: Any, default: bool = False) -> bool:
@@ -1289,9 +1329,30 @@ class MemoryNodeManager:
         if not self._llm_api_key:
             return {"states_updated": 0, "actionable_items_updated": 0}
         limit = max(1, int(kwargs.get("limit") or self._memory_cfg.get("reflect_limit") or 100))
-        facts = self._db.recent_facts(limit=limit)
+        reflect_timestamp = kwargs.get("reflect_timestamp")
+        if reflect_timestamp is None:
+            reflect_timestamp = kwargs.get("timestamp") or _now_text()
+        facts = self._db.get_unprocessed_facts_for_states(
+            limit=limit,
+            reference_timestamp=reflect_timestamp,
+        )
         if not facts:
             return {"states_updated": 0, "actionable_items_updated": 0}
+        fact_ids = [
+            int(fact["id"])
+            for fact in facts
+            if str(fact.get("id") or "").strip().isdigit()
+        ]
+        existing_states = self._db.recent_states(limit=80)
+        topic_report = self._resolve_and_update_topic_states_from_facts(
+            facts=facts,
+            existing_states=existing_states,
+        )
+        existing_states = self._db.recent_states(limit=80)
+        entity_report = self._resolve_and_update_entity_scoped_states_from_facts(
+            facts=facts,
+            existing_states=existing_states,
+        )
         existing_states = self._db.recent_states(limit=80)
         state_updates = self._extract_state_updates_with_llm(
             facts=facts,
@@ -1302,6 +1363,7 @@ class MemoryNodeManager:
             state_id = self._store_state(state)
             if state_id:
                 states_updated += 1
+        facts_marked_processed = self._db.mark_facts_processed_for_memory_state(fact_ids)
         actionable_updates = self._extract_actionable_items_with_llm(facts=facts)
         actionable_items_updated = 0
         for item in actionable_updates:
@@ -1310,7 +1372,971 @@ class MemoryNodeManager:
                 actionable_items_updated += 1
         return {
             "states_updated": states_updated,
+            "topic_states_updated": int(topic_report.get("updated", 0) or 0),
+            "topic_candidates_unresolved": int(topic_report.get("unresolved", 0) or 0),
+            "pending_unresolved_topics": int(topic_report.get("pending_unresolved", 0) or 0),
+            "entity_states_updated": int(entity_report.get("updated", 0) or 0),
+            "facts_marked_processed_for_memory_state": facts_marked_processed,
             "actionable_items_updated": actionable_items_updated,
+        }
+
+    def _resolve_and_update_topic_states_from_facts(
+        self,
+        *,
+        facts: List[Dict[str, Any]],
+        existing_states: List[Dict[str, Any]],
+    ) -> Dict[str, int]:
+        if not self._enable_topic_state_resolution:
+            return {"enabled": 0, "updated": 0, "unresolved": 0, "pending_unresolved": len(self._pending_unresolved_topics)}
+        existing_topic_states = [
+            state for state in existing_states
+            if str(state.get("state_type") or "") == "topic_state"
+        ]
+        candidates = self._build_topic_state_candidates_from_facts(facts)
+        updated = 0
+        unresolved = 0
+        for candidate in candidates:
+            matched_state, match_info = self._match_topic_candidate_to_existing_state(
+                candidate=candidate,
+                existing_topic_states=existing_topic_states,
+            )
+            grounded, chosen_state, grounding_info = self._ground_topic_state_candidate(
+                candidate=candidate,
+                matched_state=matched_state,
+                match_info=match_info,
+                existing_topic_states=existing_topic_states,
+            )
+            if not grounded:
+                unresolved += 1
+                self._remember_pending_unresolved_topic(candidate, grounding_info)
+                continue
+            if chosen_state:
+                candidate["canonical_name"] = str(
+                    chosen_state.get("canonical_name")
+                    or candidate.get("canonical_name")
+                    or "general"
+                )
+            state_update = self._extract_topic_state_update_with_llm(
+                candidate=candidate,
+                existing_state=chosen_state,
+            )
+            if not state_update or not state_update.get("summary"):
+                continue
+            state_update.setdefault("source_type", candidate.get("source_type") or "unified")
+            state_id = self._store_state(state_update)
+            if state_id:
+                updated += 1
+                refreshed = self._db.recent_states(
+                    source_types=[state_update["source_type"]],
+                    limit=200,
+                )
+                existing_topic_states = [
+                    state for state in refreshed
+                    if str(state.get("state_type") or "") == "topic_state"
+                ]
+        return {
+            "enabled": 1,
+            "candidate_count": len(candidates),
+            "updated": updated,
+            "unresolved": unresolved,
+            "pending_unresolved": len(self._pending_unresolved_topics),
+        }
+
+    def _build_topic_state_candidates_from_facts(
+        self,
+        facts: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        by_episode: Dict[str, List[Dict[str, Any]]] = {}
+        for fact in facts:
+            episode_key = str(fact.get("episode_id") or "unknown")
+            by_episode.setdefault(episode_key, []).append(fact)
+
+        candidates: List[Dict[str, Any]] = []
+        for episode_id, episode_facts in by_episode.items():
+            topic_counts: Counter[str] = Counter()
+            topic_original: Dict[str, str] = {}
+            for fact in episode_facts:
+                raw_topics = self._coerce_topic_list(fact.get("canonical_topics"))
+                if not raw_topics:
+                    raw_topics = self._topic_candidates(str(fact.get("summary") or ""))
+                for raw_topic in raw_topics:
+                    topic = self._normalize_topic_name(raw_topic)
+                    if not topic:
+                        continue
+                    key = self._topic_state_key(topic)
+                    topic_counts[key] += 1
+                    topic_original.setdefault(key, topic)
+            if not topic_counts:
+                continue
+            single_topic = len(topic_counts) == 1
+            for topic_key, _count in topic_counts.most_common(self._topic_state_max_topics_per_episode):
+                topic_name = topic_original.get(topic_key) or topic_key
+                matched_facts = [
+                    fact for fact in episode_facts
+                    if single_topic or self._fact_matches_topic_name(fact, topic_name)
+                ]
+                if not matched_facts:
+                    matched_facts = list(episode_facts)
+                fact_ids = [
+                    int(fact["id"])
+                    for fact in matched_facts
+                    if str(fact.get("id") or "").strip().isdigit()
+                ]
+                if not fact_ids:
+                    continue
+                source_type = self._state_source_type_for_facts(matched_facts, fact_ids)
+                aliases = self._merge_topic_aliases([
+                    topic_name,
+                    topic_key,
+                    *[
+                        topic for fact in matched_facts
+                        for topic in self._coerce_topic_list(fact.get("canonical_topics"))
+                    ],
+                ])
+                identity_keywords = self._topic_identity_keywords(matched_facts, limit=12)
+                topic_identity_text = self._topic_identity_text(
+                    canonical_name=topic_name,
+                    aliases=aliases,
+                    keywords=identity_keywords,
+                )
+                candidates.append({
+                    "episode_id": episode_id,
+                    "topic_key": topic_key,
+                    "canonical_name": topic_name,
+                    "aliases": aliases,
+                    "identity_keywords": identity_keywords,
+                    "topic_identity_text": topic_identity_text,
+                    "facts": matched_facts,
+                    "fact_ids": fact_ids,
+                    "source_type": source_type,
+                    "summary_text": "\n".join(
+                        str(fact.get("summary") or "") for fact in matched_facts
+                    )[:2400],
+                })
+        return candidates
+
+    def _fact_matches_topic_name(self, fact: Dict[str, Any], topic_name: str) -> bool:
+        topic_key = self._topic_state_key(topic_name)
+        fact_topics = [
+            self._topic_state_key(topic)
+            for topic in self._coerce_topic_list(fact.get("canonical_topics"))
+        ]
+        if topic_key in fact_topics:
+            return True
+        for fact_topic in fact_topics:
+            if fact_topic and topic_key and (fact_topic in topic_key or topic_key in fact_topic):
+                return True
+        summary = str(fact.get("summary") or "")
+        return bool(topic_name and topic_name in summary)
+
+    @staticmethod
+    def _topic_state_key(value: Any) -> str:
+        text = _compact_whitespace(value).lower()
+        text = re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff]+", "", text)
+        return text or "general"
+
+    def _merge_topic_aliases(self, values: Sequence[Any], *, limit: int = 20) -> List[str]:
+        aliases: List[str] = []
+        seen: set[str] = set()
+        for value in values:
+            topic = self._normalize_topic_name(value) or _compact_whitespace(value)
+            if not topic:
+                continue
+            key = topic.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            aliases.append(topic)
+            if len(aliases) >= limit:
+                break
+        return aliases
+
+    def _topic_aliases_from_state(self, state: Dict[str, Any]) -> List[str]:
+        metadata = state.get("metadata") or {}
+        return self._merge_topic_aliases([
+            state.get("canonical_name"),
+            *(metadata.get("canonical_topics") or []),
+            *(metadata.get("topic_aliases") or []),
+        ])
+
+    def _topic_identity_keywords(
+        self,
+        facts: Sequence[Dict[str, Any]],
+        *,
+        limit: int = 12,
+    ) -> List[str]:
+        values: List[str] = []
+        for fact in facts:
+            values.extend(str(fact.get("keywords") or "").split())
+            values.extend(str(entity) for entity in (fact.get("entities") or []))
+        generic = {
+            "用户", "助手", "建议", "认为", "表示", "接受", "拒绝", "尝试",
+            "方案", "问题", "工作", "时间", "方法", "讨论", "不现实",
+            "user", "assistant", "suggestion", "plan", "issue", "work",
+            "time", "method", "discussion",
+        }
+        out: List[str] = []
+        seen: set[str] = set()
+        for value in values:
+            clean = self._normalize_topic_name(value) or _compact_whitespace(value)
+            if not clean:
+                continue
+            if clean in generic:
+                continue
+            key = self._topic_state_key(clean)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(clean)
+            if len(out) >= limit:
+                break
+        return out
+
+    def _topic_identity_text(
+        self,
+        *,
+        canonical_name: Any,
+        aliases: Sequence[Any],
+        keywords: Sequence[Any],
+    ) -> str:
+        canonical = self._normalize_topic_name(canonical_name) or _compact_whitespace(canonical_name)
+        alias_values = self._merge_topic_aliases([item for item in aliases if item != canonical], limit=8)
+        keyword_values = self._merge_topic_aliases(keywords, limit=12)
+        return "\n".join([
+            f"canonical_topic: {canonical}",
+            f"aliases: {', '.join(alias_values)}",
+            f"anchor_terms: {', '.join(keyword_values)}",
+        ])
+
+    def _topic_identity_text_for_state(self, state: Dict[str, Any]) -> str:
+        metadata = state.get("metadata") or {}
+        existing_text = _compact_whitespace(metadata.get("topic_identity_text") or "")
+        if existing_text:
+            return existing_text
+        return self._topic_identity_text(
+            canonical_name=state.get("canonical_name"),
+            aliases=self._topic_aliases_from_state(state),
+            keywords=[
+                *(metadata.get("keywords") or []),
+                *(metadata.get("entities") or []),
+            ],
+        )
+
+    def _topic_embedding_similarity(self, left_text: str, right_text: str) -> float:
+        left_embedding = self._embed(left_text)
+        right_embedding = self._embed(right_text)
+        if left_embedding is None or right_embedding is None:
+            return 0.0
+        left = np.asarray(left_embedding, dtype=np.float32).reshape(-1)
+        right = np.asarray(right_embedding, dtype=np.float32).reshape(-1)
+        denom = float(np.linalg.norm(left) * np.linalg.norm(right))
+        if denom <= 0:
+            return 0.0
+        return float(np.dot(left, right) / denom)
+
+    def _topic_resolution_text(
+        self,
+        *,
+        candidate: Optional[Dict[str, Any]] = None,
+        state: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        parts: List[str] = []
+        if candidate:
+            parts.extend(candidate.get("aliases") or [])
+            parts.append(str(candidate.get("summary_text") or ""))
+            for fact in candidate.get("facts") or []:
+                parts.append(str(fact.get("summary") or "")[:500])
+        if state:
+            metadata = state.get("metadata") or {}
+            parts.extend(self._topic_aliases_from_state(state))
+            parts.append(str(state.get("summary") or ""))
+            parts.extend(str(item) for item in metadata.get("canonical_topics") or [])
+        return "\n".join(part for part in parts if str(part or "").strip())
+
+    def _match_topic_candidate_to_existing_state(
+        self,
+        *,
+        candidate: Dict[str, Any],
+        existing_topic_states: List[Dict[str, Any]],
+    ) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+        if not existing_topic_states:
+            return None, {"matched": False, "reason": "no_existing_topic_states"}
+        candidate_aliases = candidate.get("aliases") or [candidate.get("canonical_name", "")]
+        candidate_keys = {
+            self._topic_state_key(alias)
+            for alias in candidate_aliases
+            if str(alias or "").strip()
+        }
+        candidate_text = self._topic_resolution_text(candidate=candidate)
+        candidate_identity_text = (
+            _compact_whitespace(candidate.get("topic_identity_text") or "")
+            or self._topic_identity_text(
+                canonical_name=candidate.get("canonical_name"),
+                aliases=candidate_aliases,
+                keywords=candidate.get("identity_keywords") or [],
+            )
+        )
+        best_state: Optional[Dict[str, Any]] = None
+        best_info: Dict[str, Any] = {"score": 0.0}
+        for state in existing_topic_states:
+            state_aliases = self._topic_aliases_from_state(state)
+            state_keys = {
+                self._topic_state_key(alias)
+                for alias in state_aliases
+                if str(alias or "").strip()
+            }
+            exact_alias_match = bool(candidate_keys & state_keys)
+            name_overlap = self._topic_name_overlap(candidate_aliases, state_aliases)
+            text_overlap = self._topic_name_similarity(
+                candidate_text[:1200],
+                self._topic_resolution_text(state=state)[:1200],
+            )
+            embedding_similarity = self._topic_embedding_similarity(
+                candidate_identity_text,
+                self._topic_identity_text_for_state(state),
+            )
+            strong_name_match = exact_alias_match or name_overlap >= self._topic_state_resolution_similarity_threshold
+            strong_embedding_match = (
+                embedding_similarity >= self._topic_identity_embedding_similarity_threshold
+                and name_overlap >= 0.25
+            )
+            matched = strong_name_match or strong_embedding_match
+            score = max(
+                1.0 if exact_alias_match else 0.0,
+                name_overlap,
+                embedding_similarity,
+            )
+            if score > float(best_info.get("score", 0.0)):
+                best_state = state
+                best_info = {
+                    "matched": matched,
+                    "reason": "matched_existing_topic_state" if matched else "best_match_below_threshold",
+                    "score": round(score, 4),
+                    "exact_alias_match": exact_alias_match,
+                    "name_overlap": round(name_overlap, 4),
+                    "text_overlap": round(text_overlap, 4),
+                    "embedding_similarity": round(embedding_similarity, 4),
+                    "strong_name_match": strong_name_match,
+                    "strong_embedding_match": strong_embedding_match,
+                    "existing_state_id": state.get("id"),
+                    "existing_canonical_name": state.get("canonical_name"),
+                }
+        if best_state and best_info.get("matched"):
+            return best_state, best_info
+        return None, best_info
+
+    def _topic_name_overlap(self, left_aliases: Sequence[str], right_aliases: Sequence[str]) -> float:
+        best = 0.0
+        for left in left_aliases:
+            left_key = self._topic_state_key(left)
+            for right in right_aliases:
+                right_key = self._topic_state_key(right)
+                if left_key and right_key and left_key == right_key:
+                    return 1.0
+                if left_key and right_key and (left_key in right_key or right_key in left_key):
+                    best = max(best, 0.9)
+                best = max(best, self._topic_name_similarity(str(left), str(right)))
+        return best
+
+    @classmethod
+    def _topic_anchor_remainder(cls, text: str) -> str:
+        clean = re.sub(r"speaker[_-]?\d+", "", str(text or "").lower())
+        generic_terms = [
+            "产品", "方案", "策略", "讨论", "活动", "项目", "计划", "协作",
+            "落实", "筹备", "管理", "设计", "推广", "促销", "目标", "用户",
+            "定位", "成本", "质量", "部门", "会议", "总结", "后续", "安排",
+            "执行", "上线", "选择", "方式", "内容", "问题", "建议", "相关",
+            "事项", "工作", "阶段", "品牌", "赠品", "供应商", "价格", "折扣",
+            "定价", "合作", "沟通", "配合", "跟进", "确认", "时间", "排期",
+            "颜色", "外观", "风格", "提议", "参考", "偏好", "使用", "要求",
+            "会后", "各", "与", "和", "及", "的", "了",
+            "product", "products", "plan", "plans", "strategy", "strategies",
+            "discussion", "coordination", "implementation", "execution", "design",
+            "activity", "preparation", "management", "topic", "topics", "followup",
+            "follow-up", "meeting", "department", "departments", "scheme",
+            "solution", "solutions", "project", "projects", "promotion", "pricing",
+            "discount", "quality", "cost", "vendor", "vendors", "supplier",
+            "suppliers", "launch", "schedule", "scheduling", "and", "or", "the",
+            "a", "an", "to", "of", "for", "with",
+        ]
+        for term in sorted(generic_terms, key=len, reverse=True):
+            clean = clean.replace(term, "")
+        clean = re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff]+", "", clean)
+        return clean.strip()
+
+    def _topic_candidate_has_anchor(self, candidate: Dict[str, Any]) -> bool:
+        for value in [candidate.get("canonical_name"), *(candidate.get("aliases") or [])]:
+            if len(self._topic_anchor_remainder(str(value or ""))) >= 2:
+                return True
+        return False
+
+    def _ground_topic_state_candidate(
+        self,
+        *,
+        candidate: Dict[str, Any],
+        matched_state: Optional[Dict[str, Any]],
+        match_info: Dict[str, Any],
+        existing_topic_states: List[Dict[str, Any]],
+    ) -> Tuple[bool, Optional[Dict[str, Any]], Dict[str, Any]]:
+        if matched_state:
+            return True, matched_state, {
+                "grounded": True,
+                "reason": "matched_existing_topic_state",
+                "candidate_has_anchor": self._topic_candidate_has_anchor(candidate),
+                "match": match_info,
+            }
+        candidate_has_anchor = self._topic_candidate_has_anchor(candidate)
+        if candidate_has_anchor:
+            return True, None, {
+                "grounded": True,
+                "reason": "candidate_has_concrete_anchor",
+                "candidate_has_anchor": True,
+                "match": match_info,
+            }
+        best_state = None
+        if (
+            existing_topic_states
+            and float(match_info.get("embedding_similarity", 0.0) or 0.0) >= self._topic_identity_grounding_similarity_threshold
+            and float(match_info.get("name_overlap", 0.0) or 0.0) >= 0.2
+        ):
+            best_id = match_info.get("existing_state_id")
+            for state in existing_topic_states:
+                if best_id is not None and int(state.get("id") or -1) == int(best_id):
+                    best_state = state
+                    break
+        if best_state:
+            return True, best_state, {
+                "grounded": True,
+                "reason": "inherited_existing_topic_for_unanchored_candidate",
+                "candidate_has_anchor": False,
+                "match": match_info,
+            }
+        return False, None, {
+            "grounded": False,
+            "reason": "missing_concrete_topic_anchor",
+            "candidate_has_anchor": False,
+            "match": match_info,
+        }
+
+    def _remember_pending_unresolved_topic(
+        self,
+        candidate: Dict[str, Any],
+        grounding_info: Dict[str, Any],
+    ) -> None:
+        record = {
+            "created_at": _now_text(),
+            "episode_id": candidate.get("episode_id"),
+            "canonical_name": candidate.get("canonical_name"),
+            "topic_key": candidate.get("topic_key"),
+            "aliases": candidate.get("aliases", []),
+            "fact_ids": candidate.get("fact_ids", []),
+            "source_type": candidate.get("source_type"),
+            "grounding": grounding_info,
+        }
+        self._pending_unresolved_topics.append(record)
+        if len(self._pending_unresolved_topics) > self._pending_unresolved_topic_max:
+            overflow = len(self._pending_unresolved_topics) - self._pending_unresolved_topic_max
+            del self._pending_unresolved_topics[:overflow]
+
+    def _extract_topic_state_update_with_llm(
+        self,
+        *,
+        candidate: Dict[str, Any],
+        existing_state: Optional[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        facts = list(candidate.get("facts") or [])
+        prompt_language = self._resolve_prompt_language_from_text(
+            "\n".join(str(item.get("summary") or "") for item in facts[:12])
+        )
+        prompt_template = (
+            UNIFIED_TOPIC_STATE_UPDATE_PROMPT_EN
+            if prompt_language == "en"
+            else UNIFIED_TOPIC_STATE_UPDATE_PROMPT_ZH
+        )
+        prompt = (
+            prompt_template
+            .replace("{canonical_topic}", json.dumps({
+                "canonical_name": candidate.get("canonical_name"),
+                "topic_key": candidate.get("topic_key"),
+                "aliases": candidate.get("aliases", []),
+                "identity_keywords": candidate.get("identity_keywords", []),
+                "topic_identity_text": candidate.get("topic_identity_text") or "",
+            }, ensure_ascii=False, indent=2))
+            .replace("{existing_topic_state}", json.dumps(
+                self._format_existing_topic_state_for_prompt(existing_state),
+                ensure_ascii=False,
+                indent=2,
+            ))
+            .replace("{facts}", self._format_facts_for_state_prompt(facts))
+        )
+        result = self._call_llm(prompt)
+        parsed = self._parse_json_object_from_llm_text(result or "")
+        if parsed:
+            normalized = self._normalize_topic_state_update_payload(
+                parsed,
+                candidate=candidate,
+                existing_state=existing_state,
+            )
+            if normalized:
+                return normalized
+        return self._fallback_topic_state_update(candidate, existing_state)
+
+    @staticmethod
+    def _format_existing_topic_state_for_prompt(state: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        if not state:
+            return {}
+        return {
+            "id": state.get("id"),
+            "source_type": state.get("source_type"),
+            "canonical_name": state.get("canonical_name"),
+            "summary": state.get("summary"),
+            "evidence_fact_ids": state.get("evidence_fact_ids") or [],
+            "confidence": state.get("confidence"),
+            "metadata": state.get("metadata") or {},
+        }
+
+    def _normalize_topic_state_update_payload(
+        self,
+        raw: Dict[str, Any],
+        *,
+        candidate: Dict[str, Any],
+        existing_state: Optional[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        if not self._config_bool(raw.get("update_needed", True), True):
+            return None
+        summary = _compact_whitespace(raw.get("summary") or "")
+        if not summary:
+            return None
+        valid_fact_ids = {
+            int(fact["id"])
+            for fact in candidate.get("facts", [])
+            if str(fact.get("id") or "").strip().isdigit()
+        }
+        evidence_ids = [
+            int(value)
+            for value in (raw.get("evidence_fact_ids") or [])
+            if str(value).strip().isdigit() and int(value) in valid_fact_ids
+        ]
+        if not evidence_ids:
+            evidence_ids = list(candidate.get("fact_ids") or [])[:24]
+        existing_ids = [
+            int(value)
+            for value in ((existing_state or {}).get("evidence_fact_ids") or [])
+            if str(value).strip().isdigit()
+        ]
+        evidence_ids = list(dict.fromkeys([*existing_ids, *evidence_ids]))[:80]
+        canonical_name = (
+            _compact_whitespace((existing_state or {}).get("canonical_name") or "")
+            or self._normalize_topic_name(raw.get("canonical_name"))
+            or _compact_whitespace(candidate.get("canonical_name") or "")
+            or "general"
+        )
+        canonical_topics = self._merge_topic_aliases([
+            canonical_name,
+            *(raw.get("canonical_topics") or []),
+            *(candidate.get("aliases") or []),
+        ], limit=8)
+        return {
+            "state_type": "topic_state",
+            "source_type": candidate.get("source_type") or (existing_state or {}).get("source_type") or "unified",
+            "canonical_name": canonical_name,
+            "summary": summary,
+            "evidence_fact_ids": evidence_ids,
+            "keywords": self._normalize_string_list(raw.get("keywords"), limit=18),
+            "entities": self._normalize_string_list(raw.get("entities"), limit=18),
+            "canonical_topics": canonical_topics or [canonical_name],
+            "importance": self._clamp_float(raw.get("importance"), 0.0, 1.0, 0.7),
+            "confidence": self._clamp_float(raw.get("confidence"), 0.0, 1.0, 0.75),
+            "status": _compact_whitespace(raw.get("status") or "active") or "active",
+            "metadata": {
+                "topic_key": candidate.get("topic_key"),
+                "topic_aliases": candidate.get("aliases", []),
+                "topic_identity_text": candidate.get("topic_identity_text") or "",
+                "identity_keywords": candidate.get("identity_keywords", []),
+                "episode_id": candidate.get("episode_id"),
+            },
+        }
+
+    def _fallback_topic_state_update(
+        self,
+        candidate: Dict[str, Any],
+        existing_state: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        fact_summaries = [
+            _compact_whitespace(fact.get("summary") or "")
+            for fact in candidate.get("facts", [])
+            if _compact_whitespace(fact.get("summary") or "")
+        ][:5]
+        base = _compact_whitespace((existing_state or {}).get("summary") or "")
+        update_text = "；".join(fact_summaries)
+        summary = (
+            f"{base}\n最近更新：{update_text}"
+            if base and update_text
+            else update_text or base or _compact_whitespace(candidate.get("summary_text") or "")
+        )
+        summary = summary[-1800:]
+        existing_ids = [
+            int(value)
+            for value in ((existing_state or {}).get("evidence_fact_ids") or [])
+            if str(value).strip().isdigit()
+        ]
+        evidence_ids = list(dict.fromkeys([*existing_ids, *(candidate.get("fact_ids") or [])]))[:80]
+        canonical_name = (
+            _compact_whitespace((existing_state or {}).get("canonical_name") or "")
+            or _compact_whitespace(candidate.get("canonical_name") or "")
+            or "general"
+        )
+        return {
+            "state_type": "topic_state",
+            "source_type": candidate.get("source_type") or (existing_state or {}).get("source_type") or "unified",
+            "canonical_name": canonical_name,
+            "summary": summary,
+            "evidence_fact_ids": evidence_ids,
+            "keywords": self._keywords(summary, limit=18),
+            "entities": self._entities(summary),
+            "canonical_topics": self._merge_topic_aliases([canonical_name, *(candidate.get("aliases") or [])], limit=8),
+            "importance": 0.7,
+            "confidence": 0.58,
+            "status": "active",
+            "metadata": {
+                "topic_key": candidate.get("topic_key"),
+                "topic_aliases": candidate.get("aliases", []),
+                "topic_identity_text": candidate.get("topic_identity_text") or "",
+                "identity_keywords": candidate.get("identity_keywords", []),
+                "episode_id": candidate.get("episode_id"),
+                "extractor": "fallback_topic_state_update",
+            },
+        }
+
+    def _resolve_and_update_entity_scoped_states_from_facts(
+        self,
+        *,
+        facts: List[Dict[str, Any]],
+        existing_states: List[Dict[str, Any]],
+    ) -> Dict[str, int]:
+        if not self._enable_entity_scoped_state_resolution:
+            return {"enabled": 0, "updated": 0}
+        existing_entity_states = [
+            state for state in existing_states
+            if str(state.get("state_type") or "") in self._entity_scoped_state_types()
+        ]
+        candidates = self._build_entity_state_candidates_from_facts(facts)
+        updated = 0
+        for candidate in candidates:
+            existing_state, match_info = self._match_entity_state_candidate(
+                candidate=candidate,
+                existing_entity_states=existing_entity_states,
+            )
+            if existing_state:
+                candidate["canonical_name"] = str(
+                    existing_state.get("canonical_name")
+                    or candidate.get("canonical_name")
+                    or "general"
+                )
+            state_update = self._extract_entity_state_update_with_llm(
+                candidate=candidate,
+                existing_state=existing_state,
+                match_info=match_info,
+            )
+            if not state_update or not state_update.get("summary"):
+                continue
+            state_id = self._store_state(state_update)
+            if state_id:
+                updated += 1
+                refreshed = self._db.recent_states(
+                    source_types=[state_update["source_type"]],
+                    limit=200,
+                )
+                existing_entity_states = [
+                    state for state in refreshed
+                    if str(state.get("state_type") or "") in self._entity_scoped_state_types()
+                ]
+        return {"enabled": 1, "candidate_count": len(candidates), "updated": updated}
+
+    @staticmethod
+    def _entity_scoped_state_types() -> set[str]:
+        return {"preference", "relationship", "profile", "routine", "constraint"}
+
+    def _build_entity_state_candidates_from_facts(
+        self,
+        facts: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        grouped: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+        for fact in facts:
+            state_types = self._infer_entity_scoped_state_types_for_fact(fact)
+            if not state_types:
+                continue
+            entities = self._entities_for_entity_state_fact(fact)
+            if not entities:
+                continue
+            source_type = str(fact.get("source_type") or "unified")
+            for state_type in state_types:
+                for entity in entities[: self._entity_state_max_entities_per_fact]:
+                    canonical_name = self._entity_state_canonical_name(
+                        entity=entity,
+                        state_type=state_type,
+                    )
+                    key = (source_type, state_type, canonical_name.lower())
+                    item = grouped.setdefault(key, {
+                        "source_type": source_type,
+                        "state_type": state_type,
+                        "entity": entity,
+                        "canonical_name": canonical_name,
+                        "facts": [],
+                        "fact_ids": [],
+                        "aliases": self._merge_topic_aliases([entity, canonical_name], limit=10),
+                    })
+                    item["facts"].append(fact)
+                    if str(fact.get("id") or "").strip().isdigit():
+                        item["fact_ids"].append(int(fact["id"]))
+        candidates: List[Dict[str, Any]] = []
+        for item in grouped.values():
+            item["fact_ids"] = list(dict.fromkeys(item.get("fact_ids") or []))
+            if not item["fact_ids"]:
+                continue
+            item["summary_text"] = "\n".join(
+                str(fact.get("summary") or "") for fact in item.get("facts") or []
+            )[:2400]
+            candidates.append(item)
+        return candidates
+
+    def _infer_entity_scoped_state_types_for_fact(self, fact: Dict[str, Any]) -> List[str]:
+        kind = str(fact.get("fact_kind") or "").strip().lower()
+        subject = str(fact.get("fact_subject") or "").strip().lower()
+        summary = str(fact.get("summary") or "").lower()
+        state_types: List[str] = []
+        if kind == "preference" or any(marker in summary for marker in ("偏好", "喜欢", "倾向", "更愿意", "prefer", "likes", "tends to")):
+            state_types.append("preference")
+        if any(marker in summary for marker in ("习惯", "经常", "通常", "每天", "每周", "routine", "usually", "often")):
+            state_types.append("routine")
+        if kind in {"context", "instruction"} and subject in {"user", "project", "world", "other"}:
+            state_types.append("profile")
+        if kind == "risk" or any(marker in summary for marker in ("约束", "限制", "不能", "预算", "deadline", "constraint", "limited", "budget")):
+            state_types.append("constraint")
+        if any(marker in summary for marker in ("关系", "同事", "朋友", "家人", "老板", "客户", "relationship", "colleague", "friend", "family", "client")):
+            state_types.append("relationship")
+        return [item for item in dict.fromkeys(state_types) if item in self._entity_scoped_state_types()]
+
+    def _entities_for_entity_state_fact(self, fact: Dict[str, Any]) -> List[str]:
+        entities = [
+            _compact_whitespace(value)
+            for value in (fact.get("entities") or [])
+            if _compact_whitespace(value)
+        ]
+        subject = str(fact.get("fact_subject") or "").strip().lower()
+        if subject == "user":
+            return ["user"]
+        elif subject == "assistant":
+            return ["assistant"]
+        if not entities and subject in {"project", "world", "other"}:
+            topics = self._coerce_topic_list(fact.get("canonical_topics"))
+            entities.extend(self._normalize_topic_name(topic) for topic in topics)
+        out: List[str] = []
+        seen: set[str] = set()
+        for entity in entities:
+            clean = _compact_whitespace(entity)
+            if not clean:
+                continue
+            key = clean.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(clean)
+        return out
+
+    @staticmethod
+    def _entity_state_canonical_name(*, entity: str, state_type: str) -> str:
+        labels = {
+            "preference": "preference",
+            "relationship": "relationship",
+            "profile": "profile",
+            "routine": "routine",
+            "constraint": "constraint",
+        }
+        return f"{_compact_whitespace(entity)} - {labels.get(state_type, state_type)}"
+
+    def _match_entity_state_candidate(
+        self,
+        *,
+        candidate: Dict[str, Any],
+        existing_entity_states: List[Dict[str, Any]],
+    ) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+        candidate_name = str(candidate.get("canonical_name") or "")
+        candidate_entity = str(candidate.get("entity") or "")
+        candidate_type = str(candidate.get("state_type") or "")
+        best_state: Optional[Dict[str, Any]] = None
+        best_score = 0.0
+        for state in existing_entity_states:
+            if str(state.get("source_type") or "") != str(candidate.get("source_type") or ""):
+                continue
+            if str(state.get("state_type") or "") != candidate_type:
+                continue
+            metadata = state.get("metadata") or {}
+            state_aliases = [
+                state.get("canonical_name"),
+                *(metadata.get("entities") or []),
+                *(metadata.get("entity_aliases") or []),
+            ]
+            score = max(
+                self._topic_name_similarity(candidate_name, str(state.get("canonical_name") or "")),
+                self._topic_name_overlap([candidate_entity], [str(item) for item in state_aliases]),
+            )
+            if score > best_score:
+                best_score = score
+                best_state = state
+        if best_state and best_score >= self._entity_state_resolution_similarity_threshold:
+            return best_state, {
+                "matched": True,
+                "score": round(best_score, 4),
+                "existing_state_id": best_state.get("id"),
+                "existing_canonical_name": best_state.get("canonical_name"),
+            }
+        return None, {"matched": False, "score": round(best_score, 4)}
+
+    def _extract_entity_state_update_with_llm(
+        self,
+        *,
+        candidate: Dict[str, Any],
+        existing_state: Optional[Dict[str, Any]],
+        match_info: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        facts = list(candidate.get("facts") or [])
+        prompt_language = self._resolve_prompt_language_from_text(
+            "\n".join(str(item.get("summary") or "") for item in facts[:12])
+        )
+        prompt_template = (
+            UNIFIED_ENTITY_STATE_UPDATE_PROMPT_EN
+            if prompt_language == "en"
+            else UNIFIED_ENTITY_STATE_UPDATE_PROMPT_ZH
+        )
+        prompt = (
+            prompt_template
+            .replace("{entity_state_target}", json.dumps({
+                "entity": candidate.get("entity"),
+                "state_type": candidate.get("state_type"),
+                "canonical_name": candidate.get("canonical_name"),
+                "aliases": candidate.get("aliases", []),
+            }, ensure_ascii=False, indent=2))
+            .replace("{existing_entity_state}", json.dumps(
+                self._format_existing_topic_state_for_prompt(existing_state),
+                ensure_ascii=False,
+                indent=2,
+            ))
+            .replace("{facts}", self._format_facts_for_state_prompt(facts))
+        )
+        result = self._call_llm(prompt)
+        parsed = self._parse_json_object_from_llm_text(result or "")
+        if parsed:
+            normalized = self._normalize_entity_state_update_payload(
+                parsed,
+                candidate=candidate,
+                existing_state=existing_state,
+                match_info=match_info,
+            )
+            if normalized:
+                return normalized
+        return self._fallback_entity_state_update(candidate, existing_state, match_info)
+
+    def _normalize_entity_state_update_payload(
+        self,
+        raw: Dict[str, Any],
+        *,
+        candidate: Dict[str, Any],
+        existing_state: Optional[Dict[str, Any]],
+        match_info: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        if not self._config_bool(raw.get("update_needed", True), True):
+            return None
+        summary = _compact_whitespace(raw.get("summary") or "")
+        if not summary:
+            return None
+        valid_fact_ids = {
+            int(fact["id"])
+            for fact in candidate.get("facts", [])
+            if str(fact.get("id") or "").strip().isdigit()
+        }
+        evidence_ids = [
+            int(value)
+            for value in (raw.get("evidence_fact_ids") or [])
+            if str(value).strip().isdigit() and int(value) in valid_fact_ids
+        ] or list(candidate.get("fact_ids") or [])[:24]
+        existing_ids = [
+            int(value)
+            for value in ((existing_state or {}).get("evidence_fact_ids") or [])
+            if str(value).strip().isdigit()
+        ]
+        evidence_ids = list(dict.fromkeys([*existing_ids, *evidence_ids]))[:80]
+        canonical_name = (
+            _compact_whitespace((existing_state or {}).get("canonical_name") or "")
+            or _compact_whitespace(raw.get("canonical_name") or "")
+            or _compact_whitespace(candidate.get("canonical_name") or "")
+        )
+        canonical_topics = self._merge_topic_aliases(raw.get("canonical_topics") or [], limit=8)
+        return {
+            "state_type": candidate["state_type"],
+            "source_type": candidate.get("source_type") or (existing_state or {}).get("source_type") or "unified",
+            "canonical_name": canonical_name,
+            "summary": summary,
+            "evidence_fact_ids": evidence_ids,
+            "keywords": self._normalize_string_list(raw.get("keywords"), limit=18),
+            "entities": self._merge_topic_aliases([
+                candidate.get("entity"),
+                *(raw.get("entities") or []),
+            ], limit=18),
+            "canonical_topics": canonical_topics or self._coerce_topic_list((candidate.get("facts") or [{}])[0].get("canonical_topics"))[:8],
+            "importance": self._clamp_float(raw.get("importance"), 0.0, 1.0, 0.68),
+            "confidence": self._clamp_float(raw.get("confidence"), 0.0, 1.0, 0.74),
+            "status": _compact_whitespace(raw.get("status") or "active") or "active",
+            "metadata": {
+                "entity": candidate.get("entity"),
+                "entity_aliases": candidate.get("aliases", []),
+                "entity_state_resolution": match_info,
+                "extractor": "entity_scoped_state_update",
+            },
+        }
+
+    def _fallback_entity_state_update(
+        self,
+        candidate: Dict[str, Any],
+        existing_state: Optional[Dict[str, Any]],
+        match_info: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        summaries = [
+            _compact_whitespace(fact.get("summary") or "")
+            for fact in candidate.get("facts", [])
+            if _compact_whitespace(fact.get("summary") or "")
+        ][:5]
+        base = _compact_whitespace((existing_state or {}).get("summary") or "")
+        update_text = "；".join(summaries)
+        summary = (
+            f"{base}\n最近更新：{update_text}"
+            if base and update_text
+            else update_text or base or _compact_whitespace(candidate.get("summary_text") or "")
+        )
+        existing_ids = [
+            int(value)
+            for value in ((existing_state or {}).get("evidence_fact_ids") or [])
+            if str(value).strip().isdigit()
+        ]
+        evidence_ids = list(dict.fromkeys([*existing_ids, *(candidate.get("fact_ids") or [])]))[:80]
+        return {
+            "state_type": candidate["state_type"],
+            "source_type": candidate.get("source_type") or (existing_state or {}).get("source_type") or "unified",
+            "canonical_name": _compact_whitespace((existing_state or {}).get("canonical_name") or candidate.get("canonical_name") or ""),
+            "summary": summary[-1800:],
+            "evidence_fact_ids": evidence_ids,
+            "keywords": self._keywords(summary, limit=18),
+            "entities": [candidate.get("entity")] if candidate.get("entity") else [],
+            "canonical_topics": self._coerce_topic_list((candidate.get("facts") or [{}])[0].get("canonical_topics"))[:8],
+            "importance": 0.66,
+            "confidence": 0.58,
+            "status": "active",
+            "metadata": {
+                "entity": candidate.get("entity"),
+                "entity_aliases": candidate.get("aliases", []),
+                "entity_state_resolution": match_info,
+                "extractor": "fallback_entity_scoped_state_update",
+            },
         }
 
     def _extract_state_updates_with_llm(
@@ -1356,6 +2382,13 @@ class MemoryNodeManager:
             if not evidence_ids:
                 continue
             state_type = self._normalize_state_type(raw.get("state_type"))
+            if state_type == "topic_state" and self._enable_topic_state_resolution:
+                continue
+            if (
+                self._enable_entity_scoped_state_resolution
+                and state_type in self._entity_scoped_state_types()
+            ):
+                continue
             source_type = self._state_source_type_for_facts(facts, evidence_ids)
             normalized.append({
                 "state_type": state_type,
@@ -1393,6 +2426,7 @@ class MemoryNodeManager:
             evidence_fact_ids=evidence_fact_ids,
             confidence=state["confidence"],
             metadata={
+                **dict(state.get("metadata") or {}),
                 "keywords": keywords,
                 "entities": entities,
                 "canonical_topics": canonical_topics,
@@ -1732,9 +2766,8 @@ class MemoryNodeManager:
     def _normalize_state_type(value: Any) -> str:
         text = str(value or "other").strip().lower()
         allowed = {
-            "preference", "task_state", "project_state", "relationship",
-            "routine", "topic_state", "commitment", "constraint", "risk",
-            "profile", "other",
+            "preference", "relationship", "routine", "topic_state",
+            "constraint", "risk", "profile", "other",
         }
         return text if text in allowed else "other"
 

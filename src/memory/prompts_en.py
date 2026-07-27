@@ -5,7 +5,7 @@ UNIFIED_MEMORY_EXTRACTION_PROMPT_EN = """You are the memory extraction module fo
 The system no longer treats assistant_wakeup and allday_recording as two separate memory products. Both sources enter one memory line:
 - episode: one coherent interaction or transcript episode.
 - fact: traceable, self-contained narrative evidence extracted from the episode.
-- state: evolving long-term topic/preference/task state derived later from facts.
+- state: evolving long-term topic/preference/constraint/risk state derived later from facts.
 - index entry: a MemPalace-style directory card used for unified recall.
 
 Your task now is to extract the episode summary, episode canonical_topics, and Hindsight-style high-quality narrative facts from the chronological dialogue/transcript evidence batch below. The evidence may come from an active user-assistant exchange or a multi-speaker ambient transcript; use speaker, role, and time to infer participants and pragmatic flow.
@@ -73,15 +73,20 @@ Dialogue/transcript evidence batch:
 
 UNIFIED_STATE_UPDATE_PROMPT_EN = """You are the state update module for a unified AI-glasses long-term memory system inspired by MemPalace.
 
-The input contains newly stored narrative facts and the current long-term states. Your task is to update or create compact evolving states that help future recall. A state is not a copy of one fact. It should summarize a stable preference, ongoing project/task, recurring behavior, open commitment, important relationship, or topic-level situation across multiple facts.
+The input contains newly stored narrative facts and the current long-term states. Your task is to update or create compact evolving states that help future recall. A state is not a copy of one fact. It should summarize stable preferences, recurring behavior, durable constraints, persistent risks, important relationships, or topic-level situations across multiple facts.
+
+Boundary rules:
+- Topic, project, and issue progress belong in topic_state. Do not create a separate project-style state.
+- Concrete tasks, decisions, commitments, reminders, and open questions belong in actionable_item. Do not create task-style or commitment-style states.
+- Output a state only when the information should remain useful as durable memory. Do not output a state for a one-off task or commitment.
 
 Rules:
 1. Create or update only states that are useful beyond the current episode.
-2. Do not create a state from a single trivial fact unless it is a durable preference, commitment, decision, or important life/project context.
+2. Do not create a state from a single trivial fact unless it is a durable preference, long-running constraint, persistent risk, or important life/project context.
 3. Merge facts about the same durable subject into one state instead of creating near-duplicates.
 4. Preserve uncertainty and recent changes. If evidence conflicts, explicitly state the conflict.
 5. Use evidence_fact_ids to cite the fact IDs that support the state.
-6. state_type must be one of: preference, task_state, project_state, relationship, routine, topic_state, commitment, constraint, risk, profile, other.
+6. state_type must be one of: preference, relationship, routine, topic_state, constraint, risk, profile, other.
 7. importance is 0-1. confidence is 0-1.
 8. Return JSON only. No markdown.
 
@@ -89,7 +94,7 @@ Output schema:
 {
   "states": [
     {
-      "state_type": "preference|task_state|project_state|relationship|routine|topic_state|commitment|constraint|risk|profile|other",
+      "state_type": "preference|relationship|routine|topic_state|constraint|risk|profile|other",
       "canonical_name": "stable short name",
       "summary": "self-contained evolving state",
       "evidence_fact_ids": [1, 2],
@@ -107,6 +112,87 @@ Existing states:
 {existing_states}
 
 New facts:
+{facts}
+"""
+
+
+UNIFIED_TOPIC_STATE_UPDATE_PROMPT_EN = """You are the topic_state update module for a unified AI-glasses long-term memory system inspired by MemPalace.
+
+The input has already passed topic resolution: the system has decided that these facts belong to a long-term topic, or that a new long-term topic should be created. Your task is to update that topic_state summary, not to re-route the topic.
+
+Rules:
+1. Update only the given canonical_topic. Do not merge unrelated facts.
+2. The summary should describe the durable topic state: background, recent changes, key participants, decisions/preferences/constraints that still matter, unresolved questions, and next steps.
+3. If existing_topic_state is present, merge incrementally instead of concatenating. Preserve durable information that is still valid.
+4. Do not rewrite one fact into another fact. A topic_state must be more abstract and stable than individual facts.
+5. evidence_fact_ids must cite supporting fact IDs from the input facts.
+6. Return JSON only. No markdown.
+
+Output schema:
+{
+  "update_needed": true,
+  "canonical_name": "stable topic name",
+  "summary": "merged long-term topic_state",
+  "keywords": ["keyword1", "keyword2"],
+  "entities": ["entity1", "entity2"],
+  "canonical_topics": ["topic1"],
+  "evidence_fact_ids": [1, 2],
+  "importance": 0.8,
+  "confidence": 0.85,
+  "status": "active|stable|resolved|uncertain"
+}
+
+canonical_topic:
+{canonical_topic}
+
+existing_topic_state:
+{existing_topic_state}
+
+new facts:
+{facts}
+"""
+
+
+UNIFIED_ENTITY_STATE_UPDATE_PROMPT_EN = """You are the entity-scoped state update module for a unified AI-glasses long-term memory system inspired by MemPalace.
+
+The input has already passed entity resolution: the system has decided that these facts should update one durable state type for one entity. Your task is to update that entity-related state, not to re-route the topic.
+
+entity-scoped state targets:
+- preference: stable preferences, selection tendencies, likes/dislikes.
+- relationship: durable relationship state between this entity and other people, organizations, or projects.
+- profile: stable identity, background, responsibility, role, or important context.
+- routine: repeated habits, processes, cadence, or workflow.
+- constraint: durable or currently persistent limitations that affect action.
+
+Rules:
+1. Update only the given entity and state_type. Do not write a topic progress summary.
+2. If the facts only describe topic progress, leave that to topic_state. Keep only durable information about the entity itself.
+3. If existing_entity_state is present, merge incrementally instead of concatenating.
+4. The summary must answer: "What should we remember long-term about this entity?"
+5. evidence_fact_ids must cite supporting fact IDs from the input facts.
+6. Return JSON only. No markdown.
+
+Output schema:
+{
+  "update_needed": true,
+  "canonical_name": "entity name - state short name",
+  "summary": "merged entity-scoped state",
+  "keywords": ["keyword1", "keyword2"],
+  "entities": ["entity1", "entity2"],
+  "canonical_topics": ["topic1"],
+  "evidence_fact_ids": [1, 2],
+  "importance": 0.8,
+  "confidence": 0.85,
+  "status": "active|stable|resolved|uncertain"
+}
+
+entity_state_target:
+{entity_state_target}
+
+existing_entity_state:
+{existing_entity_state}
+
+new facts:
 {facts}
 """
 
@@ -162,7 +248,7 @@ The memory system has one shared index over episodes, facts, evolving states, an
 
 Guidance:
 - Use source_types only when the query clearly points to assistant_wakeup interactions or allday_recording transcripts. Otherwise use both.
-- Use index_levels to prefer fact for exact evidence, actionable_item for tasks/commitments/decisions/open questions/risks/reminders/recommendations, state for stable preferences/tasks/project status, and episode for broad summaries.
+- Use index_levels to prefer fact for exact evidence, actionable_item for tasks/commitments/decisions/open questions/risks/reminders/recommendations, state for stable preferences, durable constraints, routines, relationships, profiles, and topic/project/issue evolution, and episode for broad summaries.
 - Keep the plan broad when unsure. Missing evidence is worse than retrieving a few extra candidates.
 
 Return JSON only:

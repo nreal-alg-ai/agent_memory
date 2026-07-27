@@ -159,7 +159,12 @@ def main() -> None:
 
     reflect_result: Dict[str, Any] = {}
     if args.enable_reflect:
-        reflect_result = manager.reflect()
+        reflect_timestamp = (
+            memory_segments[-1].get("ended_at")
+            if memory_segments
+            else session_start.isoformat()
+        )
+        reflect_result = manager.reflect(reflect_timestamp=reflect_timestamp)
         logging.info("Reflect result: %s", reflect_result)
 
     report = {

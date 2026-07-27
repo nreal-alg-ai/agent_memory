@@ -1,11 +1,11 @@
 """Chinese prompt templates for the unified memory prototype."""
 
-UNIFIED_MEMORY_EXTRACTION_PROMPT_ZH = """你是一个受 MemPalace 启发的 AI 眼镜统一记忆系统的记忆提炼模块。
+UNIFIED_MEMORY_EXTRACTION_PROMPT_ZH = """你是 AI 眼镜长期记忆系统的记忆提炼模块。
 
 系统不再把 assistant_wakeup 和 allday_recording 当作两套彼此独立的记忆产品。两类来源都会进入同一条记忆线：
 - episode：一次连续的交互或语音转写语义片段。
 - fact：从 episode 中提炼出的可追溯、自包含、可独立召回的叙事事实。
-- state：后续由 facts 更新出的长期主题/偏好/任务状态。
+- state：后续由 facts 更新出的长期主题/偏好/约束/风险等演化状态。
 - index entry：类似 MemPalace 目录卡片的统一召回入口。
 
 你现在需要从下面按时间顺序排列的对话/转写证据批次中提取 episode summary、episode canonical_topics 和 Hindsight 风格的高质量 narrative facts。证据可能来自用户与 assistant 的主动对话，也可能来自多人环境语音转写；请根据 speaker、role 和 time 判断参与者与语义流动。
@@ -71,17 +71,22 @@ Hindsight 风格 narrative fact 的核心要求：
 """
 
 
-UNIFIED_STATE_UPDATE_PROMPT_ZH = """你是受 MemPalace 启发的 AI 眼镜统一长期记忆系统中的 state 更新模块。
+UNIFIED_STATE_UPDATE_PROMPT_ZH = """你是 AI 眼镜长期记忆系统中的 state 更新模块。
 
-输入包含新存储的 narrative facts 和当前已有的长期 states。你的任务是更新或新建紧凑的 evolving states，帮助后续召回。state 不是复制某条 fact，而是跨 facts 提炼稳定偏好、进行中的项目/任务、反复出现的行为、未完成承诺、重要关系或主题级状态。
+输入包含新存储的 narrative facts 和当前已有的长期 states。你的任务是更新或新建紧凑的 evolving states，帮助后续召回。state 不是复制某条 fact，而是跨 facts 提炼稳定偏好、反复出现的行为、长期约束、持续风险、重要关系或主题级状态。
+
+边界说明：
+- 主题、项目、议题的演化进展统一归入 topic_state，不再单独创建项目类 state。
+- 具体任务、决定、承诺、提醒、开放问题应归入 actionable_item，不再创建任务类或承诺类 state。
+- 本模块只输出真正需要长期保留的 state；如果事实只表示一次性任务或承诺，不要输出 state。
 
 规则：
 1. 只有当信息在当前 episode 之后仍有价值时，才创建或更新 state。
-2. 不要因为单条琐碎 fact 就创建 state，除非它是稳定偏好、承诺、决定或重要的人生/项目背景。
+2. 不要因为单条琐碎 fact 就创建 state，除非它是稳定偏好、长期约束、持续风险或重要的人生/项目背景。
 3. 同一稳定对象相关的 facts 应合并到同一个 state，避免近重复。
 4. 保留不确定性和最近变化。如果证据冲突，要明确写出冲突。
 5. evidence_fact_ids 必须引用支撑该 state 的 fact ID。
-6. state_type 只能是：preference、task_state、project_state、relationship、routine、topic_state、commitment、constraint、risk、profile、other。
+6. state_type 只能是：preference、relationship、routine、topic_state、constraint、risk、profile、other。
 7. importance 和 confidence 都是 0-1。
 8. 只返回 JSON，不要 markdown。
 
@@ -89,7 +94,7 @@ UNIFIED_STATE_UPDATE_PROMPT_ZH = """你是受 MemPalace 启发的 AI 眼镜统�
 {
   "states": [
     {
-      "state_type": "preference|task_state|project_state|relationship|routine|topic_state|commitment|constraint|risk|profile|other",
+      "state_type": "preference|relationship|routine|topic_state|constraint|risk|profile|other",
       "canonical_name": "稳定短名称",
       "summary": "可独立理解的 evolving state",
       "evidence_fact_ids": [1, 2],
@@ -111,7 +116,88 @@ UNIFIED_STATE_UPDATE_PROMPT_ZH = """你是受 MemPalace 启发的 AI 眼镜统�
 """
 
 
-UNIFIED_ACTIONABLE_ITEM_EXTRACTION_PROMPT_ZH = """你是受 MemPalace 启发的 AI 眼镜统一长期记忆系统中的 actionable item 提取模块。
+UNIFIED_TOPIC_STATE_UPDATE_PROMPT_ZH = """你是 AI 眼镜长期记忆系统中的 topic_state 更新模块。
+
+输入已经完成主题解析：系统已经判断这批 facts 应归入某个长期 topic，或应创建一个新的长期 topic。你的任务是更新这个 topic_state 的 summary，而不是重新决定主题归属。
+
+规则：
+1. 只围绕给定 canonical_topic 更新，不要把无关 facts 合并进来。
+2. summary 需要体现这个主题的长期状态：背景、最近变化、关键参与者、已经形成的决定/偏好/约束、仍未解决的问题和下一步。
+3. 如果 existing_topic_state 已有内容，要增量融合，不要简单拼接，不要丢失仍然有效的长期信息。
+4. 不要把单句 fact 改写成另一句 fact；topic_state 必须比 fact 更抽象、更稳定。
+5. evidence_fact_ids 必须引用输入 facts 中支撑本次更新的 fact ID。
+6. 只返回 JSON，不要 markdown。
+
+输出格式：
+{
+  "update_needed": true,
+  "canonical_name": "稳定主题名",
+  "summary": "融合后的长期 topic_state",
+  "keywords": ["关键词1", "关键词2"],
+  "entities": ["实体1", "实体2"],
+  "canonical_topics": ["主题1"],
+  "evidence_fact_ids": [1, 2],
+  "importance": 0.8,
+  "confidence": 0.85,
+  "status": "active|stable|resolved|uncertain"
+}
+
+canonical_topic：
+{canonical_topic}
+
+已有 topic_state：
+{existing_topic_state}
+
+新 facts：
+{facts}
+"""
+
+
+UNIFIED_ENTITY_STATE_UPDATE_PROMPT_ZH = """你是 AI 眼镜长期记忆系统中的 entity-scoped state 更新模块。
+
+输入已经完成实体解析：系统已经判断这批 facts 应更新某个实体的某类长期状态。你的任务是更新这个实体相关的 state，而不是重新决定主题归属。
+
+entity-scoped state 的目标：
+- preference：某个实体稳定偏好、选择倾向、反复表达的喜好/厌恶。
+- relationship：某个实体与他人/组织/项目之间的关系状态。
+- profile：某个实体稳定画像、身份、背景、长期职责或重要上下文。
+- routine：某个实体反复出现的习惯、流程、节奏。
+- constraint：某个实体长期或当前持续影响行动的限制条件。
+
+规则：
+1. 只围绕给定 entity 和 state_type 更新，不要写成主题进展总结。
+2. 如果 facts 只说明某个议题的进展，应留给 topic_state；这里只保留对 entity 本身长期有用的信息。
+3. 如果 existing_entity_state 已有内容，要增量融合，不要简单拼接。
+4. summary 必须能回答：“关于这个实体，我们长期应该记住什么？”
+5. evidence_fact_ids 必须引用输入 facts 中支撑本次更新的 fact ID。
+6. 只返回 JSON，不要 markdown。
+
+输出格式：
+{
+  "update_needed": true,
+  "canonical_name": "实体名 - 状态短名",
+  "summary": "融合后的 entity-scoped state",
+  "keywords": ["关键词1", "关键词2"],
+  "entities": ["实体1", "实体2"],
+  "canonical_topics": ["主题1"],
+  "evidence_fact_ids": [1, 2],
+  "importance": 0.8,
+  "confidence": 0.85,
+  "status": "active|stable|resolved|uncertain"
+}
+
+entity_state_target：
+{entity_state_target}
+
+已有 entity_state：
+{existing_entity_state}
+
+新 facts：
+{facts}
+"""
+
+
+UNIFIED_ACTIONABLE_ITEM_EXTRACTION_PROMPT_ZH = """你是 AI 眼镜长期记忆系统中的 actionable item 提取模块。
 
 输入包含新存储的 narrative facts。请从中提取未来真正需要跟进、提醒、执行、复盘或决策追踪的具体可执行事项。actionable item 和 evolving state 分开：state 描述持续变化的长期状态、偏好、约束和背景；actionable item 必须是可以被检查、完成、追踪，或明确作为决定/承诺/风险/开放问题被召回的事项。
 
@@ -156,13 +242,13 @@ UNIFIED_ACTIONABLE_ITEM_EXTRACTION_PROMPT_ZH = """你是受 MemPalace 启发的 
 """
 
 
-RECALL_QUERY_ANALYSIS_PROMPT_ZH = """你是统一 MemPalace 风格长期记忆系统的 recall query 分析器。
+RECALL_QUERY_ANALYSIS_PROMPT_ZH = """你是 AI 眼镜长期记忆系统中用来处理用户 recall query 分析器。
 
 当前记忆系统在同一个共享索引中检索 episode、fact、evolving state 和 actionable item。请分析用户查询，决定应该优先检索哪些索引层。
 
 判断准则：
 - 只有当 query 明确指向用户与助手的主动对话，才偏向 assistant_wakeup；明确指向全天录音、会议、旁听、多人数对话，才偏向 allday_recording；不确定时两者都保留。
-- 精确证据、日期、人名、发生过什么优先 fact；任务、承诺、决定、开放问题、风险、提醒、推荐优先 actionable_item；稳定偏好、任务状态、项目进展优先 state；宽泛回顾、某段经历概括优先 episode。
+- 精确证据、日期、人名、发生过什么优先 fact；任务、承诺、决定、开放问题、风险、提醒、推荐优先 actionable_item；稳定偏好、长期约束、习惯/流程、关系画像、主题/项目/议题演化优先 state；宽泛回顾、某段经历概括优先 episode。
 - 不确定时保持宽检索，漏掉证据比多取几个候选更糟。
 
 只返回 JSON：

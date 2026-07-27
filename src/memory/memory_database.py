@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
@@ -28,6 +28,23 @@ EMBEDDING_DIM = 384
 
 def utc_now_text() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _coerce_reference_datetime(value: Any) -> datetime:
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        text = str(value or "").strip()
+        if not text:
+            dt = datetime.now().astimezone()
+        else:
+            try:
+                dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            except ValueError:
+                dt = datetime.strptime(text, "%Y-%m-%d %H:%M:%S")
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.now().astimezone().tzinfo)
+    return dt
 
 
 def _json_dumps(value: Any) -> str:
@@ -106,6 +123,7 @@ class SessionDB:
                 time_key TEXT NOT NULL DEFAULT '',
                 confidence REAL NOT NULL DEFAULT 0.85,
                 importance REAL NOT NULL DEFAULT 0.5,
+                processed_for_memory_state INTEGER NOT NULL DEFAULT 0,
                 metadata TEXT NOT NULL DEFAULT '{}',
                 embedding BLOB,
                 embedding_text TEXT NOT NULL DEFAULT '',
@@ -184,6 +202,8 @@ class SessionDB:
 
             CREATE INDEX IF NOT EXISTS idx_memory_facts_time ON memory_facts(time_key);
             CREATE INDEX IF NOT EXISTS idx_memory_facts_source ON memory_facts(source_type);
+            CREATE INDEX IF NOT EXISTS idx_memory_facts_state_processing
+            ON memory_facts(processed_for_memory_state, created_at);
             CREATE INDEX IF NOT EXISTS idx_memory_index_source ON memory_index_entries(source_type);
             CREATE INDEX IF NOT EXISTS idx_memory_index_time ON memory_index_entries(time_start);
             CREATE INDEX IF NOT EXISTS idx_memory_states_source ON memory_states(source_type, state_type);
@@ -357,29 +377,60 @@ class SessionDB:
         ).fetchone()
         return int(row["id"]) if row else 0
 
-    def recent_facts(
+    def get_unprocessed_facts_for_states(
         self,
         *,
+        reference_timestamp: Any,
         source_types: Optional[Sequence[str]] = None,
         limit: int = 100,
+        restrict_to_today: bool = True,
     ) -> List[Dict[str, Any]]:
-        clauses: List[str] = []
+        clauses: List[str] = ["processed_for_memory_state = 0"]
         params: List[Any] = []
         if source_types:
             placeholders = ",".join("?" for _ in source_types)
             clauses.append(f"source_type IN ({placeholders})")
             params.extend(source_types)
+        if restrict_to_today:
+            local_now = _coerce_reference_datetime(reference_timestamp).astimezone()
+            day_start_local = datetime.combine(
+                local_now.date(),
+                datetime.min.time(),
+                tzinfo=local_now.tzinfo,
+            )
+            day_end_local = day_start_local + timedelta(days=1)
+            clauses.append("created_at >= ?")
+            params.append(day_start_local.astimezone(timezone.utc).isoformat())
+            clauses.append("created_at < ?")
+            params.append(day_end_local.astimezone(timezone.utc).isoformat())
         where = "WHERE " + " AND ".join(clauses) if clauses else ""
         rows = self._conn.execute(
             f"""
             SELECT * FROM memory_facts
             {where}
-            ORDER BY time_key DESC, id DESC
+            ORDER BY created_at ASC, id ASC
             LIMIT ?
             """,
             (*params, max(1, int(limit or 100))),
         ).fetchall()
         return [self._row_to_dict(row) for row in rows]
+
+    def mark_facts_processed_for_memory_state(self, fact_ids: Sequence[int]) -> int:
+        ids = [int(value) for value in fact_ids if value is not None]
+        if not ids:
+            return 0
+        placeholders = ",".join("?" for _ in ids)
+        cur = self._conn.execute(
+            f"""
+            UPDATE memory_facts
+            SET processed_for_memory_state = 1,
+                updated_at = ?
+            WHERE id IN ({placeholders})
+            """,
+            (utc_now_text(), *ids),
+        )
+        self._conn.commit()
+        return int(cur.rowcount or 0)
 
     def recent_states(
         self,
