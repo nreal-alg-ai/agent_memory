@@ -57,6 +57,85 @@ _STOPWORDS = {
     "that", "this", "it", "as", "at", "by", "from", "have", "had", "has",
 }
 
+_COURTESY_PATTERNS = (
+    "希望这个方法能帮到",
+    "希望这能帮到",
+    "希望对你有帮助",
+    "希望对您有帮助",
+    "有其他问题",
+    "继续沟通",
+    "随时告诉我",
+    "不客气",
+    "别客气",
+    "很高兴能帮",
+    "祝你",
+    "祝您",
+    "hope this helps",
+    "hope that helps",
+    "let me know if",
+    "feel free to ask",
+    "happy to help",
+    "you are welcome",
+    "you're welcome",
+)
+
+_WEAK_TRY_PATTERNS = (
+    "愿意尝试",
+    "决定尝试",
+    "打算尝试",
+    "尝试使用",
+    "尝试选择",
+    "可以试一试",
+    "试一试",
+    "听起来不错",
+    "听起来可以",
+    "可以考虑",
+    "觉得可以",
+    "might try",
+    "may try",
+    "willing to try",
+    "could try",
+    "sounds good",
+    "sounds okay",
+    "may consider",
+)
+
+_ACTIONABLE_HARD_MARKERS = (
+    "提醒",
+    "跟进",
+    "后续",
+    "确认",
+    "安排",
+    "预约",
+    "截止",
+    "待办",
+    "承诺",
+    "决定",
+    "必须",
+    "需要完成",
+    "明天",
+    "下周",
+    "每天",
+    "每周",
+    "每月",
+    "remind",
+    "follow up",
+    "confirm",
+    "schedule",
+    "appointment",
+    "deadline",
+    "todo",
+    "commit",
+    "decide",
+    "must",
+    "need to complete",
+    "tomorrow",
+    "next week",
+    "daily",
+    "weekly",
+    "monthly",
+)
+
 
 def _now_text() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -209,10 +288,12 @@ class MemoryNodeManager:
         *,
         tags: Optional[List[str]] = None,
         turn_timestamp: Optional[Any] = None,
-        **_: Any,
+        **extra: Any,
     ) -> bool:
         if not self._enabled:
             return False
+        if turn_timestamp is None:
+            turn_timestamp = extra.get("timestamp")
         turn = {
             "user_message": _compact_whitespace(user_message),
             "assistant_response": _compact_whitespace(assistant_response),
@@ -241,73 +322,167 @@ class MemoryNodeManager:
         return self._store_interaction_episode(turns)
 
     def _store_interaction_episode(self, turns: List[Dict[str, Any]]) -> bool:
-        started_at = turns[0].get("turn_timestamp") or _now_text()
-        ended_at = turns[-1].get("turn_timestamp") or started_at
-        extracted = self._extract_memory_from_turns(turns)
-        title = extracted.get("episode_title") or self._episode_title(turns)
-        summary = extracted.get("episode_summary") or self._episode_summary(turns)
+        segments = self._turns_to_memory_segments(turns)
         tags = sorted({tag for turn in turns for tag in turn.get("tags", [])})
-        episode_id = self._db.insert_episode(
+        return self._store_memory_episode(
+            segments=segments,
             source_type="assistant_wakeup",
             episode_type="interaction",
+            tags=tags,
+            source_ref="store_turn",
+        )
+
+    def store_transcript_segments(
+        self,
+        segments: Sequence[Dict[str, Any]],
+        *,
+        source_type: str = "allday_recording",
+        episode_type: str = "ambient_transcript",
+        source_ref: str = "",
+        tags: Optional[List[str]] = None,
+    ) -> bool:
+        """Store a multi-speaker transcript episode using the unified pipeline."""
+        if not self._enabled:
+            return False
+        normalized = self._normalize_transcript_segments(segments)
+        if not normalized:
+            return False
+        return self._store_memory_episode(
+            segments=normalized,
+            source_type=source_type,
+            episode_type=episode_type,
+            tags=list(tags or []),
+            source_ref=source_ref,
+        )
+
+    def process_transcript_segments(
+        self,
+        segments: Sequence[Dict[str, Any]],
+        **kwargs: Any,
+    ) -> bool:
+        return self.store_transcript_segments(segments, **kwargs)
+
+    def _store_memory_episode(
+        self,
+        *,
+        segments: List[Dict[str, Any]],
+        source_type: str,
+        episode_type: str,
+        tags: List[str],
+        source_ref: str = "",
+    ) -> bool:
+        if not segments:
+            return False
+        participants = self._participants_from_segments(segments)
+        started_at = segments[0].get("started_at") or _now_text()
+        ended_at = segments[-1].get("ended_at") or started_at
+        extracted = self._extract_memory_from_segments(segments)
+        title = extracted.get("episode_title") or self._episode_title_from_segments(segments)
+        summary = extracted.get("episode_summary") or self._episode_summary_from_segments(segments)
+        canonical_topics = (
+            extracted.get("canonical_topics")
+            or self._topic_candidates(summary)
+            or ["general"]
+        )
+        episode_id = self._db.insert_episode(
+            source_type=source_type,
+            episode_type=episode_type,
             title=title,
             summary=summary,
-            participants=["user", "assistant"],
+            participants=participants,
             started_at=started_at,
             ended_at=ended_at,
-            metadata={"tags": tags, "turn_count": len(turns)},
+            metadata={
+                "tags": tags,
+                "segment_count": len(segments),
+                "canonical_topics": canonical_topics,
+                "source_ref": source_ref,
+            },
         )
         self._index_episode(
             episode_id=episode_id,
+            source_type=source_type,
+            episode_type=episode_type,
             title=title,
             summary=summary,
             started_at=started_at,
             ended_at=ended_at,
             tags=tags,
+            canonical_topics=canonical_topics,
+            participants=participants,
+            source_ref=source_ref,
         )
 
         fact_count = 0
         facts = extracted.get("facts") or []
         if not facts:
-            for turn_index, turn in enumerate(turns, 1):
-                facts.extend(self._extract_turn_facts(turn, turn_index=turn_index))
+            for segment_index, segment in enumerate(segments, 1):
+                fallback_facts = self._extract_segment_facts(segment, segment_index=segment_index)
+                for fact in fallback_facts:
+                    if not fact.get("canonical_topics"):
+                        fact["canonical_topics"] = canonical_topics
+                facts.extend(fallback_facts)
         for fact in facts:
-            self._store_fact(episode_id=episode_id, fact=fact, tags=tags)
+            self._store_fact(
+                episode_id=episode_id,
+                fact=fact,
+                tags=tags,
+                source_type=source_type,
+                participants=participants,
+            )
             fact_count += 1
         return fact_count > 0
 
     def _extract_memory_from_turns(self, turns: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Extract episode metadata and facts with LLM, falling back to heuristics."""
-        data = self._extract_memory_with_llm(turns)
+        return self._extract_memory_from_segments(self._turns_to_memory_segments(turns))
+
+    def _extract_memory_from_segments(self, segments: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Extract episode metadata and facts with LLM, falling back to heuristics."""
+        data = self._extract_memory_with_llm(segments)
         if data and data.get("facts"):
             return data
+        summary = self._episode_summary_from_segments(segments)
         return {
-            "episode_title": self._episode_title(turns),
-            "episode_summary": self._episode_summary(turns),
+            "episode_title": self._episode_title_from_segments(segments),
+            "episode_summary": summary,
+            "canonical_topics": self._topic_candidates(summary),
             "facts": [],
         }
 
-    def _extract_memory_with_llm(self, turns: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    def _extract_memory_with_llm(self, segments: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         if not self._llm_api_key or not self._llm_base_url or str(self._llm_base_url).lower() == "none":
             return None
-        prompt_language = self._resolve_prompt_language(turns)
+        prompt_language = self._resolve_prompt_language_from_segments(segments)
         prompt_template = (
             UNIFIED_MEMORY_EXTRACTION_PROMPT_EN
             if prompt_language == "en"
             else UNIFIED_MEMORY_EXTRACTION_PROMPT_ZH
         )
-        prompt = prompt_template.replace(
-            "{dialogue_batch}",
-            self._build_dialogue_batch_for_prompt(
-                turns,
-                prompt_language=prompt_language,
-            ),
+        topic_candidates = self._collect_long_term_topic_candidates(limit=60)
+        prompt = (
+            prompt_template
+            .replace(
+                "{existing_long_term_topics}",
+                self._format_existing_long_term_topics_for_prompt(topic_candidates),
+            )
+            .replace(
+                "{dialogue_batch}",
+                self._build_memory_segments_for_prompt(
+                    segments,
+                    prompt_language=prompt_language,
+                ),
+            )
         )
         for attempt in range(2):
             result = self._call_llm(prompt)
             parsed = self._parse_json_object_from_llm_text(result or "")
             if parsed is not None:
-                normalized = self._normalize_llm_memory_payload(parsed, turns)
+                normalized = self._normalize_llm_memory_payload(
+                    parsed,
+                    segments,
+                    topic_candidates=topic_candidates,
+                )
                 if normalized is not None:
                     return normalized
             if attempt == 0:
@@ -389,13 +564,24 @@ class MemoryNodeManager:
     def _normalize_llm_memory_payload(
         self,
         data: Dict[str, Any],
-        turns: List[Dict[str, Any]],
+        segments: List[Dict[str, Any]],
+        *,
+        topic_candidates: Optional[List[Dict[str, Any]]] = None,
     ) -> Optional[Dict[str, Any]]:
         raw_facts = data.get("facts")
         if not isinstance(raw_facts, list):
             return None
+        episode_summary = _compact_whitespace(
+            data.get("episode_summary") or self._episode_summary_from_segments(segments)
+        )
+        episode_topics = self._normalize_episode_canonical_topics(
+            data.get("canonical_topics") or data.get("episode_canonical_topics"),
+            topic_candidates=topic_candidates or [],
+            fallback_text=episode_summary,
+            limit=5,
+        )
         facts: List[Dict[str, Any]] = []
-        fallback_timestamp = turns[0].get("turn_timestamp") if turns else _now_text()
+        fallback_timestamp = segments[0].get("started_at") if segments else _now_text()
         for index, raw_fact in enumerate(raw_facts, 1):
             if not isinstance(raw_fact, dict):
                 continue
@@ -404,6 +590,11 @@ class MemoryNodeManager:
                 continue
             priority = self._normalize_priority(raw_fact.get("priority", 70))
             if priority < 60:
+                continue
+            fact_subject = self._normalize_fact_subject(raw_fact.get("fact_subject"))
+            if fact_subject == "assistant" and self._is_low_value_assistant_closing(text):
+                continue
+            if fact_subject == "user" and self._is_low_value_user_acknowledgement(text):
                 continue
             keywords = self._normalize_string_list(raw_fact.get("keywords"), limit=18)
             if not keywords:
@@ -414,6 +605,15 @@ class MemoryNodeManager:
             primary_topic = _compact_whitespace(raw_fact.get("primary_topic") or "")
             if not primary_topic:
                 primary_topic = " ".join(keywords[:3]) if keywords else "general"
+            fact_topics = self._normalize_episode_canonical_topics(
+                [primary_topic],
+                topic_candidates=[
+                    {"canonical_topic": topic}
+                    for topic in episode_topics
+                ] + list(topic_candidates or []),
+                fallback_text=text,
+                limit=3,
+            )
             timestamp = (
                 _compact_whitespace(raw_fact.get("occurred_start") or "")
                 or _compact_whitespace(raw_fact.get("occurred_end") or "")
@@ -422,13 +622,13 @@ class MemoryNodeManager:
             facts.append({
                 "summary": text,
                 "source_text": text,
-                "fact_subject": self._normalize_fact_subject(raw_fact.get("fact_subject")),
+                "fact_subject": fact_subject,
                 "fact_kind": self._normalize_fact_kind(raw_fact.get("fact_kind")),
                 "fact_type": self._normalize_fact_type(raw_fact.get("fact_type")),
                 "time_key": f"{timestamp}#llm:{index:02d}",
                 "keywords": " ".join(keywords),
                 "entities": entities,
-                "canonical_topics": [primary_topic],
+                "canonical_topics": fact_topics or episode_topics or [primary_topic],
                 "importance": max(0.6, min(1.0, priority / 100.0)),
                 "confidence": 0.9,
                 "metadata": {
@@ -438,11 +638,15 @@ class MemoryNodeManager:
                     "occurred_end": _compact_whitespace(raw_fact.get("occurred_end") or ""),
                     "time_confidence": _compact_whitespace(raw_fact.get("time_confidence") or "unknown"),
                     "where": _compact_whitespace(raw_fact.get("where") or ""),
+                    "primary_topic": primary_topic,
                 },
             })
         return {
-            "episode_title": _compact_whitespace(data.get("episode_title") or self._episode_title(turns)),
-            "episode_summary": _compact_whitespace(data.get("episode_summary") or self._episode_summary(turns)),
+            "episode_title": _compact_whitespace(
+                data.get("episode_title") or self._episode_title_from_segments(segments)
+            ),
+            "episode_summary": episode_summary,
+            "canonical_topics": episode_topics or self._topic_candidates(episode_summary),
             "facts": facts,
         }
 
@@ -468,6 +672,301 @@ class MemoryNodeManager:
             )
         return "\n\n".join(blocks)
 
+    def _turns_to_memory_segments(self, turns: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        segments: List[Dict[str, Any]] = []
+        for turn_index, turn in enumerate(turns, 1):
+            timestamp = _to_timestamp_text(turn.get("turn_timestamp")) or _now_text()
+            tags = list(turn.get("tags") or [])
+            user_text = _compact_whitespace(turn.get("user_message") or "")
+            assistant_text = _compact_whitespace(turn.get("assistant_response") or "")
+            if user_text:
+                segments.append({
+                    "speaker": "user",
+                    "role": "user",
+                    "text": user_text,
+                    "started_at": timestamp,
+                    "ended_at": timestamp,
+                    "tags": tags,
+                    "turn_index": turn_index,
+                })
+            if assistant_text:
+                segments.append({
+                    "speaker": "assistant",
+                    "role": "assistant",
+                    "text": assistant_text,
+                    "started_at": timestamp,
+                    "ended_at": timestamp,
+                    "tags": tags,
+                    "turn_index": turn_index,
+                })
+        return segments
+
+    def _normalize_transcript_segments(
+        self,
+        segments: Sequence[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        normalized: List[Dict[str, Any]] = []
+        for index, segment in enumerate(segments, 1):
+            if not isinstance(segment, dict):
+                continue
+            text = _compact_whitespace(
+                segment.get("text")
+                or segment.get("asr_text")
+                or segment.get("reference_text")
+                or segment.get("utterance")
+                or ""
+            )
+            if not text:
+                continue
+            speaker = _compact_whitespace(
+                segment.get("speaker")
+                or segment.get("speaker_name")
+                or segment.get("speaker_id")
+                or "unknown_speaker"
+            )
+            role = _compact_whitespace(segment.get("role") or speaker or "speaker")
+            started_at = _to_timestamp_text(
+                segment.get("started_at")
+                or segment.get("start_timestamp")
+                or segment.get("timestamp")
+                or segment.get("start")
+            )
+            ended_at = _to_timestamp_text(
+                segment.get("ended_at")
+                or segment.get("end_timestamp")
+                or segment.get("timestamp_end")
+                or segment.get("end")
+                or started_at
+            )
+            normalized.append({
+                "speaker": speaker or "unknown_speaker",
+                "role": role or "speaker",
+                "text": text,
+                "started_at": started_at or _now_text(),
+                "ended_at": ended_at or started_at or _now_text(),
+                "tags": list(segment.get("tags") or []),
+                "segment_index": int(segment.get("segment_index") or index),
+                "metadata": dict(segment.get("metadata") or {}),
+            })
+        return sorted(
+            normalized,
+            key=lambda item: (
+                str(item.get("started_at") or ""),
+                str(item.get("ended_at") or ""),
+                str(item.get("speaker") or ""),
+            ),
+        )
+
+    @staticmethod
+    def _participants_from_segments(segments: List[Dict[str, Any]]) -> List[str]:
+        participants: List[str] = []
+        seen: set[str] = set()
+        for segment in segments:
+            speaker = _compact_whitespace(segment.get("speaker") or segment.get("role") or "")
+            if not speaker:
+                continue
+            key = speaker.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            participants.append(speaker)
+        return participants or ["unknown_speaker"]
+
+    def _build_memory_segments_for_prompt(
+        self,
+        segments: List[Dict[str, Any]],
+        *,
+        prompt_language: str,
+    ) -> str:
+        is_en = prompt_language == "en"
+        time_label = "Time" if is_en else "时间"
+        speaker_label = "Speaker" if is_en else "说话人"
+        role_label = "Role" if is_en else "角色"
+        text_label = "Text" if is_en else "文本"
+        blocks: List[str] = []
+        for index, segment in enumerate(segments, 1):
+            started_at = segment.get("started_at") or ""
+            ended_at = segment.get("ended_at") or started_at
+            time_text = started_at if started_at == ended_at else f"{started_at} - {ended_at}"
+            blocks.append(
+                "\n".join([
+                    f"[Segment {index}]",
+                    f"{time_label}: {time_text}",
+                    f"{speaker_label}: {segment.get('speaker') or ''}",
+                    f"{role_label}: {segment.get('role') or ''}",
+                    f"{text_label}: {segment.get('text') or ''}",
+                ])
+            )
+        return "\n\n".join(blocks)
+
+    def _collect_long_term_topic_candidates(self, *, limit: int = 60) -> List[Dict[str, Any]]:
+        """Collect durable topic names that should guide new episode topics."""
+        try:
+            states = self._db.recent_states(limit=max(1, int(limit or 60)))
+        except Exception as exc:
+            logger.debug("Failed to load long-term topic candidates: %s", exc)
+            return []
+        rows: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        for state in states:
+            metadata = state.get("metadata") or {}
+            raw_topics: List[Any] = [
+                state.get("canonical_name"),
+                *(metadata.get("canonical_topics") or []),
+            ]
+            for raw_topic in raw_topics:
+                topic = self._normalize_topic_name(raw_topic)
+                if not topic:
+                    continue
+                key = topic.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                rows.append({
+                    "canonical_topic": topic,
+                    "state_id": state.get("id"),
+                    "source_type": state.get("source_type"),
+                    "state_type": state.get("state_type"),
+                    "summary": _compact_whitespace(state.get("summary") or "")[:240],
+                })
+                if len(rows) >= limit:
+                    return rows
+        return rows
+
+    @staticmethod
+    def _format_existing_long_term_topics_for_prompt(topics: List[Dict[str, Any]]) -> str:
+        if not topics:
+            return "[]"
+        rows = [
+            {
+                "canonical_topic": item.get("canonical_topic"),
+                "source_type": item.get("source_type"),
+                "state_type": item.get("state_type"),
+                "summary": item.get("summary"),
+            }
+            for item in topics[:60]
+        ]
+        return json.dumps(rows, ensure_ascii=False, indent=2)
+
+    def _normalize_episode_canonical_topics(
+        self,
+        value: Any,
+        *,
+        topic_candidates: List[Dict[str, Any]],
+        fallback_text: str,
+        limit: int,
+    ) -> List[str]:
+        raw_topics = self._coerce_topic_list(value)
+        if not raw_topics:
+            raw_topics = self._topic_candidates(fallback_text)
+        normalized: List[str] = []
+        seen: set[str] = set()
+        for raw_topic in raw_topics:
+            topic = self._normalize_topic_name(raw_topic)
+            if not topic:
+                continue
+            topic = self._resolve_existing_topic_name(topic, topic_candidates) or topic
+            key = topic.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            normalized.append(topic)
+            if len(normalized) >= max(1, int(limit or 5)):
+                break
+        return normalized
+
+    @staticmethod
+    def _coerce_topic_list(value: Any) -> List[Any]:
+        if isinstance(value, str):
+            return re.split(r"[,，;；\n]+", value)
+        if isinstance(value, list):
+            out: List[Any] = []
+            for item in value:
+                if isinstance(item, dict):
+                    out.append(
+                        item.get("canonical_topic")
+                        or item.get("topic")
+                        or item.get("name")
+                        or item.get("text")
+                    )
+                else:
+                    out.append(item)
+            return out
+        return []
+
+    @staticmethod
+    def _normalize_topic_name(value: Any) -> str:
+        text = _compact_whitespace(value)
+        text = text.strip("'\".,:;!?，。！？、；：（）()[]{}")
+        if not text:
+            return ""
+        lower = text.lower()
+        if lower in _STOPWORDS:
+            return ""
+        if any(pattern in lower for pattern in _COURTESY_PATTERNS):
+            return ""
+        if re.search(r"[。！？!?；;，,]", text):
+            return ""
+        chinese_chars = re.findall(r"[\u4e00-\u9fff]", text)
+        if chinese_chars:
+            if not (2 <= len(chinese_chars) <= 18):
+                return ""
+        elif not (2 <= len(text.split()) <= 6):
+            return ""
+        generic_topics = {
+            "方案确定", "产品设计讨论", "部门协作", "问题讨论", "用户咨询",
+            "solution finalized", "product design discussion",
+            "team collaboration", "problem discussion", "user consultation",
+        }
+        if lower in generic_topics:
+            return ""
+        return text
+
+    def _resolve_existing_topic_name(
+        self,
+        topic: str,
+        topic_candidates: List[Dict[str, Any]],
+    ) -> Optional[str]:
+        if not topic_candidates:
+            return None
+        topic_key = topic.lower()
+        candidate_names = [
+            self._normalize_topic_name(item.get("canonical_topic"))
+            for item in topic_candidates
+        ]
+        candidate_names = [item for item in candidate_names if item]
+        for candidate in candidate_names:
+            if candidate.lower() == topic_key:
+                return candidate
+        for candidate in candidate_names:
+            candidate_key = candidate.lower()
+            if len(candidate_key) >= 4 and (candidate_key in topic_key or topic_key in candidate_key):
+                return candidate
+        best_name = ""
+        best_score = 0.0
+        for candidate in candidate_names:
+            score = self._topic_name_similarity(topic, candidate)
+            if score > best_score:
+                best_score = score
+                best_name = candidate
+        return best_name if best_score >= 0.62 else None
+
+    def _topic_name_similarity(self, left: str, right: str) -> float:
+        left_terms = set(self._topic_similarity_terms(left))
+        right_terms = set(self._topic_similarity_terms(right))
+        if not left_terms or not right_terms:
+            return 0.0
+        overlap = len(left_terms & right_terms)
+        union = len(left_terms | right_terms)
+        return overlap / max(1, union)
+
+    def _topic_similarity_terms(self, text: str) -> List[str]:
+        clean = _compact_whitespace(text).lower()
+        chinese_chars = "".join(re.findall(r"[\u4e00-\u9fff]", clean))
+        if len(chinese_chars) >= 3:
+            return [chinese_chars[i : i + 2] for i in range(len(chinese_chars) - 1)]
+        return self._keywords(clean, limit=12)
+
     def _resolve_prompt_language(self, turns: List[Dict[str, Any]]) -> str:
         mode = str(self._memory_prompt_language or "source").strip().lower()
         if mode in {"en", "english", "force_en"}:
@@ -478,6 +977,15 @@ class MemoryNodeManager:
             f"{turn.get('user_message','')}\n{turn.get('assistant_response','')}"
             for turn in turns[:3]
         )
+        return "zh" if re.search(r"[\u4e00-\u9fff]", sample) else "en"
+
+    def _resolve_prompt_language_from_segments(self, segments: List[Dict[str, Any]]) -> str:
+        mode = str(self._memory_prompt_language or "source").strip().lower()
+        if mode in {"en", "english", "force_en"}:
+            return "en"
+        if mode in {"zh", "chinese", "force_zh"}:
+            return "zh"
+        sample = "\n".join(str(segment.get("text") or "") for segment in segments[:12])
         return "zh" if re.search(r"[\u4e00-\u9fff]", sample) else "en"
 
     def _resolve_prompt_language_from_text(self, text: str, *, fallback: str = "zh") -> str:
@@ -506,38 +1014,61 @@ class MemoryNodeManager:
                 chunks.append(f"Assistant: {turn['assistant_response'][:600]}")
         return "\n".join(chunks)
 
+    def _episode_title_from_segments(self, segments: List[Dict[str, Any]]) -> str:
+        for segment in segments:
+            text = segment.get("text") or ""
+            if text:
+                return _compact_whitespace(text)[:96]
+        return "memory episode"
+
+    def _episode_summary_from_segments(self, segments: List[Dict[str, Any]]) -> str:
+        chunks: List[str] = []
+        for segment in segments[:10]:
+            speaker = segment.get("speaker") or segment.get("role") or "speaker"
+            text = _compact_whitespace(segment.get("text") or "")
+            if not text:
+                continue
+            started_at = segment.get("started_at") or ""
+            chunks.append(f"{started_at} {speaker}: {text[:600]}")
+        return "\n".join(chunks)
+
     def _index_episode(
         self,
         *,
         episode_id: int,
+        source_type: str,
+        episode_type: str,
         title: str,
         summary: str,
         started_at: str,
         ended_at: str,
         tags: List[str],
+        canonical_topics: List[str],
+        participants: List[str],
+        source_ref: str = "",
     ) -> None:
         keywords = " ".join(self._keywords(summary, limit=24))
         embedding_text = f"{title}\n{summary}\nkeywords: {keywords}"
         embedding = self._embed(embedding_text)
         self._db.upsert_index_entry(
-            source_type="assistant_wakeup",
+            source_type=source_type,
             target_table="memory_episodes",
             target_id=episode_id,
             index_level="episode",
-            memory_path="assistant_wakeup/episodes/interaction",
+            memory_path=f"{source_type}/episodes/{episode_type}",
             title=title,
             summary_for_retrieval=summary,
             keywords=keywords,
-            entities=["user", "assistant"],
-            canonical_topics=self._topic_candidates(summary),
-            participants=["user", "assistant"],
+            entities=participants,
+            canonical_topics=canonical_topics,
+            participants=participants,
             time_start=started_at,
             time_end=ended_at,
             importance=0.55,
             confidence=0.8,
             embedding=embedding,
             embedding_text=embedding_text,
-            metadata={"tags": tags},
+            metadata={"tags": tags, "source_ref": source_ref},
         )
 
     def _extract_turn_facts(self, turn: Dict[str, Any], *, turn_index: int) -> List[Dict[str, Any]]:
@@ -546,17 +1077,18 @@ class MemoryNodeManager:
         user_text = turn.get("user_message") or ""
         assistant_text = turn.get("assistant_response") or ""
         if user_text:
-            facts.append(self._build_fact(
-                summary=f"User said: {user_text}",
-                source_text=user_text,
-                fact_subject="user",
-                fact_kind=self._infer_fact_kind(user_text, speaker="user"),
-                fact_type="episodic",
-                timestamp=timestamp,
-                turn_index=turn_index,
-                role="user",
-                importance=0.75,
-            ))
+            if not self._is_low_value_user_acknowledgement(user_text):
+                facts.append(self._build_fact(
+                    summary=f"User said: {user_text}",
+                    source_text=user_text,
+                    fact_subject="user",
+                    fact_kind=self._infer_fact_kind(user_text, speaker="user"),
+                    fact_type="episodic",
+                    timestamp=timestamp,
+                    turn_index=turn_index,
+                    role="user",
+                    importance=0.75,
+                ))
             for detail in self._split_high_value_details(user_text):
                 if detail != user_text:
                     facts.append(self._build_fact(
@@ -570,7 +1102,7 @@ class MemoryNodeManager:
                         role="user_detail",
                         importance=0.82,
                     ))
-        if assistant_text:
+        if assistant_text and not self._is_low_value_assistant_closing(assistant_text):
             facts.append(self._build_fact(
                 summary=f"Assistant responded: {assistant_text[:1200]}",
                 source_text=assistant_text,
@@ -583,6 +1115,8 @@ class MemoryNodeManager:
                 importance=0.62,
             ))
             for detail in self._assistant_answer_details(assistant_text):
+                if self._is_low_value_assistant_closing(detail):
+                    continue
                 facts.append(self._build_fact(
                     summary=f"Assistant recommended or stated: {detail}",
                     source_text=detail,
@@ -595,6 +1129,69 @@ class MemoryNodeManager:
                     importance=0.68,
                 ))
         return facts
+
+    def _extract_segment_facts(
+        self,
+        segment: Dict[str, Any],
+        *,
+        segment_index: int,
+    ) -> List[Dict[str, Any]]:
+        text = _compact_whitespace(segment.get("text") or "")
+        if not text:
+            return []
+        role = str(segment.get("role") or "").lower()
+        speaker = _compact_whitespace(segment.get("speaker") or role or "speaker")
+        fact_subject = "user" if role == "user" else "assistant" if role == "assistant" else "other"
+        if fact_subject == "user" and self._is_low_value_user_acknowledgement(text):
+            return []
+        if fact_subject == "assistant" and self._is_low_value_assistant_closing(text):
+            return []
+        timestamp = segment.get("started_at") or _now_text()
+        return [
+            self._build_fact(
+                summary=f"{speaker} said: {text}",
+                source_text=text,
+                fact_subject=fact_subject,
+                fact_kind=self._infer_fact_kind(text, speaker=role or speaker),
+                fact_type="episodic",
+                timestamp=timestamp,
+                turn_index=segment_index,
+                role=speaker,
+                importance=0.7,
+            )
+        ]
+
+    def _is_low_value_assistant_closing(self, text: str) -> bool:
+        clean = _compact_whitespace(text)
+        if not clean:
+            return True
+        lower = clean.lower()
+        if any(pattern in lower for pattern in _COURTESY_PATTERNS):
+            has_specific_action = any(
+                marker in lower
+                for marker in (
+                    "建议", "需要", "决定", "计划", "截止", "预约", "购买",
+                    "recommend", "suggest", "need to", "decide", "plan", "deadline",
+                )
+            )
+            return not has_specific_action
+        return False
+
+    @staticmethod
+    def _is_low_value_user_acknowledgement(text: str) -> bool:
+        clean = _compact_whitespace(text)
+        if not clean:
+            return True
+        lower = clean.lower()
+        if len(clean) > 48:
+            return False
+        if any(marker in lower for marker in ("?", "？", "帮我", "需要", "想要", "计划", "决定", "安排", "提醒", "购买", "预约", "need", "want", "plan", "decide", "remind")):
+            return False
+        acknowledgement_markers = (
+            "好的", "可以", "行", "嗯", "谢谢", "试一试", "听起来", "明白",
+            "ok", "okay", "thanks", "thank you", "sounds good", "i'll try",
+        )
+        return any(marker in lower for marker in acknowledgement_markers)
 
     def _build_fact(
         self,
@@ -626,7 +1223,15 @@ class MemoryNodeManager:
             "metadata": {"turn_index": turn_index, "role": role},
         }
 
-    def _store_fact(self, *, episode_id: int, fact: Dict[str, Any], tags: List[str]) -> int:
+    def _store_fact(
+        self,
+        *,
+        episode_id: int,
+        fact: Dict[str, Any],
+        tags: List[str],
+        source_type: str,
+        participants: List[str],
+    ) -> int:
         embedding_text = "\n".join([
             fact["summary"],
             f"keywords: {fact['keywords']}",
@@ -635,7 +1240,7 @@ class MemoryNodeManager:
         embedding = self._embed(embedding_text)
         fact_id = self._db.insert_fact(
             episode_id=episode_id,
-            source_type="assistant_wakeup",
+            source_type=source_type,
             fact_type=fact["fact_type"],
             fact_kind=fact["fact_kind"],
             fact_subject=fact["fact_subject"],
@@ -652,17 +1257,17 @@ class MemoryNodeManager:
         )
         self._db.add_entity_names(fact["entities"])
         self._db.upsert_index_entry(
-            source_type="assistant_wakeup",
+            source_type=source_type,
             target_table="memory_facts",
             target_id=fact_id,
             index_level="fact",
-            memory_path=f"assistant_wakeup/facts/{fact['fact_subject']}/{fact['fact_kind']}",
+            memory_path=f"{source_type}/facts/{fact['fact_subject']}/{fact['fact_kind']}",
             title=fact["summary"][:96],
             summary_for_retrieval=fact["summary"],
             keywords=fact["keywords"],
             entities=fact["entities"],
             canonical_topics=fact["canonical_topics"],
-            participants=["user", "assistant"],
+            participants=participants,
             time_start=fact["time_key"].split("#", 1)[0],
             time_end=fact["time_key"].split("#", 1)[0],
             importance=fact["importance"],
@@ -847,6 +1452,8 @@ class MemoryNodeManager:
             return []
         normalized: List[Dict[str, Any]] = []
         valid_fact_ids = {int(item["id"]) for item in facts if item.get("id") is not None}
+        facts_by_id = {int(item["id"]): item for item in facts if item.get("id") is not None}
+        seen_keys: set[str] = set()
         for raw in raw_items:
             if not isinstance(raw, dict):
                 continue
@@ -862,7 +1469,7 @@ class MemoryNodeManager:
             if not evidence_ids:
                 continue
             source_type = self._state_source_type_for_facts(facts, evidence_ids)
-            normalized.append({
+            item = {
                 "item_type": self._normalize_actionable_item_type(raw.get("item_type")),
                 "source_type": source_type,
                 "canonical_name": canonical_name,
@@ -876,8 +1483,153 @@ class MemoryNodeManager:
                 "canonical_topics": self._normalize_string_list(raw.get("canonical_topics"), limit=8),
                 "importance": self._clamp_float(raw.get("importance"), 0.0, 1.0, 0.7),
                 "confidence": self._clamp_float(raw.get("confidence"), 0.0, 1.0, 0.75),
-            })
+            }
+            if not self._is_high_value_actionable_item(item, facts_by_id=facts_by_id):
+                continue
+            dedupe_key = self._actionable_dedupe_key(item)
+            if dedupe_key in seen_keys:
+                continue
+            seen_keys.add(dedupe_key)
+            normalized.append(item)
         return normalized
+
+    def _is_high_value_actionable_item(
+        self,
+        item: Dict[str, Any],
+        *,
+        facts_by_id: Dict[int, Dict[str, Any]],
+    ) -> bool:
+        item_type = str(item.get("item_type") or "other")
+        status = str(item.get("status") or "unknown")
+        summary = _compact_whitespace(item.get("summary") or "")
+        canonical_name = _compact_whitespace(item.get("canonical_name") or "")
+        if not summary or item_type == "other":
+            return False
+        if float(item.get("confidence") or 0.0) < 0.6:
+            return False
+
+        joined = "\n".join([canonical_name, summary, str(item.get("due_at") or "")]).lower()
+        evidence_text = "\n".join(
+            str(facts_by_id.get(int(fact_id), {}).get("summary") or "")
+            for fact_id in item.get("evidence_fact_ids") or []
+        ).lower()
+        all_text = f"{joined}\n{evidence_text}"
+        has_hard_marker = self._has_actionable_hard_marker(all_text) or bool(item.get("due_at"))
+        has_weak_try = any(pattern in all_text for pattern in _WEAK_TRY_PATTERNS)
+
+        if has_weak_try and not self._has_explicit_followup_or_commitment(all_text, item_type=item_type):
+            return False
+
+        if item_type in {"task", "commitment", "reminder"}:
+            return has_hard_marker or item_type in {"commitment", "reminder"}
+
+        if item_type == "decision":
+            if status == "decided":
+                return True
+            return self._has_strong_decision_marker(all_text) and not has_weak_try
+
+        if item_type in {"follow_up", "open_question"}:
+            if self._is_low_value_followup_question(all_text):
+                return False
+            return self._has_followup_marker(all_text)
+
+        if item_type == "risk":
+            return self._has_blocking_marker(all_text)
+
+        if item_type == "recommendation":
+            return self._has_explicit_followup_or_commitment(all_text, item_type=item_type)
+
+        if item_type == "constraint":
+            return status == "blocked" and self._has_blocking_marker(all_text) and has_hard_marker
+
+        return False
+
+    @staticmethod
+    def _actionable_dedupe_key(item: Dict[str, Any]) -> str:
+        terms: List[str] = []
+        for field in ("canonical_name", "summary"):
+            text = _compact_whitespace(item.get(field) or "").lower()
+            text = re.sub(r"(用户|助手|agent|assistant|user)", "", text)
+            text = re.sub(r"[^\w\u4e00-\u9fff]+", " ", text)
+            terms.extend(part for part in text.split() if len(part) > 1)
+        compact = "".join(terms)
+        return f"{item.get('source_type')}|{item.get('item_type')}|{compact[:80]}"
+
+    @staticmethod
+    def _has_actionable_hard_marker(text: str) -> bool:
+        lower = str(text or "").lower()
+        if any(marker in lower for marker in _ACTIONABLE_HARD_MARKERS):
+            return True
+        return bool(re.search(r"(每\s*\d+\s*(分钟|小时|天|周|月)|\d+\s*(分钟|小时|天|周|月)\s*后)", lower))
+
+    @staticmethod
+    def _has_explicit_followup_or_commitment(text: str, *, item_type: str) -> bool:
+        lower = str(text or "").lower()
+        if item_type == "follow_up":
+            return True
+        if re.search(r"(提醒我|帮我提醒|请提醒|帮我记|请记住)", lower):
+            return True
+        return any(
+            marker in lower
+            for marker in (
+                "跟进", "后续确认", "下次", "明天", "截止", "承诺",
+                "决定执行", "已经决定", "明确采纳", "请记住", "帮我记",
+                "remind", "follow up", "next time", "deadline", "commit",
+                "decided to", "explicitly accepted", "remember this",
+            )
+        )
+
+    @staticmethod
+    def _has_strong_decision_marker(text: str) -> bool:
+        lower = str(text or "").lower()
+        return any(
+            marker in lower
+            for marker in (
+                "决定", "明确", "拒绝", "否定", "放弃", "采纳", "接受",
+                "不再", "已经", "最终", "decided", "explicitly", "rejected",
+                "declined", "accepted", "will not", "no longer",
+            )
+        )
+
+    @staticmethod
+    def _has_followup_marker(text: str) -> bool:
+        lower = str(text or "").lower()
+        return any(
+            marker in lower
+            for marker in (
+                "后续", "跟进", "确认", "未解决", "仍需", "需要进一步",
+                "开放问题", "下次", "follow up", "confirm", "unresolved",
+                "still need", "open question", "next time",
+            )
+        )
+
+    @staticmethod
+    def _is_low_value_followup_question(text: str) -> bool:
+        lower = str(text or "").lower()
+        if any(marker in lower for marker in ("提醒我", "帮我提醒", "请提醒", "帮我记", "请记住", "remind me", "remember this")):
+            return False
+        return any(
+            marker in lower
+            for marker in (
+                "未明确接受", "未明确拒绝", "未明确回应", "是否愿意尝试",
+                "是否采纳", "是否接受", "是否愿意", "用户未明确",
+                "not explicitly accepted", "not explicitly rejected",
+                "did not clearly respond", "whether the user is willing to try",
+                "whether the user accepts",
+            )
+        )
+
+    @staticmethod
+    def _has_blocking_marker(text: str) -> bool:
+        lower = str(text or "").lower()
+        return any(
+            marker in lower
+            for marker in (
+                "阻塞", "影响", "限制", "风险", "担心", "冲突", "无法",
+                "不现实", "拒绝", "否定", "blocked", "blocking", "risk",
+                "concern", "constraint", "prevents", "cannot", "unrealistic",
+            )
+        )
 
     def _store_actionable_item(self, item: Dict[str, Any]) -> int:
         keywords = item.get("keywords") or self._keywords(item["summary"], limit=18)
@@ -1213,10 +1965,9 @@ class MemoryNodeManager:
     def _keywords(self, text: str, *, limit: int) -> List[str]:
         tokens = re.findall(r"[A-Za-z][A-Za-z0-9_.$'-]*|\d+(?:/\d+)?|[\u4e00-\u9fff]{2,}", str(text or "").lower())
         counts = Counter(
-            token.strip("'\".,:;!?()[]{}")
+            self._normalize_keyword_term(token)
             for token in tokens
-            if len(token.strip("'\".,:;!?()[]{}")) > 1
-            and token.strip("'\".,:;!?()[]{}") not in _STOPWORDS
+            if self._is_valid_keyword_term(self._normalize_keyword_term(token))
         )
         return [term for term, _count in counts.most_common(limit)]
 
@@ -1331,14 +2082,42 @@ class MemoryNodeManager:
         out: List[str] = []
         seen = set()
         for item in raw:
-            text = _compact_whitespace(item)
-            if not text or text in seen:
+            text = MemoryNodeManager._normalize_keyword_term(item)
+            if not MemoryNodeManager._is_valid_keyword_term(text) or text in seen:
                 continue
             seen.add(text)
             out.append(text)
             if len(out) >= limit:
                 break
         return out
+
+    @staticmethod
+    def _normalize_keyword_term(value: Any) -> str:
+        text = _compact_whitespace(value)
+        return text.strip("'\".,:;!?，。！？、；：（）()[]{}")
+
+    @staticmethod
+    def _is_valid_keyword_term(text: str) -> bool:
+        clean = _compact_whitespace(text)
+        if not clean:
+            return False
+        lower = clean.lower()
+        if lower in _STOPWORDS:
+            return False
+        if any(pattern in lower for pattern in _COURTESY_PATTERNS):
+            return False
+        if re.search(r"[。！？!?；;，,]", clean):
+            return False
+        if re.search(r"(好的|谢谢|不客气|继续沟通|有其他问题|帮到您|帮到你)", clean):
+            return False
+        if re.search(r"^(好的|谢谢|嗯|行|可以|ok|okay|thanks)$", lower):
+            return False
+        chinese_chars = re.findall(r"[\u4e00-\u9fff]", clean)
+        if chinese_chars and len(chinese_chars) > 10:
+            return False
+        if not chinese_chars and len(clean.split()) > 4:
+            return False
+        return len(clean) > 1
 
     @staticmethod
     def _normalize_entity_names(value: Any, *, limit: int = 16) -> List[str]:

@@ -8,13 +8,23 @@ The system no longer treats assistant_wakeup and allday_recording as two separat
 - state: evolving long-term topic/preference/task state derived later from facts.
 - index entry: a MemPalace-style directory card used for unified recall.
 
-Your task now is to extract the episode summary and Hindsight-style high-quality narrative facts from the chronological assistant dialogue batch below.
+Your task now is to extract the episode summary, episode canonical_topics, and Hindsight-style high-quality narrative facts from the chronological dialogue/transcript evidence batch below. The evidence may come from an active user-assistant exchange or a multi-speaker ambient transcript; use speaker, role, and time to infer participants and pragmatic flow.
+
+Existing long-term topic candidates:
+{existing_long_term_topics}
+
+canonical_topics rules:
+- canonical_topics are stable episode-level topic names, ordered from most relevant to least relevant. Return 1-5 topics.
+- If this episode belongs to the same stable object or long-running topic as an existing candidate, reuse the candidate's canonical_topic exactly instead of rewriting it.
+- Create a new canonical topic only when the evidence clearly introduces a new stable object, project, product, relationship, or long-running issue.
+- Avoid over-generic topics such as "solution finalized", "product design discussion", "team collaboration", "problem discussion", or "user consultation". Prefer a concrete object or stable domain, e.g. "AI glasses voice memory system" or "phone promotion strategy".
+- If the evidence is too thin to identify the concrete object, prefer the most relevant existing long-term topic. If none is reliable, output a conservative broader topic rather than a fragmented short phrase.
 
 Core Hindsight-style narrative fact requirements:
 - Each fact should cover a complete exchange or a clear topic segment, not a single utterance. Do not mechanically split "the user raised a problem", "the assistant suggested a solution", and "the user accepted/rejected it" into separate fragments; if they respond to the same issue, merge them into one narrative fact.
 - Each fact must be understandable without reading the original dialogue and preserve the pragmatic flow of the interaction: why the user raised the issue, what the assistant suggested, how the user responded, and what preference, decision, constraint, unresolved question, or next step emerged.
 - Each fact must naturally include the five dimensions in its text: what (complete event/topic/plan/conclusion), when (conversation timestamp or explicit time anchor), where (location/setting/platform/project scope; if absent, say no specific location/setting was mentioned), who (user, assistant, and other key people/organizations with their roles), and why (explicit reason, motivation, concern, disagreement, constraint, implication, conclusion, or follow-up).
-- For a roughly five-turn dialogue batch, usually produce 1-3 facts. Only split when the batch truly contains multiple unrelated events/topics. In most cases, do not exceed 5 facts.
+- For a roughly five-turn dialogue batch or a coherent multi-speaker transcript segment, usually produce 1-3 facts. Only split when the batch truly contains multiple unrelated events/topics. In most cases, do not exceed 5 facts.
 
 Rules:
 1. Extract 0-5 facts. Do not force a fact for every turn.
@@ -29,12 +39,15 @@ Rules:
 10. fact_subject must be user, assistant, world, project, system, or other.
 11. fact_kind must be preference, decision, request, recommendation, action, commitment, open_question, risk, error, context, instruction, or other.
 12. Do not output short facts like "the user said X" or "the assistant suggested Y". If deleting the topic background, reason, disagreement, or conclusion would make the text a vague short note, add those details back; if the dialogue does not support them, omit the fact.
-13. Return JSON only. No markdown.
+13. Do not store assistant pleasantries, generic closings, or low-information encouragement as standalone facts, e.g. "hope this helps", "let me know if you have other questions", "okay", or "you're welcome", unless they explicitly change a decision, commitment, or next step.
+14. keywords must be short retrieval terms: entities, topics, symptoms, plans, constraints, or decisions. Do not put full sentences, pleasantries, filler, generic encouragement, or phrases like "hope this method helps you" into keywords.
+15. Return JSON only. No markdown.
 
 Output schema:
 {
   "episode_title": "short concrete title",
   "episode_summary": "self-contained summary of the interaction episode",
+  "canonical_topics": ["stable topic 1 ordered by relevance", "stable topic 2"],
   "facts": [
     {
       "text": "self-contained narrative fact covering a complete exchange and expressing what/when/where/who/why, with background, user/assistant view or action flow, and reason/disagreement/constraint/conclusion/next step",
@@ -53,7 +66,7 @@ Output schema:
   ]
 }
 
-Dialogue batch:
+Dialogue/transcript evidence batch:
 {dialogue_batch}
 """
 
@@ -100,20 +113,23 @@ New facts:
 
 UNIFIED_ACTIONABLE_ITEM_EXTRACTION_PROMPT_EN = """You are the actionable-item extraction module for a unified AI-glasses long-term memory system inspired by MemPalace.
 
-The input contains newly stored narrative facts. Extract concrete actionable items that may require future follow-up, recall, reminder, review, or decision tracking. Actionable items are separate from evolving states: a state summarizes an ongoing situation, while an actionable item is something that can be checked, completed, tracked, or explicitly recalled as a decision/commitment/risk/open question.
+The input contains newly stored narrative facts. Extract only concrete actionable items that truly require future follow-up, reminder, execution, review, or decision tracking. Actionable items are separate from evolving states: states summarize durable situations, preferences, constraints, and background; actionable items must be checkable, completable, trackable, or explicitly recalled as decisions, commitments, risks, or open questions.
 
 Extract only items directly supported by the facts.
 
 Rules:
-1. Extract 0-12 actionable items. Do not force an item.
-2. Include decisions, commitments, tasks, follow-ups, open questions, risks/blockers, deadlines, constraints that affect action, and concrete assistant recommendations the user may later ask about.
-3. Do not copy every fact. If a fact is merely background with no follow-up value, skip it.
-4. Keep each item self-contained: include actor/owner, target object, context, reason, deadline/time if known, and current status.
-5. evidence_fact_ids must cite supporting fact IDs from the input.
-6. item_type must be one of: task, commitment, decision, follow_up, open_question, risk, reminder, recommendation, constraint, other.
-7. status must be one of: open, in_progress, done, blocked, decided, noted, unknown.
-8. importance and confidence are 0-1.
-9. Return JSON only. No markdown.
+1. Extract 0-4 actionable items. Many ordinary dialogue batches should return an empty list. Do not force coverage of facts.
+2. Extract only strong actionable items: the user explicitly asks for a reminder/follow-up/record/arrangement/execution, the user or assistant clearly commits to future action, the user makes a trackable decision, a specific open issue must be resolved later, or a high-value risk is blocking an action.
+3. Do not extract weak willingness such as "the user is willing to try", "might try", "sounds good", or "may consider" as standalone actionable items. These belong in facts or states. Extract them only when they include an explicit reminder request, deadline, follow-up check, strong commitment, or verifiable execution plan.
+4. Do not extract ordinary assistant recommendations as actionable items. Extract them only when the user explicitly accepts them, asks for follow-up/reminders, or the recommendation becomes the user's task, commitment, or decision.
+5. Ordinary constraints, preferences, and background belong in states, not constraint items. Extract a constraint item only when the constraint is actively blocking a concrete action or decision.
+6. Do not copy every fact. If multiple facts point to the same matter, keep only the most specific and trackable item.
+7. Keep each item self-contained: include actor/owner, target object, context, reason, deadline/time if known, and current status.
+8. evidence_fact_ids must cite supporting fact IDs from the input.
+9. item_type must be one of: task, commitment, decision, follow_up, open_question, risk, reminder, recommendation, constraint, other.
+10. status must be one of: open, in_progress, done, blocked, decided, noted, unknown.
+11. importance and confidence are 0-1. Do not inflate confidence to bypass the weak-willingness rule.
+12. Return JSON only. No markdown.
 
 Output schema:
 {

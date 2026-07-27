@@ -175,22 +175,6 @@ class SessionDB:
                 UNIQUE(target_table, target_id, index_level)
             );
 
-            CREATE TABLE IF NOT EXISTS memory_observations (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                summary TEXT NOT NULL DEFAULT '',
-                entity_name TEXT NOT NULL DEFAULT '',
-                topic_key TEXT NOT NULL DEFAULT '',
-                confidence REAL NOT NULL DEFAULT 0.0,
-                created_at TEXT NOT NULL DEFAULT ''
-            );
-
-            CREATE TABLE IF NOT EXISTS memory_interpretations (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                claim TEXT NOT NULL DEFAULT '',
-                confidence REAL NOT NULL DEFAULT 0.0,
-                created_at TEXT NOT NULL DEFAULT ''
-            );
-
             CREATE TABLE IF NOT EXISTS entity_nodes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL UNIQUE,

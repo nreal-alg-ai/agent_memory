@@ -5,6 +5,7 @@ __pycache__/
 *.pyc
 .DS_Store
 external/
+test_data/
 tmp_result/
 result*.json
 models/

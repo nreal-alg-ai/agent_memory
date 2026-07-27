@@ -8,13 +8,20 @@ UNIFIED_MEMORY_EXTRACTION_PROMPT_ZH = """你是一个受 MemPalace 启发的 AI 
 - state：后续由 facts 更新出的长期主题/偏好/任务状态。
 - index entry：类似 MemPalace 目录卡片的统一召回入口。
 
-你现在需要从下面按时间顺序排列的 assistant 对话批次中提取 episode summary 和 Hindsight 风格的高质量 narrative facts。
+你现在需要从下面按时间顺序排列的对话/转写证据批次中提取 episode summary、episode canonical_topics 和 Hindsight 风格的高质量 narrative facts。证据可能来自用户与 assistant 的主动对话，也可能来自多人环境语音转写；请根据 speaker、role 和 time 判断参与者与语义流动。
+
+canonical_topics 生成规则：
+- canonical_topics 是 episode 级别的稳定主题名称，按相关性从高到低排序，输出 1-5 个。
+- 如果本次 episode 与已有长期 topic 候选中的某个主题属于同一稳定对象或同一长期议题，必须复用候选里的 canonical_topic 原文，不要改写同义词。
+- 只有当输入证据明确出现了新的稳定对象、项目、产品、人物关系或长期议题，才创建新 canonical topic。
+- 不要输出过泛的 topic，例如“方案确定”“产品设计讨论”“部门协作”“问题讨论”“用户咨询”。topic 应尽量包含具体对象或稳定领域，例如“AI眼镜语音记忆系统”“手机推广策略”。
+- 如果证据不足以确定具体对象，优先复用最相关的已有长期 topic；仍无法确定时输出更保守的上位主题，但不要新建碎片化短词。
 
 Hindsight 风格 narrative fact 的核心要求：
 - 每条 fact 应覆盖一次完整 exchange 或一个清晰议题片段，而不是单个 utterance。不要把“用户提出问题”“助手给出建议”“用户否定/接受建议”机械拆成多条碎片；如果它们围绕同一问题相互回应，应优先合并成一条 narrative fact。
 - 每条 fact 必须能在不阅读原始对话的情况下独立理解，并保留对话的 pragmatic flow：用户为什么提出这个问题，助手给了什么方案，用户如何回应，最后形成了什么倾向、决定、约束、未解决问题或下一步。
 - 每条 fact 必须在 text 中自然体现五维度信息：what（完整事件/议题/方案/结论）、when（对话时间或明确时间锚点）、where（地点/场景/平台/项目范围；未提及时说明未提及具体地点/场景）、who（用户、助手和其他关键人物/组织及其角色）、why（明确原因、动机、担忧、分歧、约束、影响、结论或后续安排）。
-- 对一个 5 轮左右的对话批次，通常输出 1-3 条 facts；只有当批次中确实存在多个互不相关的事件/议题时才拆开。绝大多数情况下不要超过 5 条。
+- 对一个 5 轮左右的对话批次或一段多人转写片段，通常输出 1-3 条 facts；只有当批次中确实存在多个互不相关的事件/议题时才拆开。绝大多数情况下不要超过 5 条。
 
 提取规则：
 1. 提取 0-5 条 facts，不要为了覆盖每一轮强行生成 fact。
@@ -29,12 +36,15 @@ Hindsight 风格 narrative fact 的核心要求：
 10. fact_subject 只能是 user、assistant、world、project、system、other。
 11. fact_kind 只能是 preference、decision、request、recommendation、action、commitment、open_question、risk、error、context、instruction、other。
 12. 不要输出只有“用户说了 X”“助手建议 Y”的短 fact；如果删除议题背景、理由、分歧或结论后会变成泛泛短句，必须补回这些信息；若对话没有足够信息支撑，则不要输出该 fact。
-13. 只返回 JSON，不要 markdown。
+13. 不要把 assistant 的寒暄、礼貌收尾、泛化鼓励或无具体信息的回复单独作为 fact，例如“希望这个方法能帮到您”“有其他问题可以继续沟通”“好的”“不客气”等；除非它明确改变了用户决定、承诺或下一步。
+14. keywords 只能包含用于检索的短实体、主题、症状、方案、约束或决定，通常每个关键词 2-8 个汉字或一个短英文短语；不要把完整句子、寒暄、礼貌话、语气词、泛化表达或“希望这个方法能帮到您”这类文本放入 keywords。
+15. 只返回 JSON，不要 markdown。
 
 输出格式：
 {
   "episode_title": "简短具体标题",
   "episode_summary": "可独立理解的 episode 总结",
+  "canonical_topics": ["按相关性排序的稳定主题1", "稳定主题2"],
   "facts": [
     {
       "text": "覆盖完整 exchange 的自包含 narrative fact，在一段文本中体现 what/when/where/who/why，包含背景、用户/助手观点或动作流动、理由/分歧/约束/结论/下一步",
@@ -53,7 +63,10 @@ Hindsight 风格 narrative fact 的核心要求：
   ]
 }
 
-对话批次：
+已有长期 canonical topics 候选：
+{existing_long_term_topics}
+
+对话/转写证据批次：
 {dialogue_batch}
 """
 
@@ -100,20 +113,23 @@ UNIFIED_STATE_UPDATE_PROMPT_ZH = """你是受 MemPalace 启发的 AI 眼镜统�
 
 UNIFIED_ACTIONABLE_ITEM_EXTRACTION_PROMPT_ZH = """你是受 MemPalace 启发的 AI 眼镜统一长期记忆系统中的 actionable item 提取模块。
 
-输入包含新存储的 narrative facts。请从中提取未来可能需要跟进、召回、提醒、复盘或决策追踪的具体可执行事项。actionable item 和 evolving state 分开：state 描述持续变化的长期状态，而 actionable item 是可以被检查、完成、追踪，或作为决定/承诺/风险/开放问题被明确召回的事项。
+输入包含新存储的 narrative facts。请从中提取未来真正需要跟进、提醒、执行、复盘或决策追踪的具体可执行事项。actionable item 和 evolving state 分开：state 描述持续变化的长期状态、偏好、约束和背景；actionable item 必须是可以被检查、完成、追踪，或明确作为决定/承诺/风险/开放问题被召回的事项。
 
 只能提取 facts 直接支持的内容。
 
 规则：
-1. 提取 0-12 条 actionable items，不要强行生成。
-2. 包括决策、承诺、任务、后续跟进、开放问题、风险/阻塞、截止时间、影响行动的约束，以及用户未来可能询问的具体 assistant 建议。
-3. 不要复制每条 fact。若某条 fact 只是背景信息、没有后续跟进价值，应跳过。
-4. 每个 item 必须可独立理解：包含执行人/owner、目标对象、上下文、原因、截止时间或时间锚点、当前状态。
-5. evidence_fact_ids 必须引用输入中的 fact ID。
-6. item_type 只能是：task、commitment、decision、follow_up、open_question、risk、reminder、recommendation、constraint、other。
-7. status 只能是：open、in_progress、done、blocked、decided、noted、unknown。
-8. importance 和 confidence 都是 0-1。
-9. 只返回 JSON，不要 markdown。
+1. 提取 0-4 条 actionable items。多数普通对话可以输出空列表，不要为了覆盖 facts 强行生成。
+2. 只提取强 actionable：用户明确要求提醒/跟进/记录/安排/执行，用户或 assistant 明确承诺未来会做，用户做出可追踪的决定，存在必须后续解决的开放问题，或存在会阻塞行动的高价值风险。
+3. 不要把“用户愿意试试/可以试一试/听起来不错/可能会考虑”单独提取为 actionable item；这类弱尝试意愿默认只属于 fact 或 state。只有当它同时包含明确提醒需求、截止时间、具体后续检查、强承诺或可验证执行计划时才提取。
+4. 不要把 assistant 的普通建议单独提取为 actionable item。只有当用户明确采纳、要求后续提醒/跟进，或该建议已经变成用户的任务/承诺/决定时才提取。
+5. 普通约束、偏好、背景信息应留给 state，不要作为 constraint item；只有当约束正在阻塞一个明确行动或决策时才提取。
+6. 不要复制每条 fact。若多条 facts 指向同一件事，只保留一条最具体、最可追踪的 item。
+7. 每个 item 必须可独立理解：包含执行人/owner、目标对象、上下文、原因、截止时间或时间锚点（如果存在）、当前状态。
+8. evidence_fact_ids 必须引用输入中的 fact ID。
+9. item_type 只能是：task、commitment、decision、follow_up、open_question、risk、reminder、recommendation、constraint、other。
+10. status 只能是：open、in_progress、done、blocked、decided、noted、unknown。
+11. importance 和 confidence 都是 0-1。弱尝试意愿的 confidence 不应提高来绕过规则。
+12. 只返回 JSON，不要 markdown。
 
 输出格式：
 {
