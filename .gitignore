@@ -1,0 +1,13 @@
+.venv/
+.cache/
+.pycache/
+__pycache__/
+*.pyc
+.DS_Store
+external/
+tmp_result/
+result*.json
+models/
+outputs/
+tmp/
+docs
