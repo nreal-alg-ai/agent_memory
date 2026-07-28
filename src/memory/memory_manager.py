@@ -196,6 +196,22 @@ class MemoryNodeManager:
         self._enabled = bool(self._memory_cfg.get("memory_enabled", True))
         self._top_k = int(self._memory_cfg.get("retrieval_top_k", 8) or 8)
         self._recall_budget = str(self._memory_cfg.get("recall_budget", "mid") or "mid")
+        self._recall_context_char_budgets = {
+            "low": max(1200, int(self._memory_cfg.get("recall_context_chars_low", 3200) or 3200)),
+            "mid": max(1800, int(self._memory_cfg.get("recall_context_chars_mid", 6000) or 6000)),
+            "high": max(2400, int(self._memory_cfg.get("recall_context_chars_high", 10000) or 10000)),
+        }
+        shared_recall_context_budget = self._memory_cfg.get("recall_context_max_chars")
+        if shared_recall_context_budget not in (None, ""):
+            shared_budget = max(1200, int(shared_recall_context_budget or 0))
+            self._recall_context_char_budgets = {
+                key: shared_budget for key in self._recall_context_char_budgets
+            }
+        self._recall_entry_char_budgets = {
+            "low": max(260, int(self._memory_cfg.get("recall_entry_chars_low", 520) or 520)),
+            "mid": max(320, int(self._memory_cfg.get("recall_entry_chars_mid", 760) or 760)),
+            "high": max(420, int(self._memory_cfg.get("recall_entry_chars_high", 1100) or 1100)),
+        }
         self._min_dialogue_turns_before_store = max(
             1,
             int(
@@ -1072,6 +1088,41 @@ class MemoryNodeManager:
             chunks.append(f"{started_at} {speaker}: {text[:600]}")
         return "\n".join(chunks)
 
+    @staticmethod
+    def _truncate_index_text(text: Any, *, max_chars: int = 700) -> str:
+        clean = _compact_whitespace(text or "")
+        if len(clean) <= max_chars:
+            return clean
+        return clean[: max(0, max_chars - 3)].rstrip() + "..."
+
+    def _build_index_embedding_text(
+        self,
+        *,
+        title: str,
+        summary: str,
+        keywords: Any,
+        entities: Sequence[str],
+        canonical_topics: Sequence[str],
+        memory_path: str,
+        max_summary_chars: int = 520,
+    ) -> str:
+        if isinstance(keywords, str):
+            keyword_text = keywords
+        else:
+            keyword_text = " ".join(str(item or "") for item in keywords)
+        return "\n".join(
+            part
+            for part in (
+                f"title: {self._truncate_index_text(title, max_chars=120)}",
+                f"summary: {self._truncate_index_text(summary, max_chars=max_summary_chars)}",
+                f"topics: {', '.join(str(item or '') for item in canonical_topics[:8])}",
+                f"entities: {', '.join(str(item or '') for item in entities[:12])}",
+                f"keywords: {self._truncate_index_text(keyword_text, max_chars=180)}",
+                f"path: {memory_path}",
+            )
+            if part.strip()
+        )
+
     def _index_episode(
         self,
         *,
@@ -1088,16 +1139,25 @@ class MemoryNodeManager:
         source_ref: str = "",
     ) -> None:
         keywords = " ".join(self._keywords(summary, limit=24))
-        embedding_text = f"{title}\n{summary}\nkeywords: {keywords}"
+        memory_path = f"{source_type}/episodes/{episode_type}"
+        summary_card = self._truncate_index_text(summary, max_chars=700)
+        embedding_text = self._build_index_embedding_text(
+            title=title,
+            summary=summary_card,
+            keywords=keywords,
+            entities=participants,
+            canonical_topics=canonical_topics,
+            memory_path=memory_path,
+        )
         embedding = self._embed(embedding_text)
         self._db.upsert_index_entry(
             source_type=source_type,
             target_table="memory_episodes",
             target_id=episode_id,
             index_level="episode",
-            memory_path=f"{source_type}/episodes/{episode_type}",
+            memory_path=memory_path,
             title=title,
-            summary_for_retrieval=summary,
+            summary_for_retrieval=summary_card,
             keywords=keywords,
             entities=participants,
             canonical_topics=canonical_topics,
@@ -1296,14 +1356,26 @@ class MemoryNodeManager:
             embedding_text=embedding_text,
         )
         self._db.add_entity_names(fact["entities"])
+        memory_path = f"{source_type}/facts/{fact['fact_subject']}/{fact['fact_kind']}"
+        summary_card = self._truncate_index_text(fact["summary"], max_chars=760)
+        index_embedding_text = self._build_index_embedding_text(
+            title=fact["summary"][:96],
+            summary=summary_card,
+            keywords=fact["keywords"],
+            entities=fact["entities"],
+            canonical_topics=fact["canonical_topics"],
+            memory_path=memory_path,
+            max_summary_chars=620,
+        )
+        index_embedding = self._embed(index_embedding_text)
         self._db.upsert_index_entry(
             source_type=source_type,
             target_table="memory_facts",
             target_id=fact_id,
             index_level="fact",
-            memory_path=f"{source_type}/facts/{fact['fact_subject']}/{fact['fact_kind']}",
+            memory_path=memory_path,
             title=fact["summary"][:96],
-            summary_for_retrieval=fact["summary"],
+            summary_for_retrieval=summary_card,
             keywords=fact["keywords"],
             entities=fact["entities"],
             canonical_topics=fact["canonical_topics"],
@@ -1312,8 +1384,8 @@ class MemoryNodeManager:
             time_end=fact["time_key"].split("#", 1)[0],
             importance=fact["importance"],
             confidence=fact["confidence"],
-            embedding=embedding,
-            embedding_text=embedding_text,
+            embedding=index_embedding,
+            embedding_text=index_embedding_text,
             metadata={"tags": tags, **fact["metadata"]},
         )
         return fact_id
@@ -2437,24 +2509,38 @@ class MemoryNodeManager:
             embedding_text=embedding_text,
         )
         if state_id:
+            memory_path = f"{state['source_type']}/states/{state['state_type']}"
+            summary_card = self._truncate_index_text(state["summary"], max_chars=700)
+            evidence_time_start, evidence_time_end = self._event_time_bounds_from_facts(
+                self._db.memory_facts_by_ids(evidence_fact_ids),
+            )
+            index_embedding_text = self._build_index_embedding_text(
+                title=state["canonical_name"],
+                summary=summary_card,
+                keywords=keywords,
+                entities=entities,
+                canonical_topics=canonical_topics,
+                memory_path=memory_path,
+            )
+            index_embedding = self._embed(index_embedding_text)
             self._db.upsert_index_entry(
                 source_type=state["source_type"],
                 target_table="memory_states",
                 target_id=state_id,
                 index_level="state",
-                memory_path=f"{state['source_type']}/states/{state['state_type']}",
+                memory_path=memory_path,
                 title=state["canonical_name"],
-                summary_for_retrieval=state["summary"],
+                summary_for_retrieval=summary_card,
                 keywords=" ".join(keywords),
                 entities=entities,
                 canonical_topics=canonical_topics,
                 participants=["user", "assistant"],
-                time_start="",
-                time_end="",
+                time_start=evidence_time_start,
+                time_end=evidence_time_end,
                 importance=state["importance"],
                 confidence=state["confidence"],
-                embedding=embedding,
-                embedding_text=embedding_text,
+                embedding=index_embedding,
+                embedding_text=index_embedding_text,
                 metadata={
                     "state_type": state["state_type"],
                     "status": state["status"],
@@ -2701,24 +2787,38 @@ class MemoryNodeManager:
             embedding_text=embedding_text,
         )
         if item_id:
+            memory_path = f"{item['source_type']}/actionable_items/{item['item_type']}"
+            summary_card = self._truncate_index_text(item["summary"], max_chars=700)
+            evidence_time_start, evidence_time_end = self._event_time_bounds_from_facts(
+                self._db.memory_facts_by_ids(evidence_fact_ids),
+            )
+            index_embedding_text = self._build_index_embedding_text(
+                title=item["canonical_name"],
+                summary=summary_card,
+                keywords=keywords,
+                entities=entities,
+                canonical_topics=canonical_topics,
+                memory_path=memory_path,
+            )
+            index_embedding = self._embed(index_embedding_text)
             self._db.upsert_index_entry(
                 source_type=item["source_type"],
                 target_table="memory_actionable_items",
                 target_id=item_id,
                 index_level="actionable_item",
-                memory_path=f"{item['source_type']}/actionable_items/{item['item_type']}",
+                memory_path=memory_path,
                 title=item["canonical_name"],
-                summary_for_retrieval=item["summary"],
+                summary_for_retrieval=summary_card,
                 keywords=" ".join(keywords),
                 entities=entities,
                 canonical_topics=canonical_topics,
                 participants=["user", "assistant"],
-                time_start=item["due_at"],
-                time_end=item["due_at"],
+                time_start=evidence_time_start,
+                time_end=evidence_time_end,
                 importance=item["importance"],
                 confidence=item["confidence"],
-                embedding=embedding,
-                embedding_text=embedding_text,
+                embedding=index_embedding,
+                embedding_text=index_embedding_text,
                 metadata={
                     "item_type": item["item_type"],
                     "owner": item["owner"],
@@ -2837,28 +2937,35 @@ class MemoryNodeManager:
         k = max(1, int(top_k or self._top_k or 8))
         b = str(budget or self._recall_budget or "mid")
         recall_plan = self._analyze_recall_query(query)
-        source_types = self._normalize_source_override(memory_source_override)
-        if source_types is None:
-            source_types = self._normalize_source_override(recall_plan.get("source_types") or [])
-        index_levels = self._normalize_index_levels(recall_plan.get("index_levels") or [])
+        forced_source_types = self._normalize_source_override(memory_source_override)
+        preferred_source_types = forced_source_types or self._normalize_source_override(
+            recall_plan.get("source_types") or []
+        )
+        preferred_index_levels = self._normalize_index_levels(
+            recall_plan.get("index_levels") or []
+        )
         query_embedding = self._embed(self._query_embedding_text(query))
         terms = self._query_terms(query)
         candidate_limit = self._candidate_limit(query=query, top_k=k, budget=b)
         candidates = self._db.search_index_entries(
-            source_types=source_types,
-            index_levels=index_levels,
+            source_types=forced_source_types,
+            index_levels=None,
             time_start=time_start,
             time_end=time_end,
             limit=candidate_limit,
+            terms=terms,
         )
         ranked = self._rank_index_entries(
             candidates,
             query=query,
             terms=terms,
             query_embedding=query_embedding,
+            preferred_source_types=preferred_source_types,
+            preferred_index_levels=preferred_index_levels,
         )
         selected = ranked[: self._final_limit(query=query, top_k=k)]
-        return self._format_recall_context(query=query, entries=selected)
+        hydrated = self._hydrate_recall_entries(selected)
+        return self._format_recall_context(query=query, entries=hydrated, budget=b)
 
     def _analyze_recall_query(self, query: str) -> Dict[str, Any]:
         if not self._llm_api_key:
@@ -2910,8 +3017,12 @@ class MemoryNodeManager:
         query: str,
         terms: List[str],
         query_embedding: Optional[np.ndarray],
+        preferred_source_types: Optional[Sequence[str]] = None,
+        preferred_index_levels: Optional[Sequence[str]] = None,
     ) -> List[Dict[str, Any]]:
         query_lower = str(query or "").lower()
+        preferred_sources = set(preferred_source_types or [])
+        preferred_levels = set(preferred_index_levels or [])
         scored: List[Tuple[float, str, int, Dict[str, Any]]] = []
         for position, entry in enumerate(entries):
             text = " ".join(
@@ -2931,7 +3042,7 @@ class MemoryNodeManager:
                 if ngram in text:
                     phrase_bonus += 1.0
             sim = self._cal_embedding_similarity(query_embedding, entry.get("embedding"))
-            level_bonus = 0.35 if entry.get("index_level") == "fact" else 0.15
+            base_level_bonus = 0.35 if entry.get("index_level") == "fact" else 0.15
             importance = float(entry.get("importance") or 0.5)
             confidence = float(entry.get("confidence") or 0.8)
             score = (
@@ -2940,42 +3051,299 @@ class MemoryNodeManager:
                 + max(0.0, sim) * 2.2
                 + importance * 0.55
                 + confidence * 0.35
-                + level_bonus
+                + base_level_bonus
                 + (1.0 / max(1, position + 1)) * 0.25
             )
             item = dict(entry)
+            source_bonus = 0.0
+            if preferred_sources and entry.get("source_type") in preferred_sources:
+                source_bonus = 0.7
+            preference_level_bonus = 0.0
+            if preferred_levels and entry.get("index_level") in preferred_levels:
+                preference_level_bonus = 0.55
+            retrieval_bonus = 0.0
+            metadata = entry.get("metadata") if isinstance(entry.get("metadata"), dict) else {}
+            matched_via = metadata.get("_matched_via") or []
+            matched_via_text = " ".join(str(item) for item in matched_via)
+            if "fts" in matched_via_text:
+                retrieval_bonus += 0.55
+            if "like" in matched_via_text:
+                retrieval_bonus += 0.35
+            if "recent" in matched_via_text:
+                retrieval_bonus += 0.08
             item["_recall_score"] = round(score, 4)
             item["_embedding_similarity"] = round(float(sim), 4)
+            item["_source_preference_bonus"] = round(source_bonus, 4)
+            item["_level_preference_bonus"] = round(preference_level_bonus, 4)
+            item["_retrieval_signal_bonus"] = round(retrieval_bonus, 4)
             item.pop("embedding", None)
+            score += source_bonus + preference_level_bonus + retrieval_bonus
+            item["_recall_score"] = round(score, 4)
             scored.append((score, str(entry.get("time_start") or ""), -position, item))
         scored.sort(key=lambda row: (row[0], row[1], row[2]), reverse=True)
         return [item for _, _, _, item in scored]
 
-    def _format_recall_context(self, *, query: str, entries: List[Dict[str, Any]]) -> str:
+    def _hydrate_recall_entries(self, entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        ids_by_table: Dict[str, List[int]] = {}
+        for entry in entries:
+            table = str(entry.get("target_table") or "")
+            try:
+                target_id = int(entry.get("target_id"))
+            except (TypeError, ValueError):
+                continue
+            ids_by_table.setdefault(table, [])
+            if target_id not in ids_by_table[table]:
+                ids_by_table[table].append(target_id)
+
+        hydrated_by_table: Dict[str, Dict[int, Dict[str, Any]]] = {}
+        table_loaders = {
+            "memory_episodes": self._db.memory_episodes_by_ids,
+            "memory_facts": self._db.memory_facts_by_ids,
+            "memory_states": self._db.memory_states_by_ids,
+            "memory_actionable_items": self._db.memory_actionable_items_by_ids,
+        }
+        for table, ids in ids_by_table.items():
+            loader = table_loaders.get(table)
+            if not loader:
+                continue
+            loaded = loader(ids)
+            hydrated_by_table[table] = {
+                int(item["id"]): item
+                for item in loaded
+                if item.get("id") is not None
+            }
+
+        support_fact_ids: List[int] = []
+        for table, rows_by_id in hydrated_by_table.items():
+            if table not in {"memory_states", "memory_actionable_items"}:
+                continue
+            for item in rows_by_id.values():
+                for value in item.get("evidence_fact_ids") or []:
+                    try:
+                        fact_id = int(value)
+                    except (TypeError, ValueError):
+                        continue
+                    if fact_id not in support_fact_ids:
+                        support_fact_ids.append(fact_id)
+        support_facts_by_id = {
+            int(fact["id"]): fact
+            for fact in self._db.memory_facts_by_ids(support_fact_ids)
+            if fact.get("id") is not None
+        } if support_fact_ids else {}
+
+        hydrated_entries: List[Dict[str, Any]] = []
+        for entry in entries:
+            item = dict(entry)
+            table = str(item.get("target_table") or "")
+            try:
+                target_id = int(item.get("target_id"))
+            except (TypeError, ValueError):
+                target_id = 0
+            raw = hydrated_by_table.get(table, {}).get(target_id)
+            if raw:
+                raw_item = dict(raw)
+                raw_item.pop("embedding", None)
+                item["_hydrated"] = raw_item
+                if table in {"memory_states", "memory_actionable_items"}:
+                    evidence_ids = [
+                        int(value)
+                        for value in raw_item.get("evidence_fact_ids") or []
+                        if str(value).strip().isdigit()
+                    ]
+                    item["_supporting_facts"] = [
+                        support_facts_by_id[fact_id]
+                        for fact_id in evidence_ids[:4]
+                        if fact_id in support_facts_by_id
+                    ]
+                    for fact in item["_supporting_facts"]:
+                        fact.pop("embedding", None)
+            hydrated_entries.append(item)
+        return hydrated_entries
+
+    def _recall_context_char_budget(self, budget: str) -> int:
+        return int(
+            self._recall_context_char_budgets.get(
+                str(budget or "mid").lower(),
+                self._recall_context_char_budgets["mid"],
+            )
+        )
+
+    def _recall_entry_char_budget(self, budget: str) -> int:
+        return int(
+            self._recall_entry_char_budgets.get(
+                str(budget or "mid").lower(),
+                self._recall_entry_char_budgets["mid"],
+            )
+        )
+
+    @staticmethod
+    def _truncate_recall_line(text: Any, *, max_chars: int) -> str:
+        clean = _compact_whitespace(text or "")
+        if len(clean) <= max_chars:
+            return clean
+        return clean[: max(0, max_chars - 18)].rstrip() + "...[truncated]"
+
+    @staticmethod
+    def _normalize_event_time_text(value: Any) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        text = text.split("#", 1)[0].strip().replace("T", " ")
+        if len(text) >= 19:
+            return text[:19]
+        if len(text) >= 10:
+            return text[:10]
+        return text
+
+    @classmethod
+    def _event_time_bounds_from_facts(cls, facts: Sequence[Dict[str, Any]]) -> Tuple[str, str]:
+        times = [
+            cls._normalize_event_time_text(fact.get("time_key"))
+            for fact in facts or []
+        ]
+        times = sorted(time for time in times if time)
+        if not times:
+            return "", ""
+        return times[0], times[-1]
+
+    @staticmethod
+    def _format_event_time_range(start: str, end: str) -> str:
+        if start and end and start != end:
+            return f"{start} - {end}"
+        return start or end or "unknown-event-time"
+
+    def _recall_event_time_text(self, entry: Dict[str, Any], raw: Dict[str, Any]) -> str:
+        target_table = str(entry.get("target_table") or "")
+        if target_table == "memory_facts":
+            return (
+                self._normalize_event_time_text(raw.get("time_key"))
+                or self._normalize_event_time_text(entry.get("time_start"))
+                or self._normalize_event_time_text(entry.get("time_end"))
+                or "unknown-event-time"
+            )
+        if target_table == "memory_episodes":
+            start = self._normalize_event_time_text(raw.get("started_at") or entry.get("time_start"))
+            end = self._normalize_event_time_text(raw.get("ended_at") or entry.get("time_end"))
+            return self._format_event_time_range(start, end)
+        if target_table in {"memory_states", "memory_actionable_items"}:
+            evidence_start, evidence_end = self._event_time_bounds_from_facts(
+                entry.get("_supporting_facts") or [],
+            )
+            if evidence_start or evidence_end:
+                return self._format_event_time_range(evidence_start, evidence_end)
+            start = self._normalize_event_time_text(entry.get("time_start"))
+            end = self._normalize_event_time_text(entry.get("time_end"))
+            if start or end:
+                return self._format_event_time_range(start, end)
+            return "unknown-event-time"
+        return (
+            self._normalize_event_time_text(raw.get("time_key"))
+            or self._normalize_event_time_text(raw.get("started_at"))
+            or self._normalize_event_time_text(entry.get("time_start"))
+            or self._normalize_event_time_text(entry.get("time_end"))
+            or "unknown-event-time"
+        )
+
+    def _format_recall_context(
+        self,
+        *,
+        query: str,
+        entries: List[Dict[str, Any]],
+        budget: str = "mid",
+    ) -> str:
         if not entries:
             return ""
+        max_chars = self._recall_context_char_budget(budget)
+        entry_max_chars = self._recall_entry_char_budget(budget)
         lines = [
-            "[Unified Memory Recall — MemPalace-style index entries]",
-            "System note: All memories are retrieved from one shared index. "
-            "Each entry keeps source_type, memory_path, time, and a pointer to the original table.",
+            "[Unified Memory Recall]",
+            "System note: Candidate selection starts from memory_index_entries, "
+            "then hydrates the selected entries from their original memory tables.",
+            f"Recall budget: {budget} max_chars={max_chars}",
             f"Query: {query}",
             "",
         ]
+        emitted = 0
+        omitted = 0
         for rank, entry in enumerate(entries, 1):
+            raw = entry.get("_hydrated") if isinstance(entry.get("_hydrated"), dict) else {}
             meta = {
                 "source": entry.get("source_type"),
                 "level": entry.get("index_level"),
                 "path": entry.get("memory_path"),
                 "target": f"{entry.get('target_table')}#{entry.get('target_id')}",
                 "score": entry.get("_recall_score"),
+                "matched_via": (entry.get("metadata") or {}).get("_matched_via", []),
             }
-            time_text = entry.get("time_start") or entry.get("time_end") or "unknown-time"
-            lines.append(
-                f"{rank}. [{time_text}] {entry.get('summary_for_retrieval')}\n"
-                f"   metadata: {_json_safe(meta)}\n"
-                f"   keywords: {entry.get('keywords') or ''}"
+            time_text = self._recall_event_time_text(entry, raw)
+            content = self._truncate_recall_line(
+                self._format_hydrated_recall_content(entry, raw),
+                max_chars=entry_max_chars,
             )
+            block_lines = [
+                f"{rank}. [{time_text}] {content}",
+                f"   metadata: {_json_safe(meta)}",
+            ]
+            supporting_facts = entry.get("_supporting_facts") or []
+            if supporting_facts:
+                evidence_lines = []
+                for fact in supporting_facts[:4]:
+                    fact_time = self._normalize_event_time_text(fact.get("time_key"))
+                    prefix = f"#{fact.get('id')}"
+                    if fact_time:
+                        prefix = f"{prefix} [{fact_time}]"
+                    evidence_lines.append(
+                        f"{prefix}: {self._truncate_recall_line(fact.get('summary') or '', max_chars=240)}"
+                    )
+                block_lines.append(f"   supporting_facts: {' | '.join(evidence_lines)}")
+            block = "\n".join(block_lines)
+            current = "\n".join(lines)
+            separator = "\n" if current else ""
+            if len(current) + len(separator) + len(block) > max_chars:
+                omitted = len(entries) - emitted
+                break
+            lines.append(block)
+            emitted += 1
+        if omitted > 0:
+            note = f"... omitted {omitted} lower-ranked recall entries due to budget."
+            current = "\n".join(lines)
+            if len(current) + 1 + len(note) <= max_chars:
+                lines.append(note)
         return "\n".join(lines)
+
+    @staticmethod
+    def _format_hydrated_recall_content(
+        entry: Dict[str, Any],
+        raw: Dict[str, Any],
+    ) -> str:
+        if not raw:
+            return _compact_whitespace(entry.get("summary_for_retrieval") or "")
+        target_table = str(entry.get("target_table") or "")
+        if target_table == "memory_episodes":
+            title = _compact_whitespace(raw.get("title") or "")
+            summary = _compact_whitespace(raw.get("summary") or "")
+            participants = raw.get("participants") or []
+            participant_text = f" participants={participants}" if participants else ""
+            return f"episode: {title}. {summary}{participant_text}".strip()
+        if target_table == "memory_facts":
+            fact_kind = str(raw.get("fact_kind") or "")
+            subject = str(raw.get("fact_subject") or "")
+            summary = _compact_whitespace(raw.get("summary") or "")
+            return f"fact({subject}/{fact_kind}): {summary}".strip()
+        if target_table == "memory_states":
+            state_type = str(raw.get("state_type") or "")
+            name = _compact_whitespace(raw.get("canonical_name") or "")
+            summary = _compact_whitespace(raw.get("summary") or "")
+            return f"state({state_type}) {name}: {summary}".strip()
+        if target_table == "memory_actionable_items":
+            item_type = str(raw.get("item_type") or "")
+            status = str(raw.get("status") or "")
+            owner = str(raw.get("owner") or "")
+            name = _compact_whitespace(raw.get("canonical_name") or "")
+            summary = _compact_whitespace(raw.get("summary") or "")
+            extras = ", ".join(part for part in (f"owner={owner}", f"status={status}") if part)
+            return f"actionable({item_type}, {extras}) {name}: {summary}".strip()
+        return _compact_whitespace(raw.get("summary") or entry.get("summary_for_retrieval") or "")
 
     # ── Lightweight NLP heuristics ───────────────────────────────────────
 
@@ -2993,6 +3361,15 @@ class MemoryNodeManager:
             clean = _compact_whitespace(phrase[0] or phrase[1]).lower()
             if clean and clean not in terms:
                 terms.insert(0, clean)
+        expanded: List[str] = []
+        for term in terms:
+            expanded.append(term)
+            if re.fullmatch(r"[\u4e00-\u9fff]{3,}", term):
+                for idx in range(0, len(term) - 1):
+                    bigram = term[idx : idx + 2]
+                    if bigram not in expanded:
+                        expanded.append(bigram)
+        terms = expanded
         return terms
 
     def _keywords(self, text: str, *, limit: int) -> List[str]:
