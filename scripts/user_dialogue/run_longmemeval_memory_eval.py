@@ -21,6 +21,7 @@ import shutil
 import sys
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -207,7 +208,7 @@ def parse_args() -> argparse.Namespace:
         help="Override memory.max_chars_before_store from config.yaml.",
     )
     parser.add_argument("--log-level", default="INFO")
-    parser.add_argument("--manager-log-level", default="INFO")
+    parser.add_argument("--manager-log-level", default="DEBUG")
     return parser.parse_args()
 
 
@@ -236,6 +237,38 @@ def configure_logging(
     manager_level = getattr(logging, str(manager_log_level).upper(), logging.INFO)
     logging.getLogger("memory").setLevel(manager_level)
     logging.getLogger("memory.memory_manager").setLevel(manager_level)
+
+
+@contextmanager
+def question_memory_logging(
+    question_state_dir: Path,
+    *,
+    manager_log_level: str,
+) -> Iterable[Path]:
+    """Capture memory package logs for one benchmark instance.
+
+    The benchmark can run either in one process or multiple worker processes.
+    A per-question handler keeps MemoryNodeManager's internal logs next to that
+    question's database regardless of the execution mode.
+    """
+    question_state_dir.mkdir(parents=True, exist_ok=True)
+    log_path = question_state_dir / "memory_manager.log"
+    manager_logger = logging.getLogger("memory")
+    manager_level = getattr(logging, str(manager_log_level).upper(), logging.INFO)
+    previous_level = manager_logger.level
+
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    handler = logging.FileHandler(log_path, mode="w", encoding="utf-8")
+    handler.setLevel(manager_level)
+    handler.setFormatter(formatter)
+    manager_logger.setLevel(manager_level)
+    manager_logger.addHandler(handler)
+    try:
+        yield log_path
+    finally:
+        manager_logger.removeHandler(handler)
+        handler.close()
+        manager_logger.setLevel(previous_level)
 
 
 def load_project_config(config_path: Path) -> Dict[str, Any]:
@@ -1080,60 +1113,70 @@ def build_instance_memory_context(
     question_state_dir.mkdir(parents=True, exist_ok=True)
     db_path = question_state_dir / "memory.db"
 
-    db = SessionDB(db_path=db_path)
-    try:
-        manager = MemoryNodeManager(
-            db,
-            embedding_config=embedding_config,
-            memory_config=memory_config,
-            llm_model=args.llm_model,
-            llm_base_url=args.llm_base_url,
-            llm_api_key=args.llm_api_key,
+    with question_memory_logging(
+        question_state_dir,
+        manager_log_level=str(args.manager_log_level),
+    ) as memory_log_path:
+        logging.getLogger("memory").info(
+            "Question memory log started: question_id=%s db_path=%s",
+            question_id,
+            db_path,
         )
-        validate_runtime(manager)
+        db = SessionDB(db_path=db_path)
+        try:
+            manager = MemoryNodeManager(
+                db,
+                embedding_config=embedding_config,
+                memory_config=memory_config,
+                llm_model=args.llm_model,
+                llm_base_url=args.llm_base_url,
+                llm_api_key=args.llm_api_key,
+            )
+            validate_runtime(manager)
 
-        sessions = sorted_history_sessions(item, max_sessions=int(args.max_sessions))
-        replay_stats, reflect_runs = replay_sessions_into_memory(
-            manager=manager,
-            item=item,
-            sessions=sessions,
-            enable_reflect=args.enable_reflect,
-            reflect_every_sessions=max(1, int(args.reflect_every_sessions)),
-            reflect_limit=int(args.reflect_limit),
-        )
-        effective_question_dt = effective_question_datetime(question_dt, sessions)
-        effective_question_date_text = format_memory_time(effective_question_dt)
-        counts = db_counts(db)
-        memory_context = manager.recall(
-            question,
-            top_k=int(args.recall_top_k),
-            budget=str(args.recall_budget),
-            time_end=effective_question_date_text,
-            recall_gate_mode=str(args.recall_gate_mode),
-            memory_source_override=args.recall_memory_source,
-        )
+            sessions = sorted_history_sessions(item, max_sessions=int(args.max_sessions))
+            replay_stats, reflect_runs = replay_sessions_into_memory(
+                manager=manager,
+                item=item,
+                sessions=sessions,
+                enable_reflect=args.enable_reflect,
+                reflect_every_sessions=max(1, int(args.reflect_every_sessions)),
+                reflect_limit=int(args.reflect_limit),
+            )
+            effective_question_dt = effective_question_datetime(question_dt, sessions)
+            effective_question_date_text = format_memory_time(effective_question_dt)
+            counts = db_counts(db)
+            memory_context = manager.recall(
+                question,
+                top_k=int(args.recall_top_k),
+                budget=str(args.recall_budget),
+                time_end=effective_question_date_text,
+                recall_gate_mode=str(args.recall_gate_mode),
+                memory_source_override=args.recall_memory_source,
+            )
 
-        return {
-            "question_id": question_id,
-            "question_type": question_type,
-            "question": question,
-            "question_date": question_date_text,
-            "effective_question_date": effective_question_date_text,
-            "answer": str(item.get("answer") or ""),
-            "history_session_count": len(sessions),
-            "replayed_turn_pairs": replay_stats.turn_pairs_total,
-            "turn_pairs_with_stored_facts": replay_stats.stored_pairs,
-            "skipped_assistant_only_turns": replay_stats.skipped_assistant_only,
-            "orphan_user_chunks": replay_stats.orphan_user_chunks,
-            "reflect_runs": reflect_runs,
-            "db_path": str(db_path),
-            "db_counts": counts,
-            "recall_context_chars": len(memory_context or ""),
-            "recall_context": memory_context,
-            "recall_memory_source_override": list(args.recall_memory_source or []),
-        }
-    finally:
-        db.close()
+            return {
+                "question_id": question_id,
+                "question_type": question_type,
+                "question": question,
+                "question_date": question_date_text,
+                "effective_question_date": effective_question_date_text,
+                "answer": str(item.get("answer") or ""),
+                "history_session_count": len(sessions),
+                "replayed_turn_pairs": replay_stats.turn_pairs_total,
+                "turn_pairs_with_stored_facts": replay_stats.stored_pairs,
+                "skipped_assistant_only_turns": replay_stats.skipped_assistant_only,
+                "orphan_user_chunks": replay_stats.orphan_user_chunks,
+                "reflect_runs": reflect_runs,
+                "db_path": str(db_path),
+                "memory_log_path": str(memory_log_path),
+                "db_counts": counts,
+                "recall_context_chars": len(memory_context or ""),
+                "recall_context": memory_context,
+                "recall_memory_source_override": list(args.recall_memory_source or []),
+            }
+        finally:
+            db.close()
 
 
 def answer_instance_from_memory_context(

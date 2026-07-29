@@ -40,6 +40,13 @@ Hindsight 风格 narrative fact 的核心要求：
 - 每条 fact 必须在 text 中自然体现五维度信息：what（完整事件/议题/方案/结论）、when（对话时间或明确时间锚点）、where（地点/场景/平台/项目范围；未提及时说明未提及具体地点/场景）、who（用户、助手和其他关键人物/组织及其角色）、why（明确原因、动机、担忧、分歧、约束、影响、结论或后续安排）。
 - 对一个 5 轮左右的对话批次或一段多人转写片段，通常输出 1-3 条 facts；只有当批次中确实存在多个互不相关的事件/议题时才拆开。绝大多数情况下不要超过 5 条。
 
+时间保真要求：
+- 必须保留影响语义的顺序词和先后关系：first、first time、second、previous、next、later、earlier、before、after、once、again、subsequent、prior、last、most recent，以及“第一次/首次/第二次/之前/之后/此前/随后/后来/更早/最近一次/上一次”等。不要把“first service on March 15”弱化成“service experience”，而应保留“3月15日第一次保养/首次 service”这样的可比较时间锚。
+- 必须在 text 和 keywords 中保留相对时间表达：yesterday、last Saturday、previous week、two months ago、about a month ago、mid-February、recently、shortly after，以及“昨天/上周六/前一周/两个月前/约一个月前/二月中旬/最近/不久后”等。如果它能根据 Conversation timestamp 无歧义换算，应在 occurred_start/occurred_end 写入补全后的日期或保守日期范围。
+- 如果未来问题的答案依赖事件先后、间隔、第一次/上一次或“哪个更早”，fact text 必须同时包含事件对象和时间锚/顺序词，不能只存主题名。
+- 如果同一批证据中多个事件可能被未来问题比较先后，应在一条 narrative fact 中明确写出相对顺序，或拆成多条各自带完整背景和时间锚的 facts；不要只保留比较中的一方。
+- 带时间锚或顺序词的个人经历即使只是顺带提到，也应认真保留，例如购买、保养/维修、修理、预约、参加活动、旅行、会议、测试、失败、决定等。
+
 提取规则：
 1. 提取 0-5 条 facts，不要为了覆盖每一轮强行生成 fact。
 2. 每条 fact 必须是一段完整叙事，至少包含“议题背景 + 用户/助手的观点或动作流动 + 理由/分歧/约束/结论/下一步”中的关键要素。
@@ -54,7 +61,7 @@ Hindsight 风格 narrative fact 的核心要求：
 11. fact_kind 只能是 preference、decision、request、recommendation、action、commitment、open_question、risk、error、context、instruction、other。
 12. 不要输出只有“用户说了 X”“助手建议 Y”的短 fact；如果删除议题背景、理由、分歧或结论后会变成泛泛短句，必须补回这些信息；若对话没有足够信息支撑，则不要输出该 fact。
 13. 不要把 assistant 的寒暄、礼貌收尾、泛化鼓励或无具体信息的回复单独作为 fact，例如“希望这个方法能帮到您”“有其他问题可以继续沟通”“好的”“不客气”等；除非它明确改变了用户决定、承诺或下一步。
-14. keywords 只能包含用于检索的短实体、主题、症状、方案、约束或决定，通常每个关键词 2-8 个汉字或一个短英文短语；不要把完整句子、寒暄、礼貌话、语气词、泛化表达或“希望这个方法能帮到您”这类文本放入 keywords。
+14. keywords 只能包含用于检索的短实体、主题、症状、方案、约束、决定和关键时间/顺序锚，通常每个关键词 2-8 个汉字或一个短英文短语；对带时间锚的事件，必须加入原始或补全后的时间词，例如“March 15 2023”“first service”“3/22”“last Saturday”“two months ago”“上周六”“两个月前”。不要把完整句子、寒暄、礼貌话、语气词、泛化表达或“希望这个方法能帮到您”这类文本放入 keywords。
 15. 只返回 JSON，不要 markdown。
 
 输出格式：
@@ -291,6 +298,8 @@ RECALL_QUERY_ANALYSIS_PROMPT_ZH = """你是 AI 眼镜长期记忆系统中用来
 - 只有当 query 明确指向用户与助手的主动对话，才偏向 assistant_wakeup；明确指向全天录音、会议、旁听、多人数对话，才偏向 allday_recording；不确定时两者都保留。
 - 精确证据、日期、人名、发生过什么优先 fact；任务、承诺、决定、开放问题、风险、提醒、推荐优先 actionable_item；稳定偏好、长期约束、习惯/流程、关系画像、主题/项目/议题演化优先 state；宽泛回顾、某段经历概括优先 episode。
 - 不确定时保持宽检索，漏掉证据比多取几个候选更糟。
+- keywords 输出 2-8 个短检索词，优先保留具体人物、组织、产品、项目、主题、动作、结果、约束和时间锚点；不要输出完整句子、寒暄或泛化词。
+- entities 输出对语义检索有帮助的实体名称及类型。实体可以是人物、组织、地点、产品、项目、技术或具体概念；普通的“今天/昨天/上周”等时间表达不要作为实体。
 
 只返回 JSON：
 {
@@ -298,7 +307,8 @@ RECALL_QUERY_ANALYSIS_PROMPT_ZH = """你是 AI 眼镜长期记忆系统中用来
   "index_levels": ["fact", "actionable_item", "state", "episode"],
   "needs_broad_evidence": false,
   "query_rewrite": "面向检索的改写",
-  "keywords": ["关键词1", "关键词2"]
+  "keywords": ["关键词1", "关键词2"],
+  "entities": [{"name": "实体名", "type": "PERSON|ORGANIZATION|LOCATION|PRODUCT|PROJECT|TECHNOLOGY|CONCEPT|OTHER"}]
 }
 
 用户查询：

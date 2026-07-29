@@ -148,6 +148,9 @@ memory:
   reflect_interval_seconds: 7200
   reflect_limit: 100
   recall_budget: mid
+  recall_fact_min_embedding_similarity: 0
+  recall_state_min_embedding_similarity: 0.35
+  recall_actionable_item_min_embedding_similarity: 0.35
   recall_gate_mode: auto
   enable_entity_extraction: true
 

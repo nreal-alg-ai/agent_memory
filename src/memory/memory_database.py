@@ -1004,6 +1004,181 @@ class SessionDB:
             out.append(item)
         return out
 
+    def _search_memory_rows(
+        self,
+        *,
+        table: str,
+        searchable_fields: Sequence[str],
+        time_field: str,
+        terms: Optional[Sequence[str]],
+        source_types: Optional[Sequence[str]],
+        time_start: Optional[str],
+        time_end: Optional[str],
+        limit: int,
+    ) -> List[Dict[str, Any]]:
+        """Return raw rows for direct recall without using index cards.
+
+        Table and field names are internal constants supplied by the three
+        public wrappers below; user input is only ever bound as SQL values.
+        Keyword hits are merged with recent rows so semantic reranking still
+        has a chance to recover older records without scanning unbounded data.
+        """
+        base_clauses: List[str] = []
+        base_params: List[Any] = []
+        if source_types:
+            placeholders = ",".join("?" for _ in source_types)
+            base_clauses.append(f"source_type IN ({placeholders})")
+            base_params.extend(source_types)
+        time_expression = (
+            f"substr({time_field}, 1, 19)"
+            if time_field == "time_key"
+            else time_field
+        )
+        time_clauses: List[str] = []
+        time_params: List[Any] = []
+        if time_start:
+            time_clauses.append(f"{time_expression} >= ?")
+            time_params.append(str(time_start))
+        if time_end:
+            time_clauses.append(f"{time_expression} <= ?")
+            time_params.append(str(time_end))
+        base_where = " AND ".join(base_clauses) if base_clauses else "1=1"
+        timed_where = " AND ".join([base_where, *time_clauses]) if time_clauses else base_where
+        row_limit = max(1, int(limit or 80))
+        normalized_terms = self._normalize_search_terms(terms)
+        row_ids: List[int] = []
+
+        def add_ids(rows: Sequence[sqlite3.Row]) -> None:
+            for row in rows:
+                row_id = int(row["id"])
+                if row_id not in row_ids:
+                    row_ids.append(row_id)
+
+        def add_keyword_matches(*, where: str, params: Sequence[Any], limit_value: int) -> None:
+            if not normalized_terms:
+                return
+            match_parts: List[str] = []
+            match_params: List[Any] = []
+            for term in normalized_terms[:12]:
+                per_term = " OR ".join(
+                    f"LOWER(COALESCE({field}, '')) LIKE ?" for field in searchable_fields
+                )
+                match_parts.append(f"({per_term})")
+                match_params.extend([f"%{term}%"] * len(searchable_fields))
+            if match_parts:
+                rows = self._conn.execute(
+                    f"""
+                    SELECT id FROM {table}
+                    WHERE {where} AND ({" OR ".join(match_parts)})
+                    ORDER BY {time_expression} DESC, id DESC
+                    LIMIT ?
+                    """,
+                    (*params, *match_params, limit_value),
+                ).fetchall()
+                add_ids(rows)
+
+        def add_recent(*, where: str, params: Sequence[Any], limit_value: int) -> None:
+            rows = self._conn.execute(
+                f"""
+                SELECT id FROM {table}
+                WHERE {where}
+                ORDER BY {time_expression} DESC, id DESC
+                LIMIT ?
+                """,
+                (*params, limit_value),
+            ).fetchall()
+            add_ids(rows)
+
+        timed_params = [*base_params, *time_params]
+        add_keyword_matches(where=timed_where, params=timed_params, limit_value=row_limit * 2)
+        add_recent(where=timed_where, params=timed_params, limit_value=row_limit)
+        if time_clauses and len(row_ids) < row_limit:
+            # Time range is a strong preference, not a brittle hard stop. Pad
+            # with broader keyword/recent candidates so downstream reranking
+            # can still recover facts with coarse or slightly shifted times.
+            add_keyword_matches(where=base_where, params=base_params, limit_value=row_limit * 2)
+            add_recent(where=base_where, params=base_params, limit_value=row_limit)
+
+        selected_ids = row_ids[: row_limit * 3]
+        if not selected_ids:
+            return []
+        placeholders = ",".join("?" for _ in selected_ids)
+        rows = self._conn.execute(
+            f"SELECT * FROM {table} WHERE id IN ({placeholders})",
+            selected_ids,
+        ).fetchall()
+        by_id = {int(row["id"]): self._row_to_dict(row) for row in rows}
+        return [by_id[row_id] for row_id in selected_ids if row_id in by_id]
+
+    def search_memory_facts(
+        self,
+        *,
+        terms: Optional[Sequence[str]] = None,
+        source_types: Optional[Sequence[str]] = None,
+        time_start: Optional[str] = None,
+        time_end: Optional[str] = None,
+        limit: int = 200,
+    ) -> List[Dict[str, Any]]:
+        return self._search_memory_rows(
+            table="memory_facts",
+            searchable_fields=(
+                "summary", "keywords", "entities", "canonical_topics",
+                "fact_kind", "fact_subject", "embedding_text", "metadata",
+            ),
+            time_field="time_key",
+            terms=terms,
+            source_types=source_types,
+            time_start=time_start,
+            time_end=time_end,
+            limit=limit,
+        )
+
+    def search_memory_states(
+        self,
+        *,
+        terms: Optional[Sequence[str]] = None,
+        source_types: Optional[Sequence[str]] = None,
+        time_start: Optional[str] = None,
+        time_end: Optional[str] = None,
+        limit: int = 200,
+    ) -> List[Dict[str, Any]]:
+        return self._search_memory_rows(
+            table="memory_states",
+            searchable_fields=(
+                "canonical_name", "summary", "time_line", "entity_key",
+                "state_scope", "state_type", "embedding_text", "metadata",
+            ),
+            time_field="updated_at",
+            terms=terms,
+            source_types=source_types,
+            time_start=time_start,
+            time_end=time_end,
+            limit=limit,
+        )
+
+    def search_memory_actionable_items(
+        self,
+        *,
+        terms: Optional[Sequence[str]] = None,
+        source_types: Optional[Sequence[str]] = None,
+        time_start: Optional[str] = None,
+        time_end: Optional[str] = None,
+        limit: int = 200,
+    ) -> List[Dict[str, Any]]:
+        return self._search_memory_rows(
+            table="memory_actionable_items",
+            searchable_fields=(
+                "canonical_name", "summary", "item_type", "owner", "status",
+                "due_at", "embedding_text", "metadata",
+            ),
+            time_field="updated_at",
+            terms=terms,
+            source_types=source_types,
+            time_start=time_start,
+            time_end=time_end,
+            limit=limit,
+        )
+
     def memory_facts_by_ids(self, fact_ids: Sequence[int]) -> List[Dict[str, Any]]:
         ids = [int(value) for value in fact_ids if value is not None]
         if not ids:

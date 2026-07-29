@@ -40,6 +40,13 @@ Core Hindsight-style narrative fact requirements:
 - Each fact must naturally include the five dimensions in its text: what (complete event/topic/plan/conclusion), when (conversation timestamp or explicit time anchor), where (location/setting/platform/project scope; if absent, say no specific location/setting was mentioned), who (user, assistant, and other key people/organizations with their roles), and why (explicit reason, motivation, concern, disagreement, constraint, implication, conclusion, or follow-up).
 - For a roughly five-turn dialogue batch or a coherent multi-speaker transcript segment, usually produce 1-3 facts. Only split when the batch truly contains multiple unrelated events/topics. In most cases, do not exceed 5 facts.
 
+Temporal fidelity requirements:
+- Preserve sequence and ordering expressions exactly when they affect meaning: first, first time, second, previous, next, later, earlier, before, after, once, again, subsequent, prior, last, most recent, and similar wording. Do not paraphrase away order. For example, keep "serviced for the first time on March 15" rather than reducing it to "had a good service experience".
+- Preserve relative time expressions in text and keywords: yesterday, last Saturday, previous week, two months ago, about a month ago, mid-February, recently, shortly after, and similar phrases. If the expression is tied to a known Conversation timestamp, also write the resolved date or conservative date range into occurred_start/occurred_end.
+- If an event's answerability depends on temporal order, the fact text must include both the event object and the time anchor or order marker. Do not store only the topic name.
+- If multiple events in the batch may later be compared by before/after/first/which happened earlier, either keep them in one narrative fact that explicitly states their relative order, or split them into separate complete facts with their own time anchors. Avoid keeping only one side of a comparison.
+- Personal events mentioned as side context remain important when they include time anchors or ordering words, such as purchases, service/maintenance, repairs, appointments, attendance, travel, meetings, tests, failures, and decisions.
+
 Rules:
 1. Extract 0-5 facts. Do not force a fact for every turn.
 2. Each fact must be a complete narrative preserving the essential topic background plus the flow of user/assistant views or actions and an explicit reason, disagreement, constraint, conclusion, or next step.
@@ -54,7 +61,7 @@ Rules:
 11. fact_kind must be preference, decision, request, recommendation, action, commitment, open_question, risk, error, context, instruction, or other.
 12. Do not output short facts like "the user said X" or "the assistant suggested Y". If deleting the topic background, reason, disagreement, or conclusion would make the text a vague short note, add those details back; if the dialogue does not support them, omit the fact.
 13. Do not store assistant pleasantries, generic closings, or low-information encouragement as standalone facts, e.g. "hope this helps", "let me know if you have other questions", "okay", or "you're welcome", unless they explicitly change a decision, commitment, or next step.
-14. keywords must be short retrieval terms: entities, topics, symptoms, plans, constraints, or decisions. Do not put full sentences, pleasantries, filler, generic encouragement, or phrases like "hope this method helps you" into keywords.
+14. keywords must be short retrieval terms: entities, topics, symptoms, plans, constraints, decisions, and important time/order anchors. For time-sensitive facts, include the original or resolved time phrase such as "March 15 2023", "first service", "3/22", "last Saturday", or "two months ago". Do not put full sentences, pleasantries, filler, generic encouragement, or phrases like "hope this method helps you" into keywords.
 15. Return JSON only. No markdown.
 
 Output schema:
@@ -291,6 +298,8 @@ Guidance:
 - Use source_types only when the query clearly points to assistant_wakeup interactions or allday_recording transcripts. Otherwise use both.
 - Use index_levels to prefer fact for exact evidence, actionable_item for tasks/commitments/decisions/open questions/risks/reminders/recommendations, state for stable preferences, durable constraints, routines, relationships, profiles, and topic/project/issue evolution, and episode for broad summaries.
 - Keep the plan broad when unsure. Missing evidence is worse than retrieving a few extra candidates.
+- Extract 2-8 short retrieval keywords, prioritizing concrete people, organizations, products, projects, topics, actions, outcomes, constraints, and time anchors. Do not output full sentences, pleasantries, or generic words.
+- Extract useful semantic entities with names and types. Entities may be people, organizations, locations, products, projects, technologies, or concrete concepts; ordinary time expressions such as today, yesterday, or last week are not entities.
 
 Return JSON only:
 {
@@ -298,7 +307,8 @@ Return JSON only:
   "index_levels": ["fact", "actionable_item", "state", "episode"],
   "needs_broad_evidence": false,
   "query_rewrite": "retrieval-focused rewrite",
-  "keywords": ["keyword1", "keyword2"]
+  "keywords": ["keyword1", "keyword2"],
+  "entities": [{"name": "entity name", "type": "PERSON|ORGANIZATION|LOCATION|PRODUCT|PROJECT|TECHNOLOGY|CONCEPT|OTHER"}]
 }
 
 User query:
