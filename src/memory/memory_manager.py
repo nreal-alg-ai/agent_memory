@@ -2922,7 +2922,9 @@ class MemoryNodeManager:
         )
         if state_id:
             memory_path = f"{state['source_type']}/states/{state_scope}/{state_type}"
-            summary_card = self._truncate_index_text(state["summary"], max_chars=700)
+            # State summaries are maintained as concise current snapshots. Reuse
+            # the same text in the index so retrieval sees exactly that snapshot.
+            summary_card = _compact_whitespace(state["summary"])
             evidence_time_start, evidence_time_end = self._event_time_bounds_from_facts(
                 self._db.memory_facts_by_ids(evidence_fact_ids),
             )
@@ -3743,8 +3745,41 @@ class MemoryNodeManager:
                 lines.append(note)
         return "\n".join(lines)
 
-    @staticmethod
+    def _format_state_timeline(
+        self,
+        value: Any,
+        *,
+        max_events: int = 8,
+        max_chars: int = 520,
+    ) -> str:
+        events = self._normalize_time_line(
+            value,
+            limit=max_events,
+            max_chars=max_chars,
+        )
+        if not events:
+            return ""
+        parts: List[str] = []
+        for event in events:
+            occurred_at = self._normalize_event_time_text(event.get("occurred_at"))
+            change_type = _compact_whitespace(event.get("change_type") or "updated")
+            summary = self._truncate_recall_line(
+                event.get("summary") or "",
+                max_chars=150,
+            )
+            if not summary:
+                continue
+            time_label = occurred_at or "unknown-time"
+            parts.append(f"[{time_label} {change_type}] {summary}")
+        if not parts:
+            return ""
+        return self._truncate_recall_line(
+            "; ".join(parts),
+            max_chars=max_chars,
+        )
+
     def _format_hydrated_recall_content(
+        self,
         entry: Dict[str, Any],
         raw: Dict[str, Any],
     ) -> str:
@@ -3768,7 +3803,11 @@ class MemoryNodeManager:
             name = _compact_whitespace(raw.get("canonical_name") or "")
             summary = _compact_whitespace(raw.get("summary") or "")
             label = "/".join(part for part in (state_scope, state_type) if part)
-            return f"state({label}) {name}: {summary}".strip()
+            timeline = self._format_state_timeline(raw.get("time_line"))
+            content = f"state({label}) {name}: {summary}".strip()
+            if timeline:
+                content = f"{content}; timeline: {timeline}"
+            return content
         if target_table == "memory_actionable_items":
             item_type = str(raw.get("item_type") or "")
             status = str(raw.get("status") or "")
