@@ -135,10 +135,13 @@ class SessionDB:
 
             CREATE TABLE IF NOT EXISTS memory_states (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                state_scope TEXT NOT NULL DEFAULT 'entity_state',
                 state_type TEXT NOT NULL,
                 source_type TEXT NOT NULL DEFAULT 'unified',
+                entity_key TEXT NOT NULL DEFAULT '',
                 canonical_name TEXT NOT NULL,
                 summary TEXT NOT NULL,
+                time_line TEXT NOT NULL DEFAULT '[]',
                 evidence_fact_ids TEXT NOT NULL DEFAULT '[]',
                 confidence REAL NOT NULL DEFAULT 0.75,
                 metadata TEXT NOT NULL DEFAULT '{}',
@@ -146,7 +149,7 @@ class SessionDB:
                 embedding_text TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
-                UNIQUE(source_type, state_type, canonical_name)
+                UNIQUE(source_type, state_scope, state_type, entity_key, canonical_name)
             );
 
             CREATE TABLE IF NOT EXISTS memory_actionable_items (
@@ -208,12 +211,123 @@ class SessionDB:
             CREATE INDEX IF NOT EXISTS idx_memory_index_source ON memory_index_entries(source_type);
             CREATE INDEX IF NOT EXISTS idx_memory_index_time ON memory_index_entries(time_start);
             CREATE INDEX IF NOT EXISTS idx_memory_states_source ON memory_states(source_type, state_type);
+            CREATE INDEX IF NOT EXISTS idx_memory_states_scope
+            ON memory_states(source_type, state_scope, state_type);
             CREATE INDEX IF NOT EXISTS idx_memory_actionable_source
             ON memory_actionable_items(source_type, item_type, status);
             """
         )
+        self._ensure_memory_states_scope_schema()
+        self._ensure_memory_states_time_line_schema()
+        self._ensure_memory_states_entity_key_schema()
         self._init_index_fts()
         self._conn.commit()
+
+    def _ensure_memory_states_scope_schema(self) -> None:
+        """Normalize the state scope columns for databases created earlier."""
+        columns = {
+            str(row["name"])
+            for row in self._conn.execute("PRAGMA table_info(memory_states)").fetchall()
+        }
+        if "state_scope" not in columns:
+            self._conn.execute(
+                "ALTER TABLE memory_states ADD COLUMN state_scope TEXT NOT NULL DEFAULT 'entity_state'"
+            )
+            self._conn.execute(
+                """
+                UPDATE memory_states
+                SET state_scope = 'topic_state', state_type = 'topic'
+                WHERE state_type = 'topic_state'
+                """
+            )
+        else:
+            self._conn.execute(
+                """
+                UPDATE memory_states
+                SET state_scope = 'topic_state', state_type = 'topic'
+                WHERE state_type = 'topic_state'
+                """
+            )
+
+    def _ensure_memory_states_time_line_schema(self) -> None:
+        """Add the state change timeline column to existing databases."""
+        columns = {
+            str(row["name"])
+            for row in self._conn.execute("PRAGMA table_info(memory_states)").fetchall()
+        }
+        if "time_line" not in columns:
+            self._conn.execute(
+                "ALTER TABLE memory_states ADD COLUMN time_line TEXT NOT NULL DEFAULT '[]'"
+            )
+
+    def _ensure_memory_states_entity_key_schema(self) -> None:
+        """Keep same-named entity states separate from topic states."""
+        columns = {
+            str(row["name"])
+            for row in self._conn.execute("PRAGMA table_info(memory_states)").fetchall()
+        }
+        if "entity_key" in columns:
+            return
+        rows = self._conn.execute("SELECT * FROM memory_states ORDER BY id").fetchall()
+        self._conn.execute("DROP INDEX IF EXISTS idx_memory_states_source")
+        self._conn.execute("DROP INDEX IF EXISTS idx_memory_states_scope")
+        self._conn.execute("ALTER TABLE memory_states RENAME TO memory_states_legacy")
+        self._conn.execute(
+            """
+            CREATE TABLE memory_states (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                state_scope TEXT NOT NULL DEFAULT 'entity_state',
+                state_type TEXT NOT NULL,
+                source_type TEXT NOT NULL DEFAULT 'unified',
+                entity_key TEXT NOT NULL DEFAULT '',
+                canonical_name TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                time_line TEXT NOT NULL DEFAULT '[]',
+                evidence_fact_ids TEXT NOT NULL DEFAULT '[]',
+                confidence REAL NOT NULL DEFAULT 0.75,
+                metadata TEXT NOT NULL DEFAULT '{}',
+                embedding BLOB,
+                embedding_text TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(source_type, state_scope, state_type, entity_key, canonical_name)
+            )
+            """
+        )
+        for row in rows:
+            metadata = _json_loads(row["metadata"], {})
+            scope = str(row["state_scope"] or "entity_state")
+            entity_key = ""
+            if scope == "entity_state" and isinstance(metadata, dict):
+                entity_key = str(
+                    metadata.get("entity_key")
+                    or metadata.get("entity")
+                    or ""
+                ).strip().lower()
+            self._conn.execute(
+                """
+                INSERT INTO memory_states (
+                    id, state_scope, state_type, source_type, entity_key,
+                    canonical_name, summary, time_line, evidence_fact_ids,
+                    confidence, metadata, embedding, embedding_text,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row["id"], row["state_scope"], row["state_type"],
+                    row["source_type"], entity_key, row["canonical_name"],
+                    row["summary"], row["time_line"], row["evidence_fact_ids"],
+                    row["confidence"], row["metadata"], row["embedding"],
+                    row["embedding_text"], row["created_at"], row["updated_at"],
+                ),
+            )
+        self._conn.execute("DROP TABLE memory_states_legacy")
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_memory_states_source ON memory_states(source_type, state_type)"
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_memory_states_scope ON memory_states(source_type, state_scope, state_type)"
+        )
 
     def _init_index_fts(self) -> None:
         """Create the lightweight lexical index used for first-pass recall."""
@@ -355,10 +469,13 @@ class SessionDB:
     def upsert_state(
         self,
         *,
+        state_scope: str,
         state_type: str,
         source_type: str,
+        entity_key: str,
         canonical_name: str,
         summary: str,
+        time_line: Optional[Sequence[Dict[str, Any]]],
         evidence_fact_ids: Sequence[int],
         confidence: float,
         metadata: Optional[Dict[str, Any]],
@@ -366,46 +483,67 @@ class SessionDB:
         embedding_text: str,
     ) -> int:
         now = utc_now_text()
-        self._conn.execute(
+        normalized_scope = str(state_scope or "entity_state").strip()
+        normalized_type = str(state_type or "profile").strip()
+        normalized_source = str(source_type or "unified")
+        normalized_entity_key = str(entity_key or "").strip().lower()
+        normalized_name = str(canonical_name or "general").strip()
+        values = (
+            normalized_scope,
+            normalized_type,
+            normalized_source,
+            normalized_entity_key,
+            normalized_name,
+            str(summary or "").strip(),
+            _json_dumps(list(time_line or [])),
+            _json_dumps([int(value) for value in evidence_fact_ids or []]),
+            float(confidence),
+            _json_dumps(metadata or {}),
+            _embedding_to_blob(embedding),
+            str(embedding_text or ""),
+        )
+        existing = self._conn.execute(
             """
-            INSERT INTO memory_states (
-                state_type, source_type, canonical_name, summary,
-                evidence_fact_ids, confidence, metadata, embedding,
-                embedding_text, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(source_type, state_type, canonical_name) DO UPDATE SET
-                summary = excluded.summary,
-                evidence_fact_ids = excluded.evidence_fact_ids,
-                confidence = excluded.confidence,
-                metadata = excluded.metadata,
-                embedding = excluded.embedding,
-                embedding_text = excluded.embedding_text,
-                updated_at = excluded.updated_at
+            SELECT id FROM memory_states
+            WHERE source_type = ? AND state_scope = ? AND state_type = ?
+              AND entity_key = ? AND canonical_name = ?
             """,
             (
-                str(state_type or "other"),
-                str(source_type or "unified"),
-                str(canonical_name or "general").strip(),
-                str(summary or "").strip(),
-                _json_dumps([int(value) for value in evidence_fact_ids or []]),
-                float(confidence),
-                _json_dumps(metadata or {}),
-                _embedding_to_blob(embedding),
-                str(embedding_text or ""),
-                now,
-                now,
+                normalized_source, normalized_scope, normalized_type,
+                normalized_entity_key, normalized_name,
             ),
-        )
+        ).fetchone()
+        if existing:
+            self._conn.execute(
+                """
+                UPDATE memory_states
+                SET summary = ?, time_line = ?, evidence_fact_ids = ?, confidence = ?,
+                    metadata = ?, embedding = ?, embedding_text = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (*values[5:], now, int(existing["id"])),
+            )
+        else:
+            self._conn.execute(
+                """
+                INSERT INTO memory_states (
+                    state_scope, state_type, source_type, entity_key, canonical_name, summary,
+                    time_line, evidence_fact_ids, confidence, metadata, embedding,
+                    embedding_text, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (*values, now, now),
+            )
         self._conn.commit()
         row = self._conn.execute(
             """
             SELECT id FROM memory_states
-            WHERE source_type = ? AND state_type = ? AND canonical_name = ?
+            WHERE source_type = ? AND state_scope = ? AND state_type = ?
+              AND entity_key = ? AND canonical_name = ?
             """,
             (
-                str(source_type or "unified"),
-                str(state_type or "other"),
-                str(canonical_name or "general").strip(),
+                normalized_source, normalized_scope, normalized_type,
+                normalized_entity_key, normalized_name,
             ),
         ).fetchone()
         return int(row["id"]) if row else 0
@@ -919,7 +1057,14 @@ class SessionDB:
 
     def _row_to_dict(self, row: sqlite3.Row) -> Dict[str, Any]:
         item = dict(row)
-        for key in ("entities", "canonical_topics", "participants", "metadata", "evidence_fact_ids"):
+        for key in (
+            "entities",
+            "canonical_topics",
+            "participants",
+            "metadata",
+            "evidence_fact_ids",
+            "time_line",
+        ):
             if key in item:
                 item[key] = _json_loads(item[key], [] if key != "metadata" else {})
         for key in ("embedding",):

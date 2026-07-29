@@ -36,7 +36,6 @@ from .prompts_en import (
     UNIFIED_ACTIONABLE_ITEM_EXTRACTION_PROMPT_EN,
     UNIFIED_ENTITY_STATE_UPDATE_PROMPT_EN,
     UNIFIED_MEMORY_EXTRACTION_PROMPT_EN,
-    UNIFIED_STATE_UPDATE_PROMPT_EN,
     UNIFIED_TOPIC_STATE_UPDATE_PROMPT_EN,
 )
 from .prompts_zh import (
@@ -44,7 +43,6 @@ from .prompts_zh import (
     UNIFIED_ACTIONABLE_ITEM_EXTRACTION_PROMPT_ZH,
     UNIFIED_ENTITY_STATE_UPDATE_PROMPT_ZH,
     UNIFIED_MEMORY_EXTRACTION_PROMPT_ZH,
-    UNIFIED_STATE_UPDATE_PROMPT_ZH,
     UNIFIED_TOPIC_STATE_UPDATE_PROMPT_ZH,
 )
 
@@ -267,6 +265,9 @@ class MemoryNodeManager:
         )
         self._entity_state_resolution_similarity_threshold = float(
             self._memory_cfg.get("entity_state_resolution_similarity_threshold", 0.72) or 0.72
+        )
+        self._entity_state_attribute_similarity_threshold = float(
+            self._memory_cfg.get("entity_state_attribute_similarity_threshold", 0.62) or 0.62
         )
 
     @staticmethod
@@ -516,11 +517,12 @@ class MemoryNodeManager:
             else UNIFIED_MEMORY_EXTRACTION_PROMPT_ZH
         )
         topic_candidates = self._collect_long_term_topic_candidates(limit=60)
+        memory_state_context = self._collect_memory_state_context(limit=12)
         prompt = (
             prompt_template
             .replace(
-                "{existing_long_term_topics}",
-                self._format_existing_long_term_topics_for_prompt(topic_candidates),
+                "{existing_memory_states}",
+                self._format_memory_states_for_prompt(memory_state_context),
             )
             .replace(
                 "{dialogue_batch}",
@@ -658,6 +660,15 @@ class MemoryNodeManager:
             entities = self._normalize_entity_names(raw_fact.get("entities"))
             if not entities:
                 entities = self._entities(text)
+            primary_entity = self._normalize_primary_entity(
+                raw_fact.get("primary_entity"),
+                entities=entities,
+                fact_subject=fact_subject,
+            )
+            if primary_entity:
+                primary_entity_name = primary_entity["name"]
+                if primary_entity_name not in entities:
+                    entities = [primary_entity_name, *entities]
             primary_topic = _compact_whitespace(raw_fact.get("primary_topic") or "")
             if not primary_topic:
                 primary_topic = " ".join(keywords[:3]) if keywords else "general"
@@ -684,6 +695,7 @@ class MemoryNodeManager:
                 "time_key": f"{timestamp}#llm:{index:02d}",
                 "keywords": " ".join(keywords),
                 "entities": entities,
+                "primary_entity": primary_entity,
                 "canonical_topics": fact_topics or episode_topics or [primary_topic],
                 "importance": max(0.6, min(1.0, priority / 100.0)),
                 "confidence": 0.9,
@@ -695,6 +707,7 @@ class MemoryNodeManager:
                     "time_confidence": _compact_whitespace(raw_fact.get("time_confidence") or "unknown"),
                     "where": _compact_whitespace(raw_fact.get("where") or ""),
                     "primary_topic": primary_topic,
+                    "primary_entity": primary_entity,
                 },
             })
         return {
@@ -865,6 +878,10 @@ class MemoryNodeManager:
         rows: List[Dict[str, Any]] = []
         seen: set[str] = set()
         for state in states:
+            if str(state.get("state_scope") or "") != "topic_state":
+                continue
+            if str(state.get("state_type") or "") != "topic":
+                continue
             metadata = state.get("metadata") or {}
             raw_topics: List[Any] = [
                 state.get("canonical_name"),
@@ -882,6 +899,7 @@ class MemoryNodeManager:
                     "canonical_topic": topic,
                     "state_id": state.get("id"),
                     "source_type": state.get("source_type"),
+                    "state_scope": state.get("state_scope"),
                     "state_type": state.get("state_type"),
                     "summary": _compact_whitespace(state.get("summary") or "")[:240],
                 })
@@ -889,20 +907,66 @@ class MemoryNodeManager:
                     return rows
         return rows
 
+    def _collect_memory_state_context(self, *, limit: int = 12) -> List[Dict[str, Any]]:
+        """Collect a small, balanced state reference set for fact extraction."""
+        try:
+            states = self._db.recent_states(limit=max(40, int(limit or 12) * 6))
+        except Exception as exc:
+            logger.debug("Failed to load memory state context: %s", exc)
+            return []
+        rows: List[Dict[str, Any]] = []
+        seen: set[Tuple[str, str, str]] = set()
+        scope_counts: Counter[str] = Counter()
+        type_counts: Counter[Tuple[str, str]] = Counter()
+        scope_limits = {"topic_state": 4, "entity_state": 8}
+        type_limits = {"topic": 4}
+        max_items = max(1, int(limit or 12))
+        for state in states:
+            scope = _compact_whitespace(state.get("state_scope") or "")
+            state_type = _compact_whitespace(state.get("state_type") or "")
+            canonical_name = _compact_whitespace(state.get("canonical_name") or "")
+            summary = self._normalize_state_summary(
+                state.get("summary") or "",
+                max_chars=120,
+            )
+            if scope not in scope_limits or not state_type or not canonical_name or not summary:
+                continue
+            key = (scope, state_type, canonical_name.lower())
+            if key in seen:
+                continue
+            if scope_counts[scope] >= scope_limits[scope]:
+                continue
+            type_key = (scope, state_type)
+            if type_counts[type_key] >= type_limits.get(state_type, 2):
+                continue
+            seen.add(key)
+            scope_counts[scope] += 1
+            type_counts[type_key] += 1
+            rows.append({
+                "state_scope": scope,
+                "state_type": state_type,
+                "canonical_name": canonical_name[:60],
+                "summary": summary,
+            })
+            if len(rows) >= max_items:
+                break
+        return rows
+
     @staticmethod
-    def _format_existing_long_term_topics_for_prompt(topics: List[Dict[str, Any]]) -> str:
-        if not topics:
+    def _format_memory_states_for_prompt(
+        states: List[Dict[str, Any]],
+        *,
+        max_chars: int = 1800,
+    ) -> str:
+        if not states:
             return "[]"
-        rows = [
-            {
-                "canonical_topic": item.get("canonical_topic"),
-                "source_type": item.get("source_type"),
-                "state_type": item.get("state_type"),
-                "summary": item.get("summary"),
-            }
-            for item in topics[:60]
-        ]
-        return json.dumps(rows, ensure_ascii=False, indent=2)
+        rows = list(states)
+        while rows:
+            text = json.dumps(rows, ensure_ascii=False, indent=2)
+            if len(text) <= max_chars:
+                return text
+            rows.pop()
+        return "[]"
 
     def _normalize_episode_canonical_topics(
         self,
@@ -1308,6 +1372,11 @@ class MemoryNodeManager:
     ) -> Dict[str, Any]:
         keywords = self._keywords(source_text, limit=18)
         entities = self._entities(source_text)
+        primary_entity = self._normalize_primary_entity(
+            None,
+            entities=entities,
+            fact_subject=fact_subject,
+        )
         return {
             "summary": _compact_whitespace(summary),
             "source_text": source_text,
@@ -1317,6 +1386,7 @@ class MemoryNodeManager:
             "time_key": f"{timestamp}#{turn_index:02d}:{role}",
             "keywords": " ".join(keywords),
             "entities": entities,
+            "primary_entity": primary_entity,
             "canonical_topics": self._topic_candidates(source_text),
             "importance": importance,
             "confidence": 0.88,
@@ -1336,6 +1406,7 @@ class MemoryNodeManager:
             fact["summary"],
             f"keywords: {fact['keywords']}",
             f"entities: {', '.join(fact['entities'])}",
+            f"primary_entity: {(fact.get('primary_entity') or {}).get('name', '') if isinstance(fact.get('primary_entity'), dict) else ''}",
         ])
         embedding = self._embed(embedding_text)
         fact_id = self._db.insert_fact(
@@ -1393,7 +1464,7 @@ class MemoryNodeManager:
     # ── Reflection: facts -> evolving states ─────────────────────────────
 
     def reflect(self, *_, **kwargs: Any) -> Dict[str, int]:
-        """Update durable states and actionable items from recent facts."""
+        """Update topic/entity projections and actionable items from recent facts."""
         if self._pending_store_turns:
             self.flush_pending_store_turns()
         if not self._enabled:
@@ -1415,26 +1486,18 @@ class MemoryNodeManager:
             for fact in facts
             if str(fact.get("id") or "").strip().isdigit()
         ]
+        topic_facts = [fact for fact in facts if self._fact_can_seed_topic_state(fact)]
+        entity_facts = [fact for fact in facts if self._fact_can_seed_entity_state(fact)]
         existing_states = self._db.recent_states(limit=80)
         topic_report = self._resolve_and_update_topic_states_from_facts(
-            facts=facts,
+            facts=topic_facts,
             existing_states=existing_states,
         )
         existing_states = self._db.recent_states(limit=80)
         entity_report = self._resolve_and_update_entity_scoped_states_from_facts(
-            facts=facts,
+            facts=entity_facts,
             existing_states=existing_states,
         )
-        existing_states = self._db.recent_states(limit=80)
-        state_updates = self._extract_state_updates_with_llm(
-            facts=facts,
-            existing_states=existing_states,
-        )
-        states_updated = 0
-        for state in state_updates:
-            state_id = self._store_state(state)
-            if state_id:
-                states_updated += 1
         facts_marked_processed = self._db.mark_facts_processed_for_memory_state(fact_ids)
         actionable_updates = self._extract_actionable_items_with_llm(facts=facts)
         actionable_items_updated = 0
@@ -1443,7 +1506,17 @@ class MemoryNodeManager:
             if item_id:
                 actionable_items_updated += 1
         return {
-            "states_updated": states_updated,
+            "states_updated": (
+                int(topic_report.get("updated", 0) or 0)
+                + int(entity_report.get("updated", 0) or 0)
+            ),
+            "topic_facts_considered": len(topic_facts),
+            "entity_facts_considered": len(entity_facts),
+            "evidence_only_facts": max(0, len(facts) - len(set(
+                int(fact["id"])
+                for fact in [*topic_facts, *entity_facts]
+                if str(fact.get("id") or "").strip().isdigit()
+            ))),
             "topic_states_updated": int(topic_report.get("updated", 0) or 0),
             "topic_candidates_unresolved": int(topic_report.get("unresolved", 0) or 0),
             "pending_unresolved_topics": int(topic_report.get("pending_unresolved", 0) or 0),
@@ -1451,6 +1524,43 @@ class MemoryNodeManager:
             "facts_marked_processed_for_memory_state": facts_marked_processed,
             "actionable_items_updated": actionable_items_updated,
         }
+
+    @classmethod
+    def _fact_has_durable_state_signal(cls, fact: Dict[str, Any]) -> bool:
+        """Return whether a fact contains durable state signal, not just an event."""
+        kind = str(fact.get("fact_kind") or "").strip().lower()
+        fact_type = str(fact.get("fact_type") or "").strip().lower()
+        summary = str(fact.get("summary") or "").lower()
+        if kind in {"action", "request", "commitment", "other"} and fact_type != "semantic":
+            return any(
+                marker in summary
+                for marker in (
+                    "长期", "持续", "反复", "一直", "通常", "习惯", "偏好", "喜欢",
+                    "计划", "决定", "策略", "风险", "约束", "长期", "ongoing",
+                    "persistent", "usually", "habit", "prefer", "decided", "strategy",
+                    "risk", "constraint",
+                )
+            )
+        if fact_type == "semantic":
+            return True
+        return kind in {
+            "preference", "decision", "risk", "error", "open_question",
+            "context", "instruction",
+        }
+
+    @classmethod
+    def _fact_can_seed_topic_state(cls, fact: Dict[str, Any]) -> bool:
+        """Topic states require an anchored topic and durable topic signal."""
+        topics = cls._coerce_topic_list(fact.get("canonical_topics"))
+        return bool(topics) and cls._fact_has_durable_state_signal(fact)
+
+    def _fact_can_seed_entity_state(self, fact: Dict[str, Any]) -> bool:
+        """Entity states require both a durable signal and an entity target."""
+        if not self._fact_has_durable_state_signal(fact):
+            return False
+        if not self._infer_entity_scoped_state_types_for_fact(fact):
+            return False
+        return bool(self._entities_for_entity_state_fact(fact))
 
     def _resolve_and_update_topic_states_from_facts(
         self,
@@ -1462,7 +1572,8 @@ class MemoryNodeManager:
             return {"enabled": 0, "updated": 0, "unresolved": 0, "pending_unresolved": len(self._pending_unresolved_topics)}
         existing_topic_states = [
             state for state in existing_states
-            if str(state.get("state_type") or "") == "topic_state"
+            if str(state.get("state_scope") or "") == "topic_state"
+            and str(state.get("state_type") or "") == "topic"
         ]
         candidates = self._build_topic_state_candidates_from_facts(facts)
         updated = 0
@@ -1504,7 +1615,8 @@ class MemoryNodeManager:
                 )
                 existing_topic_states = [
                     state for state in refreshed
-                    if str(state.get("state_type") or "") == "topic_state"
+                    if str(state.get("state_scope") or "") == "topic_state"
+                    and str(state.get("state_type") or "") == "topic"
                 ]
         return {
             "enabled": 1,
@@ -1944,6 +2056,12 @@ class MemoryNodeManager:
         result = self._call_llm(prompt)
         parsed = self._parse_json_object_from_llm_text(result or "")
         if parsed:
+            if not self._config_bool(parsed.get("update_needed", True), True):
+                logger.debug(
+                    "LLM declined topic-state update for topic=%s",
+                    candidate.get("canonical_name"),
+                )
+                return None
             normalized = self._normalize_topic_state_update_payload(
                 parsed,
                 candidate=candidate,
@@ -1959,13 +2077,161 @@ class MemoryNodeManager:
             return {}
         return {
             "id": state.get("id"),
+            "state_scope": state.get("state_scope") or "topic_state",
             "source_type": state.get("source_type"),
             "canonical_name": state.get("canonical_name"),
             "summary": state.get("summary"),
+            "time_line": MemoryNodeManager._normalize_time_line(
+                state.get("time_line"),
+                limit=8,
+                max_chars=1000,
+            ),
             "evidence_fact_ids": state.get("evidence_fact_ids") or [],
             "confidence": state.get("confidence"),
             "metadata": state.get("metadata") or {},
         }
+
+    @staticmethod
+    def _normalize_state_summary(value: Any, *, max_chars: int = 280) -> str:
+        """Keep state summaries as short current snapshots, not history logs."""
+        text = _compact_whitespace(value)
+        if len(text) <= max_chars:
+            return text
+        boundary = max(
+            text.rfind("。", 0, max_chars),
+            text.rfind("！", 0, max_chars),
+            text.rfind("？", 0, max_chars),
+            text.rfind(".", 0, max_chars),
+            text.rfind("!", 0, max_chars),
+            text.rfind("?", 0, max_chars),
+        )
+        if boundary >= max_chars // 2:
+            return text[: boundary + 1]
+        return text[:max_chars].rstrip("，,；; ") + "..."
+
+    @staticmethod
+    def _normalize_time_line(
+        value: Any,
+        *,
+        limit: int = 20,
+        max_chars: int = 2400,
+        valid_fact_ids: Optional[set[int]] = None,
+    ) -> List[Dict[str, Any]]:
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except (TypeError, json.JSONDecodeError):
+                value = []
+        if isinstance(value, dict):
+            value = [value]
+        if not isinstance(value, list):
+            return []
+        events: List[Dict[str, Any]] = []
+        seen: set[Tuple[str, str, str, Tuple[int, ...]]] = set()
+        for raw in value:
+            if not isinstance(raw, dict):
+                continue
+            summary = MemoryNodeManager._normalize_state_summary(
+                raw.get("summary") or raw.get("text"),
+                max_chars=180,
+            )
+            if not summary:
+                continue
+            fact_ids: List[int] = []
+            for fact_id in raw.get("fact_ids") or raw.get("evidence_fact_ids") or []:
+                if not str(fact_id).strip().isdigit():
+                    continue
+                normalized_id = int(fact_id)
+                if valid_fact_ids is None or normalized_id in valid_fact_ids:
+                    fact_ids.append(normalized_id)
+            fact_ids = list(dict.fromkeys(fact_ids))[:12]
+            occurred_at = _compact_whitespace(
+                raw.get("occurred_at")
+                or raw.get("timestamp")
+                or raw.get("time")
+                or ""
+            )[:80]
+            change_type = _compact_whitespace(
+                raw.get("change_type") or raw.get("type") or "updated"
+            )[:40]
+            event = {
+                "occurred_at": occurred_at,
+                "change_type": change_type,
+                "summary": summary,
+                "fact_ids": fact_ids,
+            }
+            key = (occurred_at, change_type, summary, tuple(fact_ids))
+            if key in seen:
+                continue
+            seen.add(key)
+            events.append(event)
+        events = events[-max(1, int(limit or 20)):]
+        while events and len(json.dumps(events, ensure_ascii=False)) > max_chars:
+            events.pop(0)
+        return events
+
+    def _fallback_time_line_update(
+        self,
+        candidate: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        facts = [
+            fact for fact in candidate.get("facts") or []
+            if _compact_whitespace(fact.get("summary") or "")
+        ]
+        if not facts:
+            return []
+        fact_ids = [
+            int(fact["id"])
+            for fact in facts
+            if str(fact.get("id") or "").strip().isdigit()
+        ]
+        latest = facts[-1]
+        time_key = _compact_whitespace(latest.get("time_key") or "")
+        occurred_at = time_key.split("#", 1)[0] if time_key else ""
+        return [{
+            "occurred_at": occurred_at,
+            "change_type": "updated",
+            "summary": self._normalize_state_summary(
+                latest.get("summary") or "",
+                max_chars=120,
+            ),
+            "fact_ids": fact_ids[-12:],
+        }]
+
+    def _build_state_time_line(
+        self,
+        *,
+        raw_updates: Any,
+        candidate: Dict[str, Any],
+        existing_state: Optional[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        valid_fact_ids = {
+            int(fact["id"])
+            for fact in candidate.get("facts") or []
+            if str(fact.get("id") or "").strip().isdigit()
+        }
+        updates = raw_updates
+        if not updates:
+            updates = self._fallback_time_line_update(candidate)
+        existing_events = self._normalize_time_line(
+            (existing_state or {}).get("time_line"),
+            limit=20,
+            max_chars=2400,
+        )
+        update_events = self._normalize_time_line(
+            updates,
+            limit=20,
+            max_chars=2400,
+            valid_fact_ids=valid_fact_ids,
+        )
+        return self._normalize_time_line(
+            [
+                *existing_events,
+                *update_events,
+            ],
+            limit=20,
+            max_chars=2400,
+        )
 
     def _normalize_topic_state_update_payload(
         self,
@@ -1976,7 +2242,7 @@ class MemoryNodeManager:
     ) -> Optional[Dict[str, Any]]:
         if not self._config_bool(raw.get("update_needed", True), True):
             return None
-        summary = _compact_whitespace(raw.get("summary") or "")
+        summary = self._normalize_state_summary(raw.get("summary") or "", max_chars=120)
         if not summary:
             return None
         valid_fact_ids = {
@@ -2008,11 +2274,18 @@ class MemoryNodeManager:
             *(raw.get("canonical_topics") or []),
             *(candidate.get("aliases") or []),
         ], limit=8)
+        time_line = self._build_state_time_line(
+            raw_updates=raw.get("time_line_updates") or raw.get("time_line"),
+            candidate=candidate,
+            existing_state=existing_state,
+        )
         return {
-            "state_type": "topic_state",
+            "state_scope": "topic_state",
+            "state_type": "topic",
             "source_type": candidate.get("source_type") or (existing_state or {}).get("source_type") or "unified",
             "canonical_name": canonical_name,
             "summary": summary,
+            "time_line": time_line,
             "evidence_fact_ids": evidence_ids,
             "keywords": self._normalize_string_list(raw.get("keywords"), limit=18),
             "entities": self._normalize_string_list(raw.get("entities"), limit=18),
@@ -2041,12 +2314,12 @@ class MemoryNodeManager:
         ][:5]
         base = _compact_whitespace((existing_state or {}).get("summary") or "")
         update_text = "；".join(fact_summaries)
-        summary = (
-            f"{base}\n最近更新：{update_text}"
+        summary_source = (
+            f"{base}；最新变化：{update_text}"
             if base and update_text
             else update_text or base or _compact_whitespace(candidate.get("summary_text") or "")
         )
-        summary = summary[-1800:]
+        summary = self._normalize_state_summary(summary_source, max_chars=120)
         existing_ids = [
             int(value)
             for value in ((existing_state or {}).get("evidence_fact_ids") or [])
@@ -2059,10 +2332,16 @@ class MemoryNodeManager:
             or "general"
         )
         return {
-            "state_type": "topic_state",
+            "state_scope": "topic_state",
+            "state_type": "topic",
             "source_type": candidate.get("source_type") or (existing_state or {}).get("source_type") or "unified",
             "canonical_name": canonical_name,
             "summary": summary,
+            "time_line": self._build_state_time_line(
+                raw_updates=None,
+                candidate=candidate,
+                existing_state=existing_state,
+            ),
             "evidence_fact_ids": evidence_ids,
             "keywords": self._keywords(summary, limit=18),
             "entities": self._entities(summary),
@@ -2090,7 +2369,8 @@ class MemoryNodeManager:
             return {"enabled": 0, "updated": 0}
         existing_entity_states = [
             state for state in existing_states
-            if str(state.get("state_type") or "") in self._entity_scoped_state_types()
+            if str(state.get("state_scope") or "") == "entity_state"
+            and str(state.get("state_type") or "") in self._entity_scoped_state_types()
         ]
         candidates = self._build_entity_state_candidates_from_facts(facts)
         updated = 0
@@ -2121,46 +2401,62 @@ class MemoryNodeManager:
                 )
                 existing_entity_states = [
                     state for state in refreshed
-                    if str(state.get("state_type") or "") in self._entity_scoped_state_types()
+                    if str(state.get("state_scope") or "") == "entity_state"
+                    and str(state.get("state_type") or "") in self._entity_scoped_state_types()
                 ]
         return {"enabled": 1, "candidate_count": len(candidates), "updated": updated}
 
     @staticmethod
     def _entity_scoped_state_types() -> set[str]:
-        return {"preference", "relationship", "profile", "routine", "constraint"}
+        return {"preference", "profile", "routine", "relationship", "constraint", "risk"}
 
     def _build_entity_state_candidates_from_facts(
         self,
         facts: List[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
-        grouped: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+        grouped: Dict[Tuple[str, str, str, str], Dict[str, Any]] = {}
         for fact in facts:
             state_types = self._infer_entity_scoped_state_types_for_fact(fact)
             if not state_types:
                 continue
-            entities = self._entities_for_entity_state_fact(fact)
-            if not entities:
-                continue
             source_type = str(fact.get("source_type") or "unified")
             for state_type in state_types:
-                for entity in entities[: self._entity_state_max_entities_per_fact]:
-                    canonical_name = self._entity_state_canonical_name(
-                        entity=entity,
-                        state_type=state_type,
-                    )
-                    key = (source_type, state_type, canonical_name.lower())
-                    item = grouped.setdefault(key, {
-                        "source_type": source_type,
-                        "state_type": state_type,
-                        "entity": entity,
-                        "canonical_name": canonical_name,
-                        "facts": [],
-                        "fact_ids": [],
-                        "aliases": self._merge_topic_aliases([entity, canonical_name], limit=10),
-                    })
-                    item["facts"].append(fact)
-                    if str(fact.get("id") or "").strip().isdigit():
-                        item["fact_ids"].append(int(fact["id"]))
+                entities = self._entities_for_entity_state_fact(
+                    fact,
+                    state_type=state_type,
+                )
+                if not entities:
+                    continue
+                attribute_topics = self._entity_state_attribute_topics(fact)
+                for entity in entities[:1]:
+                    entity_key = self._entity_state_key(entity)
+                    for attribute_name in attribute_topics:
+                        attribute_key = self._topic_state_key(attribute_name)
+                        key = (source_type, state_type, entity_key, attribute_key)
+                        canonical_name = self._entity_state_candidate_name(
+                            attribute_name=attribute_name,
+                        )
+                        item = grouped.setdefault(key, {
+                            "source_type": source_type,
+                            "state_scope": "entity_state",
+                            "state_type": state_type,
+                            "entity": entity,
+                            "entity_key": entity_key,
+                            "canonical_name": canonical_name,
+                            "attribute_key": attribute_key,
+                            "attribute_name": attribute_name,
+                            "attribute_aliases": [attribute_name],
+                            "facts": [],
+                            "fact_ids": [],
+                            "aliases": self._merge_topic_aliases([entity, attribute_name], limit=10),
+                        })
+                        item["attribute_aliases"] = self._merge_topic_aliases([
+                            *(item.get("attribute_aliases") or []),
+                            *self._coerce_topic_list(fact.get("canonical_topics")),
+                        ], limit=10)
+                        item["facts"].append(fact)
+                        if str(fact.get("id") or "").strip().isdigit():
+                            item["fact_ids"].append(int(fact["id"]))
         candidates: List[Dict[str, Any]] = []
         for item in grouped.values():
             item["fact_ids"] = list(dict.fromkeys(item.get("fact_ids") or []))
@@ -2169,8 +2465,24 @@ class MemoryNodeManager:
             item["summary_text"] = "\n".join(
                 str(fact.get("summary") or "") for fact in item.get("facts") or []
             )[:2400]
+            item["attribute_text"] = "\n".join([
+                str(item.get("attribute_name") or ""),
+                " ".join(item.get("attribute_aliases") or []),
+                item["summary_text"],
+            ])[:2800]
             candidates.append(item)
         return candidates
+
+    def _entity_state_attribute_topics(self, fact: Dict[str, Any]) -> List[str]:
+        topics = [
+            self._normalize_topic_name(topic)
+            for topic in self._coerce_topic_list(fact.get("canonical_topics"))
+        ]
+        topics = list(dict.fromkeys(topic for topic in topics if topic))
+        if not topics:
+            fallback = self._topic_candidates(str(fact.get("summary") or ""))
+            topics = [self._normalize_topic_name(topic) for topic in fallback if topic]
+        return topics[:3] or ["general"]
 
     def _infer_entity_scoped_state_types_for_fact(self, fact: Dict[str, Any]) -> List[str]:
         kind = str(fact.get("fact_kind") or "").strip().lower()
@@ -2185,21 +2497,44 @@ class MemoryNodeManager:
             state_types.append("profile")
         if kind == "risk" or any(marker in summary for marker in ("约束", "限制", "不能", "预算", "deadline", "constraint", "limited", "budget")):
             state_types.append("constraint")
+        if kind == "risk" or any(marker in summary for marker in ("风险", "担心", "隐患", "risk", "concern", "hazard")):
+            state_types.append("risk")
         if any(marker in summary for marker in ("关系", "同事", "朋友", "家人", "老板", "客户", "relationship", "colleague", "friend", "family", "client")):
             state_types.append("relationship")
         return [item for item in dict.fromkeys(state_types) if item in self._entity_scoped_state_types()]
 
-    def _entities_for_entity_state_fact(self, fact: Dict[str, Any]) -> List[str]:
+    def _entities_for_entity_state_fact(
+        self,
+        fact: Dict[str, Any],
+        *,
+        state_type: Optional[str] = None,
+    ) -> List[str]:
+        metadata = fact.get("metadata") if isinstance(fact.get("metadata"), dict) else {}
+        primary_entity = fact.get("primary_entity") or metadata.get("primary_entity")
+        if isinstance(primary_entity, dict):
+            primary_name = _compact_whitespace(
+                primary_entity.get("name") or primary_entity.get("text") or ""
+            )
+        else:
+            primary_name = _compact_whitespace(primary_entity)
+        if primary_name:
+            normalized_primary = primary_name.lower()
+            if normalized_primary in {"用户", "user", "the user"}:
+                return ["user"]
+            if normalized_primary in {"助手", "assistant", "agent", "the assistant"}:
+                return ["assistant"]
+            return [primary_name]
+
         entities = [
             _compact_whitespace(value)
             for value in (fact.get("entities") or [])
             if _compact_whitespace(value)
         ]
         subject = str(fact.get("fact_subject") or "").strip().lower()
-        if subject == "user":
-            return ["user"]
-        elif subject == "assistant":
-            return ["assistant"]
+        if subject in {"user", "assistant"}:
+            # A fact without an explicit primary_entity still belongs to one
+            # speaker; never fan it out to every mentioned entity.
+            return [subject]
         if not entities and subject in {"project", "world", "other"}:
             topics = self._coerce_topic_list(fact.get("canonical_topics"))
             entities.extend(self._normalize_topic_name(topic) for topic in topics)
@@ -2214,18 +2549,18 @@ class MemoryNodeManager:
                 continue
             seen.add(key)
             out.append(clean)
-        return out
+        return out[:1]
 
     @staticmethod
-    def _entity_state_canonical_name(*, entity: str, state_type: str) -> str:
-        labels = {
-            "preference": "preference",
-            "relationship": "relationship",
-            "profile": "profile",
-            "routine": "routine",
-            "constraint": "constraint",
-        }
-        return f"{_compact_whitespace(entity)} - {labels.get(state_type, state_type)}"
+    def _entity_state_key(value: Any) -> str:
+        return _compact_whitespace(value).lower()
+
+    @staticmethod
+    def _entity_state_candidate_name(
+        *,
+        attribute_name: str,
+    ) -> str:
+        return _compact_whitespace(attribute_name) or "general"
 
     def _match_entity_state_candidate(
         self,
@@ -2236,34 +2571,98 @@ class MemoryNodeManager:
         candidate_name = str(candidate.get("canonical_name") or "")
         candidate_entity = str(candidate.get("entity") or "")
         candidate_type = str(candidate.get("state_type") or "")
+        candidate_entity_key = self._entity_state_key(candidate.get("entity_key") or candidate_entity)
+        candidate_attribute_aliases = self._merge_topic_aliases([
+            candidate.get("attribute_name"),
+            *(candidate.get("attribute_aliases") or []),
+        ], limit=12)
+        candidate_text = str(candidate.get("attribute_text") or candidate.get("summary_text") or "")
         best_state: Optional[Dict[str, Any]] = None
         best_score = 0.0
+        best_info: Dict[str, Any] = {"matched": False, "score": 0.0}
         for state in existing_entity_states:
             if str(state.get("source_type") or "") != str(candidate.get("source_type") or ""):
+                continue
+            if str(state.get("state_scope") or "") != "entity_state":
                 continue
             if str(state.get("state_type") or "") != candidate_type:
                 continue
             metadata = state.get("metadata") or {}
-            state_aliases = [
+            state_entity_key = self._entity_state_key(
+                metadata.get("entity_key")
+                or metadata.get("entity")
+                or candidate_entity
+            )
+            if state_entity_key != candidate_entity_key:
+                continue
+            state_attribute_aliases = self._merge_topic_aliases([
+                metadata.get("attribute_name"),
+                *(metadata.get("attribute_aliases") or []),
+                *(metadata.get("canonical_topics") or []),
                 state.get("canonical_name"),
-                *(metadata.get("entities") or []),
-                *(metadata.get("entity_aliases") or []),
-            ]
+            ], limit=16)
+            attribute_overlap = self._topic_name_overlap(
+                candidate_attribute_aliases,
+                state_attribute_aliases,
+            )
+            state_text = _compact_whitespace(
+                metadata.get("entity_state_identity_text")
+                or "\n".join([
+                    str(state.get("canonical_name") or ""),
+                    " ".join(state_attribute_aliases),
+                    str(state.get("summary") or ""),
+                ])
+            )
+            embedding_similarity = self._topic_embedding_similarity(
+                candidate_text[:1600],
+                state_text[:1600],
+            )
+            name_similarity = self._topic_name_similarity(
+                candidate_name,
+                str(state.get("canonical_name") or ""),
+            )
+            exact_attribute_match = any(
+                self._topic_state_key(left) == self._topic_state_key(right)
+                for left in candidate_attribute_aliases
+                for right in state_attribute_aliases
+                if left and right
+            )
+            matched = (
+                exact_attribute_match
+                or attribute_overlap >= self._entity_state_attribute_similarity_threshold
+                or (
+                    embedding_similarity >= self._entity_state_resolution_similarity_threshold
+                    and attribute_overlap >= 0.2
+                )
+            )
             score = max(
-                self._topic_name_similarity(candidate_name, str(state.get("canonical_name") or "")),
-                self._topic_name_overlap([candidate_entity], [str(item) for item in state_aliases]),
+                1.0 if exact_attribute_match else 0.0,
+                attribute_overlap,
+                embedding_similarity,
+                name_similarity * 0.8,
             )
             if score > best_score:
                 best_score = score
                 best_state = state
-        if best_state and best_score >= self._entity_state_resolution_similarity_threshold:
+                best_info = {
+                    "matched": matched,
+                    "score": round(score, 4),
+                    "attribute_overlap": round(attribute_overlap, 4),
+                    "embedding_similarity": round(embedding_similarity, 4),
+                    "exact_attribute_match": exact_attribute_match,
+                    "existing_state_id": state.get("id"),
+                    "existing_canonical_name": state.get("canonical_name"),
+                }
+        if best_state and best_info.get("matched"):
             return best_state, {
                 "matched": True,
                 "score": round(best_score, 4),
                 "existing_state_id": best_state.get("id"),
                 "existing_canonical_name": best_state.get("canonical_name"),
+                "attribute_overlap": best_info.get("attribute_overlap", 0.0),
+                "embedding_similarity": best_info.get("embedding_similarity", 0.0),
             }
-        return None, {"matched": False, "score": round(best_score, 4)}
+        return None, best_info
 
     def _extract_entity_state_update_with_llm(
         self,
@@ -2285,8 +2684,12 @@ class MemoryNodeManager:
             prompt_template
             .replace("{entity_state_target}", json.dumps({
                 "entity": candidate.get("entity"),
+                "entity_key": candidate.get("entity_key"),
                 "state_type": candidate.get("state_type"),
-                "canonical_name": candidate.get("canonical_name"),
+                "canonical_name_hint": candidate.get("canonical_name"),
+                "attribute_name": candidate.get("attribute_name"),
+                "attribute_key": candidate.get("attribute_key"),
+                "attribute_aliases": candidate.get("attribute_aliases", []),
                 "aliases": candidate.get("aliases", []),
             }, ensure_ascii=False, indent=2))
             .replace("{existing_entity_state}", json.dumps(
@@ -2299,6 +2702,13 @@ class MemoryNodeManager:
         result = self._call_llm(prompt)
         parsed = self._parse_json_object_from_llm_text(result or "")
         if parsed:
+            if not self._config_bool(parsed.get("update_needed", True), True):
+                logger.debug(
+                    "LLM declined entity-state update for entity=%s attribute=%s",
+                    candidate.get("entity"),
+                    candidate.get("attribute_name"),
+                )
+                return None
             normalized = self._normalize_entity_state_update_payload(
                 parsed,
                 candidate=candidate,
@@ -2319,7 +2729,7 @@ class MemoryNodeManager:
     ) -> Optional[Dict[str, Any]]:
         if not self._config_bool(raw.get("update_needed", True), True):
             return None
-        summary = _compact_whitespace(raw.get("summary") or "")
+        summary = self._normalize_state_summary(raw.get("summary") or "", max_chars=120)
         if not summary:
             return None
         valid_fact_ids = {
@@ -2339,29 +2749,50 @@ class MemoryNodeManager:
         ]
         evidence_ids = list(dict.fromkeys([*existing_ids, *evidence_ids]))[:80]
         canonical_name = (
-            _compact_whitespace((existing_state or {}).get("canonical_name") or "")
+            _compact_whitespace(candidate.get("attribute_name") or "")
             or _compact_whitespace(raw.get("canonical_name") or "")
-            or _compact_whitespace(candidate.get("canonical_name") or "")
+            or _compact_whitespace((existing_state or {}).get("canonical_name") or "")
         )
-        canonical_topics = self._merge_topic_aliases(raw.get("canonical_topics") or [], limit=8)
+        if canonical_name.lower() in self._entity_scoped_state_types() or len(canonical_name) < 3:
+            canonical_name = _compact_whitespace(candidate.get("canonical_name") or "")
+        canonical_topics = self._merge_topic_aliases(
+            [
+                *(raw.get("canonical_topics") or []),
+                candidate.get("attribute_name"),
+                *(candidate.get("attribute_aliases") or []),
+            ],
+            limit=8,
+        )
+        time_line = self._build_state_time_line(
+            raw_updates=raw.get("time_line_updates") or raw.get("time_line"),
+            candidate=candidate,
+            existing_state=existing_state,
+        )
         return {
+            "state_scope": "entity_state",
             "state_type": candidate["state_type"],
             "source_type": candidate.get("source_type") or (existing_state or {}).get("source_type") or "unified",
             "canonical_name": canonical_name,
             "summary": summary,
+            "time_line": time_line,
             "evidence_fact_ids": evidence_ids,
             "keywords": self._normalize_string_list(raw.get("keywords"), limit=18),
             "entities": self._merge_topic_aliases([
                 candidate.get("entity"),
                 *(raw.get("entities") or []),
             ], limit=18),
-            "canonical_topics": canonical_topics or self._coerce_topic_list((candidate.get("facts") or [{}])[0].get("canonical_topics"))[:8],
+            "canonical_topics": canonical_topics,
             "importance": self._clamp_float(raw.get("importance"), 0.0, 1.0, 0.68),
             "confidence": self._clamp_float(raw.get("confidence"), 0.0, 1.0, 0.74),
             "status": _compact_whitespace(raw.get("status") or "active") or "active",
             "metadata": {
                 "entity": candidate.get("entity"),
+                "entity_key": candidate.get("entity_key"),
                 "entity_aliases": candidate.get("aliases", []),
+                "attribute_key": candidate.get("attribute_key"),
+                "attribute_name": candidate.get("attribute_name"),
+                "attribute_aliases": candidate.get("attribute_aliases", []),
+                "entity_state_identity_text": candidate.get("attribute_text") or "",
                 "entity_state_resolution": match_info,
                 "extractor": "entity_scoped_state_update",
             },
@@ -2380,11 +2811,12 @@ class MemoryNodeManager:
         ][:5]
         base = _compact_whitespace((existing_state or {}).get("summary") or "")
         update_text = "；".join(summaries)
-        summary = (
-            f"{base}\n最近更新：{update_text}"
+        summary_source = (
+            f"{base}；最新变化：{update_text}"
             if base and update_text
             else update_text or base or _compact_whitespace(candidate.get("summary_text") or "")
         )
+        summary = self._normalize_state_summary(summary_source, max_chars=120)
         existing_ids = [
             int(value)
             for value in ((existing_state or {}).get("evidence_fact_ids") or [])
@@ -2392,113 +2824,93 @@ class MemoryNodeManager:
         ]
         evidence_ids = list(dict.fromkeys([*existing_ids, *(candidate.get("fact_ids") or [])]))[:80]
         return {
+            "state_scope": "entity_state",
             "state_type": candidate["state_type"],
             "source_type": candidate.get("source_type") or (existing_state or {}).get("source_type") or "unified",
-            "canonical_name": _compact_whitespace((existing_state or {}).get("canonical_name") or candidate.get("canonical_name") or ""),
-            "summary": summary[-1800:],
+            "canonical_name": _compact_whitespace(
+                candidate.get("attribute_name")
+                or candidate.get("canonical_name")
+                or (existing_state or {}).get("canonical_name")
+                or "general"
+            ),
+            "summary": summary,
+            "time_line": self._build_state_time_line(
+                raw_updates=None,
+                candidate=candidate,
+                existing_state=existing_state,
+            ),
             "evidence_fact_ids": evidence_ids,
             "keywords": self._keywords(summary, limit=18),
             "entities": [candidate.get("entity")] if candidate.get("entity") else [],
-            "canonical_topics": self._coerce_topic_list((candidate.get("facts") or [{}])[0].get("canonical_topics"))[:8],
+            "canonical_topics": self._merge_topic_aliases([
+                candidate.get("attribute_name"),
+                *(candidate.get("attribute_aliases") or []),
+            ], limit=8),
             "importance": 0.66,
             "confidence": 0.58,
             "status": "active",
             "metadata": {
                 "entity": candidate.get("entity"),
+                "entity_key": candidate.get("entity_key"),
                 "entity_aliases": candidate.get("aliases", []),
+                "attribute_key": candidate.get("attribute_key"),
+                "attribute_name": candidate.get("attribute_name"),
+                "attribute_aliases": candidate.get("attribute_aliases", []),
+                "entity_state_identity_text": candidate.get("attribute_text") or "",
                 "entity_state_resolution": match_info,
                 "extractor": "fallback_entity_scoped_state_update",
             },
         }
 
-    def _extract_state_updates_with_llm(
-        self,
-        *,
-        facts: List[Dict[str, Any]],
-        existing_states: List[Dict[str, Any]],
-    ) -> List[Dict[str, Any]]:
-        prompt_language = self._resolve_prompt_language_from_text(
-            "\n".join(str(item.get("summary") or "") for item in facts[:20])
-        )
-        prompt_template = (
-            UNIFIED_STATE_UPDATE_PROMPT_EN
-            if prompt_language == "en"
-            else UNIFIED_STATE_UPDATE_PROMPT_ZH
-        )
-        prompt = (
-            prompt_template
-            .replace("{existing_states}", self._format_existing_states_for_prompt(existing_states))
-            .replace("{facts}", self._format_facts_for_state_prompt(facts))
-        )
-        result = self._call_llm(prompt)
-        parsed = self._parse_json_object_from_llm_text(result or "")
-        if not parsed:
-            return []
-        raw_states = parsed.get("states")
-        if not isinstance(raw_states, list):
-            return []
-        normalized: List[Dict[str, Any]] = []
-        valid_fact_ids = {int(item["id"]) for item in facts if item.get("id") is not None}
-        for raw in raw_states:
-            if not isinstance(raw, dict):
-                continue
-            summary = _compact_whitespace(raw.get("summary") or "")
-            canonical_name = _compact_whitespace(raw.get("canonical_name") or "")
-            if not summary or not canonical_name:
-                continue
-            evidence_ids = [
-                int(value)
-                for value in (raw.get("evidence_fact_ids") or [])
-                if str(value).strip().isdigit() and int(value) in valid_fact_ids
-            ]
-            if not evidence_ids:
-                continue
-            state_type = self._normalize_state_type(raw.get("state_type"))
-            if state_type == "topic_state" and self._enable_topic_state_resolution:
-                continue
-            if (
-                self._enable_entity_scoped_state_resolution
-                and state_type in self._entity_scoped_state_types()
-            ):
-                continue
-            source_type = self._state_source_type_for_facts(facts, evidence_ids)
-            normalized.append({
-                "state_type": state_type,
-                "source_type": source_type,
-                "canonical_name": canonical_name,
-                "summary": summary,
-                "evidence_fact_ids": evidence_ids[:24],
-                "keywords": self._normalize_string_list(raw.get("keywords"), limit=18),
-                "entities": self._normalize_string_list(raw.get("entities"), limit=18),
-                "canonical_topics": self._normalize_string_list(raw.get("canonical_topics"), limit=8),
-                "importance": self._clamp_float(raw.get("importance"), 0.0, 1.0, 0.65),
-                "confidence": self._clamp_float(raw.get("confidence"), 0.0, 1.0, 0.75),
-                "status": _compact_whitespace(raw.get("status") or "active") or "active",
-            })
-        return normalized
-
     def _store_state(self, state: Dict[str, Any]) -> int:
+        state_scope = self._normalize_state_scope(
+            state.get("state_scope"),
+            state.get("state_type"),
+        )
+        state_type = self._normalize_state_type(state.get("state_type"))
+        if not state_scope or not state_type:
+            logger.debug("Skipping state with invalid scope/type: %s", state)
+            return 0
+        if state_scope == "topic_state" and state_type != "topic":
+            logger.debug("Skipping topic state with non-topic type: %s", state)
+            return 0
+        if state_scope == "entity_state" and state_type not in self._entity_scoped_state_types():
+            logger.debug("Skipping entity state with invalid type: %s", state)
+            return 0
         keywords = state.get("keywords") or self._keywords(state["summary"], limit=18)
         entities = state.get("entities") or self._entities(state["summary"])
         canonical_topics = state.get("canonical_topics") or [state["canonical_name"]]
         evidence_fact_ids = [int(value) for value in state.get("evidence_fact_ids") or []]
+        state_metadata = dict(state.get("metadata") or {})
+        entity_key = ""
+        if state_scope == "entity_state":
+            entity_key = self._entity_state_key(
+                state_metadata.get("entity_key")
+                or state_metadata.get("entity")
+                or ""
+            )
         embedding_text = "\n".join([
             state["canonical_name"],
             state["summary"],
-            f"state_type: {state['state_type']}",
+            f"state_scope: {state_scope}",
+            f"state_type: {state_type}",
             f"keywords: {' '.join(keywords)}",
             f"entities: {', '.join(entities)}",
         ])
         embedding = self._embed(embedding_text)
         state_id = self._db.upsert_state(
-            state_type=state["state_type"],
+            state_scope=state_scope,
+            state_type=state_type,
             source_type=state["source_type"],
+            entity_key=entity_key,
             canonical_name=state["canonical_name"],
             summary=state["summary"],
+            time_line=state.get("time_line") or [],
             evidence_fact_ids=evidence_fact_ids,
             confidence=state["confidence"],
             metadata={
-                **dict(state.get("metadata") or {}),
+                **state_metadata,
+                "entity_key": entity_key,
                 "keywords": keywords,
                 "entities": entities,
                 "canonical_topics": canonical_topics,
@@ -2509,7 +2921,7 @@ class MemoryNodeManager:
             embedding_text=embedding_text,
         )
         if state_id:
-            memory_path = f"{state['source_type']}/states/{state['state_type']}"
+            memory_path = f"{state['source_type']}/states/{state_scope}/{state_type}"
             summary_card = self._truncate_index_text(state["summary"], max_chars=700)
             evidence_time_start, evidence_time_end = self._event_time_bounds_from_facts(
                 self._db.memory_facts_by_ids(evidence_fact_ids),
@@ -2542,7 +2954,8 @@ class MemoryNodeManager:
                 embedding=index_embedding,
                 embedding_text=index_embedding_text,
                 metadata={
-                    "state_type": state["state_type"],
+                    "state_scope": state_scope,
+                    "state_type": state_type,
                     "status": state["status"],
                     "evidence_fact_ids": evidence_fact_ids,
                 },
@@ -2837,6 +3250,7 @@ class MemoryNodeManager:
             rows.append({
                 "id": state.get("id"),
                 "source_type": state.get("source_type"),
+                "state_scope": state.get("state_scope"),
                 "state_type": state.get("state_type"),
                 "canonical_name": state.get("canonical_name"),
                 "summary": state.get("summary"),
@@ -2848,6 +3262,7 @@ class MemoryNodeManager:
     def _format_facts_for_state_prompt(self, facts: List[Dict[str, Any]]) -> str:
         rows: List[Dict[str, Any]] = []
         for fact in facts[:160]:
+            metadata = fact.get("metadata") if isinstance(fact.get("metadata"), dict) else {}
             rows.append({
                 "id": fact.get("id"),
                 "source_type": fact.get("source_type"),
@@ -2858,18 +3273,35 @@ class MemoryNodeManager:
                 "summary": fact.get("summary"),
                 "keywords": fact.get("keywords"),
                 "entities": fact.get("entities") or [],
+                "primary_entity": fact.get("primary_entity") or metadata.get("primary_entity"),
                 "canonical_topics": fact.get("canonical_topics") or [],
             })
         return json.dumps(rows, ensure_ascii=False, indent=2)
 
     @staticmethod
+    def _normalize_state_scope(value: Any, state_type: Any = None) -> str:
+        text = str(value or "").strip().lower()
+        if text in {"topic_state", "topic"}:
+            return "topic_state"
+        if text in {"entity_state", "entity"}:
+            return "entity_state"
+        if str(state_type or "").strip().lower() in {"topic_state", "topic"}:
+            return "topic_state"
+        if str(state_type or "").strip().lower() in {
+            "preference", "profile", "routine", "relationship", "constraint", "risk",
+        }:
+            return "entity_state"
+        return ""
+
+    @staticmethod
     def _normalize_state_type(value: Any) -> str:
-        text = str(value or "other").strip().lower()
+        text = str(value or "").strip().lower()
         allowed = {
-            "preference", "relationship", "routine", "topic_state",
-            "constraint", "risk", "profile", "other",
+            "topic", "preference", "profile", "routine", "relationship", "constraint", "risk",
         }
-        return text if text in allowed else "other"
+        if text == "topic_state":
+            return "topic"
+        return text if text in allowed else ""
 
     @staticmethod
     def _normalize_actionable_item_type(value: Any) -> str:
@@ -3331,10 +3763,12 @@ class MemoryNodeManager:
             summary = _compact_whitespace(raw.get("summary") or "")
             return f"fact({subject}/{fact_kind}): {summary}".strip()
         if target_table == "memory_states":
+            state_scope = str(raw.get("state_scope") or "")
             state_type = str(raw.get("state_type") or "")
             name = _compact_whitespace(raw.get("canonical_name") or "")
             summary = _compact_whitespace(raw.get("summary") or "")
-            return f"state({state_type}) {name}: {summary}".strip()
+            label = "/".join(part for part in (state_scope, state_type) if part)
+            return f"state({label}) {name}: {summary}".strip()
         if target_table == "memory_actionable_items":
             item_type = str(raw.get("item_type") or "")
             status = str(raw.get("status") or "")
@@ -3551,6 +3985,39 @@ class MemoryNodeManager:
             if len(out) >= limit:
                 break
         return out
+
+    @classmethod
+    def _normalize_primary_entity(
+        cls,
+        value: Any,
+        *,
+        entities: Sequence[str],
+        fact_subject: str,
+    ) -> Optional[Dict[str, str]]:
+        """Normalize the single entity used for entity-state assignment."""
+        name = ""
+        entity_type = "CONCEPT"
+        if isinstance(value, dict):
+            name = _compact_whitespace(value.get("name") or value.get("text") or "")
+            entity_type = _compact_whitespace(value.get("type") or "CONCEPT").upper()
+        else:
+            name = _compact_whitespace(value)
+        if not name:
+            subject = str(fact_subject or "").strip().lower()
+            if subject in {"user", "assistant"}:
+                name = subject
+                entity_type = "PERSON"
+            elif entities:
+                name = _compact_whitespace(entities[0])
+        if not name:
+            return None
+        allowed_types = {
+            "PERSON", "ORGANIZATION", "LOCATION", "PRODUCT", "PROJECT",
+            "TECHNOLOGY", "CONCEPT", "TOPIC", "PREFERENCE", "OTHER",
+        }
+        if entity_type not in allowed_types:
+            entity_type = "CONCEPT"
+        return {"name": name, "type": entity_type}
 
     def _candidate_limit(self, *, query: str, top_k: int, budget: str) -> int:
         multiplier = {"low": 10, "mid": 18, "high": 28}.get(str(budget).lower(), 18)

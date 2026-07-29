@@ -15,7 +15,24 @@ canonical_topics 生成规则：
 - 如果本次 episode 与已有长期 topic 候选中的某个主题属于同一稳定对象或同一长期议题，必须复用候选里的 canonical_topic 原文，不要改写同义词。
 - 只有当输入证据明确出现了新的稳定对象、项目、产品、人物关系或长期议题，才创建新 canonical topic。
 - 不要输出过泛的 topic，例如“方案确定”“产品设计讨论”“部门协作”“问题讨论”“用户咨询”。topic 应尽量包含具体对象或稳定领域，例如“AI眼镜语音记忆系统”“手机推广策略”。
-- 如果证据不足以确定具体对象，优先复用最相关的已有长期 topic；仍无法确定时输出更保守的上位主题，但不要新建碎片化短词。
+- 如果证据不足以确定具体对象，不要仅凭领域相关性强行复用已有长期 topic；只有严格确认是同一对象或议题时才复用，否则输出基于当前证据的保守上位主题，但不要生成碎片化短词。
+- 复用已有 topic 需要严格判断：当前 episode/fact 的核心对象或具体议题、讨论目标和语义范围，必须与该 topic 的 canonical_name 基本一致。仅仅属于同一大领域、共享某个实体、使用相似词，或前后 episode 时间接近，都不足以复用。
+- 如果一个 fact 只是涉及已有 topic 的背景，但它实际讨论的是另一个对象或议题，必须为该 fact 选择更准确的 primary_topic，不能为了保持 topic 数量而强行归入已有 topic。
+
+已有长期 memory_states 参考：
+{existing_memory_states}
+
+memory_states 使用规则：
+- state_scope=topic_state 且 state_type=topic 的状态，是 episode canonical_topics 和 fact primary_topic 的命名参考；如果当前证据表达的是同一长期对象或议题，优先原样复用 canonical_name。
+- state_scope=entity_state 的状态，只用于理解实体的长期属性、偏好、约束、风险或关系，不能直接把 entity_state 的 canonical_name 当作 episode topic 或 fact primary_topic。
+- 这些 states 只是历史背景，不是当前 episode 的事实证据。当前对话没有明确支持的内容不能写入 fact；当前对话与历史 state 冲突时，以当前对话为准。
+- fact 的 primary_topic 必须描述该 fact 的主要议题；它可以复用 topic_state 的 canonical_name，但不能因为 entity_state 的名称而改变为实体属性标题。
+- fact 的 primary_topic 只有在该 fact 的核心对象、讨论目标和语义范围都与 topic_state 的 canonical_name 相近时，才可以原样复用该名称。
+- 不要仅因为 fact 与某个 topic_state 同属“健康”“产品”“团队”等宽泛领域，或 fact 中出现了该 topic 的相关背景，就复用该名称。若当前证据不能支持这种严格对应，应使用当前证据中的更具体主题，必要时输出新的保守 topic。
+- 不能因为 entity_state 的名称、summary 或历史 timeline 而改变 fact 的 primary_topic；entity_state 只能辅助理解，不得作为 topic 候选直接复用。
+- 每条 fact 必须额外输出一个 `primary_entity`，表示这条 fact 主要描述、影响或归属的唯一实体；它必须是一个实体对象，而不是数组。
+- `primary_entity` 必须来自当前 fact 的 `entities`，不能因为实体只是被提及、提供建议、作为地点/工具或背景，就把它选为主要实体。多人互动时，选择该 fact 主要描述或影响的主体；如果 fact 主要描述用户自身的偏好、习惯、约束或风险，选择用户。
+- `entities` 仍然保留所有与 fact 直接相关的实体，用于完整召回；后续 entity_state 匹配只使用 `primary_entity`，一条 fact 不得同时归属多个实体。
 
 Hindsight 风格 narrative fact 的核心要求：
 - 每条 fact 应覆盖一次完整 exchange 或一个清晰议题片段，而不是单个 utterance。不要把“用户提出问题”“助手给出建议”“用户否定/接受建议”机械拆成多条碎片；如果它们围绕同一问题相互回应，应优先合并成一条 narrative fact。
@@ -50,7 +67,8 @@ Hindsight 风格 narrative fact 的核心要求：
       "text": "覆盖完整 exchange 的自包含 narrative fact，在一段文本中体现 what/when/where/who/why，包含背景、用户/助手观点或动作流动、理由/分歧/约束/结论/下一步",
       "keywords": ["关键词1", "关键词2"],
       "entities": [{"name": "实体名", "type": "PERSON|ORGANIZATION|LOCATION|PRODUCT|PROJECT|TECHNOLOGY|CONCEPT|TOPIC|PREFERENCE|OTHER"}],
-      "primary_topic": "稳定主题字符串",
+      "primary_entity": {"name": "该 fact 的唯一主要实体", "type": "PERSON|ORGANIZATION|LOCATION|PRODUCT|PROJECT|TECHNOLOGY|CONCEPT|TOPIC|PREFERENCE|OTHER"},
+      "primary_topic": "稳定主题字符串；优先复用相关 topic_state 的 canonical_name，不要使用 entity_state 名称",
       "fact_type": "semantic|episodic",
       "fact_subject": "user|assistant|world|project|system|other",
       "fact_kind": "preference|decision|request|recommendation|action|commitment|open_question|risk|error|context|instruction|other",
@@ -62,9 +80,6 @@ Hindsight 风格 narrative fact 的核心要求：
     }
   ]
 }
-
-已有长期 canonical topics 候选：
-{existing_long_term_topics}
 
 对话/转写证据批次：
 {dialogue_batch}
@@ -78,6 +93,7 @@ UNIFIED_STATE_UPDATE_PROMPT_ZH = """你是 AI 眼镜长期记忆系统中的 sta
 边界说明：
 - 主题、项目、议题的演化进展统一归入 topic_state，不再单独创建项目类 state。
 - 具体任务、决定、承诺、提醒、开放问题应归入 actionable_item，不再创建任务类或承诺类 state。
+- state_scope 只能是 topic_state 或 entity_state；topic_state 的 state_type 固定为 topic。
 - 本模块只输出真正需要长期保留的 state；如果事实只表示一次性任务或承诺，不要输出 state。
 
 规则：
@@ -86,7 +102,7 @@ UNIFIED_STATE_UPDATE_PROMPT_ZH = """你是 AI 眼镜长期记忆系统中的 sta
 3. 同一稳定对象相关的 facts 应合并到同一个 state，避免近重复。
 4. 保留不确定性和最近变化。如果证据冲突，要明确写出冲突。
 5. evidence_fact_ids 必须引用支撑该 state 的 fact ID。
-6. state_type 只能是：preference、relationship、routine、topic_state、constraint、risk、profile、other。
+6. state_type 只能是：topic、preference、profile、routine、relationship、constraint、risk。
 7. importance 和 confidence 都是 0-1。
 8. 只返回 JSON，不要 markdown。
 
@@ -94,7 +110,8 @@ UNIFIED_STATE_UPDATE_PROMPT_ZH = """你是 AI 眼镜长期记忆系统中的 sta
 {
   "states": [
     {
-      "state_type": "preference|relationship|routine|topic_state|constraint|risk|profile|other",
+      "state_scope": "topic_state|entity_state",
+      "state_type": "topic|preference|profile|routine|relationship|constraint|risk",
       "canonical_name": "稳定短名称",
       "summary": "可独立理解的 evolving state",
       "evidence_fact_ids": [1, 2],
@@ -125,14 +142,24 @@ UNIFIED_TOPIC_STATE_UPDATE_PROMPT_ZH = """你是 AI 眼镜长期记忆系统中�
 2. summary 需要体现这个主题的长期状态：背景、最近变化、关键参与者、已经形成的决定/偏好/约束、仍未解决的问题和下一步。
 3. 如果 existing_topic_state 已有内容，要增量融合，不要简单拼接，不要丢失仍然有效的长期信息。
 4. 不要把单句 fact 改写成另一句 fact；topic_state 必须比 fact 更抽象、更稳定。
-5. evidence_fact_ids 必须引用输入 facts 中支撑本次更新的 fact ID。
-6. 只返回 JSON，不要 markdown。
+5. summary 必须是简短的当前状态快照，最多 1-2 句话，建议不超过 120 个中文字符；不要把历史 timeline 拼接进 summary。
+6. time_line_updates 只记录本次 facts 带来的状态变化，输出 0-3 条；每条包含发生时间、变化类型、简短变化说明和 fact_ids。不要重复输出已有 timeline，也不要把没有变化的内容写入 timeline。
+7. evidence_fact_ids 必须引用输入 facts 中支撑本次更新的 fact ID。
+8. 只返回 JSON，不要 markdown。
 
 输出格式：
 {
   "update_needed": true,
   "canonical_name": "稳定主题名",
-  "summary": "融合后的长期 topic_state",
+  "summary": "简短的当前长期 topic_state 快照",
+  "time_line_updates": [
+    {
+      "occurred_at": "",
+      "change_type": "confirmed|changed|rejected|resolved|updated",
+      "summary": "本次状态变化",
+      "fact_ids": [1]
+    }
+  ],
   "keywords": ["关键词1", "关键词2"],
   "entities": ["实体1", "实体2"],
   "canonical_topics": ["主题1"],
@@ -155,7 +182,7 @@ canonical_topic：
 
 UNIFIED_ENTITY_STATE_UPDATE_PROMPT_ZH = """你是 AI 眼镜长期记忆系统中的 entity-scoped state 更新模块。
 
-输入已经完成实体解析：系统已经判断这批 facts 应更新某个实体的某类长期状态。你的任务是更新这个实体相关的 state，而不是重新决定主题归属。
+输入已经完成实体解析和属性主题初步分组：系统已经判断这批 facts 可能更新某个实体的某类长期状态。你的任务是更新这个实体的某个具体属性，而不是重新决定实体归属。
 
 entity-scoped state 的目标：
 - preference：某个实体稳定偏好、选择倾向、反复表达的喜好/厌恶。
@@ -163,20 +190,34 @@ entity-scoped state 的目标：
 - profile：某个实体稳定画像、身份、背景、长期职责或重要上下文。
 - routine：某个实体反复出现的习惯、流程、节奏。
 - constraint：某个实体长期或当前持续影响行动的限制条件。
+- risk：某个实体持续存在、会影响后续判断或行动的风险。
 
 规则：
-1. 只围绕给定 entity 和 state_type 更新，不要写成主题进展总结。
-2. 如果 facts 只说明某个议题的进展，应留给 topic_state；这里只保留对 entity 本身长期有用的信息。
-3. 如果 existing_entity_state 已有内容，要增量融合，不要简单拼接。
-4. summary 必须能回答：“关于这个实体，我们长期应该记住什么？”
-5. evidence_fact_ids 必须引用输入 facts 中支撑本次更新的 fact ID。
-6. 只返回 JSON，不要 markdown。
+1. 只围绕给定 entity、state_type 和 attribute_name 更新，不要写成主题进展总结。
+2. 如果 facts 只说明某个议题的进展，应留给 topic_state；这里只保留对 entity 本身长期有用的具体属性。
+3. 如果 existing_entity_state 与当前属性不是同一件事，返回 update_needed=false，不要强行合并。
+4. 如果 existing_entity_state 已有内容，要增量融合，不要简单拼接。
+5. canonical_name 只能是简短、具体的属性或主题标题，例如“灵活健身方式偏好”或“健康管理”；不要包含实体名、state_type、斜杠、连字符或完整句子。实体由输入的 entity 单独表示，state_type 由单独字段表示。如果已有 entity_state 与当前属性相同，复用其不含实体和 state_type 的 canonical_name。
+6. 如果输入只支持一次性事件、单次建议、临时请求或礼貌回应，返回 update_needed=false。
+7. summary 必须是简短的当前状态快照，最多 1-2 句话，建议不超过 120 个中文字符；不要把历史 timeline 拼接进 summary。
+8. time_line_updates 只记录本次 facts 带来的状态变化，输出 0-3 条；每条包含发生时间、变化类型、简短变化说明和 fact_ids。不要重复输出已有 timeline，也不要把没有变化的内容写入 timeline。
+9. summary 必须能回答：“关于这个实体的这个属性，我们长期应该记住什么？”
+10. evidence_fact_ids 必须引用输入 facts 中支撑本次更新的 fact ID。
+11. 只返回 JSON，不要 markdown。
 
 输出格式：
 {
   "update_needed": true,
-  "canonical_name": "实体名 - 状态短名",
-  "summary": "融合后的 entity-scoped state",
+  "canonical_name": "属性或主题短标题，不包含实体名和 state_type",
+  "summary": "简短的当前 entity-scoped state 快照",
+  "time_line_updates": [
+    {
+      "occurred_at": "",
+      "change_type": "confirmed|changed|rejected|resolved|updated",
+      "summary": "本次状态变化",
+      "fact_ids": [1]
+    }
+  ],
   "keywords": ["关键词1", "关键词2"],
   "entities": ["实体1", "实体2"],
   "canonical_topics": ["主题1"],

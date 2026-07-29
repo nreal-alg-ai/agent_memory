@@ -10,15 +10,29 @@ The system no longer treats assistant_wakeup and allday_recording as two separat
 
 Your task now is to extract the episode summary, episode canonical_topics, and Hindsight-style high-quality narrative facts from the chronological dialogue/transcript evidence batch below. The evidence may come from an active user-assistant exchange or a multi-speaker ambient transcript; use speaker, role, and time to infer participants and pragmatic flow.
 
-Existing long-term topic candidates:
-{existing_long_term_topics}
+Existing long-term memory states for context:
+{existing_memory_states}
 
 canonical_topics rules:
 - canonical_topics are stable episode-level topic names, ordered from most relevant to least relevant. Return 1-5 topics.
 - If this episode belongs to the same stable object or long-running topic as an existing candidate, reuse the candidate's canonical_topic exactly instead of rewriting it.
 - Create a new canonical topic only when the evidence clearly introduces a new stable object, project, product, relationship, or long-running issue.
 - Avoid over-generic topics such as "solution finalized", "product design discussion", "team collaboration", "problem discussion", or "user consultation". Prefer a concrete object or stable domain, e.g. "AI glasses voice memory system" or "phone promotion strategy".
-- If the evidence is too thin to identify the concrete object, prefer the most relevant existing long-term topic. If none is reliable, output a conservative broader topic rather than a fragmented short phrase.
+- If the evidence is too thin to identify the concrete object, do not reuse an existing topic merely because it is broadly related. Reuse it only when the same object or issue is still clear; otherwise output a conservative topic grounded in the current evidence rather than a fragmented short phrase.
+- Reuse an existing topic only after a strict semantic check: the current episode/fact must have substantially the same core object or concrete issue, discussion goal, and semantic scope as that topic's canonical_name. Sharing a broad domain, one entity, similar words, or nearby timestamps is not sufficient.
+- If a fact mentions an existing topic only as background but actually discusses a different object or issue, choose a more accurate primary_topic for that fact instead of forcing it into the existing topic to reduce the topic count.
+
+memory_states usage rules:
+- A state with state_scope=topic_state and state_type=topic is a naming reference for episode canonical_topics and fact primary_topic. If the current evidence refers to the same durable object or issue, reuse its canonical_name exactly.
+- A state with state_scope=entity_state is only background for understanding durable entity attributes, preferences, constraints, risks, or relationships. Do not directly use an entity_state canonical_name as an episode topic or fact primary_topic.
+- These states are historical context, not evidence for the current episode. Do not write unsupported historical details into a fact; when current dialogue conflicts with a prior state, current dialogue wins.
+- fact primary_topic must describe the main topic of that fact. It may reuse a relevant topic_state canonical_name, but must not become an entity-attribute title merely because an entity_state was provided.
+- fact primary_topic may reuse a topic_state canonical_name only when the fact's core object, discussion goal, and semantic scope are all substantially aligned with that name.
+- Do not reuse a topic_state merely because the fact belongs to a broad domain such as health, products, or teams, or because it contains related background. When the evidence does not support a strict match, use a more specific topic grounded in the current evidence, or create a conservative new topic.
+- Never change a fact's primary_topic because of an entity_state name, summary, or historical timeline. An entity_state may help interpretation, but it is not a topic candidate to reuse directly.
+- Every fact must also output one `primary_entity`, the single entity that the fact mainly describes, affects, or belongs to; it must be one object, not an array.
+- `primary_entity` must come from the fact's `entities`. Do not choose an entity merely because it is mentioned, provides a recommendation, or is a location, tool, or background context. For a multi-person exchange, choose the person or entity mainly described or affected by the fact; for a fact about the user's own preference, habit, constraint, or risk, choose the user.
+- Keep `entities` for all directly relevant entities so retrieval preserves participants and context; downstream entity-state matching uses only `primary_entity`, so one fact must not be assigned to multiple entities.
 
 Core Hindsight-style narrative fact requirements:
 - Each fact should cover a complete exchange or a clear topic segment, not a single utterance. Do not mechanically split "the user raised a problem", "the assistant suggested a solution", and "the user accepted/rejected it" into separate fragments; if they respond to the same issue, merge them into one narrative fact.
@@ -53,7 +67,8 @@ Output schema:
       "text": "self-contained narrative fact covering a complete exchange and expressing what/when/where/who/why, with background, user/assistant view or action flow, and reason/disagreement/constraint/conclusion/next step",
       "keywords": ["keyword1", "keyword2"],
       "entities": [{"name": "entity name", "type": "PERSON|ORGANIZATION|LOCATION|PRODUCT|PROJECT|TECHNOLOGY|CONCEPT|TOPIC|PREFERENCE|OTHER"}],
-      "primary_topic": "stable topic string",
+      "primary_entity": {"name": "the single primary entity of this fact", "type": "PERSON|ORGANIZATION|LOCATION|PRODUCT|PROJECT|TECHNOLOGY|CONCEPT|TOPIC|PREFERENCE|OTHER"},
+      "primary_topic": "stable topic string; prefer a relevant topic_state canonical_name, never an entity_state name",
       "fact_type": "semantic|episodic",
       "fact_subject": "user|assistant|world|project|system|other",
       "fact_kind": "preference|decision|request|recommendation|action|commitment|open_question|risk|error|context|instruction|other",
@@ -78,6 +93,7 @@ The input contains newly stored narrative facts and the current long-term states
 Boundary rules:
 - Topic, project, and issue progress belong in topic_state. Do not create a separate project-style state.
 - Concrete tasks, decisions, commitments, reminders, and open questions belong in actionable_item. Do not create task-style or commitment-style states.
+- state_scope must be topic_state or entity_state; topic_state always uses state_type topic.
 - Output a state only when the information should remain useful as durable memory. Do not output a state for a one-off task or commitment.
 
 Rules:
@@ -86,7 +102,7 @@ Rules:
 3. Merge facts about the same durable subject into one state instead of creating near-duplicates.
 4. Preserve uncertainty and recent changes. If evidence conflicts, explicitly state the conflict.
 5. Use evidence_fact_ids to cite the fact IDs that support the state.
-6. state_type must be one of: preference, relationship, routine, topic_state, constraint, risk, profile, other.
+6. state_type must be one of: topic, preference, profile, routine, relationship, constraint, risk.
 7. importance is 0-1. confidence is 0-1.
 8. Return JSON only. No markdown.
 
@@ -94,7 +110,8 @@ Output schema:
 {
   "states": [
     {
-      "state_type": "preference|relationship|routine|topic_state|constraint|risk|profile|other",
+      "state_scope": "topic_state|entity_state",
+      "state_type": "topic|preference|profile|routine|relationship|constraint|risk",
       "canonical_name": "stable short name",
       "summary": "self-contained evolving state",
       "evidence_fact_ids": [1, 2],
@@ -125,14 +142,24 @@ Rules:
 2. The summary should describe the durable topic state: background, recent changes, key participants, decisions/preferences/constraints that still matter, unresolved questions, and next steps.
 3. If existing_topic_state is present, merge incrementally instead of concatenating. Preserve durable information that is still valid.
 4. Do not rewrite one fact into another fact. A topic_state must be more abstract and stable than individual facts.
-5. evidence_fact_ids must cite supporting fact IDs from the input facts.
-6. Return JSON only. No markdown.
+5. summary must be a concise current-state snapshot: at most 1-2 sentences and preferably no more than 80 English words. Do not append the historical timeline to summary.
+6. time_line_updates must contain only changes supported by the new facts, with 0-3 events. Each event must include time, change_type, a short change summary, and fact_ids. Do not repeat existing timeline events or record unchanged information.
+7. evidence_fact_ids must cite supporting fact IDs from the input facts.
+8. Return JSON only. No markdown.
 
 Output schema:
 {
   "update_needed": true,
   "canonical_name": "stable topic name",
-  "summary": "merged long-term topic_state",
+  "summary": "concise current long-term topic_state snapshot",
+  "time_line_updates": [
+    {
+      "occurred_at": "",
+      "change_type": "confirmed|changed|rejected|resolved|updated",
+      "summary": "the state change in this update",
+      "fact_ids": [1]
+    }
+  ],
   "keywords": ["keyword1", "keyword2"],
   "entities": ["entity1", "entity2"],
   "canonical_topics": ["topic1"],
@@ -155,7 +182,7 @@ new facts:
 
 UNIFIED_ENTITY_STATE_UPDATE_PROMPT_EN = """You are the entity-scoped state update module for a unified AI-glasses long-term memory system inspired by MemPalace.
 
-The input has already passed entity resolution: the system has decided that these facts should update one durable state type for one entity. Your task is to update that entity-related state, not to re-route the topic.
+The input has already passed entity and preliminary attribute-topic resolution: the system has decided that these facts may update one durable state type for one entity and one attribute. Your task is to update that specific entity attribute, not to re-route the entity.
 
 entity-scoped state targets:
 - preference: stable preferences, selection tendencies, likes/dislikes.
@@ -163,20 +190,34 @@ entity-scoped state targets:
 - profile: stable identity, background, responsibility, role, or important context.
 - routine: repeated habits, processes, cadence, or workflow.
 - constraint: durable or currently persistent limitations that affect action.
+- risk: a persistent risk about an entity that can affect future decisions or actions.
 
 Rules:
-1. Update only the given entity and state_type. Do not write a topic progress summary.
-2. If the facts only describe topic progress, leave that to topic_state. Keep only durable information about the entity itself.
-3. If existing_entity_state is present, merge incrementally instead of concatenating.
-4. The summary must answer: "What should we remember long-term about this entity?"
-5. evidence_fact_ids must cite supporting fact IDs from the input facts.
-6. Return JSON only. No markdown.
+1. Update only the given entity, state_type, and attribute_name. Do not write a topic progress summary.
+2. If the facts only describe topic progress, leave that to topic_state. Keep only durable information about this specific entity attribute.
+3. If existing_entity_state is about a different attribute, return update_needed=false instead of forcing a merge.
+4. If existing_entity_state is present and about the same attribute, merge incrementally instead of concatenating.
+5. canonical_name must be only a short, concrete attribute or topic title, such as "flexible workout preference" or "health management". Do not include the entity name, state_type, slashes, hyphens, or a full sentence. The entity is provided separately and state_type is a separate field. If existing_entity_state describes the same attribute, reuse its canonical_name without entity or state_type decorations.
+6. If the input supports only a one-off event, single recommendation, temporary request, or courtesy response, return update_needed=false.
+7. summary must be a concise current-state snapshot: at most 1-2 sentences and preferably no more than 60 English words. Do not append the historical timeline to summary.
+8. time_line_updates must contain only changes supported by the new facts, with 0-3 events. Each event must include time, change_type, a short change summary, and fact_ids. Do not repeat existing timeline events or record unchanged information.
+9. The summary must answer: "What should we remember long-term about this entity attribute?"
+10. evidence_fact_ids must cite supporting fact IDs from the input facts.
+11. Return JSON only. No markdown.
 
 Output schema:
 {
   "update_needed": true,
-  "canonical_name": "entity name - state short name",
-  "summary": "merged entity-scoped state",
+  "canonical_name": "short attribute or topic title without entity or state_type",
+  "summary": "concise current entity-scoped state snapshot",
+  "time_line_updates": [
+    {
+      "occurred_at": "",
+      "change_type": "confirmed|changed|rejected|resolved|updated",
+      "summary": "the state change in this update",
+      "fact_ids": [1]
+    }
+  ],
   "keywords": ["keyword1", "keyword2"],
   "entities": ["entity1", "entity2"],
   "canonical_topics": ["topic1"],
