@@ -490,6 +490,13 @@ class MemoryNodeManager:
                     if not fact.get("canonical_topics"):
                         fact["canonical_topics"] = canonical_topics
                 facts.extend(fallback_facts)
+        self._log_extracted_fact_state_aspects(
+            segments=segments,
+            facts=facts,
+            source_type=source_type,
+            episode_type=episode_type,
+            source_ref=source_ref,
+        )
         episode_entity_names = self._episode_entity_names(
             participants=participants,
             segments=segments,
@@ -539,6 +546,48 @@ class MemoryNodeManager:
             )
             fact_count += 1
         return fact_count > 0
+
+    def _log_extracted_fact_state_aspects(
+        self,
+        *,
+        segments: List[Dict[str, Any]],
+        facts: List[Dict[str, Any]],
+        source_type: str,
+        episode_type: str,
+        source_ref: str,
+    ) -> None:
+        if not facts:
+            return
+        self._log_info(
+            "memory_store",
+            "extract_fact_state_aspects",
+            {
+                "source_type": source_type,
+                "episode_type": episode_type,
+                "source_ref": source_ref,
+                "raw_segments": self._build_memory_segments_for_prompt(
+                    segments,
+                    prompt_language=self._resolve_prompt_language_from_segments(segments),
+                ),
+                "source_segment_count": len(segments),
+            },
+        )
+        for index, fact in enumerate(facts, 1):
+            self._log_info(
+                "memory_store",
+                "extract_fact_state_aspects",
+                {
+                    "summary": fact.get("summary") or "",
+                    "fact_type": fact.get("fact_type"),
+                    "fact_subject": fact.get("fact_subject"),
+                    "fact_kind": fact.get("fact_kind"),
+                    "primary_entity": fact.get("primary_entity"),
+                    "canonical_topics": fact.get("canonical_topics") or [],
+                    "state_aspects": fact.get("state_aspects") or [],
+                    "batch_fact_index": index,
+                    "batch_fact_count": len(facts),
+                },
+            )
 
     def _extract_memory_from_turns(self, turns: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Extract episode metadata and facts with LLM, falling back to heuristics."""
@@ -724,6 +773,10 @@ class MemoryNodeManager:
             primary_topic = _compact_whitespace(raw_fact.get("primary_topic") or "")
             if not primary_topic:
                 primary_topic = " ".join(keywords[:3]) if keywords else "general"
+            state_aspects = self._normalize_state_aspects(
+                raw_fact.get("state_aspects"),
+                fallback_entity=primary_entity,
+            )
             fact_topics = self._normalize_episode_canonical_topics(
                 [primary_topic],
                 topic_candidates=[
@@ -743,6 +796,7 @@ class MemoryNodeManager:
                 "keywords": " ".join(keywords),
                 "entities": entities,
                 "primary_entity": primary_entity,
+                "state_aspects": state_aspects,
                 "canonical_topics": fact_topics or episode_topics or [primary_topic],
                 "importance": max(0.6, min(1.0, priority / 100.0)),
                 "confidence": 0.9,
@@ -765,6 +819,89 @@ class MemoryNodeManager:
             "canonical_topics": episode_topics or self._topic_candidates(episode_summary),
             "facts": facts,
         }
+
+    def _normalize_state_aspects(
+        self,
+        value: Any,
+        *,
+        fallback_entity: Optional[Dict[str, str]] = None,
+        limit: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        if not isinstance(value, list):
+            return []
+        max_items = max(
+            0,
+            int(
+                limit
+                if limit is not None
+                else self._memory_cfg.get("state_aspect_max_per_fact", 3) or 3
+            ),
+        )
+        if max_items <= 0:
+            return []
+        allowed_types = self._entity_scoped_state_types()
+        normalized: List[Dict[str, Any]] = []
+        seen: set[Tuple[str, str, str]] = set()
+        for raw in value:
+            if not isinstance(raw, dict):
+                continue
+            state_type = str(raw.get("state_type") or "").strip().lower()
+            if state_type not in allowed_types:
+                continue
+            attribute_name = _compact_whitespace(
+                raw.get("attribute_name")
+                or raw.get("canonical_name")
+                or raw.get("attribute")
+                or ""
+            )
+            aspect_summary = _compact_whitespace(
+                raw.get("aspect_summary")
+                or raw.get("summary")
+                or raw.get("text")
+                or ""
+            )
+            evidence_basis = _compact_whitespace(
+                raw.get("evidence_basis")
+                or raw.get("evidence")
+                or raw.get("reason")
+                or ""
+            )
+            if not attribute_name or not aspect_summary:
+                continue
+            confidence = self._clamp_float(raw.get("confidence"), 0.0, 1.0, 0.75)
+            entity = raw.get("entity") or raw.get("primary_entity") or fallback_entity
+            if isinstance(entity, dict):
+                entity_name = _compact_whitespace(entity.get("name") or entity.get("text") or "")
+                entity_type = _compact_whitespace(entity.get("type") or "CONCEPT").upper()
+            else:
+                entity_name = _compact_whitespace(entity)
+                entity_type = "CONCEPT"
+            entity_payload = (
+                {"name": entity_name, "type": entity_type}
+                if entity_name
+                else None
+            )
+            key = (
+                state_type,
+                attribute_name.lower(),
+                aspect_summary.lower(),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            item: Dict[str, Any] = {
+                "state_type": state_type,
+                "attribute_name": attribute_name,
+                "aspect_summary": aspect_summary,
+                "evidence_basis": evidence_basis,
+                "confidence": confidence,
+            }
+            if entity_payload:
+                item["entity"] = entity_payload
+            normalized.append(item)
+            if len(normalized) >= max_items:
+                break
+        return normalized
 
     def _build_dialogue_batch_for_prompt(
         self,
@@ -1554,7 +1691,12 @@ class MemoryNodeManager:
             time_key=fact["time_key"],
             confidence=fact["confidence"],
             importance=fact["importance"],
-            metadata={**fact["metadata"], "tags": tags, "source_text": fact["source_text"]},
+            metadata={
+                **fact["metadata"],
+                "tags": tags,
+                "source_text": fact["source_text"],
+                "state_aspects": fact.get("state_aspects") or [],
+            },
             embedding=embedding,
             embedding_text=embedding_text,
         )
@@ -1588,7 +1730,7 @@ class MemoryNodeManager:
             confidence=fact["confidence"],
             embedding=index_embedding,
             embedding_text=index_embedding_text,
-            metadata={"tags": tags, **fact["metadata"]},
+            metadata={"tags": tags, **fact["metadata"], "state_aspects": fact.get("state_aspects") or []},
         )
         return fact_id
 
@@ -2305,6 +2447,30 @@ class MemoryNodeManager:
         self,
         candidate: Dict[str, Any],
     ) -> List[Dict[str, Any]]:
+        aspect_items = [
+            aspect for aspect in candidate.get("state_aspects") or []
+            if isinstance(aspect, dict)
+            and _compact_whitespace(aspect.get("aspect_summary") or "")
+        ]
+        if aspect_items:
+            fact_ids = [
+                int(aspect.get("fact_id"))
+                for aspect in aspect_items
+                if str(aspect.get("fact_id") or "").strip().isdigit()
+            ]
+            latest = aspect_items[-1]
+            occurred_at = _compact_whitespace(
+                str(latest.get("fact_time_key") or "").split("#", 1)[0]
+            )
+            return [{
+                "occurred_at": occurred_at,
+                "change_type": "updated",
+                "summary": self._normalize_state_summary(
+                    latest.get("aspect_summary") or "",
+                    max_chars=120,
+                ),
+                "fact_ids": list(dict.fromkeys(fact_ids))[-12:],
+            }]
         facts = [
             fact for fact in candidate.get("facts") or []
             if _compact_whitespace(fact.get("summary") or "")
@@ -2547,10 +2713,62 @@ class MemoryNodeManager:
     ) -> List[Dict[str, Any]]:
         grouped: Dict[Tuple[str, str, str, str], Dict[str, Any]] = {}
         for fact in facts:
+            source_type = str(fact.get("source_type") or "unified")
+            state_aspects = self._state_aspects_from_fact(fact)
+            if state_aspects:
+                for aspect in state_aspects:
+                    state_type = str(aspect.get("state_type") or "").strip().lower()
+                    if state_type not in self._entity_scoped_state_types():
+                        continue
+                    entities = self._entities_for_state_aspect(aspect, fact)
+                    if not entities:
+                        continue
+                    attribute_name = _compact_whitespace(aspect.get("attribute_name") or "")
+                    if not attribute_name:
+                        continue
+                    for entity in entities[:1]:
+                        entity_key = self._entity_state_key(entity)
+                        attribute_key = self._topic_state_key(attribute_name)
+                        key = (source_type, state_type, entity_key, attribute_key)
+                        item = grouped.setdefault(key, {
+                            "source_type": source_type,
+                            "state_scope": "entity_state",
+                            "state_type": state_type,
+                            "entity": entity,
+                            "entity_key": entity_key,
+                            "canonical_name": self._entity_state_candidate_name(
+                                attribute_name=attribute_name,
+                            ),
+                            "attribute_key": attribute_key,
+                            "attribute_name": attribute_name,
+                            "attribute_aliases": [attribute_name],
+                            "facts": [],
+                            "fact_ids": [],
+                            "aliases": self._merge_topic_aliases([entity, attribute_name], limit=10),
+                            "state_aspects": [],
+                            "candidate_source": "state_aspects",
+                        })
+                        item["attribute_aliases"] = self._merge_topic_aliases([
+                            *(item.get("attribute_aliases") or []),
+                            attribute_name,
+                            *self._coerce_topic_list(fact.get("canonical_topics")),
+                        ], limit=10)
+                        item["facts"].append(fact)
+                        fact_id = None
+                        if str(fact.get("id") or "").strip().isdigit():
+                            fact_id = int(fact["id"])
+                            item["fact_ids"].append(fact_id)
+                        item["state_aspects"].append({
+                            **aspect,
+                            "fact_id": fact_id,
+                            "fact_summary": fact.get("summary") or "",
+                            "fact_time_key": fact.get("time_key") or "",
+                        })
+                continue
+
             state_types = self._infer_entity_scoped_state_types_for_fact(fact)
             if not state_types:
                 continue
-            source_type = str(fact.get("source_type") or "unified")
             for state_type in state_types:
                 entities = self._entities_for_entity_state_fact(
                     fact,
@@ -2580,6 +2798,8 @@ class MemoryNodeManager:
                             "facts": [],
                             "fact_ids": [],
                             "aliases": self._merge_topic_aliases([entity, attribute_name], limit=10),
+                            "state_aspects": [],
+                            "candidate_source": "heuristic",
                         })
                         item["attribute_aliases"] = self._merge_topic_aliases([
                             *(item.get("attribute_aliases") or []),
@@ -2593,16 +2813,53 @@ class MemoryNodeManager:
             item["fact_ids"] = list(dict.fromkeys(item.get("fact_ids") or []))
             if not item["fact_ids"]:
                 continue
+            aspect_summaries = [
+                _compact_whitespace(aspect.get("aspect_summary") or "")
+                for aspect in item.get("state_aspects") or []
+                if _compact_whitespace(aspect.get("aspect_summary") or "")
+            ]
+            aspect_evidence = [
+                _compact_whitespace(aspect.get("evidence_basis") or "")
+                for aspect in item.get("state_aspects") or []
+                if _compact_whitespace(aspect.get("evidence_basis") or "")
+            ]
             item["summary_text"] = "\n".join(
-                str(fact.get("summary") or "") for fact in item.get("facts") or []
+                aspect_summaries
+                or [str(fact.get("summary") or "") for fact in item.get("facts") or []]
             )[:2400]
             item["attribute_text"] = "\n".join([
                 str(item.get("attribute_name") or ""),
                 " ".join(item.get("attribute_aliases") or []),
                 item["summary_text"],
+                "\n".join(aspect_evidence),
             ])[:2800]
             candidates.append(item)
         return candidates
+
+    def _state_aspects_from_fact(self, fact: Dict[str, Any]) -> List[Dict[str, Any]]:
+        metadata = fact.get("metadata") if isinstance(fact.get("metadata"), dict) else {}
+        raw = fact.get("state_aspects") or metadata.get("state_aspects")
+        fallback_entity = fact.get("primary_entity") or metadata.get("primary_entity")
+        return self._normalize_state_aspects(raw, fallback_entity=fallback_entity)
+
+    def _entities_for_state_aspect(
+        self,
+        aspect: Dict[str, Any],
+        fact: Dict[str, Any],
+    ) -> List[str]:
+        entity = aspect.get("entity") or aspect.get("primary_entity")
+        if isinstance(entity, dict):
+            name = _compact_whitespace(entity.get("name") or entity.get("text") or "")
+        else:
+            name = _compact_whitespace(entity)
+        if name:
+            lower = name.lower()
+            if lower in {"用户", "user", "the user"}:
+                return ["user"]
+            if lower in {"助手", "assistant", "agent", "the assistant"}:
+                return ["assistant"]
+            return [name]
+        return self._entities_for_entity_state_fact(fact)
 
     def _entity_state_attribute_topics(self, fact: Dict[str, Any]) -> List[str]:
         topics = [
@@ -2822,13 +3079,24 @@ class MemoryNodeManager:
                 "attribute_key": candidate.get("attribute_key"),
                 "attribute_aliases": candidate.get("attribute_aliases", []),
                 "aliases": candidate.get("aliases", []),
+                "candidate_source": candidate.get("candidate_source") or "heuristic",
+                "state_aspect_summaries": [
+                    {
+                        "fact_id": aspect.get("fact_id"),
+                        "aspect_summary": aspect.get("aspect_summary") or "",
+                        "evidence_basis": aspect.get("evidence_basis") or "",
+                        "confidence": aspect.get("confidence"),
+                    }
+                    for aspect in candidate.get("state_aspects") or []
+                    if isinstance(aspect, dict)
+                ],
             }, ensure_ascii=False, indent=2))
             .replace("{existing_entity_state}", json.dumps(
                 self._format_existing_topic_state_for_prompt(existing_state),
                 ensure_ascii=False,
                 indent=2,
             ))
-            .replace("{facts}", self._format_facts_for_state_prompt(facts))
+            .replace("{facts}", self._format_entity_state_candidate_facts_for_prompt(candidate))
         )
         result = self._call_llm(prompt)
         parsed = self._parse_json_object_from_llm_text(result or "")
@@ -2880,9 +3148,10 @@ class MemoryNodeManager:
         ]
         evidence_ids = list(dict.fromkeys([*existing_ids, *evidence_ids]))[:80]
         canonical_name = (
-            _compact_whitespace(candidate.get("attribute_name") or "")
+            _compact_whitespace((existing_state or {}).get("canonical_name") or "")
+            or _compact_whitespace(candidate.get("canonical_name") or "")
             or _compact_whitespace(raw.get("canonical_name") or "")
-            or _compact_whitespace((existing_state or {}).get("canonical_name") or "")
+            or _compact_whitespace(candidate.get("attribute_name") or "")
         )
         if canonical_name.lower() in self._entity_scoped_state_types() or len(canonical_name) < 3:
             canonical_name = _compact_whitespace(candidate.get("canonical_name") or "")
@@ -2923,6 +3192,8 @@ class MemoryNodeManager:
                 "attribute_key": candidate.get("attribute_key"),
                 "attribute_name": candidate.get("attribute_name"),
                 "attribute_aliases": candidate.get("attribute_aliases", []),
+                "candidate_source": candidate.get("candidate_source") or "heuristic",
+                "state_aspects": candidate.get("state_aspects") or [],
                 "entity_state_identity_text": candidate.get("attribute_text") or "",
                 "entity_state_resolution": match_info,
                 "extractor": "entity_scoped_state_update",
@@ -2936,10 +3207,17 @@ class MemoryNodeManager:
         match_info: Dict[str, Any],
     ) -> Dict[str, Any]:
         summaries = [
-            _compact_whitespace(fact.get("summary") or "")
-            for fact in candidate.get("facts", [])
-            if _compact_whitespace(fact.get("summary") or "")
+            _compact_whitespace(aspect.get("aspect_summary") or "")
+            for aspect in candidate.get("state_aspects") or []
+            if isinstance(aspect, dict)
+            and _compact_whitespace(aspect.get("aspect_summary") or "")
         ][:5]
+        if not summaries:
+            summaries = [
+                _compact_whitespace(fact.get("summary") or "")
+                for fact in candidate.get("facts", [])
+                if _compact_whitespace(fact.get("summary") or "")
+            ][:5]
         base = _compact_whitespace((existing_state or {}).get("summary") or "")
         update_text = "；".join(summaries)
         summary_source = (
@@ -2959,9 +3237,9 @@ class MemoryNodeManager:
             "state_type": candidate["state_type"],
             "source_type": candidate.get("source_type") or (existing_state or {}).get("source_type") or "unified",
             "canonical_name": _compact_whitespace(
-                candidate.get("attribute_name")
+                (existing_state or {}).get("canonical_name")
                 or candidate.get("canonical_name")
-                or (existing_state or {}).get("canonical_name")
+                or candidate.get("attribute_name")
                 or "general"
             ),
             "summary": summary,
@@ -2987,6 +3265,8 @@ class MemoryNodeManager:
                 "attribute_key": candidate.get("attribute_key"),
                 "attribute_name": candidate.get("attribute_name"),
                 "attribute_aliases": candidate.get("attribute_aliases", []),
+                "candidate_source": candidate.get("candidate_source") or "heuristic",
+                "state_aspects": candidate.get("state_aspects") or [],
                 "entity_state_identity_text": candidate.get("attribute_text") or "",
                 "entity_state_resolution": match_info,
                 "extractor": "fallback_entity_scoped_state_update",
@@ -3408,6 +3688,29 @@ class MemoryNodeManager:
                 "canonical_topics": fact.get("canonical_topics") or [],
             })
         return json.dumps(rows, ensure_ascii=False, indent=2)
+
+    def _format_entity_state_candidate_facts_for_prompt(
+        self,
+        candidate: Dict[str, Any],
+    ) -> str:
+        aspect_rows = []
+        for aspect in candidate.get("state_aspects") or []:
+            if not isinstance(aspect, dict):
+                continue
+            aspect_rows.append({
+                "fact_id": aspect.get("fact_id"),
+                "source_type": candidate.get("source_type"),
+                "state_type": aspect.get("state_type") or candidate.get("state_type"),
+                "attribute_name": aspect.get("attribute_name") or candidate.get("attribute_name"),
+                "aspect_summary": aspect.get("aspect_summary") or "",
+                "evidence_basis": aspect.get("evidence_basis") or "",
+                "confidence": aspect.get("confidence"),
+                "fact_time_key": aspect.get("fact_time_key") or "",
+                "full_fact_summary": aspect.get("fact_summary") or "",
+            })
+        if aspect_rows:
+            return json.dumps(aspect_rows[:160], ensure_ascii=False, indent=2)
+        return self._format_facts_for_state_prompt(list(candidate.get("facts") or []))
 
     @staticmethod
     def _normalize_state_scope(value: Any, state_type: Any = None) -> str:

@@ -104,6 +104,15 @@ Hindsight 风格 narrative fact 的核心要求：
 14. keywords 只能包含用于检索的短实体、主题、症状、方案、约束、决定和关键时间/顺序锚，通常每个关键词 2-8 个汉字或一个短英文短语；对带时间锚的事件，必须加入原始或补全后的时间词，例如“March 15 2023”“first service”“3/22”“last Saturday”“two months ago”“上周六”“两个月前”。不要把完整句子、寒暄、礼貌话、语气词、泛化表达或“希望这个方法能帮到您”这类文本放入 keywords。
 15. 只返回 JSON，不要 markdown。
 
+state_aspects 输出规则：
+- `fact_kind` 仍然是这条 fact 的主语义类型；`state_aspects` 是这条 fact 对 entity_state 的多个长期状态投影切片。
+- 只有当该 fact 对用户或关键实体的长期状态确实有复用价值时才输出 state_aspects；普通一次性事件、临时建议、寒暄、低价值背景输出空数组。
+- 每条 fact 最多输出 3 个 state_aspects，只保留最明确、最有价值的侧面。
+- state_type 只能是 preference、profile、routine、relationship、constraint、risk。
+- aspect_summary 必须只描述当前 state_type 的贡献点，不能复述整条 fact。比如 risk 必须说明可能影响什么或造成什么后果；constraint 说明限制条件；routine 说明反复行为/节奏；preference 说明偏好/拒绝/选择倾向。
+- attribute_name 必须比 episode topic 更具体，例如“碎片化健身方式偏好”“健康管理执行限制”“减重计划持续性风险”，不要直接使用“健康管理”这类宽泛主题，除非证据只能支持宽泛属性。
+- evidence_basis 必须引用当前 fact 中支持该 aspect 的具体证据，不要引入历史 state 或外部推断。
+
 输出格式：
 {
   "episode_title": "简短具体标题",
@@ -123,7 +132,16 @@ Hindsight 风格 narrative fact 的核心要求：
       "occurred_start": "",
       "occurred_end": "",
       "time_confidence": "explicit|inferred_from_turn|unknown",
-      "where": ""
+      "where": "",
+      "state_aspects": [
+        {
+          "state_type": "preference|profile|routine|relationship|constraint|risk",
+          "attribute_name": "具体属性名",
+          "aspect_summary": "只描述该 state_type 侧面的长期状态贡献点",
+          "evidence_basis": "当前 fact 中支持该 aspect 的具体证据",
+          "confidence": 0.8
+        }
+      ]
     }
   ]
 }

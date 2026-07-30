@@ -104,6 +104,15 @@ Rules:
 14. keywords must be short retrieval terms: entities, topics, symptoms, plans, constraints, decisions, and important time/order anchors. For time-sensitive facts, include the original or resolved time phrase such as "March 15 2023", "first service", "3/22", "last Saturday", or "two months ago". Do not put full sentences, pleasantries, filler, generic encouragement, or phrases like "hope this method helps you" into keywords.
 15. Return JSON only. No markdown.
 
+state_aspects rules:
+- `fact_kind` remains the primary semantic type of the fact. `state_aspects` are projection slices showing how this fact can contribute to multiple entity_state types.
+- Output state_aspects only when the fact has durable long-term value for the user or another key entity. For one-off events, temporary suggestions, pleasantries, or low-value background, use an empty array.
+- Return at most 3 state_aspects per fact, keeping only the clearest and most useful aspects.
+- state_type must be one of: preference, profile, routine, relationship, constraint, risk.
+- aspect_summary must describe only the contribution for the current state_type, not restate the whole fact. For example, risk must say what may be affected or what negative outcome may happen; constraint states the limiting condition; routine states repeated behavior or cadence; preference states likes, dislikes, refusal, or selection tendency.
+- attribute_name must be more specific than the episode topic, such as "flexible workout preference", "health management execution constraint", or "weight-loss plan continuity risk". Avoid broad names like "health management" unless the evidence supports only a broad attribute.
+- evidence_basis must cite the specific evidence in the current fact that supports this aspect. Do not import prior state or outside inference.
+
 Output schema:
 {
   "episode_title": "short concrete title",
@@ -123,7 +132,16 @@ Output schema:
       "occurred_start": "",
       "occurred_end": "",
       "time_confidence": "explicit|inferred_from_turn|unknown",
-      "where": ""
+      "where": "",
+      "state_aspects": [
+        {
+          "state_type": "preference|profile|routine|relationship|constraint|risk",
+          "attribute_name": "specific attribute name",
+          "aspect_summary": "durable contribution for this state_type only",
+          "evidence_basis": "specific evidence from this fact supporting the aspect",
+          "confidence": 0.8
+        }
+      ]
     }
   ]
 }
