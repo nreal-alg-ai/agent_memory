@@ -38,6 +38,7 @@ import requests
 from .embedding_client import EmbeddingClient
 from .memory_database import SessionDB
 from .prompts_en import (
+    EPISODE_SUMMARY_PROMPT_EN,
     RECALL_QUERY_ANALYSIS_PROMPT_EN,
     UNIFIED_ACTIONABLE_ITEM_EXTRACTION_PROMPT_EN,
     UNIFIED_ENTITY_STATE_UPDATE_PROMPT_EN,
@@ -45,6 +46,7 @@ from .prompts_en import (
     UNIFIED_TOPIC_STATE_UPDATE_PROMPT_EN,
 )
 from .prompts_zh import (
+    EPISODE_SUMMARY_PROMPT_ZH,
     RECALL_QUERY_ANALYSIS_PROMPT_ZH,
     UNIFIED_ACTIONABLE_ITEM_EXTRACTION_PROMPT_ZH,
     UNIFIED_ENTITY_STATE_UPDATE_PROMPT_ZH,
@@ -475,40 +477,83 @@ class MemoryNodeManager:
         started_at = segments[0].get("started_at") or _now_text()
         ended_at = segments[-1].get("ended_at") or started_at
         extracted = self._extract_memory_from_segments(segments)
-        title = extracted.get("episode_title") or self._episode_title_from_segments(segments)
-        summary = extracted.get("episode_summary") or self._episode_summary_from_segments(segments)
+        episode_title = (
+            _compact_whitespace(extracted.get("episode_title") or "")
+            or self._episode_title_from_segments(segments)
+        )
+        episode_summary = (
+            _compact_whitespace(extracted.get("episode_summary") or "")
+            or self._episode_summary_from_segments(segments)
+        )
         canonical_topics = (
             extracted.get("canonical_topics")
-            or self._topic_candidates(summary)
+            or self._topic_candidates(episode_summary)
             or ["general"]
         )
         facts = list(extracted.get("facts") or [])
-        if not facts:
-            for segment_index, segment in enumerate(segments, 1):
-                fallback_facts = self._extract_segment_facts(segment, segment_index=segment_index)
-                for fact in fallback_facts:
-                    if not fact.get("canonical_topics"):
-                        fact["canonical_topics"] = canonical_topics
-                facts.extend(fallback_facts)
-        self._log_extracted_fact_state_aspects(
+        
+        self._log_extracted_fact_info(
             segments=segments,
             facts=facts,
             source_type=source_type,
             episode_type=episode_type,
             source_ref=source_ref,
         )
+
+        episode_info = self._store_extracted_episode_info(
+            participants=participants,
+            segments=segments,
+            facts=facts,
+            source_type=source_type,
+            episode_type=episode_type,
+            tags=tags,
+            source_ref=source_ref,
+            episode_title=episode_title,
+            episode_summary=episode_summary,
+            canonical_topics=canonical_topics,
+            started_at=started_at,
+            ended_at=ended_at,
+        )
+        episode_id = int(episode_info["episode_id"])
+        episode_participants = list(episode_info["participants"])
+
+        fact_ids = self._store_facts_info(
+            episode_id=episode_id,
+            facts=facts,
+            tags=tags,
+            source_type=source_type,
+            participants=episode_participants,
+        )
+        return bool(episode_id)
+
+    def _store_extracted_episode_info(
+        self,
+        *,
+        participants: List[str],
+        segments: List[Dict[str, Any]],
+        facts: List[Dict[str, Any]],
+        source_type: str,
+        episode_type: str,
+        tags: List[str],
+        source_ref: str,
+        episode_title: str,
+        episode_summary: str,
+        canonical_topics: List[str],
+        started_at: str,
+        ended_at: str,
+    ) -> Dict[str, Any]:
         episode_entity_names = self._episode_entity_names(
             participants=participants,
             segments=segments,
             facts=facts,
-            summary=summary,
+            summary=episode_summary,
         )
         episode_entity_ids = self._entity_ids_for_names(episode_entity_names)
         episode_id = self._db.insert_episode(
             source_type=source_type,
             episode_type=episode_type,
-            title=title,
-            summary=summary,
+            title=episode_title,
+            summary=episode_summary,
             participants=participants,
             started_at=started_at,
             ended_at=ended_at,
@@ -525,8 +570,8 @@ class MemoryNodeManager:
             episode_id=episode_id,
             source_type=source_type,
             episode_type=episode_type,
-            title=title,
-            summary=summary,
+            title=episode_title,
+            summary=episode_summary,
             started_at=started_at,
             ended_at=ended_at,
             tags=tags,
@@ -535,19 +580,17 @@ class MemoryNodeManager:
             source_ref=source_ref,
         )
 
-        fact_count = 0
-        for fact in facts:
-            self._store_fact(
-                episode_id=episode_id,
-                fact=fact,
-                tags=tags,
-                source_type=source_type,
-                participants=participants,
-            )
-            fact_count += 1
-        return fact_count > 0
+        return {
+            "episode_id": episode_id,
+            "participants": participants,
+            "entity_names": episode_entity_names,
+            "entity_ids": episode_entity_ids,
+            "title": episode_title,
+            "summary": episode_summary,
+            "canonical_topics": canonical_topics,
+        }
 
-    def _log_extracted_fact_state_aspects(
+    def _log_extracted_fact_info(
         self,
         *,
         segments: List[Dict[str, Any]],
@@ -598,13 +641,70 @@ class MemoryNodeManager:
         data = self._extract_memory_with_llm(segments)
         if data and data.get("facts"):
             return data
-        summary = self._episode_summary_from_segments(segments)
+        llm_episode_summary = self._summarize_episode_directly_with_llm(segments) or {}
+        summary = (
+            llm_episode_summary.get("summary")
+            or self._episode_summary_from_segments(segments)
+        )
+        title = (llm_episode_summary.get("title")
+                or self._episode_title_from_segments(segments)
+        )
         return {
-            "episode_title": self._episode_title_from_segments(segments),
+            "episode_title": title,
             "episode_summary": summary,
             "canonical_topics": self._topic_candidates(summary),
             "facts": [],
         }
+
+    def _summarize_episode_directly_with_llm(
+        self,
+        segments: List[Dict[str, Any]],
+    ) -> Optional[Dict[str, str]]:
+        if (
+            not segments
+            or not self._llm_api_key
+            or not self._llm_base_url
+            or str(self._llm_base_url).lower() == "none"
+        ):
+            return None
+        prompt_language = self._resolve_prompt_language_from_segments(segments)
+        prompt_template = (
+            EPISODE_SUMMARY_PROMPT_EN
+            if prompt_language == "en"
+            else EPISODE_SUMMARY_PROMPT_ZH
+        )
+        prompt = prompt_template.replace(
+            "{dialogue_batch}",
+            self._build_memory_segments_for_prompt(
+                segments,
+                prompt_language=prompt_language,
+            ),
+        )
+        for attempt in range(2):
+            result = self._call_llm(prompt)
+            parsed = self._parse_json_object_from_llm_text(result or "")
+            if parsed is not None:
+                title = _compact_whitespace(
+                    parsed.get("title")
+                    or parsed.get("episode_title")
+                    or ""
+                )
+                summary = _compact_whitespace(
+                    parsed.get("summary")
+                    or parsed.get("episode_summary")
+                    or ""
+                )
+                if summary:
+                    self._log_info("memory_store", "episode_summary_fallback", {
+                        "title": title,
+                        "summary": summary,
+                        "summary_chars": len(summary),
+                        "source_segment_count": len(segments),
+                    })
+                    return {"title": title, "summary": summary}
+            if attempt == 0:
+                logger.debug("Episode summary LLM fallback failed, retrying")
+        return None
 
     def _extract_memory_with_llm(self, segments: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         if not self._llm_api_key or not self._llm_base_url or str(self._llm_base_url).lower() == "none":
@@ -728,8 +828,15 @@ class MemoryNodeManager:
         raw_facts = data.get("facts")
         if not isinstance(raw_facts, list):
             return None
-        episode_summary = _compact_whitespace(
-            data.get("episode_summary") or self._episode_summary_from_segments(segments)
+        raw_episode_title = _compact_whitespace(data.get("episode_title") or "")
+        raw_episode_summary = _compact_whitespace(data.get("episode_summary") or "")
+        llm_episode_summary: Dict[str, str] = {}
+        if not raw_episode_title or not raw_episode_summary:
+            llm_episode_summary = self._summarize_episode_directly_with_llm(segments) or {}
+        episode_summary = (
+            raw_episode_summary
+            or llm_episode_summary.get("summary")
+            or self._episode_summary_from_segments(segments)
         )
         episode_topics = self._normalize_episode_canonical_topics(
             data.get("canonical_topics") or data.get("episode_canonical_topics"),
@@ -812,8 +919,10 @@ class MemoryNodeManager:
                 },
             })
         return {
-            "episode_title": _compact_whitespace(
-                data.get("episode_title") or self._episode_title_from_segments(segments)
+            "episode_title": (
+                raw_episode_title
+                or llm_episode_summary.get("title")
+                or self._episode_title_from_segments(segments)
             ),
             "episode_summary": episode_summary,
             "canonical_topics": episode_topics or self._topic_candidates(episode_summary),
@@ -1659,80 +1768,96 @@ class MemoryNodeManager:
             "metadata": {"turn_index": turn_index, "role": role},
         }
 
-    def _store_fact(
+    def _store_facts_info(
         self,
         *,
         episode_id: int,
-        fact: Dict[str, Any],
+        facts: List[Dict[str, Any]],
         tags: List[str],
         source_type: str,
         participants: List[str],
-    ) -> int:
-        embedding_text = "\n".join([
-            fact["summary"],
-            f"keywords: {fact['keywords']}",
-            f"entities: {', '.join(fact['entities'])}",
-            f"primary_entity: {(fact.get('primary_entity') or {}).get('name', '') if isinstance(fact.get('primary_entity'), dict) else ''}",
-        ])
-        embedding = self._embed(embedding_text)
-        fact_entities = self._fact_entity_names(fact)
-        entity_ids = self._entity_ids_for_names(fact_entities)
-        fact_id = self._db.insert_fact(
-            episode_id=episode_id,
-            source_type=source_type,
-            fact_type=fact["fact_type"],
-            fact_kind=fact["fact_kind"],
-            fact_subject=fact["fact_subject"],
-            summary=fact["summary"],
-            keywords=fact["keywords"],
-            entities=fact["entities"],
-            entity_ids=entity_ids,
-            canonical_topics=fact["canonical_topics"],
-            time_key=fact["time_key"],
-            confidence=fact["confidence"],
-            importance=fact["importance"],
-            metadata={
-                **fact["metadata"],
+    ) -> List[int]:
+        fact_ids: List[int] = []
+        for fact in facts:
+            keywords = fact.get("keywords") or ""
+            if isinstance(keywords, (list, tuple, set)):
+                keywords = " ".join(str(item).strip() for item in keywords if str(item).strip())
+            else:
+                keywords = str(keywords).strip()
+            entities = self._normalize_entity_names(fact.get("entities"))
+            canonical_topics = self._normalize_string_list(
+                fact.get("canonical_topics"),
+                limit=8,
+            ) or ["general"]
+            raw_metadata = fact.get("metadata")
+            metadata = dict(raw_metadata) if isinstance(raw_metadata, dict) else {}
+            embedding_text = "\n".join([
+                fact["summary"],
+                f"keywords: {keywords}",
+                f"entities: {', '.join(entities)}",
+                f"primary_entity: {(fact.get('primary_entity') or {}).get('name', '') if isinstance(fact.get('primary_entity'), dict) else ''}",
+            ])
+            embedding = self._embed(embedding_text)
+            fact_entities = self._fact_entity_names(fact)
+            entity_ids = self._entity_ids_for_names(fact_entities)
+            fact_metadata = {
+                **metadata,
                 "tags": tags,
                 "source_text": fact["source_text"],
                 "state_aspects": fact.get("state_aspects") or [],
-            },
-            embedding=embedding,
-            embedding_text=embedding_text,
-        )
-        memory_path = f"{source_type}/facts/{fact['fact_subject']}/{fact['fact_kind']}"
-        summary_card = self._truncate_index_text(fact["summary"], max_chars=760)
-        index_embedding_text = self._build_index_embedding_text(
-            title=fact["summary"][:96],
-            summary=summary_card,
-            keywords=fact["keywords"],
-            entities=fact["entities"],
-            canonical_topics=fact["canonical_topics"],
-            memory_path=memory_path,
-            max_summary_chars=620,
-        )
-        index_embedding = self._embed(index_embedding_text)
-        self._db.upsert_index_entry(
-            source_type=source_type,
-            target_table="memory_facts",
-            target_id=fact_id,
-            index_level="fact",
-            memory_path=memory_path,
-            title=fact["summary"][:96],
-            summary_for_retrieval=summary_card,
-            keywords=fact["keywords"],
-            entities=fact["entities"],
-            canonical_topics=fact["canonical_topics"],
-            participants=participants,
-            time_start=fact["time_key"].split("#", 1)[0],
-            time_end=fact["time_key"].split("#", 1)[0],
-            importance=fact["importance"],
-            confidence=fact["confidence"],
-            embedding=index_embedding,
-            embedding_text=index_embedding_text,
-            metadata={"tags": tags, **fact["metadata"], "state_aspects": fact.get("state_aspects") or []},
-        )
-        return fact_id
+            }
+            fact_id = self._db.insert_fact(
+                episode_id=episode_id,
+                source_type=source_type,
+                fact_type=fact["fact_type"],
+                fact_kind=fact["fact_kind"],
+                fact_subject=fact["fact_subject"],
+                summary=fact["summary"],
+                keywords=keywords,
+                entities=entities,
+                entity_ids=entity_ids,
+                canonical_topics=canonical_topics,
+                time_key=fact["time_key"],
+                confidence=fact["confidence"],
+                importance=fact["importance"],
+                metadata=fact_metadata,
+                embedding=embedding,
+                embedding_text=embedding_text,
+            )
+            memory_path = f"{source_type}/facts/{fact['fact_subject']}/{fact['fact_kind']}"
+            summary_card = self._truncate_index_text(fact["summary"], max_chars=760)
+            index_embedding_text = self._build_index_embedding_text(
+                title=fact["summary"][:96],
+                summary=summary_card,
+                keywords=keywords,
+                entities=entities,
+                canonical_topics=canonical_topics,
+                memory_path=memory_path,
+                max_summary_chars=620,
+            )
+            index_embedding = self._embed(index_embedding_text)
+            self._db.upsert_index_entry(
+                source_type=source_type,
+                target_table="memory_facts",
+                target_id=fact_id,
+                index_level="fact",
+                memory_path=memory_path,
+                title=fact["summary"][:96],
+                summary_for_retrieval=summary_card,
+                keywords=keywords,
+                entities=entities,
+                canonical_topics=canonical_topics,
+                participants=participants,
+                time_start=fact["time_key"].split("#", 1)[0],
+                time_end=fact["time_key"].split("#", 1)[0],
+                importance=fact["importance"],
+                confidence=fact["confidence"],
+                embedding=index_embedding,
+                embedding_text=index_embedding_text,
+                metadata=fact_metadata,
+            )
+            fact_ids.append(fact_id)
+        return fact_ids
 
     # ── Reflection: facts -> evolving states ─────────────────────────────
 

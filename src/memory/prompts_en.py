@@ -38,6 +38,28 @@ Entities must come from explicit conversation content or be directly determined 
 Each retained memory fact should usually include a subject entity, such as user/assistant/speaker, plus 1-4 core semantic anchors."""
 
 
+EPISODE_SUMMARY_PROMPT_EN = """You are the episode summarization module for a long-term memory system. Generate exactly one faithful, traceable, self-contained episode title and episode summary from the chronological dialogue/transcript segments below.
+
+Summary requirements:
+1. title must be short and specific enough to distinguish this episode from other episodes on the same broad topic. Avoid vague titles such as "health management" or "family communication".
+2. summary must preserve explicit key objects, participants, actions, recommendations, acceptance/refusal, constraints, reasons, conclusions, or unresolved issues from this episode.
+3. This is an episode-level faithful compression. Do not turn it into a long-term preference, profile, risk, or cross-episode observation.
+4. Use only input evidence. Do not import prior state, outside knowledge, or unsupported completion status.
+5. If the episode contains several related high-value points, express them in one complete summary rather than a vague topic statement.
+6. Ignore greetings, courtesy closings, and repeated low-value content.
+7. Return JSON only. No markdown.
+
+Output schema:
+{
+  "title": "short specific title",
+  "summary": "self-contained episode summary"
+}
+
+Dialogue/transcript segments:
+{dialogue_batch}
+"""
+
+
 UNIFIED_MEMORY_EXTRACTION_PROMPT_EN = """You are the memory extraction module for a unified AI-glasses memory system inspired by MemPalace.
 
 The system no longer treats assistant_wakeup and allday_recording as two separate memory products. Both sources enter one memory line:

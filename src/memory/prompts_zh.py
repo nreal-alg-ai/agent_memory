@@ -38,6 +38,28 @@ ENTITY_EXTRACTION_GUIDANCE_ZH = """实体提取规则:
 每条长期记忆 fact 通常至少包含主体实体（如 用户/助手/speaker）和 1-4 个核心语义锚点。"""
 
 
+EPISODE_SUMMARY_PROMPT_ZH = """你是长期记忆系统的 episode 摘要模块。请根据以下按时间顺序排列的对话/转写片段，只生成一个忠实、可追溯、自包含的 episode title 和 episode summary。
+
+摘要要求：
+1. title 必须简短具体，能区分同主题下的不同 episode，不要只写“健康管理”“家庭沟通”等宽泛主题。
+2. summary 必须保留当前 episode 中明确出现的关键对象、参与者、动作、建议、拒绝/接受、约束、原因、结论或未解决问题。
+3. summary 是 episode 级别的忠实压缩，不要提前归纳成长期偏好、画像、风险或跨 episode 观察。
+4. 只使用输入证据，不要补充历史 state、外部知识或未明说的完成状态。
+5. 如果对话包含多个相关信息点，用一段完整复句表达；不要写成空泛的“讨论了某主题”。
+6. 忽略寒暄、礼貌收尾和无复用价值的重复内容。
+7. 只返回 JSON，不要 markdown。
+
+输出格式：
+{
+  "title": "简短具体标题",
+  "summary": "可独立理解的 episode 摘要"
+}
+
+对话/转写片段：
+{dialogue_batch}
+"""
+
+
 UNIFIED_MEMORY_EXTRACTION_PROMPT_ZH = """你是 AI 眼镜长期记忆系统的记忆提炼模块。
 
 系统不再把 assistant_wakeup 和 allday_recording 当作两套彼此独立的记忆产品。两类来源都会进入同一条记忆线：
