@@ -4940,12 +4940,6 @@ class MemoryNodeManager:
                 return ", ".join(values)
             return _compact_whitespace(value)
 
-        def metadata_line(entry: Dict[str, Any]) -> str:
-            source = str(entry.get("source_type") or "unified")
-            target = f"{entry.get('target_table')}#{entry.get('target_id')}"
-            score = entry.get("_recall_score")
-            return f"   source: {source}; target: {target}; recall_score: {score}"
-
         grouped = {
             "state": [entry for entry in entries if entry.get("index_level") == "state"],
             "actionable_item": [
@@ -4990,18 +4984,15 @@ class MemoryNodeManager:
                 if group_key == "fact":
                     block_lines = [
                         f"{index}. [{time_text}] narrative fact",
-                        metadata_line(entry),
                         f"   fact_type: {raw.get('fact_type') or ''}; fact_kind: {raw.get('fact_kind') or ''}; subject: {raw.get('fact_subject') or ''}",
                         f"   summary: {raw.get('summary') or entry.get('summary_for_retrieval') or ''}",
                         f"   topics: {values_text(raw.get('canonical_topics'))}",
                         f"   entities: {values_text(raw.get('entities'))}",
-                        f"   keywords: {values_text(raw.get('keywords'))}",
                     ]
                 elif group_key == "state":
                     timeline = self._format_state_timeline(raw.get("time_line"))
                     block_lines = [
                         f"{index}. [{time_text}] long-term state",
-                        metadata_line(entry),
                         f"   state_scope: {raw.get('state_scope') or ''}; state_type: {raw.get('state_type') or ''}",
                         f"   canonical_name: {raw.get('canonical_name') or ''}",
                         f"   entity: {raw.get('entity_key') or ''}",
@@ -5012,7 +5003,6 @@ class MemoryNodeManager:
                 else:
                     block_lines = [
                         f"{index}. [{time_text}] actionable item",
-                        metadata_line(entry),
                         f"   item_type: {raw.get('item_type') or ''}; status: {raw.get('status') or ''}",
                         f"   canonical_name: {raw.get('canonical_name') or ''}",
                         f"   owner: {raw.get('owner') or ''}; due_at: {raw.get('due_at') or ''}",
