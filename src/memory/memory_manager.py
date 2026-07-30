@@ -87,6 +87,23 @@ _COURTESY_PATTERNS = (
     "you're welcome",
 )
 
+_ORDINARY_TIME_ENTITY_PATTERNS = (
+    r"^(今天|昨天|前天|明天|后天|上周|本周|下周|上个月|这个月|下个月|最近|近期)$",
+    r"^最近\d+(天|周|个月|月|年)$",
+    r"^过去\d+(天|周|个月|月|年)$",
+    r"^\d{4}[-/.]\d{1,2}[-/.]\d{1,2}$",
+    r"^\d{1,2}:\d{2}(?::\d{2})?$",
+    r"^\d+(分钟|小时|天|周|个月|月|年)$",
+    r"^(today|yesterday|tomorrow|last week|this week|next week|last month|this month|next month|recently|lately)$",
+    r"^(last|past|previous|next)\s+\d+\s+(day|days|week|weeks|month|months|year|years)$",
+    r"^\d{4}[-/.]\d{1,2}[-/.]\d{1,2}$",
+)
+
+_ATTRIBUTE_ONLY_ENTITY_PATTERNS = (
+    r"^(低|高|强|弱|轻|重|小|大|快|慢|短|长|稳定|灵活|固定|频繁|高频|低频|长期|短期).{0,8}$",
+    r"^(low|high|strong|weak|light|heavy|fast|slow|short|long|stable|flexible|fixed|frequent)\s+[\w -]{0,24}$",
+)
+
 _WEAK_TRY_PATTERNS = (
     "愿意尝试",
     "决定尝试",
@@ -465,6 +482,21 @@ class MemoryNodeManager:
             or self._topic_candidates(summary)
             or ["general"]
         )
+        facts = list(extracted.get("facts") or [])
+        if not facts:
+            for segment_index, segment in enumerate(segments, 1):
+                fallback_facts = self._extract_segment_facts(segment, segment_index=segment_index)
+                for fact in fallback_facts:
+                    if not fact.get("canonical_topics"):
+                        fact["canonical_topics"] = canonical_topics
+                facts.extend(fallback_facts)
+        episode_entity_names = self._episode_entity_names(
+            participants=participants,
+            segments=segments,
+            facts=facts,
+            summary=summary,
+        )
+        episode_entity_ids = self._entity_ids_for_names(episode_entity_names)
         episode_id = self._db.insert_episode(
             source_type=source_type,
             episode_type=episode_type,
@@ -473,10 +505,12 @@ class MemoryNodeManager:
             participants=participants,
             started_at=started_at,
             ended_at=ended_at,
+            entity_ids=episode_entity_ids,
             metadata={
                 "tags": tags,
                 "segment_count": len(segments),
                 "canonical_topics": canonical_topics,
+                "entities": episode_entity_names,
                 "source_ref": source_ref,
             },
         )
@@ -495,14 +529,6 @@ class MemoryNodeManager:
         )
 
         fact_count = 0
-        facts = extracted.get("facts") or []
-        if not facts:
-            for segment_index, segment in enumerate(segments, 1):
-                fallback_facts = self._extract_segment_facts(segment, segment_index=segment_index)
-                for fact in fallback_facts:
-                    if not fact.get("canonical_topics"):
-                        fact["canonical_topics"] = canonical_topics
-                facts.extend(fallback_facts)
         for fact in facts:
             self._store_fact(
                 episode_id=episode_id,
@@ -861,6 +887,88 @@ class MemoryNodeManager:
             seen.add(key)
             participants.append(speaker)
         return participants or ["unknown_speaker"]
+
+    @staticmethod
+    def _append_unique_text(values: List[str], value: Any, *, limit: int = 64) -> None:
+        text = _compact_whitespace(value)
+        if not text:
+            return
+        seen = {item.lower() for item in values}
+        if text.lower() in seen:
+            return
+        values.append(text)
+        if len(values) > limit:
+            del values[limit:]
+
+    def _entity_ids_for_names(self, names: Sequence[Any], *, limit: int = 64) -> List[int]:
+        normalized: List[str] = []
+        for name in names or []:
+            self._append_unique_text(normalized, name, limit=limit)
+        mapping = self._db.add_entity_names(normalized)
+        ids: List[int] = []
+        for name in normalized:
+            entity_id = mapping.get(name)
+            if entity_id and entity_id not in ids:
+                ids.append(entity_id)
+        return ids
+
+    def _entity_ids_from_names_and_facts(
+        self,
+        *,
+        names: Sequence[Any],
+        facts: Sequence[Dict[str, Any]],
+        limit: int = 64,
+    ) -> List[int]:
+        ids: List[int] = []
+        for fact in facts or []:
+            for value in fact.get("entity_ids") or []:
+                try:
+                    entity_id = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if entity_id and entity_id not in ids:
+                    ids.append(entity_id)
+                if len(ids) >= limit:
+                    return ids
+        for entity_id in self._entity_ids_for_names(names, limit=limit):
+            if entity_id not in ids:
+                ids.append(entity_id)
+            if len(ids) >= limit:
+                break
+        return ids
+
+    def _fact_entity_names(self, fact: Dict[str, Any]) -> List[str]:
+        names: List[str] = []
+        for entity in self._normalize_entity_names(fact.get("entities"), limit=32):
+            self._append_unique_text(names, entity)
+        primary = fact.get("primary_entity")
+        if isinstance(primary, dict):
+            self._append_unique_text(names, primary.get("name") or primary.get("text"))
+        else:
+            self._append_unique_text(names, primary)
+        return names
+
+    def _episode_entity_names(
+        self,
+        *,
+        participants: Sequence[str],
+        segments: Sequence[Dict[str, Any]],
+        facts: Sequence[Dict[str, Any]],
+        summary: str,
+    ) -> List[str]:
+        names: List[str] = []
+        for participant in participants or []:
+            self._append_unique_text(names, participant)
+        for fact in facts or []:
+            for entity in self._fact_entity_names(fact):
+                self._append_unique_text(names, entity)
+        for entity in self._entities(summary):
+            self._append_unique_text(names, entity)
+        if not names:
+            for segment in segments[:12]:
+                for entity in self._entities(segment.get("text") or ""):
+                    self._append_unique_text(names, entity)
+        return names
 
     def _build_memory_segments_for_prompt(
         self,
@@ -1430,6 +1538,8 @@ class MemoryNodeManager:
             f"primary_entity: {(fact.get('primary_entity') or {}).get('name', '') if isinstance(fact.get('primary_entity'), dict) else ''}",
         ])
         embedding = self._embed(embedding_text)
+        fact_entities = self._fact_entity_names(fact)
+        entity_ids = self._entity_ids_for_names(fact_entities)
         fact_id = self._db.insert_fact(
             episode_id=episode_id,
             source_type=source_type,
@@ -1439,6 +1549,7 @@ class MemoryNodeManager:
             summary=fact["summary"],
             keywords=fact["keywords"],
             entities=fact["entities"],
+            entity_ids=entity_ids,
             canonical_topics=fact["canonical_topics"],
             time_key=fact["time_key"],
             confidence=fact["confidence"],
@@ -1447,7 +1558,6 @@ class MemoryNodeManager:
             embedding=embedding,
             embedding_text=embedding_text,
         )
-        self._db.add_entity_names(fact["entities"])
         memory_path = f"{source_type}/facts/{fact['fact_subject']}/{fact['fact_kind']}"
         summary_card = self._truncate_index_text(fact["summary"], max_chars=760)
         index_embedding_text = self._build_index_embedding_text(
@@ -2910,6 +3020,14 @@ class MemoryNodeManager:
                 or state_metadata.get("entity")
                 or ""
             )
+        evidence_facts = self._db.memory_facts_by_ids(evidence_fact_ids)
+        entity_names = list(entities or [])
+        if entity_key:
+            entity_names.append(entity_key)
+        entity_ids = self._entity_ids_from_names_and_facts(
+            names=entity_names,
+            facts=evidence_facts,
+        )
         embedding_text = "\n".join([
             state["canonical_name"],
             state["summary"],
@@ -2927,6 +3045,7 @@ class MemoryNodeManager:
             canonical_name=state["canonical_name"],
             summary=state["summary"],
             time_line=state.get("time_line") or [],
+            entity_ids=entity_ids,
             evidence_fact_ids=evidence_fact_ids,
             confidence=state["confidence"],
             metadata={
@@ -2947,7 +3066,7 @@ class MemoryNodeManager:
             # the same text in the index so retrieval sees exactly that snapshot.
             summary_card = _compact_whitespace(state["summary"])
             evidence_time_start, evidence_time_end = self._event_time_bounds_from_facts(
-                self._db.memory_facts_by_ids(evidence_fact_ids),
+                evidence_facts,
             )
             index_embedding_text = self._build_index_embedding_text(
                 title=state["canonical_name"],
@@ -3192,6 +3311,11 @@ class MemoryNodeManager:
         entities = item.get("entities") or self._entities(item["summary"])
         canonical_topics = item.get("canonical_topics") or [item["canonical_name"]]
         evidence_fact_ids = [int(value) for value in item.get("evidence_fact_ids") or []]
+        evidence_facts = self._db.memory_facts_by_ids(evidence_fact_ids)
+        entity_ids = self._entity_ids_from_names_and_facts(
+            names=[*entities, item.get("owner") or ""],
+            facts=evidence_facts,
+        )
         embedding_text = "\n".join([
             item["canonical_name"],
             item["summary"],
@@ -3211,6 +3335,7 @@ class MemoryNodeManager:
             owner=item["owner"],
             status=item["status"],
             due_at=item["due_at"],
+            entity_ids=entity_ids,
             evidence_fact_ids=evidence_fact_ids,
             confidence=item["confidence"],
             importance=item["importance"],
@@ -3226,7 +3351,7 @@ class MemoryNodeManager:
             memory_path = f"{item['source_type']}/actionable_items/{item['item_type']}"
             summary_card = self._truncate_index_text(item["summary"], max_chars=700)
             evidence_time_start, evidence_time_end = self._event_time_bounds_from_facts(
-                self._db.memory_facts_by_ids(evidence_fact_ids),
+                evidence_facts,
             )
             index_embedding_text = self._build_index_embedding_text(
                 title=item["canonical_name"],
@@ -5094,7 +5219,7 @@ class MemoryNodeManager:
         entities: List[str] = []
         for match in re.findall(r"\b[A-Z][A-Za-z0-9'&.-]*(?:\s+[A-Z][A-Za-z0-9'&.-]*){0,4}\b", str(text or "")):
             clean = _compact_whitespace(match)
-            if clean.lower() not in _STOPWORDS and clean not in entities:
+            if self._is_valid_entity_name(clean) and clean not in entities:
                 entities.append(clean)
             if len(entities) >= 12:
                 break
@@ -5253,13 +5378,50 @@ class MemoryNodeManager:
                 text = _compact_whitespace(item.get("name") or item.get("text") or "")
             else:
                 text = _compact_whitespace(item)
-            if not text or text in seen:
+            if not MemoryNodeManager._is_valid_entity_name(text) or text in seen:
                 continue
             seen.add(text)
             out.append(text)
             if len(out) >= limit:
                 break
         return out
+
+    @staticmethod
+    def _is_valid_entity_name(value: Any) -> bool:
+        """Validate entity anchors using the shared extraction guidance."""
+        text = _compact_whitespace(value).strip("'\".,:;!?，。！？、；：（）()[]{}")
+        if not text:
+            return False
+        lower = text.lower()
+        if lower in _STOPWORDS:
+            return False
+        if any(pattern in lower for pattern in _COURTESY_PATTERNS):
+            return False
+        if re.search(r"[。！？!?；;，,]", text):
+            return False
+        if len(text) > 48:
+            return False
+        if any(
+            re.fullmatch(pattern, text, flags=re.IGNORECASE)
+            for pattern in _ORDINARY_TIME_ENTITY_PATTERNS
+        ):
+            return False
+        if any(
+            re.fullmatch(pattern, text, flags=re.IGNORECASE)
+            for pattern in _ATTRIBUTE_ONLY_ENTITY_PATTERNS
+        ):
+            if not re.search(
+                r"(工作|压力|负担|时间|作息|活动|场景|问题|任务|状态|沟通|管理|"
+                r"fatigue|burden|pressure|schedule|activity|scenario|task|condition|communication|management)",
+                lower,
+            ):
+                return False
+        chinese_chars = re.findall(r"[\u4e00-\u9fff]", text)
+        if chinese_chars and len(chinese_chars) > 16:
+            return False
+        if not chinese_chars and len(text.split()) > 5:
+            return False
+        return len(text) > 1
 
     @classmethod
     def _normalize_primary_entity(

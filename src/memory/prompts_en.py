@@ -1,5 +1,43 @@
 """English prompt templates for the unified memory prototype."""
 
+ENTITY_EXTRACTION_GUIDANCE_EN = """Entity extraction rules:
+
+Entities are not limited to traditional named entities. In this memory system, an entity is a semantic anchor that can be reused across facts for clustering, retrieval, and graph construction.
+Prefer nouns or short noun phrases with long-term memory value instead of only proper names.
+
+Allowed entity type values:
+- PERSON: specific people, names, roles, or speakers mentioned in the conversation
+- ORGANIZATION: companies, teams, institutions, or groups
+- LOCATION: geographic locations or venues
+- PRODUCT: products or services
+- PROJECT: projects, product names, or long-running work items
+- TECHNOLOGY: technology stacks, frameworks, libraries, tools, APIs, or systems
+- CONCEPT: abstract concepts, methods, theories, or reusable ideas
+- TOPIC: discussed domains or subject areas
+- PREFERENCE: user preferences, likes, habits, or dislikes
+- OTHER: explicitly mentioned entities that do not fit the above types
+
+Entities that should be extracted include:
+- Conversation subjects or roles, such as user, assistant, speaker_1, speaker_2, spouse, child, team, or client
+- User-relevant domains, problems, tasks, states, or scenarios, such as health management, physical condition, work, business events, family education, communication, or fatigue
+- Reusable plans, methods, tools, activities, or objects, such as healthy eating, family meetings, shared rules, picnics, or yoga mats
+- Constraint objects or conditions that affect user choices, such as financial burden, fixed schedule, time shortage, or work pressure
+
+Do not extract ordinary time expressions as entities, such as today, yesterday, last week, the past three days, 2026-05-07, 10:30, or three months.
+Time should be stored as fact time metadata, not in the entity graph.
+Only named time concepts with semantic identity may be entities, such as Spring Festival, Q3 earnings season, or Sprint 42.
+
+Do not extract pure attributes, adjective-only phrases, isolated degree words, or generic labels as entities; keep them in fact text, keywords, topics, or states instead.
+For example: low venue dependence, low intensity, high priority, low cost, strong privacy, lightweight.
+If a phrase contains a reusable object or scenario, extract the core object or scenario:
+- "fatigue caused by long-term high-intensity work" may yield "work" and "fatigue"
+- "high-frequency business activities" may yield "business activities"
+- "the financial burden is too heavy" may yield "financial burden"
+
+Entities must come from explicit conversation content or be directly determined by a role/fact subject. Do not over-infer.
+Each retained memory fact should usually include a subject entity, such as user/assistant/speaker, plus 1-4 core semantic anchors."""
+
+
 UNIFIED_MEMORY_EXTRACTION_PROMPT_EN = """You are the memory extraction module for a unified AI-glasses memory system inspired by MemPalace.
 
 The system no longer treats assistant_wakeup and allday_recording as two separate memory products. Both sources enter one memory line:
@@ -33,6 +71,8 @@ memory_states usage rules:
 - Every fact must also output one `primary_entity`, the single entity that the fact mainly describes, affects, or belongs to; it must be one object, not an array.
 - `primary_entity` must come from the fact's `entities`. Do not choose an entity merely because it is mentioned, provides a recommendation, or is a location, tool, or background context. For a multi-person exchange, choose the person or entity mainly described or affected by the fact; for a fact about the user's own preference, habit, constraint, or risk, choose the user.
 - Keep `entities` for all directly relevant entities so retrieval preserves participants and context; downstream entity-state matching uses only `primary_entity`, so one fact must not be assigned to multiple entities.
+
+""" + ENTITY_EXTRACTION_GUIDANCE_EN + """
 
 Core Hindsight-style narrative fact requirements:
 - Each fact should cover a complete exchange or a clear topic segment, not a single utterance. Do not mechanically split "the user raised a problem", "the assistant suggested a solution", and "the user accepted/rejected it" into separate fragments; if they respond to the same issue, merge them into one narrative fact.

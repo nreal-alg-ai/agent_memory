@@ -103,6 +103,7 @@ class SessionDB:
                 title TEXT NOT NULL DEFAULT '',
                 summary TEXT NOT NULL DEFAULT '',
                 participants TEXT NOT NULL DEFAULT '[]',
+                entity_ids TEXT NOT NULL DEFAULT '[]',
                 started_at TEXT,
                 ended_at TEXT,
                 metadata TEXT NOT NULL DEFAULT '{}',
@@ -120,6 +121,7 @@ class SessionDB:
                 summary TEXT NOT NULL,
                 keywords TEXT NOT NULL DEFAULT '',
                 entities TEXT NOT NULL DEFAULT '[]',
+                entity_ids TEXT NOT NULL DEFAULT '[]',
                 canonical_topics TEXT NOT NULL DEFAULT '[]',
                 time_key TEXT NOT NULL DEFAULT '',
                 confidence REAL NOT NULL DEFAULT 0.85,
@@ -142,6 +144,7 @@ class SessionDB:
                 canonical_name TEXT NOT NULL,
                 summary TEXT NOT NULL,
                 time_line TEXT NOT NULL DEFAULT '[]',
+                entity_ids TEXT NOT NULL DEFAULT '[]',
                 evidence_fact_ids TEXT NOT NULL DEFAULT '[]',
                 confidence REAL NOT NULL DEFAULT 0.75,
                 metadata TEXT NOT NULL DEFAULT '{}',
@@ -161,6 +164,7 @@ class SessionDB:
                 owner TEXT NOT NULL DEFAULT 'unknown',
                 status TEXT NOT NULL DEFAULT 'unknown',
                 due_at TEXT NOT NULL DEFAULT '',
+                entity_ids TEXT NOT NULL DEFAULT '[]',
                 evidence_fact_ids TEXT NOT NULL DEFAULT '[]',
                 confidence REAL NOT NULL DEFAULT 0.75,
                 importance REAL NOT NULL DEFAULT 0.6,
@@ -217,11 +221,29 @@ class SessionDB:
             ON memory_actionable_items(source_type, item_type, status);
             """
         )
+        self._ensure_entity_ids_schema()
         self._ensure_memory_states_scope_schema()
         self._ensure_memory_states_time_line_schema()
         self._ensure_memory_states_entity_key_schema()
         self._init_index_fts()
         self._conn.commit()
+
+    def _ensure_entity_ids_schema(self) -> None:
+        """Ensure all primary memory tables expose direct entity id mappings."""
+        for table in (
+            "memory_episodes",
+            "memory_facts",
+            "memory_states",
+            "memory_actionable_items",
+        ):
+            columns = {
+                str(row["name"])
+                for row in self._conn.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+            if "entity_ids" not in columns:
+                self._conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN entity_ids TEXT NOT NULL DEFAULT '[]'"
+                )
 
     def _ensure_memory_states_scope_schema(self) -> None:
         """Normalize the state scope columns for databases created earlier."""
@@ -283,6 +305,7 @@ class SessionDB:
                 canonical_name TEXT NOT NULL,
                 summary TEXT NOT NULL,
                 time_line TEXT NOT NULL DEFAULT '[]',
+                entity_ids TEXT NOT NULL DEFAULT '[]',
                 evidence_fact_ids TEXT NOT NULL DEFAULT '[]',
                 confidence REAL NOT NULL DEFAULT 0.75,
                 metadata TEXT NOT NULL DEFAULT '{}',
@@ -308,17 +331,18 @@ class SessionDB:
                 """
                 INSERT INTO memory_states (
                     id, state_scope, state_type, source_type, entity_key,
-                    canonical_name, summary, time_line, evidence_fact_ids,
+                    canonical_name, summary, time_line, entity_ids, evidence_fact_ids,
                     confidence, metadata, embedding, embedding_text,
                     created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     row["id"], row["state_scope"], row["state_type"],
                     row["source_type"], entity_key, row["canonical_name"],
-                    row["summary"], row["time_line"], row["evidence_fact_ids"],
-                    row["confidence"], row["metadata"], row["embedding"],
-                    row["embedding_text"], row["created_at"], row["updated_at"],
+                    row["summary"], row["time_line"], row["entity_ids"],
+                    row["evidence_fact_ids"], row["confidence"], row["metadata"],
+                    row["embedding"], row["embedding_text"], row["created_at"],
+                    row["updated_at"],
                 ),
             )
         self._conn.execute("DROP TABLE memory_states_legacy")
@@ -440,6 +464,7 @@ class SessionDB:
         participants: Sequence[str],
         started_at: str,
         ended_at: str,
+        entity_ids: Optional[Sequence[int]] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> int:
         now = utc_now_text()
@@ -447,8 +472,8 @@ class SessionDB:
             """
             INSERT INTO memory_episodes (
                 source_type, episode_type, title, summary, participants,
-                started_at, ended_at, metadata, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                entity_ids, started_at, ended_at, metadata, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 source_type,
@@ -456,6 +481,7 @@ class SessionDB:
                 title,
                 summary,
                 _json_dumps(list(participants or [])),
+                _json_dumps([int(value) for value in entity_ids or []]),
                 started_at,
                 ended_at,
                 _json_dumps(metadata or {}),
@@ -476,6 +502,7 @@ class SessionDB:
         canonical_name: str,
         summary: str,
         time_line: Optional[Sequence[Dict[str, Any]]],
+        entity_ids: Optional[Sequence[int]],
         evidence_fact_ids: Sequence[int],
         confidence: float,
         metadata: Optional[Dict[str, Any]],
@@ -496,6 +523,7 @@ class SessionDB:
             normalized_name,
             str(summary or "").strip(),
             _json_dumps(list(time_line or [])),
+            _json_dumps([int(value) for value in entity_ids or []]),
             _json_dumps([int(value) for value in evidence_fact_ids or []]),
             float(confidence),
             _json_dumps(metadata or {}),
@@ -517,7 +545,7 @@ class SessionDB:
             self._conn.execute(
                 """
                 UPDATE memory_states
-                SET summary = ?, time_line = ?, evidence_fact_ids = ?, confidence = ?,
+                SET summary = ?, time_line = ?, entity_ids = ?, evidence_fact_ids = ?, confidence = ?,
                     metadata = ?, embedding = ?, embedding_text = ?, updated_at = ?
                 WHERE id = ?
                 """,
@@ -528,9 +556,9 @@ class SessionDB:
                 """
                 INSERT INTO memory_states (
                     state_scope, state_type, source_type, entity_key, canonical_name, summary,
-                    time_line, evidence_fact_ids, confidence, metadata, embedding,
+                    time_line, entity_ids, evidence_fact_ids, confidence, metadata, embedding,
                     embedding_text, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (*values, now, now),
             )
@@ -558,6 +586,7 @@ class SessionDB:
         owner: str,
         status: str,
         due_at: str,
+        entity_ids: Optional[Sequence[int]],
         evidence_fact_ids: Sequence[int],
         confidence: float,
         importance: float,
@@ -570,14 +599,15 @@ class SessionDB:
             """
             INSERT INTO memory_actionable_items (
                 item_type, source_type, canonical_name, summary, owner,
-                status, due_at, evidence_fact_ids, confidence, importance,
+                status, due_at, entity_ids, evidence_fact_ids, confidence, importance,
                 metadata, embedding, embedding_text, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(source_type, item_type, canonical_name) DO UPDATE SET
                 summary = excluded.summary,
                 owner = excluded.owner,
                 status = excluded.status,
                 due_at = excluded.due_at,
+                entity_ids = excluded.entity_ids,
                 evidence_fact_ids = excluded.evidence_fact_ids,
                 confidence = excluded.confidence,
                 importance = excluded.importance,
@@ -594,6 +624,7 @@ class SessionDB:
                 str(owner or "unknown").strip(),
                 str(status or "unknown").strip(),
                 str(due_at or "").strip(),
+                _json_dumps([int(value) for value in entity_ids or []]),
                 _json_dumps([int(value) for value in evidence_fact_ids or []]),
                 float(confidence),
                 float(importance),
@@ -725,6 +756,7 @@ class SessionDB:
         summary: str,
         keywords: str,
         entities: Sequence[str],
+        entity_ids: Optional[Sequence[int]],
         canonical_topics: Sequence[str],
         time_key: str,
         confidence: float,
@@ -738,10 +770,10 @@ class SessionDB:
             """
             INSERT INTO memory_facts (
                 episode_id, source_type, fact_type, fact_kind, fact_subject,
-                summary, keywords, entities, canonical_topics, time_key,
+                summary, keywords, entities, entity_ids, canonical_topics, time_key,
                 confidence, importance, metadata, embedding, embedding_text,
                 created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 episode_id,
@@ -752,6 +784,7 @@ class SessionDB:
                 summary,
                 keywords,
                 _json_dumps(list(entities or [])),
+                _json_dumps([int(value) for value in entity_ids or []]),
                 _json_dumps(list(canonical_topics or [])),
                 time_key,
                 float(confidence),
@@ -861,17 +894,27 @@ class SessionDB:
         self._conn.commit()
         return row_id
 
-    def add_entity_names(self, names: Iterable[str]) -> None:
+    def add_entity_names(self, names: Iterable[str]) -> Dict[str, int]:
         now = utc_now_text()
+        normalized: List[str] = []
         for name in names:
             clean = str(name or "").strip()
-            if not clean:
+            if not clean or clean in normalized:
                 continue
+            normalized.append(clean)
             self._conn.execute(
                 "INSERT OR IGNORE INTO entity_nodes (name, type, created_at) VALUES (?, ?, ?)",
                 (clean, "OTHER", now),
             )
         self._conn.commit()
+        if not normalized:
+            return {}
+        placeholders = ",".join("?" for _ in normalized)
+        rows = self._conn.execute(
+            f"SELECT id, name FROM entity_nodes WHERE name IN ({placeholders})",
+            normalized,
+        ).fetchall()
+        return {str(row["name"]): int(row["id"]) for row in rows}
 
     def search_index_entries(
         self,
@@ -1122,7 +1165,7 @@ class SessionDB:
         return self._search_memory_rows(
             table="memory_facts",
             searchable_fields=(
-                "summary", "keywords", "entities", "canonical_topics",
+                "summary", "keywords", "entities", "entity_ids", "canonical_topics",
                 "fact_kind", "fact_subject", "embedding_text", "metadata",
             ),
             time_field="time_key",
@@ -1145,7 +1188,7 @@ class SessionDB:
         return self._search_memory_rows(
             table="memory_states",
             searchable_fields=(
-                "canonical_name", "summary", "time_line", "entity_key",
+                "canonical_name", "summary", "time_line", "entity_ids", "entity_key",
                 "state_scope", "state_type", "embedding_text", "metadata",
             ),
             time_field="updated_at",
@@ -1169,7 +1212,7 @@ class SessionDB:
             table="memory_actionable_items",
             searchable_fields=(
                 "canonical_name", "summary", "item_type", "owner", "status",
-                "due_at", "embedding_text", "metadata",
+                "due_at", "entity_ids", "embedding_text", "metadata",
             ),
             time_field="updated_at",
             terms=terms,
@@ -1234,6 +1277,7 @@ class SessionDB:
         item = dict(row)
         for key in (
             "entities",
+            "entity_ids",
             "canonical_topics",
             "participants",
             "metadata",
