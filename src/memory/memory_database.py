@@ -697,7 +697,7 @@ class SessionDB:
         self._conn.commit()
         return int(cur.rowcount or 0)
 
-    def recent_states(
+    def get_recent_memory_states(
         self,
         *,
         source_types: Optional[Sequence[str]] = None,

@@ -688,7 +688,7 @@ def main() -> int:
                 # does not collide on "#00" across turns in the same sample.
                 turn_timestamp = base_turn_timestamp + timedelta(hours=hour_offset, seconds=turn_index)
                 before_id = db._conn.execute("SELECT COALESCE(MAX(id), 0) AS max_id FROM memory_facts").fetchone()["max_id"]
-                pending_before = list(manager._pending_store_turns)
+                pending_before = list(manager._pending_interaction_turns)
                 pending_with_current = pending_before + [{
                     "user_message": user,
                     "assistant_response": assistant,
@@ -725,7 +725,7 @@ def main() -> int:
                     "source_turn_count": (
                         len(pending_before) + 1 if extraction_due else 0
                     ),
-                    "pending_turn_count": len(manager._pending_store_turns),
+                    "pending_turn_count": len(manager._pending_interaction_turns),
                     "stored": bool(ok),
                     "fact_count": len(nodes),
                     "user": user,
@@ -743,7 +743,7 @@ def main() -> int:
                     turn_index,
                     extraction_due,
                     len(pending_before) + 1 if extraction_due else 0,
-                    len(manager._pending_store_turns),
+                    len(manager._pending_interaction_turns),
                     ok,
                     len(nodes),
                 )
@@ -789,7 +789,7 @@ def main() -> int:
         "facts_stored": stored_facts,
         "min_dialogue_turns_before_store": manager._min_dialogue_turns_before_store,
         "max_dialogue_chars_before_store": manager._max_dialogue_chars_before_store,
-        "pending_turns": len(manager._pending_store_turns),
+        "pending_turns": len(manager._pending_interaction_turns),
         "reflect_runs": reflect_runs,
         "llm_model": args.llm_model,
         "llm_base_url": args.llm_base_url,

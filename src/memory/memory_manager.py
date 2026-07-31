@@ -271,7 +271,7 @@ class MemoryNodeManager:
                 or 2000
             ),
         )
-        self._pending_store_turns: List[Dict[str, Any]] = []
+        self._pending_interaction_turns: List[Dict[str, Any]] = []
         self._embedding_client: Optional[EmbeddingClient] = None
         self._enable_topic_state_resolution = self._config_bool(
             self._memory_cfg.get("enable_topic_state_resolution", True),
@@ -402,30 +402,30 @@ class MemoryNodeManager:
         }
         if not turn["user_message"] and not turn["assistant_response"]:
             return False
-        self._pending_store_turns.append(turn)
+        self._pending_interaction_turns.append(turn)
         pending_chars = sum(
             len(item.get("user_message", "")) + len(item.get("assistant_response", ""))
-            for item in self._pending_store_turns
+            for item in self._pending_interaction_turns
         )
         if (
-            len(self._pending_store_turns) >= self._min_dialogue_turns_before_store
+            len(self._pending_interaction_turns) >= self._min_dialogue_turns_before_store
             or pending_chars >= self._max_dialogue_chars_before_store
         ):
-            return self.flush_pending_store_turns()
+            return self.flush_pending_interaction_turns()
         return False
 
-    def flush_pending_store_turns(self) -> bool:
-        if not self._pending_store_turns:
+    def flush_pending_interaction_turns(self) -> bool:
+        if not self._pending_interaction_turns:
             return False
-        turns = list(self._pending_store_turns)
-        self._pending_store_turns.clear()
-        return self._store_interaction_episode(turns)
+        turns = list(self._pending_interaction_turns)
+        self._pending_interaction_turns.clear()
+        return self._process_interaction_turns(turns)
 
-    def _store_interaction_episode(self, turns: List[Dict[str, Any]]) -> bool:
-        segments = self._turns_to_memory_segments(turns)
+    def _process_interaction_turns(self, turns: List[Dict[str, Any]]) -> bool:
+        raw_segments = self._convert_interaction_turns_to_memory_raw_segments(turns)
         tags = sorted({tag for turn in turns for tag in turn.get("tags", [])})
         return self._store_memory_episode(
-            segments=segments,
+            raw_segments=raw_segments,
             source_type="assistant_wakeup",
             episode_type="interaction",
             tags=tags,
@@ -444,11 +444,11 @@ class MemoryNodeManager:
         """Store a multi-speaker transcript episode using the unified pipeline."""
         if not self._enabled:
             return False
-        normalized = self._normalize_transcript_segments(segments)
-        if not normalized:
+        raw_segments = self._normalize_transcript_segments_into_memory_raw_segments(segments)
+        if not raw_segments:
             return False
         return self._store_memory_episode(
-            segments=normalized,
+            raw_segments=raw_segments,
             source_type=source_type,
             episode_type=episode_type,
             tags=list(tags or []),
@@ -465,25 +465,25 @@ class MemoryNodeManager:
     def _store_memory_episode(
         self,
         *,
-        segments: List[Dict[str, Any]],
+        raw_segments: List[Dict[str, Any]],
         source_type: str,
         episode_type: str,
         tags: List[str],
         source_ref: str = "",
     ) -> bool:
-        if not segments:
+        if not raw_segments:
             return False
-        participants = self._participants_from_segments(segments)
-        started_at = segments[0].get("started_at") or _now_text()
-        ended_at = segments[-1].get("ended_at") or started_at
-        extracted = self._extract_memory_from_segments(segments)
+        participants = self._parse_participants_from_raw_segments(raw_segments)
+        started_at = raw_segments[0].get("started_at") or _now_text()
+        ended_at = raw_segments[-1].get("ended_at") or started_at
+        extracted = self._extract_memory_fact_from_raw_segments(raw_segments)
         episode_title = (
             _compact_whitespace(extracted.get("episode_title") or "")
-            or self._episode_title_from_segments(segments)
+            or self._fallback_generate_episode_title_from_raw_segments(raw_segments)
         )
         episode_summary = (
             _compact_whitespace(extracted.get("episode_summary") or "")
-            or self._episode_summary_from_segments(segments)
+            or self._fallback_generate_episode_summary_from_raw_segments(raw_segments)
         )
         canonical_topics = (
             extracted.get("canonical_topics")
@@ -493,7 +493,7 @@ class MemoryNodeManager:
         facts = list(extracted.get("facts") or [])
         
         self._log_extracted_fact_info(
-            segments=segments,
+            raw_segments=raw_segments,
             facts=facts,
             source_type=source_type,
             episode_type=episode_type,
@@ -502,7 +502,7 @@ class MemoryNodeManager:
 
         episode_info = self._store_extracted_episode_info(
             participants=participants,
-            segments=segments,
+            raw_segments=raw_segments,
             facts=facts,
             source_type=source_type,
             episode_type=episode_type,
@@ -530,7 +530,7 @@ class MemoryNodeManager:
         self,
         *,
         participants: List[str],
-        segments: List[Dict[str, Any]],
+        raw_segments: List[Dict[str, Any]],
         facts: List[Dict[str, Any]],
         source_type: str,
         episode_type: str,
@@ -544,7 +544,7 @@ class MemoryNodeManager:
     ) -> Dict[str, Any]:
         episode_entity_names = self._episode_entity_names(
             participants=participants,
-            segments=segments,
+            segments=raw_segments,
             facts=facts,
             summary=episode_summary,
         )
@@ -560,7 +560,7 @@ class MemoryNodeManager:
             entity_ids=episode_entity_ids,
             metadata={
                 "tags": tags,
-                "segment_count": len(segments),
+                "segment_count": len(raw_segments),
                 "canonical_topics": canonical_topics,
                 "entities": episode_entity_names,
                 "source_ref": source_ref,
@@ -593,7 +593,7 @@ class MemoryNodeManager:
     def _log_extracted_fact_info(
         self,
         *,
-        segments: List[Dict[str, Any]],
+        raw_segments: List[Dict[str, Any]],
         facts: List[Dict[str, Any]],
         source_type: str,
         episode_type: str,
@@ -609,10 +609,10 @@ class MemoryNodeManager:
                 "episode_type": episode_type,
                 "source_ref": source_ref,
                 "raw_segments": self._build_memory_segments_for_prompt(
-                    segments,
-                    prompt_language=self._resolve_prompt_language_from_segments(segments),
+                    raw_segments,
+                    prompt_language=self._resolve_prompt_language_from_segments(raw_segments),
                 ),
-                "source_segment_count": len(segments),
+                "source_segment_count": len(raw_segments),
             },
         )
         for index, fact in enumerate(facts, 1):
@@ -632,22 +632,18 @@ class MemoryNodeManager:
                 },
             )
 
-    def _extract_memory_from_turns(self, turns: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def _extract_memory_fact_from_raw_segments(self, raw_segments: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Extract episode metadata and facts with LLM, falling back to heuristics."""
-        return self._extract_memory_from_segments(self._turns_to_memory_segments(turns))
-
-    def _extract_memory_from_segments(self, segments: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Extract episode metadata and facts with LLM, falling back to heuristics."""
-        data = self._extract_memory_with_llm(segments)
+        data = self._extract_memory_fact_with_llm(raw_segments)
         if data and data.get("facts"):
             return data
-        llm_episode_summary = self._summarize_episode_directly_with_llm(segments) or {}
+        llm_episode_summary = self._generate_episode_summary_directly_with_llm(raw_segments) or {}
         summary = (
             llm_episode_summary.get("summary")
-            or self._episode_summary_from_segments(segments)
+            or self._fallback_generate_episode_summary_from_raw_segments(raw_segments)
         )
         title = (llm_episode_summary.get("title")
-                or self._episode_title_from_segments(segments)
+                or self._fallback_generate_episode_title_from_raw_segments(raw_segments)
         )
         return {
             "episode_title": title,
@@ -656,7 +652,7 @@ class MemoryNodeManager:
             "facts": [],
         }
 
-    def _summarize_episode_directly_with_llm(
+    def _generate_episode_summary_directly_with_llm(
         self,
         segments: List[Dict[str, Any]],
     ) -> Optional[Dict[str, str]]:
@@ -706,7 +702,7 @@ class MemoryNodeManager:
                 logger.debug("Episode summary LLM fallback failed, retrying")
         return None
 
-    def _extract_memory_with_llm(self, segments: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    def _extract_memory_fact_with_llm(self, segments: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         if not self._llm_api_key or not self._llm_base_url or str(self._llm_base_url).lower() == "none":
             return None
         prompt_language = self._resolve_prompt_language_from_segments(segments)
@@ -735,7 +731,7 @@ class MemoryNodeManager:
             result = self._call_llm(prompt)
             parsed = self._parse_json_object_from_llm_text(result or "")
             if parsed is not None:
-                normalized = self._normalize_llm_memory_payload(
+                normalized = self._normalize_memory_fact_extraction_llm_output(
                     parsed,
                     segments,
                     topic_candidates=topic_candidates,
@@ -818,10 +814,10 @@ class MemoryNodeManager:
             return None
         return data if isinstance(data, dict) else None
 
-    def _normalize_llm_memory_payload(
+    def _normalize_memory_fact_extraction_llm_output(
         self,
         data: Dict[str, Any],
-        segments: List[Dict[str, Any]],
+        raw_segments: List[Dict[str, Any]],
         *,
         topic_candidates: Optional[List[Dict[str, Any]]] = None,
     ) -> Optional[Dict[str, Any]]:
@@ -832,11 +828,11 @@ class MemoryNodeManager:
         raw_episode_summary = _compact_whitespace(data.get("episode_summary") or "")
         llm_episode_summary: Dict[str, str] = {}
         if not raw_episode_title or not raw_episode_summary:
-            llm_episode_summary = self._summarize_episode_directly_with_llm(segments) or {}
+            llm_episode_summary = self._generate_episode_summary_directly_with_llm(raw_segments) or {}
         episode_summary = (
             raw_episode_summary
             or llm_episode_summary.get("summary")
-            or self._episode_summary_from_segments(segments)
+            or self._fallback_generate_episode_summary_from_raw_segments(raw_segments)
         )
         episode_topics = self._normalize_episode_canonical_topics(
             data.get("canonical_topics") or data.get("episode_canonical_topics"),
@@ -846,7 +842,7 @@ class MemoryNodeManager:
         )
         facts: List[Dict[str, Any]] = []
         fallback_timestamp = _to_timestamp_text(
-            segments[0].get("started_at") if segments else ""
+            raw_segments[0].get("started_at") if raw_segments else ""
         ) or _now_text()
         for index, raw_fact in enumerate(raw_facts, 1):
             if not isinstance(raw_fact, dict):
@@ -922,7 +918,7 @@ class MemoryNodeManager:
             "episode_title": (
                 raw_episode_title
                 or llm_episode_summary.get("title")
-                or self._episode_title_from_segments(segments)
+                or self._fallback_generate_episode_title_from_raw_segments(raw_segments)
             ),
             "episode_summary": episode_summary,
             "canonical_topics": episode_topics or self._topic_candidates(episode_summary),
@@ -1034,7 +1030,7 @@ class MemoryNodeManager:
             )
         return "\n\n".join(blocks)
 
-    def _turns_to_memory_segments(self, turns: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _convert_interaction_turns_to_memory_raw_segments(self, turns: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         segments: List[Dict[str, Any]] = []
         for turn_index, turn in enumerate(turns, 1):
             timestamp = _to_timestamp_text(turn.get("turn_timestamp")) or _now_text()
@@ -1063,7 +1059,7 @@ class MemoryNodeManager:
                 })
         return segments
 
-    def _normalize_transcript_segments(
+    def _normalize_transcript_segments_into_memory_raw_segments(
         self,
         segments: Sequence[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
@@ -1120,10 +1116,10 @@ class MemoryNodeManager:
         )
 
     @staticmethod
-    def _participants_from_segments(segments: List[Dict[str, Any]]) -> List[str]:
+    def _parse_participants_from_raw_segments(raw_segments: List[Dict[str, Any]]) -> List[str]:
         participants: List[str] = []
         seen: set[str] = set()
-        for segment in segments:
+        for segment in raw_segments:
             speaker = _compact_whitespace(segment.get("speaker") or segment.get("role") or "")
             if not speaker:
                 continue
@@ -1246,7 +1242,7 @@ class MemoryNodeManager:
     def _collect_long_term_topic_candidates(self, *, limit: int = 60) -> List[Dict[str, Any]]:
         """Collect durable topic names that should guide new episode topics."""
         try:
-            states = self._db.recent_states(limit=max(1, int(limit or 60)))
+            states = self._db.get_recent_memory_states(limit=max(1, int(limit or 60)))
         except Exception as exc:
             logger.debug("Failed to load long-term topic candidates: %s", exc)
             return []
@@ -1285,7 +1281,7 @@ class MemoryNodeManager:
     def _collect_memory_state_context(self, *, limit: int = 12) -> List[Dict[str, Any]]:
         """Collect a small, balanced state reference set for fact extraction."""
         try:
-            states = self._db.recent_states(limit=max(40, int(limit or 12) * 6))
+            states = self._db.get_recent_memory_states(limit=max(40, int(limit or 12) * 6))
         except Exception as exc:
             logger.debug("Failed to load memory state context: %s", exc)
             return []
@@ -1509,16 +1505,16 @@ class MemoryNodeManager:
                 chunks.append(f"Assistant: {turn['assistant_response'][:600]}")
         return "\n".join(chunks)
 
-    def _episode_title_from_segments(self, segments: List[Dict[str, Any]]) -> str:
-        for segment in segments:
+    def _fallback_generate_episode_title_from_raw_segments(self, raw_segments: List[Dict[str, Any]]) -> str:
+        for segment in raw_segments:
             text = segment.get("text") or ""
             if text:
                 return _compact_whitespace(text)[:96]
         return "memory episode"
 
-    def _episode_summary_from_segments(self, segments: List[Dict[str, Any]]) -> str:
+    def _fallback_generate_episode_summary_from_raw_segments(self, raw_segments: List[Dict[str, Any]]) -> str:
         chunks: List[str] = []
-        for segment in segments[:10]:
+        for segment in raw_segments[:10]:
             speaker = segment.get("speaker") or segment.get("role") or "speaker"
             text = _compact_whitespace(segment.get("text") or "")
             if not text:
@@ -1863,8 +1859,8 @@ class MemoryNodeManager:
 
     def reflect(self, *_, **kwargs: Any) -> Dict[str, int]:
         """Update topic/entity projections and actionable items from recent facts."""
-        if self._pending_store_turns:
-            self.flush_pending_store_turns()
+        if self._pending_interaction_turns:
+            self.flush_pending_interaction_turns()
         if not self._enabled:
             return {"states_updated": 0, "actionable_items_updated": 0}
         if not self._llm_api_key:
@@ -1886,12 +1882,12 @@ class MemoryNodeManager:
         ]
         topic_facts = [fact for fact in facts if self._fact_can_seed_topic_state(fact)]
         entity_facts = [fact for fact in facts if self._fact_can_seed_entity_state(fact)]
-        existing_states = self._db.recent_states(limit=80)
+        existing_states = self._db.get_recent_memory_states(limit=80)
         topic_report = self._resolve_and_update_topic_states_from_facts(
             facts=topic_facts,
             existing_states=existing_states,
         )
-        existing_states = self._db.recent_states(limit=80)
+        existing_states = self._db.get_recent_memory_states(limit=80)
         entity_report = self._resolve_and_update_entity_scoped_states_from_facts(
             facts=entity_facts,
             existing_states=existing_states,
@@ -1953,7 +1949,15 @@ class MemoryNodeManager:
         return bool(topics) and cls._fact_has_durable_state_signal(fact)
 
     def _fact_can_seed_entity_state(self, fact: Dict[str, Any]) -> bool:
-        """Entity states require both a durable signal and an entity target."""
+        """Entity states require a projected aspect or a durable heuristic signal."""
+        state_aspects = self._state_aspects_from_fact(fact)
+        if state_aspects:
+            return any(
+                str(aspect.get("state_type") or "").strip().lower()
+                in self._entity_scoped_state_types()
+                and bool(self._entities_for_state_aspect(aspect, fact))
+                for aspect in state_aspects
+            )
         if not self._fact_has_durable_state_signal(fact):
             return False
         if not self._infer_entity_scoped_state_types_for_fact(fact):
@@ -2007,9 +2011,9 @@ class MemoryNodeManager:
             state_id = self._store_state(state_update)
             if state_id:
                 updated += 1
-                refreshed = self._db.recent_states(
+                refreshed = self._db.get_recent_memory_states(
                     source_types=[state_update["source_type"]],
-                    limit=200,
+                    limit=80,
                 )
                 existing_topic_states = [
                     state for state in refreshed
@@ -2817,7 +2821,7 @@ class MemoryNodeManager:
             state_id = self._store_state(state_update)
             if state_id:
                 updated += 1
-                refreshed = self._db.recent_states(
+                refreshed = self._db.get_recent_memory_states(
                     source_types=[state_update["source_type"]],
                     limit=200,
                 )
@@ -4238,8 +4242,6 @@ class MemoryNodeManager:
             return ""
         started_at = time.monotonic()
         try:
-            if self._pending_store_turns:
-                self.flush_pending_store_turns()
             k = max(1, int(top_k or self._top_k or 8))
             b = str(budget or self._recall_budget or "mid")
             recall_time_end = self._normalize_recall_time_bound(

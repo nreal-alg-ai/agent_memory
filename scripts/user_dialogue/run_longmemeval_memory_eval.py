@@ -1058,14 +1058,14 @@ def replay_sessions_into_memory(
             )
             reflect_runs += 1
     
-    if manager._pending_store_turns:
-        flushed = manager.flush_pending_store_turns()
+    if manager._pending_interaction_turns:
+        flushed = manager.flush_pending_interaction_turns()
         if flushed:
             stored_pairs += 1
     
     if enable_reflect and sessions:
-        if manager._pending_store_turns:
-            flushed = manager.flush_pending_store_turns()
+        if manager._pending_interaction_turns:
+            flushed = manager.flush_pending_interaction_turns()
             if flushed:
                 stored_pairs += 1
         final_ts = normalize_unique_timestamp(
@@ -1078,11 +1078,11 @@ def replay_sessions_into_memory(
         )
         reflect_runs += 1
     
-    if manager._pending_store_turns:
+    if manager._pending_interaction_turns:
         logging.warning(
             "Replay finished with %s pending turns still buffered. "
             "The final batch could not be force-stored.",
-            len(manager._pending_store_turns),
+            len(manager._pending_interaction_turns),
         )
 
     return (
