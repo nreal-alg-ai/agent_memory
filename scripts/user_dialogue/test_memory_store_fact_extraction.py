@@ -70,6 +70,17 @@ class StoreFactExtractionManager(MemoryNodeManager):
             if "recall query 分析器" in prompt or "recall query analyzer" in prompt
             else "other"
         )
+        if (
+            not self._llm_api_key
+            or not self._llm_base_url
+            or str(self._llm_base_url).strip().lower() == "none"
+        ):
+            logging.info(
+                "LLM call #%s kind=%s skipped: missing llm_api_key or llm_base_url",
+                self._test_llm_call_count,
+                call_kind,
+            )
+            return None
         url = f"{self._llm_base_url.rstrip('/')}/chat/completions"
         headers = {"Content-Type": "application/json"}
         if self._llm_api_key:
@@ -622,12 +633,6 @@ def main() -> int:
     configure_logging(args.log_path, args.log_level, args.manager_log_level)
     logging.info("Loaded memory store test config from: %s", args.config)
     
-    if not args.llm_api_key and args.llm_base_url.rstrip("/") == DEFAULT_LLM_BASE_URL:
-        raise RuntimeError(
-            "No API key configured for memory LLM. Set memory.llm_api_key in config.yaml "
-            "or pass --llm-api-key."
-        )
-
     turns = load_test_turns(args.sample_source, args.input)
     if args.start:
         turns = turns[args.start :]

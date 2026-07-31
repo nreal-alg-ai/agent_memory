@@ -657,12 +657,7 @@ class MemoryNodeManager:
         self,
         segments: List[Dict[str, Any]],
     ) -> Optional[Dict[str, str]]:
-        if (
-            not segments
-            or not self._llm_api_key
-            or not self._llm_base_url
-            or str(self._llm_base_url).lower() == "none"
-        ):
+        if not segments:
             return None
         prompt_language = self._resolve_prompt_language_from_segments(segments)
         prompt_template = (
@@ -704,8 +699,6 @@ class MemoryNodeManager:
         return None
 
     def _extract_memory_fact_with_llm(self, segments: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-        if not self._llm_api_key or not self._llm_base_url or str(self._llm_base_url).lower() == "none":
-            return None
         prompt_language = self._resolve_prompt_language_from_segments(segments)
         prompt_template = (
             UNIFIED_MEMORY_EXTRACTION_PROMPT_EN
@@ -744,6 +737,15 @@ class MemoryNodeManager:
         return None
 
     def _call_llm(self, prompt: str) -> Optional[str]:
+        if (
+            not self._llm_api_key
+            or not self._llm_base_url
+            or str(self._llm_base_url).strip().lower() == "none"
+        ):
+            logger.debug(
+                "Skipping LLM call because llm_api_key or llm_base_url is not configured"
+            )
+            return None
         url = f"{self._llm_base_url.rstrip('/')}/chat/completions"
         headers = {"Content-Type": "application/json"}
         if self._llm_api_key:
@@ -1940,11 +1942,6 @@ class MemoryNodeManager:
         if not self._enabled:
             self._log_info("memory_reflect", "skipped", {
                 "reason": "memory_disabled",
-            })
-            return {"states_updated": 0, "actionable_items_updated": 0}
-        if not self._llm_api_key:
-            self._log_info("memory_reflect", "skipped", {
-                "reason": "missing_llm_api_key",
             })
             return {"states_updated": 0, "actionable_items_updated": 0}
         limit = max(1, int(kwargs.get("limit") or self._memory_cfg.get("reflect_limit") or 100))
@@ -5317,8 +5314,6 @@ class MemoryNodeManager:
         return selected
     
     def _analyze_recall_query(self, query: str) -> Dict[str, Any]:
-        if not self._llm_api_key:
-            return {}
         prompt_language = self._resolve_prompt_language_from_text(query, fallback="en")
         prompt_template = (
             RECALL_QUERY_ANALYSIS_PROMPT_EN
