@@ -471,11 +471,24 @@ class MemoryNodeManager:
         tags: List[str],
         source_ref: str = "",
     ) -> bool:
+        store_started_at = time.monotonic()
+        self._log_info("memory_store", "start", {
+            "source_type": source_type,
+            "episode_type": episode_type,
+            "source_ref": source_ref,
+            "source_segment_count": len(raw_segments),
+        })
         if not raw_segments:
+            self._log_info("memory_store", "finish", {
+                "status": "skipped",
+                "reason": "no_raw_segments",
+                "elapsed_ms": round((time.monotonic() - store_started_at) * 1000, 2),
+            })
             return False
         participants = self._parse_participants_from_raw_segments(raw_segments)
         started_at = raw_segments[0].get("started_at") or _now_text()
         ended_at = raw_segments[-1].get("ended_at") or started_at
+        extraction_started_at = time.monotonic()
         extracted = self._extract_memory_fact_from_raw_segments(raw_segments)
         episode_title = (
             _compact_whitespace(extracted.get("episode_title") or "")
@@ -491,6 +504,9 @@ class MemoryNodeManager:
             or ["general"]
         )
         facts = list(extracted.get("facts") or [])
+        self._log_info("memory_store", "fact_extraction_finish", {
+            "elapsed_ms": round((time.monotonic() - extraction_started_at) * 1000, 2,),
+        })
         
         self._log_extracted_fact_info(
             raw_segments=raw_segments,
@@ -524,6 +540,19 @@ class MemoryNodeManager:
             source_type=source_type,
             participants=episode_participants,
         )
+        self._log_info("memory_store", "finish", {
+            "status": "ok",
+            "episode_id": episode_id,
+            "source_type": source_type,
+            "episode_type": episode_type,
+            "source_segment_count": len(raw_segments),
+            "fact_count": len(facts),
+            "fact_ids": fact_ids,
+            "total_elapsed_ms": round(
+                (time.monotonic() - store_started_at) * 1000,
+                2,
+            ),
+        })
         return bool(episode_id)
 
     def _store_extracted_episode_info(
@@ -566,19 +595,19 @@ class MemoryNodeManager:
                 "source_ref": source_ref,
             },
         )
-        self._index_episode(
-            episode_id=episode_id,
-            source_type=source_type,
-            episode_type=episode_type,
-            title=episode_title,
-            summary=episode_summary,
-            started_at=started_at,
-            ended_at=ended_at,
-            tags=tags,
-            canonical_topics=canonical_topics,
-            participants=participants,
-            source_ref=source_ref,
-        )
+        # self._index_episode(
+        #     episode_id=episode_id,
+        #     source_type=source_type,
+        #     episode_type=episode_type,
+        #     title=episode_title,
+        #     summary=episode_summary,
+        #     started_at=started_at,
+        #     ended_at=ended_at,
+        #     tags=tags,
+        #     canonical_topics=canonical_topics,
+        #     participants=participants,
+        #     source_ref=source_ref,
+        # )
 
         return {
             "episode_id": episode_id,
@@ -1678,97 +1707,7 @@ class MemoryNodeManager:
             embedding_text=embedding_text,
             metadata={"tags": tags, "source_ref": source_ref},
         )
-
-    def _extract_turn_facts(self, turn: Dict[str, Any], *, turn_index: int) -> List[Dict[str, Any]]:
-        facts: List[Dict[str, Any]] = []
-        timestamp = turn.get("turn_timestamp") or _now_text()
-        user_text = turn.get("user_message") or ""
-        assistant_text = turn.get("assistant_response") or ""
-        if user_text:
-            if not self._is_low_value_user_acknowledgement(user_text):
-                facts.append(self._build_fact(
-                    summary=f"User said: {user_text}",
-                    source_text=user_text,
-                    fact_subject="user",
-                    fact_kind=self._infer_fact_kind(user_text, speaker="user"),
-                    fact_type="episodic",
-                    timestamp=timestamp,
-                    turn_index=turn_index,
-                    role="user",
-                    importance=0.75,
-                ))
-            for detail in self._split_high_value_details(user_text):
-                if detail != user_text:
-                    facts.append(self._build_fact(
-                        summary=f"User mentioned: {detail}",
-                        source_text=detail,
-                        fact_subject="user",
-                        fact_kind=self._infer_fact_kind(detail, speaker="user"),
-                        fact_type="episodic",
-                        timestamp=timestamp,
-                        turn_index=turn_index,
-                        role="user_detail",
-                        importance=0.82,
-                    ))
-        if assistant_text and not self._is_low_value_assistant_closing(assistant_text):
-            facts.append(self._build_fact(
-                summary=f"Assistant responded: {assistant_text[:1200]}",
-                source_text=assistant_text,
-                fact_subject="assistant",
-                fact_kind=self._infer_fact_kind(assistant_text, speaker="assistant"),
-                fact_type="semantic" if self._looks_like_recommendation(assistant_text) else "episodic",
-                timestamp=timestamp,
-                turn_index=turn_index,
-                role="assistant",
-                importance=0.62,
-            ))
-            for detail in self._assistant_answer_details(assistant_text):
-                if self._is_low_value_assistant_closing(detail):
-                    continue
-                facts.append(self._build_fact(
-                    summary=f"Assistant recommended or stated: {detail}",
-                    source_text=detail,
-                    fact_subject="assistant",
-                    fact_kind="recommendation",
-                    fact_type="semantic",
-                    timestamp=timestamp,
-                    turn_index=turn_index,
-                    role="assistant_detail",
-                    importance=0.68,
-                ))
-        return facts
-
-    def _extract_segment_facts(
-        self,
-        segment: Dict[str, Any],
-        *,
-        segment_index: int,
-    ) -> List[Dict[str, Any]]:
-        text = _compact_whitespace(segment.get("text") or "")
-        if not text:
-            return []
-        role = str(segment.get("role") or "").lower()
-        speaker = _compact_whitespace(segment.get("speaker") or role or "speaker")
-        fact_subject = "user" if role == "user" else "assistant" if role == "assistant" else "other"
-        if fact_subject == "user" and self._is_low_value_user_acknowledgement(text):
-            return []
-        if fact_subject == "assistant" and self._is_low_value_assistant_closing(text):
-            return []
-        timestamp = segment.get("started_at") or _now_text()
-        return [
-            self._build_fact(
-                summary=f"{speaker} said: {text}",
-                source_text=text,
-                fact_subject=fact_subject,
-                fact_kind=self._infer_fact_kind(text, speaker=role or speaker),
-                fact_type="episodic",
-                timestamp=timestamp,
-                turn_index=segment_index,
-                role=speaker,
-                importance=0.7,
-            )
-        ]
-
+        
     def _is_low_value_assistant_closing(self, text: str) -> bool:
         clean = _compact_whitespace(text)
         if not clean:
@@ -1894,38 +1833,38 @@ class MemoryNodeManager:
                 embedding=embedding,
                 embedding_text=embedding_text,
             )
-            memory_path = f"{source_type}/facts/{fact['fact_subject']}/{fact['fact_kind']}"
-            summary_card = self._truncate_index_text(fact["summary"], max_chars=760)
-            index_embedding_text = self._build_index_embedding_text(
-                title=fact["summary"][:96],
-                summary=summary_card,
-                keywords=keywords,
-                entities=entities,
-                canonical_topics=canonical_topics,
-                memory_path=memory_path,
-                max_summary_chars=620,
-            )
-            index_embedding = self._embed(index_embedding_text)
-            self._db.upsert_index_entry(
-                source_type=source_type,
-                target_table="memory_facts",
-                target_id=fact_id,
-                index_level="fact",
-                memory_path=memory_path,
-                title=fact["summary"][:96],
-                summary_for_retrieval=summary_card,
-                keywords=keywords,
-                entities=entities,
-                canonical_topics=canonical_topics,
-                participants=participants,
-                time_start=fact["time_key"].split("#", 1)[0],
-                time_end=fact["time_key"].split("#", 1)[0],
-                importance=fact["importance"],
-                confidence=fact["confidence"],
-                embedding=index_embedding,
-                embedding_text=index_embedding_text,
-                metadata=fact_metadata,
-            )
+            # memory_path = f"{source_type}/facts/{fact['fact_subject']}/{fact['fact_kind']}"
+            # summary_card = self._truncate_index_text(fact["summary"], max_chars=760)
+            # index_embedding_text = self._build_index_embedding_text(
+            #     title=fact["summary"][:96],
+            #     summary=summary_card,
+            #     keywords=keywords,
+            #     entities=entities,
+            #     canonical_topics=canonical_topics,
+            #     memory_path=memory_path,
+            #     max_summary_chars=620,
+            # )
+            # index_embedding = self._embed(index_embedding_text)
+            # self._db.upsert_index_entry(
+            #     source_type=source_type,
+            #     target_table="memory_facts",
+            #     target_id=fact_id,
+            #     index_level="fact",
+            #     memory_path=memory_path,
+            #     title=fact["summary"][:96],
+            #     summary_for_retrieval=summary_card,
+            #     keywords=keywords,
+            #     entities=entities,
+            #     canonical_topics=canonical_topics,
+            #     participants=participants,
+            #     time_start=fact["time_key"].split("#", 1)[0],
+            #     time_end=fact["time_key"].split("#", 1)[0],
+            #     importance=fact["importance"],
+            #     confidence=fact["confidence"],
+            #     embedding=index_embedding,
+            #     embedding_text=index_embedding_text,
+            #     metadata=fact_metadata,
+            # )
             fact_ids.append(fact_id)
         return fact_ids
 
@@ -1933,15 +1872,29 @@ class MemoryNodeManager:
 
     def reflect(self, *_, **kwargs: Any) -> Dict[str, int]:
         """Update topic/entity projections and actionable items from recent facts."""
+        reflect_started_at = time.monotonic()
         if self._pending_interaction_turns:
             pending_count = len(self._pending_interaction_turns)
+            pending_flush_started_at = time.monotonic()
             self.flush_pending_interaction_turns()
             self._log_info("memory_reflect", "pending_interactions_flushed", {
                 "pending_interaction_count": pending_count,
+                "elapsed_ms": round(
+                    (time.monotonic() - pending_flush_started_at) * 1000,
+                    2,
+                ),
             })
         if not self._enabled:
-            self._log_info("memory_reflect", "skipped", {
+            skipped_payload = {
                 "reason": "memory_disabled",
+                "elapsed_ms": round(
+                    (time.monotonic() - reflect_started_at) * 1000,
+                    2,
+                ),
+            }
+            self._log_info("memory_reflect", "finish", {
+                **skipped_payload,
+                "status": "skipped",
             })
             return {"states_updated": 0, "actionable_items_updated": 0}
         limit = max(1, int(kwargs.get("limit") or self._memory_cfg.get("reflect_limit") or 100))
@@ -1951,16 +1904,28 @@ class MemoryNodeManager:
         self._log_info("memory_reflect", "start", {
             "limit": limit,
             "reflect_timestamp": reflect_timestamp,
+            "elapsed_ms": round(
+                (time.monotonic() - reflect_started_at) * 1000,
+                2,
+            ),
         })
         facts = self._db.get_unprocessed_facts_for_states(
             limit=limit,
             reference_timestamp=reflect_timestamp,
         )
         if not facts:
-            self._log_info("memory_reflect", "facts_loaded", {
+            facts_loaded_payload = {
                 "fact_count": 0,
                 "limit": limit,
                 "reflect_timestamp": reflect_timestamp,
+                "total_elapsed_ms": round(
+                    (time.monotonic() - reflect_started_at) * 1000,
+                    2,
+                ),
+            }
+            self._log_info("memory_reflect", "finish", {
+                **facts_loaded_payload,
+                "status": "empty",
             })
             return {"states_updated": 0, "actionable_items_updated": 0}
         fact_ids = [
@@ -1990,20 +1955,35 @@ class MemoryNodeManager:
         })
         existing_states = self._db.get_recent_memory_states(limit=80)
 
+        topic_update_started_at = time.monotonic()
         topic_report = self._resolve_and_update_topic_states_from_facts(
             facts=topic_facts,
             existing_states=existing_states,
         )
-        self._log_info("memory_reflect", "topic_state_update_finish", topic_report)
+        self._log_info("memory_reflect", "topic_state_update_finish", {
+            **topic_report,
+            "elapsed_ms": round(
+                (time.monotonic() - topic_update_started_at) * 1000, 
+                2,
+            ),
+        })
 
         existing_states = self._db.get_recent_memory_states(limit=80)
+        entity_update_started_at = time.monotonic()
         entity_report = self._resolve_and_update_entity_scoped_states_from_facts(
             facts=entity_facts,
             existing_states=existing_states,
         )
-        self._log_info("memory_reflect", "entity_state_update_finish", entity_report)
+        self._log_info("memory_reflect", "entity_state_update_finish", {
+            **entity_report,
+            "elapsed_ms": round(
+                (time.monotonic() - entity_update_started_at) * 1000, 
+                2,
+            ),
+        })
 
         actionable_facts = self._filter_facts_for_actionable_item_extraction(facts)
+        actionable_extraction_started_at = time.monotonic()
         self._log_info("memory_reflect", "actionable_item_extraction_start", {
             "candidate_fact_count": len(actionable_facts),
             "candidate_fact_ids": [
@@ -2035,10 +2015,14 @@ class MemoryNodeManager:
             if item_id:
                 actionable_items_updated += 1
                 actionable_item_ids.append(item_id)
-        self._log_info("memory_reflect", "actionable_item_store_finish", {
+        self._log_info("memory_reflect", "actionable_item_update_finish", {
             "requested_store_count": len(actionable_updates),
             "stored_count": actionable_items_updated,
             "item_ids": actionable_item_ids,
+            "elapsed_ms": round(
+                (time.monotonic() - actionable_extraction_started_at) * 1000,
+                2,
+            ),
         })
         facts_marked_processed = self._db.mark_facts_processed_for_memory_state(fact_ids)
         report = {
@@ -2060,6 +2044,10 @@ class MemoryNodeManager:
             "actionable_facts_considered": len(actionable_facts),
             "facts_marked_processed_for_memory_state": facts_marked_processed,
             "actionable_items_updated": actionable_items_updated,
+            "total_elapsed_ms": round(
+                (time.monotonic() - reflect_started_at) * 1000,
+                2,
+            ),
         }
         self._log_info("memory_reflect", "finish", report)
         return report
@@ -4659,8 +4647,13 @@ class MemoryNodeManager:
             preferred_source_types = forced_source_types or self._normalize_source_override(
                 recall_plan.get("source_types") or []
             )
-            preferred_index_levels = self._normalize_index_levels(
-                recall_plan.get("index_levels") or []
+            layer_preference = recall_plan.get("layer_preference")
+            if layer_preference is None:
+                # Keep old local/test LLM adapters compatible while the prompt
+                # contract migrates from index_levels to layer_preference.
+                layer_preference = recall_plan.get("index_levels") or []
+            preferred_layer_preferences = self._normalize_recall_layer_preference(
+                layer_preference or []
             )
             llm_keywords = self._normalize_string_list(
                 recall_plan.get("keywords"),
@@ -4691,7 +4684,7 @@ class MemoryNodeManager:
                 query=search_query,
                 top_k=k,
                 budget=b,
-                preferred_index_levels=preferred_index_levels,
+                preferred_layer_preferences=preferred_layer_preferences,
             )
             raw_candidate_limits = self._cal_raw_candidate_limits_from_recall_limits(
                 final_candidate_limits,
@@ -4701,7 +4694,7 @@ class MemoryNodeManager:
                 "recall_plan": recall_plan,
                 "forced_source_types": forced_source_types or [],
                 "preferred_source_types": preferred_source_types or [],
-                "preferred_index_levels": preferred_index_levels or [],
+                "preferred_layer_preferences": preferred_layer_preferences or [],
                 "keywords": llm_keywords,
                 "entities": llm_entities,
                 "terms": terms,
@@ -4736,7 +4729,7 @@ class MemoryNodeManager:
                 terms=terms,
                 query_embedding=query_embedding,
                 preferred_source_types=preferred_source_types,
-                preferred_index_levels=preferred_index_levels,
+                preferred_layer_preferences=preferred_layer_preferences,
                 final_candidate_limits=final_candidate_limits,
                 fact_type_preference=str(
                     recall_plan.get("fact_type_preference") or "both"
@@ -4928,11 +4921,11 @@ class MemoryNodeManager:
     def _recall_type_weights(
         self,
         query: str,
-        preferred_index_levels: Optional[Sequence[str]],
+        preferred_layer_preferences: Optional[Sequence[str]],
     ) -> Dict[str, float]:
         """Build query-intent weights for the three raw memory layers."""
         weights = {"fact": 1.0, "state": 1.0, "actionable_item": 1.0}
-        preferred = set(preferred_index_levels or [])
+        preferred = set(preferred_layer_preferences or [])
         if preferred:
             for level in weights:
                 weights[level] = 1.3 if level in preferred else 0.82
@@ -5199,7 +5192,7 @@ class MemoryNodeManager:
         terms: Sequence[str],
         query_embedding: Optional[np.ndarray],
         preferred_source_types: Optional[Sequence[str]] = None,
-        preferred_index_levels: Optional[Sequence[str]] = None,
+        preferred_layer_preferences: Optional[Sequence[str]] = None,
         final_candidate_limits: Optional[Dict[str, int]] = None,
         fact_type_preference: str = "both",
         fact_min_embedding_similarity: Optional[float] = None,
@@ -5207,7 +5200,7 @@ class MemoryNodeManager:
         actionable_item_min_embedding_similarity: Optional[float] = None,
     ) -> List[Dict[str, Any]]:
         """Rank each raw layer independently, then merge normalized scores."""
-        weights = self._recall_type_weights(query, preferred_index_levels)
+        weights = self._recall_type_weights(query, preferred_layer_preferences)
         ranked_states = self._rank_recall_state_candidates(
             states,
             terms=terms,
@@ -5365,7 +5358,7 @@ class MemoryNodeManager:
                 out.append(normalized)
         return out or None
 
-    def _normalize_index_levels(self, value: Optional[Sequence[str]]) -> Optional[List[str]]:
+    def _normalize_recall_layer_preference(self, value: Optional[Sequence[str]]) -> Optional[List[str]]:
         if not value:
             return None
         allowed = {"episode", "fact", "state", "actionable_item"}
@@ -5916,7 +5909,7 @@ class MemoryNodeManager:
         query: str,
         top_k: int,
         budget: str,
-        preferred_index_levels: Optional[Sequence[str]],
+        preferred_layer_preferences: Optional[Sequence[str]],
     ) -> Dict[str, int]:
         """Allocate independent post-ranking limits for each memory type."""
         k = max(1, int(top_k or 1))
@@ -5928,7 +5921,7 @@ class MemoryNodeManager:
         }
         if self._needs_broad_evidence(query):
             limits["facts"] = max(limits["facts"], int(math.ceil(k * 0.85)))
-        preferred = set(preferred_index_levels or [])
+        preferred = set(preferred_layer_preferences or [])
         aliases = {"actionable": "actionable_items", "action": "actionable_items"}
         preferred = {aliases.get(level, level) for level in preferred}
         if preferred:

@@ -391,23 +391,37 @@ Candidate facts:
 """
 
 
-RECALL_QUERY_ANALYSIS_PROMPT_EN = """You are the recall query analyzer for a unified MemPalace-style memory system.
+RECALL_QUERY_ANALYSIS_PROMPT_EN = """You are the recall query analyzer for the AI-glasses long-term memory system.
 
-The memory system has one shared index over episodes, facts, evolving states, and actionable items. Analyze the user query and decide which parts of the index are most useful.
+Understand the memory structure before analyzing the query. The default recall path does not use the shared `memory_index_entries` table as its retrieval entry point. It searches the following raw memory tables directly, so do not treat "index" as an additional unified document layer.
+
+Memory structure:
+1. `memory_facts` / fact: traceable, self-contained narrative facts extracted from one conversation episode or all-day transcript. They preserve what happened, participants, time, place or scene, reasons, viewpoint changes, suggestions, acceptance or rejection, constraints, conclusions, and unresolved questions. A fact may contain an explicitly stated preference, routine, profile detail, risk, or constraint, but it remains current conversational evidence rather than a cross-episode long-term summary. Facts usually include `fact_type`, `fact_kind`, `fact_subject`, `summary`, `keywords`, `entities`, `canonical_topics`, and `time_key`.
+2. `memory_states` / state: durable evolving projections updated from multiple facts, not raw dialogue quotations. It contains:
+   - `topic_state`: background, progress, decisions, constraints, risks, and unresolved issues for a project, product, topic, or long-running issue.
+   - `entity_state`: durable properties of an entity, including preference, routine, profile, relationship, constraint, and risk.
+   Use state for long-term patterns and snapshots, but do not treat it as a replacement for concrete fact evidence.
+3. `memory_actionable_items` / actionable_item: concrete items extracted from facts that need future execution, follow-up, reminder, review, or decision tracking. They include tasks, commitments, decisions, follow-ups, open questions, risks, reminders, recommendations, and constraints that block a specific action. Items usually include `canonical_name`, `summary`, `owner`, `status`, `due_at`, and `evidence_fact_ids`. Ordinary preferences, background, one-off descriptions, and suggestions without a concrete next action are not actionable items.
+
+An episode is the storage container for a conversation or transcript batch with a title, summary, participants, and time range. The default recall path does not retrieve episodes as an independent selectable layer. For recalling an experience, prefer `fact`; for a durable overview, consider `state` as well. States and actionable items can be traced back to facts through `evidence_fact_ids`.
 
 Guidance:
-- Use source_types only when the query clearly points to assistant_wakeup interactions or allday_recording transcripts. Otherwise use both.
-- Use index_levels to prefer fact for exact evidence, actionable_item for tasks/commitments/decisions/open questions/risks/reminders/recommendations, state for stable preferences, durable constraints, routines, relationships, profiles, and topic/project/issue evolution, and episode for broad summaries.
-- Keep the plan broad when unsure. Missing evidence is worse than retrieving a few extra candidates.
+- Use `source_types` only when the query clearly points to assistant_wakeup interactions or allday_recording transcripts. Otherwise use both.
+- Prefer `fact` for what happened, dates, places, people, exact evidence, event order, and traceable details.
+- Prefer `state` for stable preferences, durable constraints, routines, relationships, profiles, and topic/project/issue evolution.
+- Prefer `actionable_item` for tasks, commitments, decisions, open questions, risks, reminders, recommendations, and explicit next steps. If the user also asks for background or evidence, include `fact` too.
+- For queries about current progress, durable status, and next steps, usually include `state`, `actionable_item`, and `fact`.
+- Keep the plan broad when unsure, but do not select every layer by default. Missing evidence is worse than retrieving a few extra candidates.
+- Output 1-3 values in `layer_preference`, chosen from `fact`, `state`, and `actionable_item`. It identifies layers to prioritize; it is not a new database table.
 - Extract 2-8 short retrieval keywords, prioritizing concrete people, organizations, products, projects, topics, actions, outcomes, constraints, and time anchors. Do not output full sentences, pleasantries, or generic words.
 - Extract useful semantic entities with names and types. Entities may be people, organizations, locations, products, projects, technologies, or concrete concepts; ordinary time expressions such as today, yesterday, or last week are not entities.
 
 Return JSON only:
 {
   "source_types": ["assistant_wakeup", "allday_recording"],
-  "index_levels": ["fact", "actionable_item", "state", "episode"],
+  "layer_preference": ["fact", "actionable_item", "state"],
   "needs_broad_evidence": false,
-  "query_rewrite": "retrieval-focused rewrite",
+  "query_rewrite": "retrieval-focused rewrite over raw memory tables",
   "keywords": ["keyword1", "keyword2"],
   "entities": [{"name": "entity name", "type": "PERSON|ORGANIZATION|LOCATION|PRODUCT|PROJECT|TECHNOLOGY|CONCEPT|OTHER"}]
 }

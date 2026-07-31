@@ -391,23 +391,37 @@ UNIFIED_ACTIONABLE_ITEM_EXTRACTION_PROMPT_ZH = """你是 AI 眼镜长期记忆�
 """
 
 
-RECALL_QUERY_ANALYSIS_PROMPT_ZH = """你是 AI 眼镜长期记忆系统中用来处理用户 recall query 分析器。
+RECALL_QUERY_ANALYSIS_PROMPT_ZH = """你是 AI 眼镜长期记忆系统中的 recall query 分析器。
 
-当前记忆系统在同一个共享索引中检索 episode、fact、evolving state 和 actionable item。请分析用户查询，决定应该优先检索哪些索引层。
+请先理解当前记忆结构，再分析用户查询应该优先检索哪些记忆层。当前默认 recall 路径不使用共享的 memory_index_entries 表作为检索入口，而是直接检索以下三类原始记忆表；因此不要把“index”理解为一个额外的统一文档层。
+
+记忆结构：
+1. `memory_facts` / fact：从一次 episode 的对话或全天候转写中提炼出的、可追溯且自包含的 narrative fact。它保留具体发生了什么、谁参与、时间、地点/场景、原因、观点变化、建议、接受/拒绝、约束、结论和未解决问题等证据。fact 可能是一次事件、一次讨论结论，也可能是用户明确表达的偏好、习惯、画像、风险或约束；但它仍然是当前对话证据，不等于跨多次对话融合后的长期状态。fact 通常带有 `fact_type`、`fact_kind`、`fact_subject`、`summary`、`keywords`、`entities`、`canonical_topics` 和 `time_key`。
+2. `memory_states` / state：由多个 facts 反思更新出的长期演化状态，不是原始对话引用。它包含两类投影：
+   - `topic_state`：某个项目、产品、主题或长期议题的背景、进展、决定、约束、风险和未解决问题。
+   - `entity_state`：某个实体的长期属性，包括 preference（偏好）、routine（习惯/流程）、profile（画像/背景）、relationship（关系）、constraint（约束）和 risk（风险）。
+   state 适合回答“长期是什么状态、通常怎样、对某人/某项目的稳定认识是什么”，但不能替代具体 fact 证据。
+3. `memory_actionable_items` / actionable_item：从 facts 中提炼出的需要未来执行、跟进、提醒、复盘或决策追踪的事项。包括 task、commitment、decision、follow_up、open_question、risk、reminder、recommendation 和被明确行动阻塞的 constraint。每个 item 通常带有 `canonical_name`、`summary`、`owner`、`status`、`due_at` 和 `evidence_fact_ids`。普通偏好、背景、一次性描述或没有明确后续动作的建议不属于 actionable_item。
+
+episode 是原始对话/转写批次的存储容器，包含 title、summary、参与者和时间范围；当前默认 recall 不把 episode 作为独立可选择的检索层。需要回顾一段经历时，优先选择 `fact`；需要长期概括时，同时考虑 `state`。states 和 actionable_items 都可以通过 `evidence_fact_ids` 追溯到 facts。
 
 判断准则：
-- 只有当 query 明确指向用户与助手的主动对话，才偏向 assistant_wakeup；明确指向全天录音、会议、旁听、多人数对话，才偏向 allday_recording；不确定时两者都保留。
-- 精确证据、日期、人名、发生过什么优先 fact；任务、承诺、决定、开放问题、风险、提醒、推荐优先 actionable_item；稳定偏好、长期约束、习惯/流程、关系画像、主题/项目/议题演化优先 state；宽泛回顾、某段经历概括优先 episode。
-- 不确定时保持宽检索，漏掉证据比多取几个候选更糟。
-- keywords 输出 2-8 个短检索词，优先保留具体人物、组织、产品、项目、主题、动作、结果、约束和时间锚点；不要输出完整句子、寒暄或泛化词。
-- entities 输出对语义检索有帮助的实体名称及类型。实体可以是人物、组织、地点、产品、项目、技术或具体概念；普通的“今天/昨天/上周”等时间表达不要作为实体。
+- 只有当 query 明确指向用户与助手的主动对话，才偏向 `assistant_wakeup`；明确指向全天录音、会议、旁听、多人数对话，才偏向 `allday_recording`；不确定时两者都保留。
+- 具体发生了什么、日期、地点、人名、原话语义、事件先后和可追溯证据，优先 `fact`。
+- 稳定偏好、长期约束、习惯/流程、关系画像、个人背景，以及主题/项目/议题的长期演化，优先 `state`。
+- 任务、承诺、决定、开放问题、风险、提醒、推荐和明确下一步，优先 `actionable_item`；如果用户同时询问事项的背景或来源，可以同时选择 `fact`。
+- 查询涉及“目前进展、长期状态和下一步”时，通常同时选择 `state`、`actionable_item` 和 `fact`。
+- 不确定时保持宽检索，漏掉证据比多取几个候选更糟，但不要无差别默认选择所有层。
+- `layer_preference` 输出 1-3 个最相关的层，值只能是 `fact`、`state`、`actionable_item`；它表示需要优先加强的召回层，不是新的数据库表。
+- `keywords` 输出 2-8 个短检索词，优先保留具体人物、组织、产品、项目、主题、动作、结果、约束和时间锚点；不要输出完整句子、寒暄或泛化词。
+- `entities` 输出对语义检索有帮助的实体名称及类型。实体可以是人物、组织、地点、产品、项目、技术或具体概念；普通的“今天/昨天/上周”等时间表达不要作为实体。
 
 只返回 JSON：
 {
   "source_types": ["assistant_wakeup", "allday_recording"],
-  "index_levels": ["fact", "actionable_item", "state", "episode"],
+  "layer_preference": ["fact", "actionable_item", "state"],
   "needs_broad_evidence": false,
-  "query_rewrite": "面向检索的改写",
+  "query_rewrite": "面向原始记忆表检索的改写",
   "keywords": ["关键词1", "关键词2"],
   "entities": [{"name": "实体名", "type": "PERSON|ORGANIZATION|LOCATION|PRODUCT|PROJECT|TECHNOLOGY|CONCEPT|OTHER"}]
 }
