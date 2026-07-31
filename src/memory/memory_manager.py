@@ -2361,32 +2361,6 @@ class MemoryNodeManager:
             f"anchor_terms: {', '.join(keyword_values)}",
         ])
 
-    def _topic_identity_text_for_state(self, state: Dict[str, Any]) -> str:
-        metadata = state.get("metadata") or {}
-        existing_text = _compact_whitespace(metadata.get("topic_identity_text") or "")
-        if existing_text:
-            return existing_text
-        return self._topic_identity_text(
-            canonical_name=state.get("canonical_name"),
-            aliases=self._topic_aliases_from_state(state),
-            keywords=[
-                *(metadata.get("keywords") or []),
-                *(metadata.get("entities") or []),
-            ],
-        )
-
-    def _topic_embedding_similarity(self, left_text: str, right_text: str) -> float:
-        left_embedding = self._embed(left_text)
-        right_embedding = self._embed(right_text)
-        if left_embedding is None or right_embedding is None:
-            return 0.0
-        left = np.asarray(left_embedding, dtype=np.float32).reshape(-1)
-        right = np.asarray(right_embedding, dtype=np.float32).reshape(-1)
-        denom = float(np.linalg.norm(left) * np.linalg.norm(right))
-        if denom <= 0:
-            return 0.0
-        return float(np.dot(left, right) / denom)
-
     def _topic_resolution_text(
         self,
         *,
@@ -2431,6 +2405,15 @@ class MemoryNodeManager:
         )
         best_state: Optional[Dict[str, Any]] = None
         best_info: Dict[str, Any] = {"score": 0.0}
+        candidate_identity_embedding: Optional[np.ndarray] = None
+        candidate_name_embedding: Optional[np.ndarray] = None
+        if any(state.get("embedding") is not None for state in existing_topic_states):
+            candidate_identity_embedding = self._embed(candidate_identity_text)
+        if any(
+            state.get("canonical_name_embedding") is not None
+            for state in existing_topic_states
+        ):
+            candidate_name_embedding = self._embed(candidate.get("canonical_name") or "")
         for state in existing_topic_states:
             state_aliases = self._topic_aliases_from_state(state)
             state_keys = {
@@ -2444,9 +2427,17 @@ class MemoryNodeManager:
                 candidate_text[:1200],
                 self._topic_resolution_text(state=state)[:1200],
             )
-            embedding_similarity = self._topic_embedding_similarity(
-                candidate_identity_text,
-                self._topic_identity_text_for_state(state),
+            state_embedding_similarity = self._cal_embedding_similarity(
+                candidate_identity_embedding,
+                state.get("embedding"),
+            )
+            canonical_name_embedding_similarity = self._cal_embedding_similarity(
+                candidate_name_embedding,
+                state.get("canonical_name_embedding"),
+            )
+            embedding_similarity = max(
+                state_embedding_similarity,
+                canonical_name_embedding_similarity,
             )
             strong_name_match = exact_alias_match or name_overlap >= self._topic_state_resolution_similarity_threshold
             strong_embedding_match = (
@@ -2469,6 +2460,11 @@ class MemoryNodeManager:
                     "name_overlap": round(name_overlap, 4),
                     "text_overlap": round(text_overlap, 4),
                     "embedding_similarity": round(embedding_similarity, 4),
+                    "state_embedding_similarity": round(state_embedding_similarity, 4),
+                    "canonical_name_embedding_similarity": round(
+                        canonical_name_embedding_similarity,
+                        4,
+                    ),
                     "strong_name_match": strong_name_match,
                     "strong_embedding_match": strong_embedding_match,
                     "existing_state_id": state.get("id"),
@@ -3370,6 +3366,7 @@ class MemoryNodeManager:
         best_state: Optional[Dict[str, Any]] = None
         best_score = 0.0
         best_info: Dict[str, Any] = {"matched": False, "score": 0.0}
+        matching_states: List[Dict[str, Any]] = []
         for state in existing_entity_states:
             if str(state.get("source_type") or "") != str(candidate.get("source_type") or ""):
                 continue
@@ -3385,6 +3382,22 @@ class MemoryNodeManager:
             )
             if state_entity_key != candidate_entity_key:
                 continue
+            matching_states.append(state)
+
+        if not matching_states:
+            return None, best_info
+
+        candidate_name_embedding: Optional[np.ndarray] = None
+        candidate_summary_embedding: Optional[np.ndarray] = None
+        if any(state.get("canonical_name_embedding") is not None for state in matching_states):
+            candidate_name_embedding = self._embed(
+                candidate.get("attribute_name") or candidate_name
+            )
+        if any(state.get("embedding") is not None for state in matching_states):
+            candidate_summary_embedding = self._embed(candidate_text[:1600])
+
+        for state in matching_states:
+            metadata = state.get("metadata") or {}
             state_attribute_aliases = self._merge_topic_aliases([
                 metadata.get("attribute_name"),
                 *(metadata.get("attribute_aliases") or []),
@@ -3395,21 +3408,17 @@ class MemoryNodeManager:
                 candidate_attribute_aliases,
                 state_attribute_aliases,
             )
-            state_text = _compact_whitespace(
-                metadata.get("entity_state_identity_text")
-                or "\n".join([
-                    str(state.get("canonical_name") or ""),
-                    " ".join(state_attribute_aliases),
-                    str(state.get("summary") or ""),
-                ])
+            summary_embedding_similarity = self._cal_embedding_similarity(
+                candidate_summary_embedding,
+                state.get("embedding"),
             )
-            embedding_similarity = self._topic_embedding_similarity(
-                candidate_text[:1600],
-                state_text[:1600],
+            canonical_name_embedding_similarity = self._cal_embedding_similarity(
+                candidate_name_embedding,
+                state.get("canonical_name_embedding"),
             )
-            name_similarity = self._topic_name_similarity(
-                candidate_name,
-                str(state.get("canonical_name") or ""),
+            embedding_similarity = max(
+                summary_embedding_similarity,
+                canonical_name_embedding_similarity,
             )
             exact_attribute_match = any(
                 self._topic_state_key(left) == self._topic_state_key(right)
@@ -3429,7 +3438,6 @@ class MemoryNodeManager:
                 1.0 if exact_attribute_match else 0.0,
                 attribute_overlap,
                 embedding_similarity,
-                name_similarity * 0.8,
             )
             if score > best_score:
                 best_score = score
@@ -3439,6 +3447,11 @@ class MemoryNodeManager:
                     "score": round(score, 4),
                     "attribute_overlap": round(attribute_overlap, 4),
                     "embedding_similarity": round(embedding_similarity, 4),
+                    "summary_embedding_similarity": round(summary_embedding_similarity, 4),
+                    "canonical_name_embedding_similarity": round(
+                        canonical_name_embedding_similarity,
+                        4,
+                    ),
                     "exact_attribute_match": exact_attribute_match,
                     "existing_state_id": state.get("id"),
                     "existing_canonical_name": state.get("canonical_name"),
@@ -3451,6 +3464,14 @@ class MemoryNodeManager:
                 "existing_canonical_name": best_state.get("canonical_name"),
                 "attribute_overlap": best_info.get("attribute_overlap", 0.0),
                 "embedding_similarity": best_info.get("embedding_similarity", 0.0),
+                "summary_embedding_similarity": best_info.get(
+                    "summary_embedding_similarity",
+                    0.0,
+                ),
+                "canonical_name_embedding_similarity": best_info.get(
+                    "canonical_name_embedding_similarity",
+                    0.0,
+                ),
             }
         return None, best_info
 
@@ -3719,6 +3740,7 @@ class MemoryNodeManager:
             f"entities: {', '.join(entities)}",
         ])
         embedding = self._embed(embedding_text)
+        canonical_name_embedding = self._embed(state["canonical_name"])
         state_id = self._db.upsert_state(
             state_scope=state_scope,
             state_type=state_type,
@@ -3740,6 +3762,7 @@ class MemoryNodeManager:
                 "status": state["status"],
             },
             embedding=embedding,
+            canonical_name_embedding=canonical_name_embedding,
             embedding_text=embedding_text,
         )
         # if state_id:
