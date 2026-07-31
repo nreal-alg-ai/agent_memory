@@ -1870,7 +1870,7 @@ class MemoryNodeManager:
 
     # ── Reflection: facts -> evolving states ─────────────────────────────
 
-    def reflect(self, *_, **kwargs: Any) -> Dict[str, int]:
+    def reflect(self, *_, **kwargs: Any) -> Dict[str, Any]:
         """Update topic/entity projections and actionable items from recent facts."""
         reflect_started_at = time.monotonic()
         if self._pending_interaction_turns:
@@ -1904,10 +1904,6 @@ class MemoryNodeManager:
         self._log_info("memory_reflect", "start", {
             "limit": limit,
             "reflect_timestamp": reflect_timestamp,
-            "elapsed_ms": round(
-                (time.monotonic() - reflect_started_at) * 1000,
-                2,
-            ),
         })
         facts = self._db.get_unprocessed_facts_for_states(
             limit=limit,
@@ -1953,37 +1949,57 @@ class MemoryNodeManager:
                 fact.get("id") for fact in entity_facts if fact.get("id") is not None
             ],
         })
-        existing_states = self._db.get_recent_memory_states(limit=80)
-
-        topic_update_started_at = time.monotonic()
         topic_report = self._resolve_and_update_topic_states_from_facts(
             facts=topic_facts,
-            existing_states=existing_states,
         )
-        self._log_info("memory_reflect", "topic_state_update_finish", {
-            **topic_report,
-            "elapsed_ms": round(
-                (time.monotonic() - topic_update_started_at) * 1000, 
-                2,
-            ),
-        })
-
-        existing_states = self._db.get_recent_memory_states(limit=80)
-        entity_update_started_at = time.monotonic()
         entity_report = self._resolve_and_update_entity_scoped_states_from_facts(
             facts=entity_facts,
-            existing_states=existing_states,
         )
-        self._log_info("memory_reflect", "entity_state_update_finish", {
-            **entity_report,
-            "elapsed_ms": round(
-                (time.monotonic() - entity_update_started_at) * 1000, 
+
+        actionable_report = self._update_memory_actionable_items_using_facts(
+            facts=facts,
+        )
+        facts_marked_processed = self._db.mark_facts_processed_for_memory_state(fact_ids)
+        report = {
+            "states_updated": (
+                int(topic_report.get("updated", 0) or 0)
+                + int(entity_report.get("updated", 0) or 0)
+            ),
+            "topic_facts_considered": len(topic_facts),
+            "entity_facts_considered": len(entity_facts),
+            "evidence_only_facts": max(0, len(facts) - len(set(
+                int(fact["id"])
+                for fact in [*topic_facts, *entity_facts]
+                if str(fact.get("id") or "").strip().isdigit()
+            ))),
+            "topic_states_updated": int(topic_report.get("updated", 0) or 0),
+            "topic_candidates_unresolved": int(topic_report.get("unresolved", 0) or 0),
+            "pending_unresolved_topics": int(topic_report.get("pending_unresolved", 0) or 0),
+            "entity_states_updated": int(entity_report.get("updated", 0) or 0),
+            "actionable_facts_considered": int(
+                actionable_report.get("candidate_fact_count", 0) or 0
+            ),
+            "facts_marked_processed_for_memory_state": facts_marked_processed,
+            "actionable_items_updated": int(
+                actionable_report.get("stored_count", 0) or 0
+            ),
+            "actionable_item_ids": actionable_report.get("item_ids") or [],
+            "total_elapsed_ms": round(
+                (time.monotonic() - reflect_started_at) * 1000,
                 2,
             ),
-        })
+        }
+        self._log_info("memory_reflect", "finish", report)
+        return report
 
+    def _update_memory_actionable_items_using_facts(
+        self,
+        *,
+        facts: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Extract and persist actionable items from the current reflect facts."""
+        started_at = time.monotonic()
         actionable_facts = self._filter_facts_for_actionable_item_extraction(facts)
-        actionable_extraction_started_at = time.monotonic()
         self._log_info("memory_reflect", "actionable_item_extraction_start", {
             "candidate_fact_count": len(actionable_facts),
             "candidate_fact_ids": [
@@ -2015,41 +2031,27 @@ class MemoryNodeManager:
             if item_id:
                 actionable_items_updated += 1
                 actionable_item_ids.append(item_id)
-        self._log_info("memory_reflect", "actionable_item_update_finish", {
+        
+        report = {
+            "candidate_fact_count": len(actionable_facts),
+            "candidate_fact_ids": [
+                fact.get("id") for fact in actionable_facts
+                if fact.get("id") is not None
+            ],
+            "actionable_update_count": len(actionable_updates),
             "requested_store_count": len(actionable_updates),
             "stored_count": actionable_items_updated,
             "item_ids": actionable_item_ids,
-            "elapsed_ms": round(
-                (time.monotonic() - actionable_extraction_started_at) * 1000,
-                2,
-            ),
-        })
-        facts_marked_processed = self._db.mark_facts_processed_for_memory_state(fact_ids)
-        report = {
-            "states_updated": (
-                int(topic_report.get("updated", 0) or 0)
-                + int(entity_report.get("updated", 0) or 0)
-            ),
-            "topic_facts_considered": len(topic_facts),
-            "entity_facts_considered": len(entity_facts),
-            "evidence_only_facts": max(0, len(facts) - len(set(
-                int(fact["id"])
-                for fact in [*topic_facts, *entity_facts]
-                if str(fact.get("id") or "").strip().isdigit()
-            ))),
-            "topic_states_updated": int(topic_report.get("updated", 0) or 0),
-            "topic_candidates_unresolved": int(topic_report.get("unresolved", 0) or 0),
-            "pending_unresolved_topics": int(topic_report.get("pending_unresolved", 0) or 0),
-            "entity_states_updated": int(entity_report.get("updated", 0) or 0),
-            "actionable_facts_considered": len(actionable_facts),
-            "facts_marked_processed_for_memory_state": facts_marked_processed,
-            "actionable_items_updated": actionable_items_updated,
             "total_elapsed_ms": round(
-                (time.monotonic() - reflect_started_at) * 1000,
+                (time.monotonic() - started_at) * 1000,
                 2,
             ),
         }
-        self._log_info("memory_reflect", "finish", report)
+        self._log_info(
+            "memory_reflect",
+            "actionable_item_update_finish",
+            report,
+        )
         return report
 
     @classmethod
@@ -2101,10 +2103,24 @@ class MemoryNodeManager:
         self,
         *,
         facts: List[Dict[str, Any]],
-        existing_states: List[Dict[str, Any]],
     ) -> Dict[str, int]:
+        update_started_at = time.monotonic()
+        existing_states = self._db.get_recent_memory_states(limit=80)
         if not self._enable_topic_state_resolution:
-            return {"enabled": 0, "updated": 0, "unresolved": 0, "pending_unresolved": len(self._pending_unresolved_topics)}
+            report = {
+                "enabled": 0,
+                "updated": 0,
+                "unresolved": 0,
+                "pending_unresolved": len(self._pending_unresolved_topics),
+            }
+            self._log_info("memory_reflect", "topic_state_update_finish", {
+                **report,
+                "elapsed_ms": round(
+                    (time.monotonic() - update_started_at) * 1000,
+                    2,
+                ),
+            })
+            return report
         existing_topic_states = [
             state for state in existing_states
             if str(state.get("state_scope") or "") == "topic_state"
@@ -2163,13 +2179,21 @@ class MemoryNodeManager:
                     if str(state.get("state_scope") or "") == "topic_state"
                     and str(state.get("state_type") or "") == "topic"
                 ]
-        return {
+        report = {
             "enabled": 1,
             "candidate_count": len(candidates),
             "updated": updated,
             "unresolved": unresolved,
             "pending_unresolved": len(self._pending_unresolved_topics),
         }
+        self._log_info("memory_reflect", "topic_state_update_finish", {
+            **report,
+            "elapsed_ms": round(
+                (time.monotonic() - update_started_at) * 1000,
+                2,
+            ),
+        })
+        return report
 
     def _build_topic_state_candidates_from_facts(
         self,
@@ -2932,10 +2956,19 @@ class MemoryNodeManager:
         self,
         *,
         facts: List[Dict[str, Any]],
-        existing_states: List[Dict[str, Any]],
     ) -> Dict[str, int]:
+        update_started_at = time.monotonic()
+        existing_states = self._db.get_recent_memory_states(limit=80)
         if not self._enable_entity_scoped_state_resolution:
-            return {"enabled": 0, "updated": 0}
+            report = {"enabled": 0, "updated": 0}
+            self._log_info("memory_reflect", "entity_state_update_finish", {
+                **report,
+                "elapsed_ms": round(
+                    (time.monotonic() - update_started_at) * 1000,
+                    2,
+                ),
+            })
+            return report
         existing_entity_states = [
             state for state in existing_states
             if str(state.get("state_scope") or "") == "entity_state"
@@ -2983,7 +3016,15 @@ class MemoryNodeManager:
                     if str(state.get("state_scope") or "") == "entity_state"
                     and str(state.get("state_type") or "") in self._entity_scoped_state_types()
                 ]
-        return {"enabled": 1, "candidate_count": len(candidates), "updated": updated}
+        report = {"enabled": 1, "candidate_count": len(candidates), "updated": updated}
+        self._log_info("memory_reflect", "entity_state_update_finish", {
+            **report,
+            "elapsed_ms": round(
+                (time.monotonic() - update_started_at) * 1000,
+                2,
+            ),
+        })
+        return report
 
     def _state_update_log_payload(
         self,
@@ -3701,48 +3742,48 @@ class MemoryNodeManager:
             embedding=embedding,
             embedding_text=embedding_text,
         )
-        if state_id:
-            memory_path = f"{state['source_type']}/states/{state_scope}/{state_type}"
-            # State summaries are maintained as concise current snapshots. Reuse
-            # the same text in the index so retrieval sees exactly that snapshot.
-            summary_card = _compact_whitespace(state["summary"])
-            evidence_time_start, evidence_time_end = self._event_time_bounds_from_facts(
-                evidence_facts,
-            )
-            index_embedding_text = self._build_index_embedding_text(
-                title=state["canonical_name"],
-                summary=summary_card,
-                keywords=keywords,
-                entities=entities,
-                canonical_topics=canonical_topics,
-                memory_path=memory_path,
-            )
-            index_embedding = self._embed(index_embedding_text)
-            self._db.upsert_index_entry(
-                source_type=state["source_type"],
-                target_table="memory_states",
-                target_id=state_id,
-                index_level="state",
-                memory_path=memory_path,
-                title=state["canonical_name"],
-                summary_for_retrieval=summary_card,
-                keywords=" ".join(keywords),
-                entities=entities,
-                canonical_topics=canonical_topics,
-                participants=["user", "assistant"],
-                time_start=evidence_time_start,
-                time_end=evidence_time_end,
-                importance=state["importance"],
-                confidence=state["confidence"],
-                embedding=index_embedding,
-                embedding_text=index_embedding_text,
-                metadata={
-                    "state_scope": state_scope,
-                    "state_type": state_type,
-                    "status": state["status"],
-                    "evidence_fact_ids": evidence_fact_ids,
-                },
-            )
+        # if state_id:
+        #     memory_path = f"{state['source_type']}/states/{state_scope}/{state_type}"
+        #     # State summaries are maintained as concise current snapshots. Reuse
+        #     # the same text in the index so retrieval sees exactly that snapshot.
+        #     summary_card = _compact_whitespace(state["summary"])
+        #     evidence_time_start, evidence_time_end = self._event_time_bounds_from_facts(
+        #         evidence_facts,
+        #     )
+        #     index_embedding_text = self._build_index_embedding_text(
+        #         title=state["canonical_name"],
+        #         summary=summary_card,
+        #         keywords=keywords,
+        #         entities=entities,
+        #         canonical_topics=canonical_topics,
+        #         memory_path=memory_path,
+        #     )
+        #     index_embedding = self._embed(index_embedding_text)
+        #     self._db.upsert_index_entry(
+        #         source_type=state["source_type"],
+        #         target_table="memory_states",
+        #         target_id=state_id,
+        #         index_level="state",
+        #         memory_path=memory_path,
+        #         title=state["canonical_name"],
+        #         summary_for_retrieval=summary_card,
+        #         keywords=" ".join(keywords),
+        #         entities=entities,
+        #         canonical_topics=canonical_topics,
+        #         participants=["user", "assistant"],
+        #         time_start=evidence_time_start,
+        #         time_end=evidence_time_end,
+        #         importance=state["importance"],
+        #         confidence=state["confidence"],
+        #         embedding=index_embedding,
+        #         embedding_text=index_embedding_text,
+        #         metadata={
+        #             "state_scope": state_scope,
+        #             "state_type": state_type,
+        #             "status": state["status"],
+        #             "evidence_fact_ids": evidence_fact_ids,
+        #         },
+        #     )
         return state_id
 
     def _extract_actionable_items_with_llm(
@@ -4094,47 +4135,47 @@ class MemoryNodeManager:
             embedding=embedding,
             embedding_text=embedding_text,
         )
-        if item_id:
-            memory_path = f"{item['source_type']}/actionable_items/{item['item_type']}"
-            summary_card = self._truncate_index_text(item["summary"], max_chars=700)
-            evidence_time_start, evidence_time_end = self._event_time_bounds_from_facts(
-                evidence_facts,
-            )
-            index_embedding_text = self._build_index_embedding_text(
-                title=item["canonical_name"],
-                summary=summary_card,
-                keywords=keywords,
-                entities=entities,
-                canonical_topics=canonical_topics,
-                memory_path=memory_path,
-            )
-            index_embedding = self._embed(index_embedding_text)
-            self._db.upsert_index_entry(
-                source_type=item["source_type"],
-                target_table="memory_actionable_items",
-                target_id=item_id,
-                index_level="actionable_item",
-                memory_path=memory_path,
-                title=item["canonical_name"],
-                summary_for_retrieval=summary_card,
-                keywords=" ".join(keywords),
-                entities=entities,
-                canonical_topics=canonical_topics,
-                participants=["user", "assistant"],
-                time_start=evidence_time_start,
-                time_end=evidence_time_end,
-                importance=item["importance"],
-                confidence=item["confidence"],
-                embedding=index_embedding,
-                embedding_text=index_embedding_text,
-                metadata={
-                    "item_type": item["item_type"],
-                    "owner": item["owner"],
-                    "status": item["status"],
-                    "due_at": item["due_at"],
-                    "evidence_fact_ids": evidence_fact_ids,
-                },
-            )
+        # if item_id:
+        #     memory_path = f"{item['source_type']}/actionable_items/{item['item_type']}"
+        #     summary_card = self._truncate_index_text(item["summary"], max_chars=700)
+        #     evidence_time_start, evidence_time_end = self._event_time_bounds_from_facts(
+        #         evidence_facts,
+        #     )
+        #     index_embedding_text = self._build_index_embedding_text(
+        #         title=item["canonical_name"],
+        #         summary=summary_card,
+        #         keywords=keywords,
+        #         entities=entities,
+        #         canonical_topics=canonical_topics,
+        #         memory_path=memory_path,
+        #     )
+        #     index_embedding = self._embed(index_embedding_text)
+        #     self._db.upsert_index_entry(
+        #         source_type=item["source_type"],
+        #         target_table="memory_actionable_items",
+        #         target_id=item_id,
+        #         index_level="actionable_item",
+        #         memory_path=memory_path,
+        #         title=item["canonical_name"],
+        #         summary_for_retrieval=summary_card,
+        #         keywords=" ".join(keywords),
+        #         entities=entities,
+        #         canonical_topics=canonical_topics,
+        #         participants=["user", "assistant"],
+        #         time_start=evidence_time_start,
+        #         time_end=evidence_time_end,
+        #         importance=item["importance"],
+        #         confidence=item["confidence"],
+        #         embedding=index_embedding,
+        #         embedding_text=index_embedding_text,
+        #         metadata={
+        #             "item_type": item["item_type"],
+        #             "owner": item["owner"],
+        #             "status": item["status"],
+        #             "due_at": item["due_at"],
+        #             "evidence_fact_ids": evidence_fact_ids,
+        #         },
+        #     )
         return item_id
     
     def _format_facts_for_state_prompt(self, facts: List[Dict[str, Any]]) -> str:
