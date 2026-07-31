@@ -135,6 +135,16 @@ state_aspects rules:
 - attribute_name must be more specific than the episode topic, such as "flexible workout preference", "health management execution constraint", or "weight-loss plan continuity risk". Avoid broad names like "health management" unless the evidence supports only a broad attribute.
 - evidence_basis must cite the specific evidence in the current fact that supports this aspect. Do not import prior state or outside inference.
 
+actionable_aspects rules:
+- `actionable_aspects` are candidate projections showing how this fact may later become an actionable_item, used to reduce downstream LLM cost and noise.
+- Output actionable_aspects only when the fact explicitly contains something that needs future reminder, follow-up, execution, review, decision tracking, open-question resolution, or a high-value risk that blocks action.
+- Return at most 2 actionable_aspects per fact, keeping only the most concrete and trackable action signals.
+- item_type must be one of: task, commitment, decision, follow_up, open_question, risk, reminder, recommendation, constraint.
+- Do not extract weak willingness such as "might try", "sounds good", or "may consider" as an actionable_aspect unless it also includes an explicit reminder, deadline, follow-up check, strong commitment, or verifiable execution plan.
+- action_summary must describe the specific item to follow up, execute, remind, review, or track. Do not restate the whole fact.
+- trigger_basis must cite the specific evidence in the current fact that supports this actionable signal.
+- due_at should be filled only when the evidence contains an explicit time, deadline, or reminder time; otherwise use an empty string.
+
 Output schema:
 {
   "episode_title": "short concrete title",
@@ -161,6 +171,17 @@ Output schema:
           "attribute_name": "specific attribute name",
           "aspect_summary": "durable contribution for this state_type only",
           "evidence_basis": "specific evidence from this fact supporting the aspect",
+          "confidence": 0.8
+        }
+      ],
+      "actionable_aspects": [
+        {
+          "item_type": "task|commitment|decision|follow_up|open_question|risk|reminder|recommendation|constraint",
+          "action_summary": "specific item that needs future reminder, follow-up, execution, review, or decision tracking",
+          "owner": "user|assistant|other|unknown",
+          "status": "open|in_progress|done|blocked|decided|noted|unknown",
+          "due_at": "",
+          "trigger_basis": "specific evidence from this fact supporting the actionable signal",
           "confidence": 0.8
         }
       ]
@@ -327,9 +348,9 @@ new facts:
 
 UNIFIED_ACTIONABLE_ITEM_EXTRACTION_PROMPT_EN = """You are the actionable-item extraction module for a unified AI-glasses long-term memory system inspired by MemPalace.
 
-The input contains newly stored narrative facts. Extract only concrete actionable items that truly require future follow-up, reminder, execution, review, or decision tracking. Actionable items are separate from evolving states: states summarize durable situations, preferences, constraints, and background; actionable items must be checkable, completable, trackable, or explicitly recalled as decisions, commitments, risks, or open questions.
+The input contains newly stored candidate narrative facts. Some facts include actionable_aspects as pre-filtered action signals. Extract only concrete actionable items that truly require future follow-up, reminder, execution, review, or decision tracking. Actionable items are separate from evolving states: states summarize durable situations, preferences, constraints, and background; actionable items must be checkable, completable, trackable, or explicitly recalled as decisions, commitments, risks, or open questions.
 
-Extract only items directly supported by the facts.
+Prefer actionable_aspects when present, but extract only items directly supported by the fact summary and actionable_aspects.
 
 Rules:
 1. Extract 0-4 actionable items. Many ordinary dialogue batches should return an empty list. Do not force coverage of facts.
@@ -365,7 +386,7 @@ Output schema:
   ]
 }
 
-New facts:
+Candidate facts:
 {facts}
 """
 

@@ -135,6 +135,16 @@ state_aspects 输出规则：
 - attribute_name 必须比 episode topic 更具体，例如“碎片化健身方式偏好”“健康管理执行限制”“减重计划持续性风险”，不要直接使用“健康管理”这类宽泛主题，除非证据只能支持宽泛属性。
 - evidence_basis 必须引用当前 fact 中支持该 aspect 的具体证据，不要引入历史 state 或外部推断。
 
+actionable_aspects 输出规则：
+- `actionable_aspects` 是这条 fact 对后续 actionable_item 提取的候选投影，用于降低后续 LLM 成本和噪声。
+- 只有当该 fact 明确包含未来需要提醒、跟进、执行、复盘、决策追踪、开放问题处理，或阻塞行动的高价值风险时才输出；普通偏好、背景、一次性建议、弱尝试意愿输出空数组。
+- 每条 fact 最多输出 2 个 actionable_aspects，只保留最具体、最可追踪的事项线索。
+- item_type 只能是 task、commitment、decision、follow_up、open_question、risk、reminder、recommendation、constraint。
+- 不要把“愿意试试/可以考虑/听起来不错”提取为 actionable_aspect，除非同时有明确提醒、截止时间、具体后续检查、强承诺或可验证执行计划。
+- action_summary 必须说明需要被跟进/执行/追踪的事项，不能只复述整条 fact。
+- trigger_basis 必须引用当前 fact 中支持该 actionable 线索的具体证据。
+- due_at 只在证据明确包含时间、截止或提醒时间时填写，否则为空字符串。
+
 输出格式：
 {
   "episode_title": "简短具体标题",
@@ -161,6 +171,17 @@ state_aspects 输出规则：
           "attribute_name": "具体属性名",
           "aspect_summary": "只描述该 state_type 侧面的长期状态贡献点",
           "evidence_basis": "当前 fact 中支持该 aspect 的具体证据",
+          "confidence": 0.8
+        }
+      ],
+      "actionable_aspects": [
+        {
+          "item_type": "task|commitment|decision|follow_up|open_question|risk|reminder|recommendation|constraint",
+          "action_summary": "需要后续提醒、跟进、执行、复盘或决策追踪的具体事项",
+          "owner": "user|assistant|other|unknown",
+          "status": "open|in_progress|done|blocked|decided|noted|unknown",
+          "due_at": "",
+          "trigger_basis": "当前 fact 中支持该 actionable 线索的具体证据",
           "confidence": 0.8
         }
       ]
@@ -327,9 +348,9 @@ entity_state_target：
 
 UNIFIED_ACTIONABLE_ITEM_EXTRACTION_PROMPT_ZH = """你是 AI 眼镜长期记忆系统中的 actionable item 提取模块。
 
-输入包含新存储的 narrative facts。请从中提取未来真正需要跟进、提醒、执行、复盘或决策追踪的具体可执行事项。actionable item 和 evolving state 分开：state 描述持续变化的长期状态、偏好、约束和背景；actionable item 必须是可以被检查、完成、追踪，或明确作为决定/承诺/风险/开放问题被召回的事项。
+输入包含新存储的候选 narrative facts，部分 fact 会带有 actionable_aspects 作为前置筛选出的行动线索。请从中提取未来真正需要跟进、提醒、执行、复盘或决策追踪的具体可执行事项。actionable item 和 evolving state 分开：state 描述持续变化的长期状态、偏好、约束和背景；actionable item 必须是可以被检查、完成、追踪，或明确作为决定/承诺/风险/开放问题被召回的事项。
 
-只能提取 facts 直接支持的内容。
+优先参考 actionable_aspects，但最终只能提取 fact summary 和 actionable_aspects 直接支持的内容。
 
 规则：
 1. 提取 0-4 条 actionable items。多数普通对话可以输出空列表，不要为了覆盖 facts 强行生成。
@@ -365,7 +386,7 @@ UNIFIED_ACTIONABLE_ITEM_EXTRACTION_PROMPT_ZH = """你是 AI 眼镜长期记忆�
   ]
 }
 
-新 facts：
+候选 facts：
 {facts}
 """
 

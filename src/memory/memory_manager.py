@@ -627,6 +627,7 @@ class MemoryNodeManager:
                     "primary_entity": fact.get("primary_entity"),
                     "canonical_topics": fact.get("canonical_topics") or [],
                     "state_aspects": fact.get("state_aspects") or [],
+                    "actionable_aspects": fact.get("actionable_aspects") or [],
                     "batch_fact_index": index,
                     "batch_fact_count": len(facts),
                 },
@@ -880,6 +881,9 @@ class MemoryNodeManager:
                 raw_fact.get("state_aspects"),
                 fallback_entity=primary_entity,
             )
+            actionable_aspects = self._normalize_actionable_aspects(
+                raw_fact.get("actionable_aspects"),
+            )
             fact_topics = self._normalize_episode_canonical_topics(
                 [primary_topic],
                 topic_candidates=[
@@ -900,6 +904,7 @@ class MemoryNodeManager:
                 "entities": entities,
                 "primary_entity": primary_entity,
                 "state_aspects": state_aspects,
+                "actionable_aspects": actionable_aspects,
                 "canonical_topics": fact_topics or episode_topics or [primary_topic],
                 "importance": max(0.6, min(1.0, priority / 100.0)),
                 "confidence": 0.9,
@@ -1004,6 +1009,72 @@ class MemoryNodeManager:
             if entity_payload:
                 item["entity"] = entity_payload
             normalized.append(item)
+            if len(normalized) >= max_items:
+                break
+        return normalized
+
+    def _normalize_actionable_aspects(
+        self,
+        value: Any,
+        *,
+        limit: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        if not isinstance(value, list):
+            return []
+        max_items = max(
+            0,
+            int(
+                limit
+                if limit is not None
+                else self._memory_cfg.get("actionable_aspect_max_per_fact", 2) or 2
+            ),
+        )
+        if max_items <= 0:
+            return []
+        allowed_types = {
+            "task", "commitment", "decision", "follow_up", "open_question",
+            "risk", "reminder", "recommendation", "constraint",
+        }
+        normalized: List[Dict[str, Any]] = []
+        seen: set[Tuple[str, str]] = set()
+        for raw in value:
+            if not isinstance(raw, dict):
+                continue
+            item_type = self._normalize_actionable_item_type(raw.get("item_type"))
+            if item_type not in allowed_types:
+                continue
+            action_summary = _compact_whitespace(
+                raw.get("action_summary")
+                or raw.get("summary")
+                or raw.get("text")
+                or ""
+            )
+            trigger_basis = _compact_whitespace(
+                raw.get("trigger_basis")
+                or raw.get("evidence_basis")
+                or raw.get("evidence")
+                or raw.get("reason")
+                or ""
+            )
+            if not action_summary or not trigger_basis:
+                continue
+            owner = self._normalize_actionable_owner(raw.get("owner"))
+            status = self._normalize_actionable_status(raw.get("status"))
+            due_at = _compact_whitespace(raw.get("due_at") or "")
+            confidence = self._clamp_float(raw.get("confidence"), 0.0, 1.0, 0.75)
+            key = (item_type, action_summary.lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            normalized.append({
+                "item_type": item_type,
+                "action_summary": action_summary,
+                "owner": owner,
+                "status": status,
+                "due_at": due_at,
+                "trigger_basis": trigger_basis,
+                "confidence": confidence,
+            })
             if len(normalized) >= max_items:
                 break
         return normalized
@@ -1801,6 +1872,7 @@ class MemoryNodeManager:
                 "tags": tags,
                 "source_text": fact["source_text"],
                 "state_aspects": fact.get("state_aspects") or [],
+                "actionable_aspects": fact.get("actionable_aspects") or [],
             }
             fact_id = self._db.insert_fact(
                 episode_id=episode_id,
@@ -1860,46 +1932,119 @@ class MemoryNodeManager:
     def reflect(self, *_, **kwargs: Any) -> Dict[str, int]:
         """Update topic/entity projections and actionable items from recent facts."""
         if self._pending_interaction_turns:
+            pending_count = len(self._pending_interaction_turns)
             self.flush_pending_interaction_turns()
+            self._log_info("memory_reflect", "pending_interactions_flushed", {
+                "pending_interaction_count": pending_count,
+            })
         if not self._enabled:
+            self._log_info("memory_reflect", "skipped", {
+                "reason": "memory_disabled",
+            })
             return {"states_updated": 0, "actionable_items_updated": 0}
         if not self._llm_api_key:
+            self._log_info("memory_reflect", "skipped", {
+                "reason": "missing_llm_api_key",
+            })
             return {"states_updated": 0, "actionable_items_updated": 0}
         limit = max(1, int(kwargs.get("limit") or self._memory_cfg.get("reflect_limit") or 100))
         reflect_timestamp = kwargs.get("reflect_timestamp")
         if reflect_timestamp is None:
             reflect_timestamp = kwargs.get("timestamp") or _now_text()
+        self._log_info("memory_reflect", "start", {
+            "limit": limit,
+            "reflect_timestamp": reflect_timestamp,
+        })
         facts = self._db.get_unprocessed_facts_for_states(
             limit=limit,
             reference_timestamp=reflect_timestamp,
         )
         if not facts:
+            self._log_info("memory_reflect", "facts_loaded", {
+                "fact_count": 0,
+                "limit": limit,
+                "reflect_timestamp": reflect_timestamp,
+            })
             return {"states_updated": 0, "actionable_items_updated": 0}
         fact_ids = [
             int(fact["id"])
             for fact in facts
             if str(fact.get("id") or "").strip().isdigit()
         ]
+        source_counts = Counter(str(fact.get("source_type") or "unified") for fact in facts)
+        self._log_info("memory_reflect", "facts_loaded", {
+            "fact_count": len(facts),
+            "fact_ids": fact_ids,
+            "source_counts": dict(source_counts),
+            "time_start": facts[0].get("time_key") if facts else "",
+            "time_end": facts[-1].get("time_key") if facts else "",
+        })
         topic_facts = [fact for fact in facts if self._fact_can_seed_topic_state(fact)]
         entity_facts = [fact for fact in facts if self._fact_can_seed_entity_state(fact)]
+        self._log_info("memory_reflect", "state_fact_candidates", {
+            "topic_fact_count": len(topic_facts),
+            "topic_fact_ids": [
+                fact.get("id") for fact in topic_facts if fact.get("id") is not None
+            ],
+            "entity_fact_count": len(entity_facts),
+            "entity_fact_ids": [
+                fact.get("id") for fact in entity_facts if fact.get("id") is not None
+            ],
+        })
         existing_states = self._db.get_recent_memory_states(limit=80)
+
         topic_report = self._resolve_and_update_topic_states_from_facts(
             facts=topic_facts,
             existing_states=existing_states,
         )
+        self._log_info("memory_reflect", "topic_state_update_finish", topic_report)
+
         existing_states = self._db.get_recent_memory_states(limit=80)
         entity_report = self._resolve_and_update_entity_scoped_states_from_facts(
             facts=entity_facts,
             existing_states=existing_states,
         )
-        facts_marked_processed = self._db.mark_facts_processed_for_memory_state(fact_ids)
-        actionable_updates = self._extract_actionable_items_with_llm(facts=facts)
+        self._log_info("memory_reflect", "entity_state_update_finish", entity_report)
+
+        actionable_facts = self._filter_facts_for_actionable_item_extraction(facts)
+        self._log_info("memory_reflect", "actionable_item_extraction_start", {
+            "candidate_fact_count": len(actionable_facts),
+            "candidate_fact_ids": [
+                fact.get("id") for fact in actionable_facts if fact.get("id") is not None
+            ],
+        })
+        actionable_updates = self._extract_actionable_items_with_llm(facts=actionable_facts)
+        self._log_info("memory_reflect", "actionable_item_extraction_finish", {
+            "candidate_fact_count": len(actionable_facts),
+            "actionable_update_count": len(actionable_updates),
+            "actionable_updates": [
+                {
+                    "item_type": item.get("item_type"),
+                    "canonical_name": item.get("canonical_name"),
+                    "owner": item.get("owner"),
+                    "status": item.get("status"),
+                    "due_at": item.get("due_at"),
+                    "evidence_fact_ids": item.get("evidence_fact_ids") or [],
+                    "confidence": item.get("confidence"),
+                    "importance": item.get("importance"),
+                }
+                for item in actionable_updates
+            ],
+        })
         actionable_items_updated = 0
+        actionable_item_ids: List[int] = []
         for item in actionable_updates:
             item_id = self._store_actionable_item(item)
             if item_id:
                 actionable_items_updated += 1
-        return {
+                actionable_item_ids.append(item_id)
+        self._log_info("memory_reflect", "actionable_item_store_finish", {
+            "requested_store_count": len(actionable_updates),
+            "stored_count": actionable_items_updated,
+            "item_ids": actionable_item_ids,
+        })
+        facts_marked_processed = self._db.mark_facts_processed_for_memory_state(fact_ids)
+        report = {
             "states_updated": (
                 int(topic_report.get("updated", 0) or 0)
                 + int(entity_report.get("updated", 0) or 0)
@@ -1915,9 +2060,12 @@ class MemoryNodeManager:
             "topic_candidates_unresolved": int(topic_report.get("unresolved", 0) or 0),
             "pending_unresolved_topics": int(topic_report.get("pending_unresolved", 0) or 0),
             "entity_states_updated": int(entity_report.get("updated", 0) or 0),
+            "actionable_facts_considered": len(actionable_facts),
             "facts_marked_processed_for_memory_state": facts_marked_processed,
             "actionable_items_updated": actionable_items_updated,
         }
+        self._log_info("memory_reflect", "finish", report)
+        return report
 
     @classmethod
     def _fact_has_durable_state_signal(cls, fact: Dict[str, Any]) -> bool:
@@ -2010,6 +2158,16 @@ class MemoryNodeManager:
             state_update.setdefault("source_type", candidate.get("source_type") or "unified")
             state_id = self._store_state(state_update)
             if state_id:
+                self._log_info(
+                    "memory_reflect",
+                    "topic_state_updated",
+                    self._state_update_log_payload(
+                        state_id=state_id,
+                        state_update=state_update,
+                        candidate=candidate,
+                        existing_state=chosen_state,
+                    ),
+                )
                 updated += 1
                 refreshed = self._db.get_recent_memory_states(
                     source_types=[state_update["source_type"]],
@@ -2820,6 +2978,16 @@ class MemoryNodeManager:
                 continue
             state_id = self._store_state(state_update)
             if state_id:
+                self._log_info(
+                    "memory_reflect",
+                    "entity_state_updated",
+                    self._state_update_log_payload(
+                        state_id=state_id,
+                        state_update=state_update,
+                        candidate=candidate,
+                        existing_state=existing_state,
+                    ),
+                )
                 updated += 1
                 refreshed = self._db.get_recent_memory_states(
                     source_types=[state_update["source_type"]],
@@ -2831,6 +2999,85 @@ class MemoryNodeManager:
                     and str(state.get("state_type") or "") in self._entity_scoped_state_types()
                 ]
         return {"enabled": 1, "candidate_count": len(candidates), "updated": updated}
+
+    def _state_update_log_payload(
+        self,
+        *,
+        state_id: int,
+        state_update: Dict[str, Any],
+        candidate: Dict[str, Any],
+        existing_state: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        facts = list(candidate.get("facts") or [])
+        return {
+            "state_id": state_id,
+            "candidate": {
+                "state_scope": candidate.get("state_scope"),
+                "state_type": candidate.get("state_type"),
+                "source_type": candidate.get("source_type"),
+                "canonical_name": candidate.get("canonical_name"),
+                "entity": candidate.get("entity"),
+                "entity_key": candidate.get("entity_key"),
+                "attribute_name": candidate.get("attribute_name"),
+                "candidate_source": candidate.get("candidate_source"),
+                "fact_ids": candidate.get("fact_ids") or [],
+                "aliases": candidate.get("aliases") or [],
+            },
+            "existing_state": self._state_log_view(existing_state),
+            "participating_facts": [
+                self._fact_log_view_for_state_update(fact)
+                for fact in facts
+            ],
+            "updated_state": self._state_log_view(
+                {
+                    **state_update,
+                    "id": state_id,
+                }
+            ),
+        }
+
+    def _fact_log_view_for_state_update(self, fact: Dict[str, Any]) -> Dict[str, Any]:
+        metadata = fact.get("metadata") if isinstance(fact.get("metadata"), dict) else {}
+        return {
+            "id": fact.get("id"),
+            "episode_id": fact.get("episode_id"),
+            "source_type": fact.get("source_type"),
+            "fact_type": fact.get("fact_type"),
+            "fact_kind": fact.get("fact_kind"),
+            "fact_subject": fact.get("fact_subject"),
+            "time_key": fact.get("time_key"),
+            "summary": self._log_text(fact.get("summary") or "", limit=1200),
+            "keywords": fact.get("keywords"),
+            "entities": fact.get("entities") or [],
+            "primary_entity": fact.get("primary_entity") or metadata.get("primary_entity"),
+            "canonical_topics": fact.get("canonical_topics") or [],
+            "state_aspects": fact.get("state_aspects") or metadata.get("state_aspects") or [],
+            "actionable_aspects": fact.get("actionable_aspects") or metadata.get("actionable_aspects") or [],
+            "confidence": fact.get("confidence"),
+            "importance": fact.get("importance"),
+        }
+
+    def _state_log_view(self, state: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        if not state:
+            return {}
+        metadata = state.get("metadata") if isinstance(state.get("metadata"), dict) else {}
+        return {
+            "id": state.get("id"),
+            "state_scope": state.get("state_scope"),
+            "state_type": state.get("state_type"),
+            "source_type": state.get("source_type"),
+            "entity_key": state.get("entity_key") or metadata.get("entity_key") or "",
+            "canonical_name": state.get("canonical_name"),
+            "summary": self._log_text(state.get("summary") or "", limit=1200),
+            "time_line": self._normalize_time_line(
+                state.get("time_line"),
+                limit=20,
+                max_chars=2400,
+            ),
+            "evidence_fact_ids": state.get("evidence_fact_ids") or [],
+            "confidence": state.get("confidence"),
+            "metadata": metadata,
+        }
 
     @staticmethod
     def _entity_scoped_state_types() -> set[str]:
@@ -3518,6 +3765,11 @@ class MemoryNodeManager:
         *,
         facts: List[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
+        if not facts:
+            self._log_info("memory_reflect", "actionable_llm_skipped", {
+                "reason": "no_candidate_facts",
+            })
+            return []
         prompt_language = self._resolve_prompt_language_from_text(
             "\n".join(str(item.get("summary") or "") for item in facts[:20])
         )
@@ -3526,24 +3778,44 @@ class MemoryNodeManager:
             if prompt_language == "en"
             else UNIFIED_ACTIONABLE_ITEM_EXTRACTION_PROMPT_ZH
         )
-        prompt = prompt_template.replace("{facts}", self._format_facts_for_state_prompt(facts))
+        prompt = prompt_template.replace("{facts}", self._format_facts_for_actionable_prompt(facts))
+        self._log_info("memory_reflect", "actionable_llm_call_start", {
+            "candidate_fact_count": len(facts),
+            "candidate_fact_ids": [
+                fact.get("id") for fact in facts if fact.get("id") is not None
+            ],
+            "prompt_language": prompt_language,
+            "prompt_chars": len(prompt),
+        })
         result = self._call_llm(prompt)
         parsed = self._parse_json_object_from_llm_text(result or "")
         if not parsed:
+            self._log_info("memory_reflect", "actionable_llm_parse_failed", {
+                "candidate_fact_count": len(facts),
+                "response_chars": len(result or ""),
+                "response_preview": self._log_text(result or "", limit=600),
+            })
             return []
         raw_items = parsed.get("actionable_items")
         if not isinstance(raw_items, list):
+            self._log_info("memory_reflect", "actionable_llm_schema_failed", {
+                "candidate_fact_count": len(facts),
+                "parsed_keys": sorted(str(key) for key in parsed.keys()),
+            })
             return []
         normalized: List[Dict[str, Any]] = []
         valid_fact_ids = {int(item["id"]) for item in facts if item.get("id") is not None}
         facts_by_id = {int(item["id"]): item for item in facts if item.get("id") is not None}
         seen_keys: set[str] = set()
+        rejected_counts: Counter[str] = Counter()
         for raw in raw_items:
             if not isinstance(raw, dict):
+                rejected_counts["non_object"] += 1
                 continue
             summary = _compact_whitespace(raw.get("summary") or "")
             canonical_name = _compact_whitespace(raw.get("canonical_name") or "")
             if not summary or not canonical_name:
+                rejected_counts["missing_summary_or_name"] += 1
                 continue
             evidence_ids = [
                 int(value)
@@ -3551,6 +3823,7 @@ class MemoryNodeManager:
                 if str(value).strip().isdigit() and int(value) in valid_fact_ids
             ]
             if not evidence_ids:
+                rejected_counts["missing_valid_evidence"] += 1
                 continue
             source_type = self._state_source_type_for_facts(facts, evidence_ids)
             item = {
@@ -3569,13 +3842,93 @@ class MemoryNodeManager:
                 "confidence": self._clamp_float(raw.get("confidence"), 0.0, 1.0, 0.75),
             }
             if not self._is_high_value_actionable_item(item, facts_by_id=facts_by_id):
+                rejected_counts["low_value"] += 1
                 continue
             dedupe_key = self._actionable_dedupe_key(item)
             if dedupe_key in seen_keys:
+                rejected_counts["duplicate"] += 1
                 continue
             seen_keys.add(dedupe_key)
             normalized.append(item)
+        self._log_info("memory_reflect", "actionable_llm_normalized", {
+            "candidate_fact_count": len(facts),
+            "raw_item_count": len(raw_items),
+            "normalized_item_count": len(normalized),
+            "rejected_counts": dict(rejected_counts),
+        })
         return normalized
+
+    def _filter_facts_for_actionable_item_extraction(
+        self,
+        facts: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        selected: List[Dict[str, Any]] = []
+        seen_ids: set[int] = set()
+        for fact in facts:
+            fact_id = fact.get("id")
+            numeric_id = int(fact_id) if str(fact_id or "").strip().isdigit() else 0
+            if numeric_id and numeric_id in seen_ids:
+                continue
+            if self._actionable_aspects_from_fact(fact) or self._fact_can_seed_actionable_item(fact):
+                selected.append(fact)
+                if numeric_id:
+                    seen_ids.add(numeric_id)
+        limit = max(
+            1,
+            int(self._memory_cfg.get("actionable_fact_candidate_limit", 40) or 40),
+        )
+        selected = selected[:limit]
+        aspect_seed_count = sum(
+            1 for fact in selected
+            if self._actionable_aspects_from_fact(fact)
+        )
+        self._log_info("memory_reflect", "actionable_fact_candidates", {
+            "candidate_count": len(selected),
+            "input_fact_count": len(facts),
+            "candidate_limit": limit,
+            "candidate_fact_ids": [
+                fact.get("id")
+                for fact in selected
+                if fact.get("id") is not None
+            ],
+            "aspect_seed_count": aspect_seed_count,
+            "heuristic_seed_count": max(0, len(selected) - aspect_seed_count),
+        })
+        return selected
+
+    def _actionable_aspects_from_fact(self, fact: Dict[str, Any]) -> List[Dict[str, Any]]:
+        metadata = fact.get("metadata") if isinstance(fact.get("metadata"), dict) else {}
+        raw = fact.get("actionable_aspects") or metadata.get("actionable_aspects")
+        return self._normalize_actionable_aspects(raw)
+
+    def _fact_can_seed_actionable_item(self, fact: Dict[str, Any]) -> bool:
+        kind = str(fact.get("fact_kind") or "").strip().lower()
+        fact_type = str(fact.get("fact_type") or "").strip().lower()
+        subject = str(fact.get("fact_subject") or "").strip().lower()
+        summary = str(fact.get("summary") or "")
+        metadata = fact.get("metadata") if isinstance(fact.get("metadata"), dict) else {}
+        source_text = str(metadata.get("source_text") or fact.get("source_text") or "")
+        all_text = f"{summary}\n{source_text}".lower()
+        if not summary:
+            return False
+        if any(pattern in all_text for pattern in _WEAK_TRY_PATTERNS):
+            if not self._has_explicit_followup_or_commitment(all_text, item_type="task"):
+                return False
+        if self._has_actionable_hard_marker(all_text):
+            return True
+        if kind in {"commitment", "open_question", "request"}:
+            return True
+        if kind == "decision":
+            return self._has_strong_decision_marker(all_text)
+        if kind == "risk":
+            return self._has_blocking_marker(all_text)
+        if kind == "instruction" and subject in {"user", "assistant", "system"}:
+            return True
+        if kind == "action" and fact_type == "episodic":
+            return self._has_explicit_followup_or_commitment(all_text, item_type="task")
+        if kind == "recommendation":
+            return self._has_explicit_followup_or_commitment(all_text, item_type="recommendation")
+        return False
 
     def _is_high_value_actionable_item(
         self,
@@ -3815,6 +4168,27 @@ class MemoryNodeManager:
                 "entities": fact.get("entities") or [],
                 "primary_entity": fact.get("primary_entity") or metadata.get("primary_entity"),
                 "canonical_topics": fact.get("canonical_topics") or [],
+            })
+        return json.dumps(rows, ensure_ascii=False, indent=2)
+
+    def _format_facts_for_actionable_prompt(self, facts: List[Dict[str, Any]]) -> str:
+        rows: List[Dict[str, Any]] = []
+        for fact in facts[:80]:
+            metadata = fact.get("metadata") if isinstance(fact.get("metadata"), dict) else {}
+            actionable_aspects = self._actionable_aspects_from_fact(fact)
+            rows.append({
+                "id": fact.get("id"),
+                "source_type": fact.get("source_type"),
+                "fact_type": fact.get("fact_type"),
+                "fact_kind": fact.get("fact_kind"),
+                "fact_subject": fact.get("fact_subject"),
+                "time_key": fact.get("time_key"),
+                "summary": fact.get("summary"),
+                "keywords": fact.get("keywords"),
+                "entities": fact.get("entities") or [],
+                "primary_entity": fact.get("primary_entity") or metadata.get("primary_entity"),
+                "canonical_topics": fact.get("canonical_topics") or [],
+                "actionable_aspects": actionable_aspects,
             })
         return json.dumps(rows, ensure_ascii=False, indent=2)
 

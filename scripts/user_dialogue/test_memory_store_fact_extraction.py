@@ -113,12 +113,12 @@ class StoreFactExtractionManager(MemoryNodeManager):
                     len(content),
                     response_data.get("usage"),
                 )
-                logging.info(
-                    "LLM raw response #%s kind=%s:\n%s",
-                    self._test_llm_call_count,
-                    call_kind,
-                    content,
-                )
+                # logging.info(
+                #     "LLM raw response #%s kind=%s:\n%s",
+                #     self._test_llm_call_count,
+                #     call_kind,
+                #     content,
+                # )
                 if finish_reason == "length":
                     logging.warning(
                         "LLM result #%s was truncated; increase --llm-max-tokens",
