@@ -207,13 +207,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--fact-extraction-interval",
         type=int,
-        default=1,
-        help="Force fact extraction every N stored pairs. Default: 1 for benchmark fidelity.",
+        default=None,
+        help=(
+            "Override memory.min_dialogue_turns_before_store from config.yaml. "
+            "When omitted, use the config.yaml value."
+        ),
     )
     parser.add_argument(
         "--fact-extraction-max-chars",
         type=int,
-        help="Override memory.max_chars_before_store from config.yaml.",
+        default=None,
+        help=(
+            "Override memory.max_dialogue_chars_before_store from config.yaml. "
+            "When omitted, use the config.yaml value."
+        ),
     )
     parser.add_argument("--log-level", default="INFO")
     parser.add_argument("--manager-log-level", default="INFO")
@@ -643,26 +650,35 @@ def prepare_runtime_configs(
         if isinstance(config.get("memory"), dict)
         else {}
     )
-    min_turns_before_store = max(1, int(args.fact_extraction_interval))
+    configured_min_turns = memory_config.get("min_dialogue_turns_before_store")
+    if configured_min_turns in (None, ""):
+        configured_min_turns = memory_config.get("min_turns_before_store", 1)
+    min_turns_before_store = max(
+        1,
+        int(
+            args.fact_extraction_interval
+            if args.fact_extraction_interval is not None
+            else configured_min_turns
+        ),
+    )
+    args.fact_extraction_interval = min_turns_before_store
     memory_config["min_turns_before_store"] = min_turns_before_store
     memory_config["min_dialogue_turns_before_store"] = min_turns_before_store
-    memory_config["min_dilaogue_turns_before_store"] = min_turns_before_store
-    if args.fact_extraction_max_chars:
-        max_chars_before_store = max(1, int(args.fact_extraction_max_chars))
+    configured_max_chars = memory_config.get("max_dialogue_chars_before_store")
+    if configured_max_chars in (None, ""):
+        configured_max_chars = memory_config.get("max_chars_before_store")
+    if args.fact_extraction_max_chars is not None or configured_max_chars not in (None, ""):
+        max_chars_before_store = max(
+            1,
+            int(
+                args.fact_extraction_max_chars
+                if args.fact_extraction_max_chars is not None
+                else configured_max_chars
+            ),
+        )
+        args.fact_extraction_max_chars = max_chars_before_store
         memory_config["max_chars_before_store"] = max_chars_before_store
         memory_config["max_dialogue_chars_before_store"] = max_chars_before_store
-        memory_config["max_dilaogue_chars_before_store"] = max_chars_before_store
-    else:
-        configured_max_chars = (
-            memory_config.get("max_dilaogue_chars_before_store")
-            or memory_config.get("max_dialogue_chars_before_store")
-            or memory_config.get("max_chars_before_store")
-        )
-        if configured_max_chars:
-            max_chars_before_store = max(1, int(configured_max_chars))
-            memory_config["max_chars_before_store"] = max_chars_before_store
-            memory_config["max_dialogue_chars_before_store"] = max_chars_before_store
-            memory_config["max_dilaogue_chars_before_store"] = max_chars_before_store
     memory_config["llm_timeout"] = int(args.llm_timeout)
     memory_config["llm_thinking"] = str(args.llm_thinking)
     memory_config["llm_json_mode"] = bool(args.llm_json_mode)
