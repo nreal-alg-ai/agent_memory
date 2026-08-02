@@ -80,16 +80,19 @@ canonical_topics rules:
 - Avoid over-generic topics such as "solution finalized", "product design discussion", "team collaboration", "problem discussion", or "user consultation". Prefer a concrete object or stable domain, e.g. "AI glasses voice memory system" or "phone promotion strategy".
 - If the evidence is too thin to identify the concrete object, do not reuse an existing topic merely because it is broadly related. Reuse it only when the same object or issue is still clear; otherwise output a conservative topic grounded in the current evidence rather than a fragmented short phrase.
 - Reuse an existing topic only after a strict semantic check: the current episode/fact must have substantially the same core object or concrete issue, discussion goal, and semantic scope as that topic's canonical_name. Sharing a broad domain, one entity, similar words, or nearby timestamps is not sufficient.
-- If a fact mentions an existing topic only as background but actually discusses a different object or issue, choose a more accurate primary_topic for that fact instead of forcing it into the existing topic to reduce the topic count.
+- If a fact mentions an existing topic only as background but actually discusses a different object or issue, choose a more accurate `fact_root_topic` for that fact instead of forcing it into the existing topic to reduce the topic count.
+- Every fact must also output `fact_root_topic` and `fact_aspect_topic` as sibling fields to place the fine-grained issue under a stable root topic. `fact_root_topic` should be a product, project, or long-running issue; `fact_aspect_topic` should be the specific aspect discussed by the fact. If the root cannot be supported, use a conservative root topic grounded in the current evidence; if no finer aspect is supported, set fact_aspect_topic equal to fact_root_topic rather than inventing an unsupported parent.
+- `fact_root_topic` must reference the existing `memory_states` entries with `state_scope=topic_state` and their `canonical_name` values. When the fact has the same core object, discussion goal, and semantic scope as an existing topic state, reuse that `canonical_name` exactly. Do not force reuse based only on a shared entity, broad domain, or similar keywords; otherwise use a conservative root topic supported by the current evidence.
+- The system reuses this fact's `entities` as the root-topic context entities; do not generate a separate context-entity field.
 
 memory_states usage rules:
-- A state with state_scope=topic_state and state_type=topic is a naming reference for episode canonical_topics and fact primary_topic. If the current evidence refers to the same durable object or issue, reuse its canonical_name exactly.
-- A state with state_scope=entity_state is only background for understanding durable entity attributes, preferences, constraints, risks, or relationships. Do not directly use an entity_state canonical_name as an episode topic or fact primary_topic.
+- A state with state_scope=topic_state and state_type=topic is a naming reference for episode canonical_topics and the fact's `fact_root_topic`. If the current evidence refers to the same durable object or issue, reuse its canonical_name exactly.
+- A state with state_scope=entity_state is only background for understanding durable entity attributes, preferences, constraints, risks, or relationships. Do not directly use an entity_state canonical_name as an episode topic or the fact's fact_root_topic.
 - These states are historical context, not evidence for the current episode. Do not write unsupported historical details into a fact; when current dialogue conflicts with a prior state, current dialogue wins.
-- fact primary_topic must describe the main topic of that fact. It may reuse a relevant topic_state canonical_name, but must not become an entity-attribute title merely because an entity_state was provided.
-- fact primary_topic may reuse a topic_state canonical_name only when the fact's core object, discussion goal, and semantic scope are all substantially aligned with that name.
+- fact's `fact_root_topic` must describe the main durable topic of that fact. It may reuse a relevant topic_state canonical_name, but must not become an entity-attribute title merely because an entity_state was provided.
+- `fact_root_topic` may reuse a topic_state canonical_name only when the fact's core object, discussion goal, and semantic scope are all substantially aligned with that name; `fact_aspect_topic` should retain the specific aspect discussed under that root.
 - Do not reuse a topic_state merely because the fact belongs to a broad domain such as health, products, or teams, or because it contains related background. When the evidence does not support a strict match, use a more specific topic grounded in the current evidence, or create a conservative new topic.
-- Never change a fact's primary_topic because of an entity_state name, summary, or historical timeline. An entity_state may help interpretation, but it is not a topic candidate to reuse directly.
+- Never change a fact's root_topic because of an entity_state name, summary, or historical timeline. An entity_state may help interpretation, but it is not a topic candidate to reuse directly.
 - Every fact must also output one `primary_entity`, the single entity that the fact mainly describes, affects, or belongs to; it must be one object, not an array.
 - `primary_entity` must come from the fact's `entities`. Do not choose an entity merely because it is mentioned, provides a recommendation, or is a location, tool, or background context. For a multi-person exchange, choose the person or entity mainly described or affected by the fact; for a fact about the user's own preference, habit, constraint, or risk, choose the user.
 - Keep `entities` for all directly relevant entities so retrieval preserves participants and context; downstream entity-state matching uses only `primary_entity`, so one fact must not be assigned to multiple entities.
@@ -156,7 +159,8 @@ Output schema:
       "keywords": ["keyword1", "keyword2"],
       "entities": [{"name": "entity name", "type": "PERSON|ORGANIZATION|LOCATION|PRODUCT|PROJECT|TECHNOLOGY|CONCEPT|TOPIC|PREFERENCE|OTHER"}],
       "primary_entity": {"name": "the single primary entity of this fact", "type": "PERSON|ORGANIZATION|LOCATION|PRODUCT|PROJECT|TECHNOLOGY|CONCEPT|TOPIC|PREFERENCE|OTHER"},
-      "primary_topic": "stable topic string; prefer a relevant topic_state canonical_name, never an entity_state name",
+      "fact_root_topic": "stable product/project/long-running issue root topic",
+      "fact_aspect_topic": "specific aspect discussed by this fact",
       "fact_type": "semantic|episodic",
       "fact_subject": "user|assistant|world|project|system|other",
       "fact_kind": "preference|decision|request|recommendation|action|commitment|open_question|risk|error|context|instruction|other",
@@ -246,20 +250,29 @@ UNIFIED_TOPIC_STATE_UPDATE_PROMPT_EN = """You are the topic_state update module 
 The input has already passed topic resolution: the system has decided that these facts belong to a long-term topic, or that a new long-term topic should be created. Your task is to update that topic_state summary, not to re-route the topic.
 
 Rules:
-1. Update only the given canonical_topic. Do not merge unrelated facts.
-2. The summary should describe the durable topic state: background, recent changes, key participants, decisions/preferences/constraints that still matter, unresolved questions, and next steps.
-3. If existing_topic_state is present, merge incrementally instead of concatenating. Preserve durable information that is still valid.
-4. Do not rewrite one fact into another fact. A topic_state must be more abstract and stable than individual facts.
-5. summary must be a concise current-state snapshot: at most 1-2 sentences and preferably no more than 80 English words. Do not append the historical timeline to summary.
-6. time_line_updates must contain only changes supported by the new facts, with 0-3 events. Each event must include time, change_type, a short change summary, and fact_ids. Do not repeat existing timeline events or record unchanged information.
-7. evidence_fact_ids must cite supporting fact IDs from the input facts.
-8. Return JSON only. No markdown.
+1. The given canonical_topic is the root topic. Update only that root topic and do not merge unrelated facts.
+2. Do not create a separate topic_state for each aspect; return concrete aspects as local progress under the root topic.
+3. The summary should describe the durable root state: background, recent changes, key participants, decisions/preferences/constraints that still matter, unresolved questions, and next steps.
+4. If existing_topic_state is present, merge incrementally instead of concatenating. Preserve durable information that is still valid.
+5. Do not rewrite one fact into another fact. A topic_state must be more abstract and stable than individual facts.
+6. summary must be a concise current-state snapshot: at most 1-2 sentences and preferably no more than 80 English words. Do not append the historical timeline or every aspect to summary.
+7. Return only evidence-supported aspects from the input. Each aspect should include a name, current progress summary, and status.
+8. time_line_updates must contain only changes supported by the new facts, with 0-3 events. Each event must include time, change_type, a short change summary, and fact_ids. Do not repeat existing timeline events or record unchanged information.
+9. evidence_fact_ids must cite supporting fact IDs from the input facts.
+10. Return JSON only. No markdown.
 
 Output schema:
 {
   "update_needed": true,
   "canonical_name": "stable topic name",
   "summary": "concise current long-term topic_state snapshot",
+  "aspects": [
+    {
+      "name": "specific aspect",
+      "summary": "current progress for this aspect",
+      "status": "active|stable|resolved|uncertain"
+    }
+  ],
   "time_line_updates": [
     {
       "occurred_at": "",
@@ -398,7 +411,7 @@ Understand the memory structure before analyzing the query. The default recall p
 Memory structure:
 1. `memory_facts` / fact: traceable, self-contained narrative facts extracted from one conversation episode or all-day transcript. They preserve what happened, participants, time, place or scene, reasons, viewpoint changes, suggestions, acceptance or rejection, constraints, conclusions, and unresolved questions. A fact may contain an explicitly stated preference, routine, profile detail, risk, or constraint, but it remains current conversational evidence rather than a cross-episode long-term summary. Facts usually include `fact_type`, `fact_kind`, `fact_subject`, `summary`, `keywords`, `entities`, `canonical_topics`, and `time_key`.
 2. `memory_states` / state: durable evolving projections updated from multiple facts, not raw dialogue quotations. It contains:
-   - `topic_state`: background, progress, decisions, constraints, risks, and unresolved issues for a project, product, topic, or long-running issue.
+   - `topic_state`: the root state for a project, product, topic, or long-running issue, containing overall background, progress, decisions, constraints, risks, and unresolved issues; fine-grained aspects such as "livestream platform selection" or "gift plan" are stored as root-state context and retrieval aliases and do not necessarily become separate states.
    - `entity_state`: durable properties of an entity, including preference, routine, profile, relationship, constraint, and risk.
    Use state for long-term patterns and snapshots, but do not treat it as a replacement for concrete fact evidence.
 3. `memory_actionable_items` / actionable_item: concrete items extracted from facts that need future execution, follow-up, reminder, review, or decision tracking. They include tasks, commitments, decisions, follow-ups, open questions, risks, reminders, recommendations, and constraints that block a specific action. Items usually include `canonical_name`, `summary`, `owner`, `status`, `due_at`, and `evidence_fact_ids`. Ordinary preferences, background, one-off descriptions, and suggestions without a concrete next action are not actionable items.

@@ -77,19 +77,21 @@ canonical_topics 生成规则：
 - 不要输出过泛的 topic，例如“方案确定”“产品设计讨论”“部门协作”“问题讨论”“用户咨询”。topic 应尽量包含具体对象或稳定领域，例如“AI眼镜语音记忆系统”“手机推广策略”。
 - 如果证据不足以确定具体对象，不要仅凭领域相关性强行复用已有长期 topic；只有严格确认是同一对象或议题时才复用，否则输出基于当前证据的保守上位主题，但不要生成碎片化短词。
 - 复用已有 topic 需要严格判断：当前 episode/fact 的核心对象或具体议题、讨论目标和语义范围，必须与该 topic 的 canonical_name 基本一致。仅仅属于同一大领域、共享某个实体、使用相似词，或前后 episode 时间接近，都不足以复用。
-- 如果一个 fact 只是涉及已有 topic 的背景，但它实际讨论的是另一个对象或议题，必须为该 fact 选择更准确的 primary_topic，不能为了保持 topic 数量而强行归入已有 topic。
+- 如果一个 fact 只是涉及已有 topic 的背景，但它实际讨论的是另一个对象或议题，必须在 `fact_root_topic` 中选择更准确的根主题，不能为了保持 topic 数量而强行归入已有 topic。
+- 每条 fact 还要并列输出 `fact_root_topic` 和 `fact_aspect_topic`，把细粒度议题放入一个更稳定的根主题下。`fact_root_topic` 应是产品、项目或长期议题，`fact_aspect_topic` 应是当前 fact 讨论的具体方面；如果无法确认根主题，使用当前证据支持的保守根主题；如果无法进一步区分具体方面，可以让 `fact_aspect_topic` 与 `fact_root_topic` 相同，不要猜测无证据的上层主题。
+- `fact_root_topic` 必须参考已有 `memory_states` 中 `state_scope=topic_state` 的 `canonical_name`；如果当前 fact 与某个已有 topic_state 的核心对象、讨论目标和语义范围一致，优先原样复用该 `canonical_name`。仅共享实体、领域或相近关键词时不要强行复用；无法严格匹配时使用当前证据支持的保守根主题。
 
 已有长期 memory_states 参考：
 {existing_memory_states}
 
 memory_states 使用规则：
-- state_scope=topic_state 且 state_type=topic 的状态，是 episode canonical_topics 和 fact primary_topic 的命名参考；如果当前证据表达的是同一长期对象或议题，优先原样复用 canonical_name。
-- state_scope=entity_state 的状态，只用于理解实体的长期属性、偏好、约束、风险或关系，不能直接把 entity_state 的 canonical_name 当作 episode topic 或 fact primary_topic。
+- state_scope=topic_state 且 state_type=topic 的状态，是 episode canonical_topics 和 fact `fact_root_topic` 的命名参考；如果当前证据表达的是同一长期对象或议题，优先原样复用 canonical_name。
+- state_scope=entity_state 的状态，只用于理解实体的长期属性、偏好、约束、风险或关系，不能直接把 entity_state 的 canonical_name 当作 episode topic 或 fact 的 fact_root_topic。
 - 这些 states 只是历史背景，不是当前 episode 的事实证据。当前对话没有明确支持的内容不能写入 fact；当前对话与历史 state 冲突时，以当前对话为准。
-- fact 的 primary_topic 必须描述该 fact 的主要议题；它可以复用 topic_state 的 canonical_name，但不能因为 entity_state 的名称而改变为实体属性标题。
-- fact 的 primary_topic 只有在该 fact 的核心对象、讨论目标和语义范围都与 topic_state 的 canonical_name 相近时，才可以原样复用该名称。
+- fact 的 `fact_root_topic` 必须描述该 fact 的主要稳定议题；它可以复用 topic_state 的 canonical_name，但不能因为 entity_state 的名称而改变为实体属性标题。
+- `fact_root_topic` 只有在该 fact 的核心对象、讨论目标和语义范围都与 topic_state 的 canonical_name 相近时，才可以原样复用该名称；`fact_aspect_topic` 应保留该 fact 在根主题下的具体讨论方面。
 - 不要仅因为 fact 与某个 topic_state 同属“健康”“产品”“团队”等宽泛领域，或 fact 中出现了该 topic 的相关背景，就复用该名称。若当前证据不能支持这种严格对应，应使用当前证据中的更具体主题，必要时输出新的保守 topic。
-- 不能因为 entity_state 的名称、summary 或历史 timeline 而改变 fact 的 primary_topic；entity_state 只能辅助理解，不得作为 topic 候选直接复用。
+- 不能因为 entity_state 的名称、summary 或历史 timeline 而改变 fact 的 root_topic；entity_state 只能辅助理解，不得作为 topic 候选直接复用。
 - 每条 fact 必须额外输出一个 `primary_entity`，表示这条 fact 主要描述、影响或归属的唯一实体；它必须是一个实体对象，而不是数组。
 - `primary_entity` 必须来自当前 fact 的 `entities`，不能因为实体只是被提及、提供建议、作为地点/工具或背景，就把它选为主要实体。多人互动时，选择该 fact 主要描述或影响的主体；如果 fact 主要描述用户自身的偏好、习惯、约束或风险，选择用户。
 - `entities` 仍然保留所有与 fact 直接相关的实体，用于完整召回；后续 entity_state 匹配只使用 `primary_entity`，一条 fact 不得同时归属多个实体。
@@ -156,7 +158,8 @@ actionable_aspects 输出规则：
       "keywords": ["关键词1", "关键词2"],
       "entities": [{"name": "实体名", "type": "PERSON|ORGANIZATION|LOCATION|PRODUCT|PROJECT|TECHNOLOGY|CONCEPT|TOPIC|PREFERENCE|OTHER"}],
       "primary_entity": {"name": "该 fact 的唯一主要实体", "type": "PERSON|ORGANIZATION|LOCATION|PRODUCT|PROJECT|TECHNOLOGY|CONCEPT|TOPIC|PREFERENCE|OTHER"},
-      "primary_topic": "稳定主题字符串；优先复用相关 topic_state 的 canonical_name，不要使用 entity_state 名称",
+      "fact_root_topic": "稳定的产品/项目/长期议题根主题",
+      "fact_aspect_topic": "当前 fact 讨论的具体方面",
       "fact_type": "semantic|episodic",
       "fact_subject": "user|assistant|world|project|system|other",
       "fact_kind": "preference|decision|request|recommendation|action|commitment|open_question|risk|error|context|instruction|other",
@@ -246,20 +249,29 @@ UNIFIED_TOPIC_STATE_UPDATE_PROMPT_ZH = """你是 AI 眼镜长期记忆系统中�
 输入已经完成主题解析：系统已经判断这批 facts 应归入某个长期 topic，或应创建一个新的长期 topic。你的任务是更新这个 topic_state 的 summary，而不是重新决定主题归属。
 
 规则：
-1. 只围绕给定 canonical_topic 更新，不要把无关 facts 合并进来。
-2. summary 需要体现这个主题的长期状态：背景、最近变化、关键参与者、已经形成的决定/偏好/约束、仍未解决的问题和下一步。
-3. 如果 existing_topic_state 已有内容，要增量融合，不要简单拼接，不要丢失仍然有效的长期信息。
-4. 不要把单句 fact 改写成另一句 fact；topic_state 必须比 fact 更抽象、更稳定。
-5. summary 必须是简短的当前状态快照，最多 1-2 句话，建议不超过 120 个中文字符；不要把历史 timeline 拼接进 summary。
-6. time_line_updates 只记录本次 facts 带来的状态变化，输出 0-3 条；每条包含发生时间、变化类型、简短变化说明和 fact_ids。不要重复输出已有 timeline，也不要把没有变化的内容写入 timeline。
-7. evidence_fact_ids 必须引用输入 facts 中支撑本次更新的 fact ID。
-8. 只返回 JSON，不要 markdown。
+1. 给定的 canonical_topic 是根主题，只围绕这个根主题更新，不要把无关 facts 合并进来。
+2. 不要为每个 aspect 创建独立 topic_state；将本次 facts 涉及的具体 aspects 作为根主题下的局部进展返回。
+3. summary 需要体现根主题的长期状态：背景、最近变化、关键参与者、已经形成的决定/偏好/约束、仍未解决的问题和下一步。
+4. 如果 existing_topic_state 已有内容，要增量融合，不要简单拼接，不要丢失仍然有效的长期信息。
+5. 不要把单句 fact 改写成另一句 fact；topic_state 必须比 fact 更抽象、更稳定。
+6. summary 必须是简短的当前状态快照，最多 1-2 句话，建议不超过 120 个中文字符；不要把历史 timeline 或所有 aspects 拼接进 summary。
+7. aspects 只返回本次输入中有证据支持的具体方面，每个 aspect 包含名称、当前进展摘要和状态。
+8. time_line_updates 只记录本次 facts 带来的状态变化，输出 0-3 条；每条包含发生时间、变化类型、简短变化说明和 fact_ids。不要重复输出已有 timeline，也不要把没有变化的内容写入 timeline。
+9. evidence_fact_ids 必须引用输入 facts 中支撑本次更新的 fact ID。
+10. 只返回 JSON，不要 markdown。
 
 输出格式：
 {
   "update_needed": true,
   "canonical_name": "稳定主题名",
   "summary": "简短的当前长期 topic_state 快照",
+  "aspects": [
+    {
+      "name": "具体方面",
+      "summary": "该方面当前进展",
+      "status": "active|stable|resolved|uncertain"
+    }
+  ],
   "time_line_updates": [
     {
       "occurred_at": "",
@@ -398,7 +410,7 @@ RECALL_QUERY_ANALYSIS_PROMPT_ZH = """你是 AI 眼镜长期记忆系统中的 re
 记忆结构：
 1. `memory_facts` / fact：从一次 episode 的对话或全天候转写中提炼出的、可追溯且自包含的 narrative fact。它保留具体发生了什么、谁参与、时间、地点/场景、原因、观点变化、建议、接受/拒绝、约束、结论和未解决问题等证据。fact 可能是一次事件、一次讨论结论，也可能是用户明确表达的偏好、习惯、画像、风险或约束；但它仍然是当前对话证据，不等于跨多次对话融合后的长期状态。fact 通常带有 `fact_type`、`fact_kind`、`fact_subject`、`summary`、`keywords`、`entities`、`canonical_topics` 和 `time_key`。
 2. `memory_states` / state：由多个 facts 反思更新出的长期演化状态，不是原始对话引用。它包含两类投影：
-   - `topic_state`：某个项目、产品、主题或长期议题的背景、进展、决定、约束、风险和未解决问题。
+   - `topic_state`：某个项目、产品、主题或长期议题的根状态，保存整体背景、进展、决定、约束、风险和未解决问题；细粒度的 aspect（例如“直播平台选择”“赠品方案”）作为根状态的上下文和检索别名，不一定单独形成 state。
    - `entity_state`：某个实体的长期属性，包括 preference（偏好）、routine（习惯/流程）、profile（画像/背景）、relationship（关系）、constraint（约束）和 risk（风险）。
    state 适合回答“长期是什么状态、通常怎样、对某人/某项目的稳定认识是什么”，但不能替代具体 fact 证据。
 3. `memory_actionable_items` / actionable_item：从 facts 中提炼出的需要未来执行、跟进、提醒、复盘或决策追踪的事项。包括 task、commitment、decision、follow_up、open_question、risk、reminder、recommendation 和被明确行动阻塞的 constraint。每个 item 通常带有 `canonical_name`、`summary`、`owner`、`status`、`due_at` 和 `evidence_fact_ids`。普通偏好、背景、一次性描述或没有明确后续动作的建议不属于 actionable_item。

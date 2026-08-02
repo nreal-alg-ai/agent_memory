@@ -104,6 +104,7 @@ class SessionDB:
                 summary TEXT NOT NULL DEFAULT '',
                 participants TEXT NOT NULL DEFAULT '[]',
                 entity_ids TEXT NOT NULL DEFAULT '[]',
+                canonical_topics TEXT NOT NULL DEFAULT '[]',
                 started_at TEXT,
                 ended_at TEXT,
                 metadata TEXT NOT NULL DEFAULT '{}',
@@ -123,6 +124,8 @@ class SessionDB:
                 entities TEXT NOT NULL DEFAULT '[]',
                 entity_ids TEXT NOT NULL DEFAULT '[]',
                 canonical_topics TEXT NOT NULL DEFAULT '[]',
+                fact_root_topic TEXT NOT NULL DEFAULT '',
+                fact_aspect_topic TEXT NOT NULL DEFAULT '',
                 time_key TEXT NOT NULL DEFAULT '',
                 confidence REAL NOT NULL DEFAULT 0.85,
                 importance REAL NOT NULL DEFAULT 0.5,
@@ -482,16 +485,21 @@ class SessionDB:
         participants: Sequence[str],
         started_at: str,
         ended_at: str,
+        canonical_topics: Optional[Sequence[str]] = None,
         entity_ids: Optional[Sequence[int]] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> int:
         now = utc_now_text()
+        episode_metadata = dict(metadata or {})
+        episode_metadata.pop("canonical_topics", None)
+        normalized_topics = list(canonical_topics or [])
         cur = self._conn.execute(
             """
             INSERT INTO memory_episodes (
                 source_type, episode_type, title, summary, participants,
-                entity_ids, started_at, ended_at, metadata, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                entity_ids, canonical_topics, started_at, ended_at,
+                metadata, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 source_type,
@@ -500,9 +508,10 @@ class SessionDB:
                 summary,
                 _json_dumps(list(participants or [])),
                 _json_dumps([int(value) for value in entity_ids or []]),
+                _json_dumps(normalized_topics),
                 started_at,
                 ended_at,
-                _json_dumps(metadata or {}),
+                _json_dumps(episode_metadata),
                 now,
                 now,
             ),
@@ -778,6 +787,8 @@ class SessionDB:
         entities: Sequence[str],
         entity_ids: Optional[Sequence[int]],
         canonical_topics: Sequence[str],
+        fact_root_topic: str,
+        fact_aspect_topic: str,
         time_key: str,
         confidence: float,
         importance: float,
@@ -790,10 +801,11 @@ class SessionDB:
             """
             INSERT INTO memory_facts (
                 episode_id, source_type, fact_type, fact_kind, fact_subject,
-                summary, keywords, entities, entity_ids, canonical_topics, time_key,
+                summary, keywords, entities, entity_ids, canonical_topics,
+                fact_root_topic, fact_aspect_topic, time_key,
                 confidence, importance, metadata, embedding, embedding_text,
                 created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 episode_id,
@@ -806,6 +818,8 @@ class SessionDB:
                 _json_dumps(list(entities or [])),
                 _json_dumps([int(value) for value in entity_ids or []]),
                 _json_dumps(list(canonical_topics or [])),
+                str(fact_root_topic or ""),
+                str(fact_aspect_topic or ""),
                 time_key,
                 float(confidence),
                 float(importance),
@@ -1186,7 +1200,8 @@ class SessionDB:
             table="memory_facts",
             searchable_fields=(
                 "summary", "keywords", "entities", "entity_ids", "canonical_topics",
-                "fact_kind", "fact_subject", "embedding_text", "metadata",
+                "fact_root_topic", "fact_aspect_topic", "fact_kind", "fact_subject",
+                "embedding_text", "metadata",
             ),
             time_field="time_key",
             terms=terms,
