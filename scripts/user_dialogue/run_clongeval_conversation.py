@@ -26,7 +26,9 @@ import logging
 import re
 import shutil
 import sys
+import time
 from collections import OrderedDict
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -76,6 +78,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--start", type=int, default=0)
     parser.add_argument("--limit", type=int, default=0, help="0 means all records.")
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Number of worker processes used to process independent context groups.",
+    )
     parser.add_argument(
         "--question-id",
         action="append",
@@ -298,10 +306,25 @@ def replay_context_into_memory(
     seen_timestamps: set[str] = set()
     pair_count = 0
     store_batches = 0
+    store_turn_calls = 0
+    store_turn_total_elapsed_ms = 0.0
+    store_flushes = 0
+    store_flush_total_elapsed_ms = 0.0
     reflect_runs = 0
+    reflect_total_elapsed_ms = 0.0
     reflect_reports: List[Dict[str, Any]] = []
     last_reflected_day = 0
     every_days = max(1, int(reflect_every_days or 1))
+
+    def flush_pending_store_turns() -> bool:
+        nonlocal store_batches, store_flushes, store_flush_total_elapsed_ms
+        flush_started_at = time.monotonic()
+        stored = bool(manager.flush_pending_interaction_turns())
+        store_flushes += 1
+        store_flush_total_elapsed_ms += (time.monotonic() - flush_started_at) * 1000
+        if stored:
+            store_batches += 1
+        return stored
 
     for day_index, day in enumerate(days, 1):
         last_timestamp: Optional[datetime] = None
@@ -312,7 +335,7 @@ def replay_context_into_memory(
                 seen_timestamps,
             )
             last_timestamp = turn_timestamp
-            stored = manager.store_turn(
+            store_report = manager.store_turn(
                 user,
                 assistant,
                 tags=[
@@ -323,7 +346,11 @@ def replay_context_into_memory(
                 ],
                 turn_timestamp=turn_timestamp,
             )
-            if stored:
+            store_turn_calls += 1
+            store_turn_total_elapsed_ms += float(
+                store_report.get("total_elapsed_ms") or 0.0
+            )
+            if store_report.get("stored"):
                 store_batches += 1
 
         should_reflect = enable_reflect and (
@@ -331,14 +358,14 @@ def replay_context_into_memory(
         )
         if should_reflect:
             if manager._pending_interaction_turns:
-                if manager.flush_pending_interaction_turns():
-                    store_batches += 1
+                flush_pending_store_turns()
             reflect_timestamp = last_timestamp or day["date"]
             report = manager.reflect(
                 limit=max(1, int(reflect_limit or 100)),
                 reflect_timestamp=reflect_timestamp,
             )
             reflect_runs += 1
+            reflect_total_elapsed_ms += float(report.get("total_elapsed_ms") or 0.0)
             last_reflected_day = day_index
             reflect_reports.append({
                 "day_index": day_index,
@@ -347,8 +374,7 @@ def replay_context_into_memory(
             })
 
     if manager._pending_interaction_turns:
-        if manager.flush_pending_interaction_turns():
-            store_batches += 1
+        flush_pending_store_turns()
 
     return {
         "parsed_days": len(days),
@@ -357,6 +383,17 @@ def replay_context_into_memory(
         "reflect_runs": reflect_runs,
         "last_reflected_day": last_reflected_day,
         "reflect_reports": reflect_reports,
+        "timing": {
+            "store_turn_calls": store_turn_calls,
+            "store_turn_total_elapsed_ms": round(store_turn_total_elapsed_ms, 2),
+            "store_flushes": store_flushes,
+            "store_flush_total_elapsed_ms": round(store_flush_total_elapsed_ms, 2),
+            "store_total_elapsed_ms": round(
+                store_turn_total_elapsed_ms + store_flush_total_elapsed_ms,
+                2,
+            ),
+            "reflect_total_elapsed_ms": round(reflect_total_elapsed_ms, 2),
+        },
         "db_counts": db_counts(db),
     }
 
@@ -380,9 +417,13 @@ def truncate_text(value: str, max_chars: int) -> str:
 
 def build_reader_prompt(query: str, memory_context: str) -> str:
     return (
-        "你是一个长期记忆问答评测器。只能依据下面的记忆上下文回答问题，不要补充上下文之外的信息。\n"
-        "如果上下文中有直接证据，简洁返回答案；如果没有足够证据，返回空字符串。\n"
-        "只返回 JSON：{\"answer\": \"...\"}\n\n"
+        "你是一个长期记忆问答评测器。请只依据下面的记忆上下文回答问题，不要补充上下文之外的事实。\n"
+        "问题可能是对原始对话的概括或改写，问题中的动作、时间和表达方式不一定与上下文逐字一致。\n"
+        "回答时重点识别问题真正询问的实体、名称、属性或具体事实；只要上下文能够明确确定该答案，就应当回答，不要因为措辞差异而返回空字符串。\n"
+        "例如，问题说‘推荐过哪本书’，上下文说‘正在读一本书，叫《小王子》’，则答案应为‘《小王子》’。\n"
+        "答案必须有上下文证据支持，不能根据常识或猜测补全；如果上下文确实没有足够相关证据，才返回空字符串。\n"
+        "答案尽量简短，并优先复用上下文中的原文表达，不要解释推理过程。\n"
+        "只返回合法 JSON：{\"answer\": \"...\"}\n\n"
         f"问题：{query}\n\n"
         "记忆上下文：\n"
         f"{memory_context or '[empty]'}"
@@ -458,6 +499,247 @@ def remove_context_log_handler(handler: Optional[logging.Handler]) -> None:
     handler.close()
 
 
+def configure_worker_logging(
+    log_path: Path,
+    log_level: str,
+    manager_log_level: str,
+) -> None:
+    """Configure file-only logging inside a worker process."""
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    root_logger = logging.getLogger()
+    root_logger.handlers.clear()
+    root_logger.setLevel(getattr(logging, str(log_level).upper(), logging.INFO))
+    handler = logging.FileHandler(log_path, mode="w", encoding="utf-8")
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    )
+    root_logger.addHandler(handler)
+    manager_level = getattr(
+        logging,
+        str(manager_log_level).upper(),
+        logging.INFO,
+    )
+    logging.getLogger("agent.memory_node_manager").setLevel(manager_level)
+    logging.getLogger("memory").setLevel(manager_level)
+    logging.getLogger("memory.memory_manager").setLevel(manager_level)
+
+
+def process_context_group(
+    *,
+    args: argparse.Namespace,
+    group_index: int,
+    total_groups: int,
+    total_records: int,
+    context: str,
+    group_records: Sequence[Dict[str, Any]],
+    embedding_config: Dict[str, Any],
+    memory_config: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Replay, reflect, recall, and optionally answer one isolated context."""
+    group_id = context_group_id(context, group_index)
+    group_dir = args.output_dir / group_id
+    group_dir.mkdir(parents=True, exist_ok=True)
+    db_path = group_dir / "memory.db"
+    context_log_path = group_dir / "context.log"
+    logging.info(
+        "Processing context group %s/%s id=%s records=%s context_chars=%s",
+        group_index,
+        total_groups,
+        group_id,
+        len(group_records),
+        len(context),
+    )
+    days = parse_context_days(context)
+    db = SessionDB(db_path)
+    context_log_handler = add_context_log_handler(context_log_path)
+    results: List[Dict[str, Any]] = []
+    try:
+        logging.info(
+            "Context processing started id=%s records=%s parsed_days=%s",
+            group_id,
+            len(group_records),
+            len(days),
+        )
+        manager = StoreFactExtractionManager(
+            db,
+            embedding_config=embedding_config,
+            memory_config=memory_config,
+            llm_model=args.llm_model,
+            llm_base_url=args.llm_base_url,
+            llm_api_key=args.llm_api_key,
+            report_rows=[],
+            llm_max_tokens=args.llm_max_tokens,
+            llm_thinking=args.llm_thinking or "disabled",
+            llm_json_mode=args.llm_json_mode,
+        )
+        if not args.skip_embedding_validation:
+            validate_embedding_runtime(manager, db, embedding_config)
+        log_memory_index_state(db, f"before_context:{group_id}")
+        replay_stats = replay_context_into_memory(
+            manager=manager,
+            db=db,
+            days=days,
+            group_id=group_id,
+            enable_reflect=args.enable_reflect,
+            reflect_every_days=args.reflect_every_days,
+            reflect_limit=args.reflect_limit,
+        )
+        log_memory_index_state(db, f"after_context:{group_id}")
+        counts = db_counts(db)
+
+        for record_index, record in enumerate(group_records, 1):
+            recall_context = manager.recall(
+                str(record["query"]),
+                top_k=args.recall_top_k,
+                budget=args.recall_budget,
+                recall_gate_mode=str(memory_config.get("recall_gate_mode") or "auto"),
+                recall_path=args.recall_path,
+            )
+            covered = gold_answer_in_context(record.get("answer", ""), recall_context)
+            hypothesis = ""
+            if args.run_reader:
+                hypothesis = run_reader(
+                    manager,
+                    str(record["query"]),
+                    recall_context,
+                    args.reader_max_context_chars,
+                )
+            recall_metadata = dict(
+                getattr(manager, "_last_recall_metadata", {}) or {}
+            )
+            actual_recall_path = str(
+                recall_metadata.get("actual_recall_path") or "unknown"
+            )
+            replay_timing = dict(replay_stats.get("timing") or {})
+            recall_total_elapsed_ms = float(recall_metadata.get("elapsed_ms") or 0.0)
+            result = {
+                "id": record["id"],
+                "source_line": record.get("_source_line"),
+                "context_group_id": group_id,
+                "query": record["query"],
+                "answer": record.get("answer", ""),
+                "hypothesis": hypothesis,
+                "answer_in_recall_context": covered,
+                "recall_path": args.recall_path,
+                "requested_recall_path": args.recall_path,
+                "actual_recall_path": actual_recall_path,
+                "recall_status": str(
+                    recall_metadata.get("status")
+                    or ("ok" if recall_context else "empty")
+                ),
+                "store_turn_total_elapsed_ms": float(
+                    replay_timing.get("store_turn_total_elapsed_ms") or 0.0
+                ),
+                "store_flush_total_elapsed_ms": float(
+                    replay_timing.get("store_flush_total_elapsed_ms") or 0.0
+                ),
+                "store_total_elapsed_ms": float(
+                    replay_timing.get("store_total_elapsed_ms") or 0.0
+                ),
+                "reflect_total_elapsed_ms": float(
+                    replay_timing.get("reflect_total_elapsed_ms") or 0.0
+                ),
+                "recall_total_elapsed_ms": recall_total_elapsed_ms,
+                "memory_total_elapsed_ms": round(
+                    float(replay_timing.get("store_total_elapsed_ms") or 0.0)
+                    + float(replay_timing.get("reflect_total_elapsed_ms") or 0.0)
+                    + recall_total_elapsed_ms,
+                    2,
+                ),
+                "recall_context_chars": len(recall_context or ""),
+                "recall_context": recall_context,
+                "db_path": str(db_path),
+                "db_counts": counts,
+            }
+            results.append(result)
+            logging.info(
+                "[%s/%s] context_record=%s/%s id=%s group=%s recall_chars=%s "
+                "actual_recall_path=%s answer_in_context=%s",
+                group_index,
+                total_groups,
+                record_index,
+                len(group_records),
+                record["id"],
+                group_id,
+                len(recall_context or ""),
+                actual_recall_path,
+                covered,
+            )
+
+        return {
+            "context_group_id": group_id,
+            "record_count": len(group_records),
+            "context_chars": len(context),
+            "db_path": str(db_path),
+            "context_log_path": str(context_log_path),
+            "days": len(days),
+            "replay": replay_stats,
+            "db_counts": counts,
+            "results": results,
+        }
+    finally:
+        log_memory_index_state(db, f"finished_context:{group_id}")
+        db.close()
+        remove_context_log_handler(context_log_handler)
+
+
+def run_context_group_worker(
+    payload: Tuple[
+        int,
+        int,
+        int,
+        str,
+        List[Dict[str, Any]],
+        argparse.Namespace,
+        Dict[str, Any],
+        Dict[str, Any],
+    ],
+) -> Tuple[int, Dict[str, Any]]:
+    """Process one CLongEval context in an isolated worker process."""
+    (
+        group_index,
+        total_groups,
+        total_records,
+        context,
+        group_records,
+        args,
+        embedding_config,
+        memory_config,
+    ) = payload
+    group_id = context_group_id(context, group_index)
+    group_dir = args.output_dir / group_id
+    configure_worker_logging(
+        group_dir / "worker.log",
+        args.log_level,
+        args.manager_log_level,
+    )
+    logging.info(
+        "Worker started for context group %s/%s id=%s records=%s",
+        group_index,
+        total_groups,
+        group_id,
+        len(group_records),
+    )
+    result = process_context_group(
+        args=args,
+        group_index=group_index,
+        total_groups=total_groups,
+        total_records=total_records,
+        context=context,
+        group_records=group_records,
+        embedding_config=embedding_config,
+        memory_config=memory_config,
+    )
+    logging.info(
+        "Worker finished context group %s/%s id=%s recall_results=%s",
+        group_index,
+        total_groups,
+        group_id,
+        len(result.get("results") or []),
+    )
+    return group_index, result
+
+
 def main() -> int:
     args = parse_args()
     records = filter_records(
@@ -475,133 +757,128 @@ def main() -> int:
 
     embedding_config, memory_config = prepare_runtime(args)
     groups = group_records_by_context(records)
-    results_path = output_dir / "clongeval_conversation_results.jsonl"
+    results_path = output_dir / "clongeval_conversation_results.json"
+    results: List[Dict[str, Any]] = []
     group_summaries: List[Dict[str, Any]] = []
     result_count = 0
     recall_nonempty = 0
     gold_covered = 0
     reader_answered = 0
 
-    with results_path.open("w", encoding="utf-8") as result_file:
-        for group_index, (context, group_records) in enumerate(groups, 1):
-            group_id = context_group_id(context, group_index)
-            group_dir = output_dir / group_id
-            group_dir.mkdir(parents=True, exist_ok=True)
-            db_path = group_dir / "memory.db"
-            logging.info(
-                "Processing context group %s/%s id=%s records=%s context_chars=%s",
+    workers = max(1, int(args.workers or 1))
+    group_results_by_index: Dict[int, Dict[str, Any]] = {}
+    group_errors_by_index: Dict[int, Dict[str, Any]] = {}
+    if workers > 1:
+        logging.info(
+            "Processing %s context groups with %s worker processes",
+            len(groups),
+            workers,
+        )
+        payloads = [
+            (
                 group_index,
                 len(groups),
-                group_id,
-                len(group_records),
-                len(context),
+                len(records),
+                context,
+                list(group_records),
+                args,
+                embedding_config,
+                memory_config,
             )
-            days = parse_context_days(context)
-            db = SessionDB(db_path)
-            context_log_path = group_dir / "context.log"
-            context_log_handler = add_context_log_handler(context_log_path)
+            for group_index, (context, group_records) in enumerate(groups, 1)
+        ]
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(run_context_group_worker, payload): payload
+                for payload in payloads
+            }
+            for future in as_completed(futures):
+                payload = futures[future]
+                group_index, _total, _records, context, group_records, _args, _embedding, _memory = payload
+                group_id = context_group_id(context, group_index)
+                try:
+                    result_index, group_result = future.result()
+                    group_results_by_index[result_index] = group_result
+                    logging.info(
+                        "Context group ready index=%s id=%s records=%s",
+                        result_index,
+                        group_id,
+                        len(group_records),
+                    )
+                except Exception as exc:
+                    group_errors_by_index[group_index] = {
+                        "context_group_id": group_id,
+                        "record_count": len(group_records),
+                        "status": "error",
+                        "stage": "context_worker",
+                        "error": str(exc),
+                    }
+                    logging.exception(
+                        "Failed to process context group %s: %s",
+                        group_id,
+                        exc,
+                    )
+    else:
+        for group_index, (context, group_records) in enumerate(groups, 1):
             try:
-                logging.info(
-                    "Context processing started id=%s records=%s parsed_days=%s",
-                    group_id,
-                    len(group_records),
-                    len(days),
-                )
-                manager = StoreFactExtractionManager(
-                    db,
+                group_results_by_index[group_index] = process_context_group(
+                    args=args,
+                    group_index=group_index,
+                    total_groups=len(groups),
+                    total_records=len(records),
+                    context=context,
+                    group_records=group_records,
                     embedding_config=embedding_config,
                     memory_config=memory_config,
-                    llm_model=args.llm_model,
-                    llm_base_url=args.llm_base_url,
-                    llm_api_key=args.llm_api_key,
-                    report_rows=[],
-                    llm_max_tokens=args.llm_max_tokens,
-                    llm_thinking=args.llm_thinking or "disabled",
-                    llm_json_mode=args.llm_json_mode,
                 )
-                if not args.skip_embedding_validation:
-                    validate_embedding_runtime(manager, db, embedding_config)
-                log_memory_index_state(db, f"before_context:{group_id}")
-                replay_stats = replay_context_into_memory(
-                    manager=manager,
-                    db=db,
-                    days=days,
-                    group_id=group_id,
-                    enable_reflect=args.enable_reflect,
-                    reflect_every_days=args.reflect_every_days,
-                    reflect_limit=args.reflect_limit,
-                )
-                log_memory_index_state(db, f"after_context:{group_id}")
-                counts = db_counts(db)
-                group_summary = {
+            except Exception as exc:
+                group_id = context_group_id(context, group_index)
+                group_errors_by_index[group_index] = {
                     "context_group_id": group_id,
                     "record_count": len(group_records),
-                    "context_chars": len(context),
-                    "db_path": str(db_path),
-                    "context_log_path": str(context_log_path),
-                    "days": len(days),
-                    "replay": replay_stats,
-                    "db_counts": counts,
+                    "status": "error",
+                    "stage": "context",
+                    "error": str(exc),
                 }
-                group_summaries.append(group_summary)
+                logging.exception("Failed to process context group %s: %s", group_id, exc)
 
-                for record in group_records:
-                    recall_context = manager.recall(
-                        str(record["query"]),
-                        top_k=args.recall_top_k,
-                        budget=args.recall_budget,
-                        recall_gate_mode=str(memory_config.get("recall_gate_mode") or "auto"),
-                        recall_path=args.recall_path,
-                    )
-                    covered = gold_answer_in_context(record.get("answer", ""), recall_context)
-                    hypothesis = ""
-                    if args.run_reader:
-                        hypothesis = run_reader(
-                            manager,
-                            str(record["query"]),
-                            recall_context,
-                            args.reader_max_context_chars,
-                        )
-                    result = {
-                        "id": record["id"],
-                        "source_line": record.get("_source_line"),
-                        "context_group_id": group_id,
-                        "query": record["query"],
-                        "answer": record.get("answer", ""),
-                        "hypothesis": hypothesis,
-                        "answer_in_recall_context": covered,
-                        "recall_path": args.recall_path,
-                        "recall_context_chars": len(recall_context or ""),
-                        "recall_context": recall_context,
-                        "db_path": str(db_path),
-                        "db_counts": counts,
-                    }
-                    result_file.write(json.dumps(result, ensure_ascii=False) + "\n")
-                    result_file.flush()
-                    result_count += 1
-                    recall_nonempty += int(bool(recall_context))
-                    gold_covered += int(covered)
-                    reader_answered += int(bool(hypothesis))
-                    logging.info(
-                        "[%s/%s] id=%s group=%s recall_chars=%s answer_in_context=%s",
-                        result_count,
-                        len(records),
-                        record["id"],
-                        group_id,
-                        len(recall_context or ""),
-                        covered,
-                    )
-            finally:
-                log_memory_index_state(db, f"finished_context:{group_id}")
-                db.close()
-                remove_context_log_handler(context_log_handler)
+    for group_index, (context, group_records) in enumerate(groups, 1):
+        if group_index in group_errors_by_index:
+            group_summaries.append(group_errors_by_index[group_index])
+            continue
+        group_result = group_results_by_index.get(group_index)
+        if group_result is None:
+            group_summaries.append({
+                "context_group_id": context_group_id(context, group_index),
+                "record_count": len(group_records),
+                "status": "error",
+                "stage": "context_worker",
+                "error": "Context worker returned no result",
+            })
+            continue
+        group_summaries.append({
+            key: value for key, value in group_result.items() if key != "results"
+        })
+        for result in group_result.get("results") or []:
+            results.append(result)
+            result_count += 1
+            recall_nonempty += int(bool(result.get("recall_context")))
+            gold_covered += int(result.get("answer_in_recall_context"))
+            reader_answered += int(bool(result.get("hypothesis")))
+
+    results_path.write_text(
+        json.dumps(results, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
     summary = {
         "input": str(args.input.resolve()),
         "config": str(args.config.resolve()),
         "output_dir": str(output_dir),
         "results_path": str(results_path),
+        "results_format": "json",
         "log_path": str(log_path),
+        "workers": workers,
         "records_processed": result_count,
         "context_groups": len(groups),
         "recall_nonempty": recall_nonempty,
@@ -609,6 +886,16 @@ def main() -> int:
         "reader_answered": reader_answered,
         "gold_coverage_rate": gold_covered / result_count if result_count else 0.0,
         "recall_path": args.recall_path,
+        "actual_recall_path_counts": {
+            path: sum(
+                1
+                for item in results
+                if item.get("actual_recall_path") == path
+            )
+            for path in sorted(
+                {str(item.get("actual_recall_path") or "unknown") for item in results}
+            )
+        },
         "enable_reflect": bool(args.enable_reflect),
         "group_summaries": group_summaries,
     }

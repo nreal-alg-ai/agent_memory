@@ -1087,7 +1087,7 @@ def replay_sessions_into_memory(
                 ],
                 turn_timestamp=turn_dt,
             )
-            if stored:
+            if stored.get("stored"):
                 stored_pairs += 1
 
         if enable_reflect and session_position % reflect_every_sessions == 0:

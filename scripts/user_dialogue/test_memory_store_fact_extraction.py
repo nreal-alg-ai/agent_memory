@@ -712,7 +712,7 @@ def main() -> int:
                     turn_timestamp=turn_timestamp,
                 )
                 nodes = list(iter_stored_nodes(db, before_id))
-                if ok:
+                if ok.get("stored"):
                     stored_turns += 1
                     stored_facts += len(nodes)
                 row = {
@@ -731,7 +731,8 @@ def main() -> int:
                         len(pending_before) + 1 if extraction_due else 0
                     ),
                     "pending_turn_count": len(manager._pending_interaction_turns),
-                    "stored": bool(ok),
+                    "stored": bool(ok.get("stored")),
+                    "store_total_elapsed_ms": float(ok.get("total_elapsed_ms") or 0.0),
                     "fact_count": len(nodes),
                     "user": user,
                     "assistant": assistant,
