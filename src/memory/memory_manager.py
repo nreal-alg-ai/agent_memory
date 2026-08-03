@@ -2379,13 +2379,6 @@ class MemoryNodeManager:
                 break
         return aliases
 
-    def _topic_identity_aliases_from_state(self, state: Dict[str, Any]) -> List[str]:
-        metadata = state.get("metadata") or {}
-        return self._merge_topic_aliases([
-            metadata.get("topic_key"),
-            state.get("canonical_name"),
-        ], limit=8)
-
     def _topic_identity_keywords(
         self,
         facts: Sequence[Dict[str, Any]],
@@ -2454,7 +2447,15 @@ class MemoryNodeManager:
         candidate_root_key = self._topic_state_key(
             candidate.get("topic_key") or candidate_root_name
         )
-        candidate_keys = {candidate_root_key}
+        candidate_aspect_topics = self._merge_topic_aliases(
+            candidate.get("aspect_topics") or [],
+            limit=16,
+        )
+        candidate_aspect_keys = {
+            self._topic_state_key(topic)
+            for topic in candidate_aspect_topics
+            if self._topic_state_key(topic)
+        }
         candidate_identity_text = (
             _compact_whitespace(candidate.get("topic_identity_text") or "")
             or self._topic_identity_text(
@@ -2474,11 +2475,19 @@ class MemoryNodeManager:
         ):
             candidate_name_embedding = self._embed(candidate_root_name)
         for state in existing_topic_states:
-            state_aliases = self._topic_identity_aliases_from_state(state)
-            state_keys = {
-                self._topic_state_key(alias)
-                for alias in state_aliases
-                if str(alias or "").strip()
+            state_metadata = state.get("metadata") if isinstance(state.get("metadata"), dict) else {}
+            state_aspect_topics = self._merge_topic_aliases([
+                *(state_metadata.get("aspect_names") or []),
+                *(
+                    aspect.get("name")
+                    for aspect in (state_metadata.get("aspect_states") or [])
+                    if isinstance(aspect, dict)
+                ),
+            ], limit=16)
+            state_aspect_keys = {
+                self._topic_state_key(topic)
+                for topic in state_aspect_topics
+                if self._topic_state_key(topic)
             }
             state_root_name = (
                 self._normalize_topic_name(state.get("canonical_name"))
@@ -2486,8 +2495,10 @@ class MemoryNodeManager:
             )
             state_root_key = self._topic_state_key(state_root_name)
             exact_root_match = candidate_root_key == state_root_key
-            exact_alias_match = bool(candidate_keys & state_keys)
-            name_overlap = self._topic_name_overlap(
+            matched_aspect_keys = candidate_aspect_keys & state_aspect_keys
+            exact_aspect_match = bool(matched_aspect_keys)
+            aspect_to_root_match = state_root_key in candidate_aspect_keys
+            root_name_overlap = self._topic_name_overlap(
                 [candidate_root_name],
                 [state_root_name],
                 allow_substring=False,
@@ -2504,18 +2515,29 @@ class MemoryNodeManager:
                 state_embedding_similarity,
                 canonical_name_embedding_similarity,
             )
-            strong_name_match = exact_alias_match or name_overlap >= self._topic_state_resolution_similarity_threshold
+            strong_name_match = root_name_overlap >= self._topic_state_resolution_similarity_threshold
             strong_embedding_match = (
                 embedding_similarity >= self._topic_identity_embedding_similarity_threshold
-                and (exact_root_match or name_overlap >= 0.5)
+                and root_name_overlap >= 0.5
             )
-            matched = exact_root_match or (
-                strong_name_match and name_overlap >= self._topic_state_resolution_similarity_threshold
-            ) or strong_embedding_match
+            aspect_supported_name_threshold = max(
+                0.4,
+                self._topic_state_resolution_similarity_threshold - 0.15,
+            )
+            aspect_supported_match = exact_aspect_match and (
+                root_name_overlap >= aspect_supported_name_threshold
+                or embedding_similarity >= self._topic_identity_embedding_similarity_threshold
+            )
+            matched = (
+                exact_root_match
+                or strong_name_match
+                or strong_embedding_match
+                or aspect_supported_match
+            )
+            aspect_match_bonus = 0.16 if exact_aspect_match else 0.0
             score = max(
                 1.0 if exact_root_match else 0.0,
-                name_overlap,
-                embedding_similarity,
+                min(1.0, max(root_name_overlap, embedding_similarity) + aspect_match_bonus),
             )
             if score > float(best_info.get("score", 0.0)):
                 best_state = state
@@ -2523,11 +2545,15 @@ class MemoryNodeManager:
                     "matched": matched,
                     "reason": "matched_existing_topic_state" if matched else "best_match_below_threshold",
                     "score": round(score, 4),
-                    "exact_alias_match": exact_alias_match,
+                    "exact_aspect_match": exact_aspect_match,
+                    "aspect_to_root_match": aspect_to_root_match,
                     "exact_root_match": exact_root_match,
                     "candidate_root_topic": candidate_root_name,
+                    "candidate_aspect_topics": candidate_aspect_topics,
+                    "existing_aspect_topics": state_aspect_topics,
+                    "matched_aspect_keys": sorted(matched_aspect_keys),
                     "existing_root_topic": state_root_name,
-                    "name_overlap": round(name_overlap, 4),
+                    "root_name_overlap": round(root_name_overlap, 4),
                     "embedding_similarity": round(embedding_similarity, 4),
                     "state_embedding_similarity": round(state_embedding_similarity, 4),
                     "canonical_name_embedding_similarity": round(
@@ -2536,6 +2562,11 @@ class MemoryNodeManager:
                     ),
                     "strong_name_match": strong_name_match,
                     "strong_embedding_match": strong_embedding_match,
+                    "aspect_supported_match": aspect_supported_match,
+                    "aspect_supported_name_threshold": round(
+                        aspect_supported_name_threshold,
+                        4,
+                    ),
                     "existing_state_id": state.get("id"),
                     "existing_canonical_name": state.get("canonical_name"),
                 }
@@ -2625,7 +2656,7 @@ class MemoryNodeManager:
         if (
             existing_topic_states
             and float(match_info.get("embedding_similarity", 0.0) or 0.0) >= self._topic_identity_grounding_similarity_threshold
-            and float(match_info.get("name_overlap", 0.0) or 0.0) >= 0.2
+            and float(match_info.get("root_name_overlap", 0.0) or 0.0) >= 0.2
         ):
             best_id = match_info.get("existing_state_id")
             for state in existing_topic_states:
