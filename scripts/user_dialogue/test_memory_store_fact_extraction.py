@@ -32,7 +32,7 @@ from memory.memory_manager import DEFAULT_LLM_BASE_URL, DEFAULT_LLM_MODEL, Memor
 from memory.memory_database import SessionDB
 
 
-DEFAULT_INPUT = Path("/Users/zhouboyu/Downloads/history_dialogue.json")
+DEFAULT_INPUT = Path("/Users/zhouboyu/Documents/agent_memory/test_data/user_dialogue/history_dialogue.json")
 DEFAULT_OUTPUT_ROOT_DIR = REPO_ROOT / "tmp" / "memory_store_fact_test"
 
 SAMPLE_ID_RE = re.compile(r"(?:^|_)sample(\d+)$")
@@ -294,7 +294,8 @@ def load_test_turns(
 def iter_stored_nodes(db: SessionDB, start_id: int) -> Iterable[Dict[str, Any]]:
     rows = db._conn.execute(
         """SELECT id, episode_id, source_type, time_key, summary, keywords,
-                  fact_type, fact_kind, fact_subject, entities, canonical_topics,
+                  fact_type, fact_kind, fact_subject, entities,
+                  fact_root_topic, fact_aspect_topic,
                   confidence, importance, metadata, created_at, updated_at
              FROM memory_facts
             WHERE id > ?
@@ -305,7 +306,6 @@ def iter_stored_nodes(db: SessionDB, start_id: int) -> Iterable[Dict[str, Any]]:
         item = dict(row)
         for key, default in (
             ("entities", []),
-            ("canonical_topics", []),
             ("metadata", {}),
         ):
             try:

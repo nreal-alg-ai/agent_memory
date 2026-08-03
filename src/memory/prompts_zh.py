@@ -408,7 +408,7 @@ RECALL_QUERY_ANALYSIS_PROMPT_ZH = """你是 AI 眼镜长期记忆系统中的 re
 请先理解当前记忆结构，再分析用户查询应该优先检索哪些记忆层。当前默认 recall 路径不使用共享的 memory_index_entries 表作为检索入口，而是直接检索以下三类原始记忆表；因此不要把“index”理解为一个额外的统一文档层。
 
 记忆结构：
-1. `memory_facts` / fact：从一次 episode 的对话或全天候转写中提炼出的、可追溯且自包含的 narrative fact。它保留具体发生了什么、谁参与、时间、地点/场景、原因、观点变化、建议、接受/拒绝、约束、结论和未解决问题等证据。fact 可能是一次事件、一次讨论结论，也可能是用户明确表达的偏好、习惯、画像、风险或约束；但它仍然是当前对话证据，不等于跨多次对话融合后的长期状态。fact 通常带有 `fact_type`、`fact_kind`、`fact_subject`、`summary`、`keywords`、`entities`、`canonical_topics` 和 `time_key`。
+1. `memory_facts` / fact：从一次 episode 的对话或全天候转写中提炼出的、可追溯且自包含的 narrative fact。它保留具体发生了什么、谁参与、时间、地点/场景、原因、观点变化、建议、接受/拒绝、约束、结论和未解决问题等证据。fact 可能是一次事件、一次讨论结论，也可能是用户明确表达的偏好、习惯、画像、风险或约束；但它仍然是当前对话证据，不等于跨多次对话融合后的长期状态。fact 通常带有 `fact_type`、`fact_kind`、`fact_subject`、`summary`、`keywords`、`entities`、`fact_root_topic`、`fact_aspect_topic` 和 `time_key`。
 2. `memory_states` / state：由多个 facts 反思更新出的长期演化状态，不是原始对话引用。它包含两类投影：
    - `topic_state`：某个项目、产品、主题或长期议题的根状态，保存整体背景、进展、决定、约束、风险和未解决问题；细粒度的 aspect（例如“直播平台选择”“赠品方案”）作为根状态的上下文和检索别名，不一定单独形成 state。
    - `entity_state`：某个实体的长期属性，包括 preference（偏好）、routine（习惯/流程）、profile（画像/背景）、relationship（关系）、constraint（约束）和 risk（风险）。

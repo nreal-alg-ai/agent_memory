@@ -123,7 +123,6 @@ class SessionDB:
                 keywords TEXT NOT NULL DEFAULT '',
                 entities TEXT NOT NULL DEFAULT '[]',
                 entity_ids TEXT NOT NULL DEFAULT '[]',
-                canonical_topics TEXT NOT NULL DEFAULT '[]',
                 fact_root_topic TEXT NOT NULL DEFAULT '',
                 fact_aspect_topic TEXT NOT NULL DEFAULT '',
                 time_key TEXT NOT NULL DEFAULT '',
@@ -786,7 +785,6 @@ class SessionDB:
         keywords: str,
         entities: Sequence[str],
         entity_ids: Optional[Sequence[int]],
-        canonical_topics: Sequence[str],
         fact_root_topic: str,
         fact_aspect_topic: str,
         time_key: str,
@@ -801,11 +799,11 @@ class SessionDB:
             """
             INSERT INTO memory_facts (
                 episode_id, source_type, fact_type, fact_kind, fact_subject,
-                summary, keywords, entities, entity_ids, canonical_topics,
-                fact_root_topic, fact_aspect_topic, time_key,
+                summary, keywords, entities, entity_ids, fact_root_topic,
+                fact_aspect_topic, time_key,
                 confidence, importance, metadata, embedding, embedding_text,
                 created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 episode_id,
@@ -817,7 +815,6 @@ class SessionDB:
                 keywords,
                 _json_dumps(list(entities or [])),
                 _json_dumps([int(value) for value in entity_ids or []]),
-                _json_dumps(list(canonical_topics or [])),
                 str(fact_root_topic or ""),
                 str(fact_aspect_topic or ""),
                 time_key,
@@ -1199,8 +1196,8 @@ class SessionDB:
         return self._search_memory_rows(
             table="memory_facts",
             searchable_fields=(
-                "summary", "keywords", "entities", "entity_ids", "canonical_topics",
-                "fact_root_topic", "fact_aspect_topic", "fact_kind", "fact_subject",
+                "summary", "keywords", "entities", "entity_ids", "fact_root_topic",
+                "fact_aspect_topic", "fact_kind", "fact_subject",
                 "embedding_text", "metadata",
             ),
             time_field="time_key",
