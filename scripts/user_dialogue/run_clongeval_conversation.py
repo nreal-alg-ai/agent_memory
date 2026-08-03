@@ -588,13 +588,14 @@ def process_context_group(
         counts = db_counts(db)
 
         for record_index, record in enumerate(group_records, 1):
-            recall_context = manager.recall(
+            recall_report = manager.recall(
                 str(record["query"]),
                 top_k=args.recall_top_k,
                 budget=args.recall_budget,
                 recall_gate_mode=str(memory_config.get("recall_gate_mode") or "auto"),
                 recall_path=args.recall_path,
             )
+            recall_context = str(recall_report.get("memory_context") or "")
             covered = gold_answer_in_context(record.get("answer", ""), recall_context)
             hypothesis = ""
             if args.run_reader:
@@ -604,14 +605,11 @@ def process_context_group(
                     recall_context,
                     args.reader_max_context_chars,
                 )
-            recall_metadata = dict(
-                getattr(manager, "_last_recall_metadata", {}) or {}
-            )
             actual_recall_path = str(
-                recall_metadata.get("actual_recall_path") or "unknown"
+                recall_report.get("actual_recall_path") or "unknown"
             )
             replay_timing = dict(replay_stats.get("timing") or {})
-            recall_total_elapsed_ms = float(recall_metadata.get("elapsed_ms") or 0.0)
+            recall_total_elapsed_ms = float(recall_report.get("elapsed_ms") or 0.0)
             result = {
                 "id": record["id"],
                 "source_line": record.get("_source_line"),
@@ -624,7 +622,7 @@ def process_context_group(
                 "requested_recall_path": args.recall_path,
                 "actual_recall_path": actual_recall_path,
                 "recall_status": str(
-                    recall_metadata.get("status")
+                    recall_report.get("status")
                     or ("ok" if recall_context else "empty")
                 ),
                 "store_turn_total_elapsed_ms": float(

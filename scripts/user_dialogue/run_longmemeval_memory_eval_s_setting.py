@@ -1188,13 +1188,14 @@ def build_instance_memory_context(
         effective_question_dt = effective_question_datetime(question_dt, sessions)
         effective_question_date_text = format_memory_time(effective_question_dt)
         counts = db_counts(db)
-        memory_context = manager.recall(
+        recall_report = manager.recall(
             question,
             top_k=int(args.recall_top_k),
             budget=str(args.recall_budget),
             time_end=effective_question_date_text,
             recall_gate_mode=str(args.recall_gate_mode),
         )
+        memory_context = str(recall_report.get("memory_context") or "")
 
         return {
             "question_id": question_id,
