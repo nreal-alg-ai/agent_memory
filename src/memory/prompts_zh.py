@@ -340,7 +340,6 @@ entity-scoped state 的目标：
   ],
   "keywords": ["关键词1", "关键词2"],
   "entities": ["实体1", "实体2"],
-  "canonical_topics": ["主题1"],
   "evidence_fact_ids": [1, 2],
   "importance": 0.8,
   "confidence": 0.85,

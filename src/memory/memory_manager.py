@@ -2132,20 +2132,14 @@ class MemoryNodeManager:
         return list(dict.fromkeys(topic for topic in topics if topic))
 
     def _fact_can_seed_entity_state(self, fact: Dict[str, Any]) -> bool:
-        """Entity states require a projected aspect or a durable heuristic signal."""
+        """Entity states require an explicit projected aspect."""
         state_aspects = self._state_aspects_from_fact(fact)
-        if state_aspects:
-            return any(
-                str(aspect.get("state_type") or "").strip().lower()
-                in self._entity_scoped_state_types()
-                and bool(self._entities_for_state_aspect(aspect, fact))
-                for aspect in state_aspects
-            )
-        if not self._fact_has_durable_state_signal(fact):
-            return False
-        if not self._infer_entity_scoped_state_types_for_fact(fact):
-            return False
-        return bool(self._entities_for_entity_state_fact(fact))
+        return any(
+            str(aspect.get("state_type") or "").strip().lower()
+            in self._entity_scoped_state_types()
+            and bool(self._entities_for_state_aspect(aspect, fact))
+            for aspect in state_aspects
+        )
 
     def _resolve_and_update_topic_states_from_facts(
         self,
@@ -2258,7 +2252,7 @@ class MemoryNodeManager:
             root_original: Dict[str, str] = {}
             for fact in episode_facts:
                 root_topic = self._normalize_topic_name(fact.get("fact_root_topic")) or "general"
-                root_key = self._generate_topic_name_corresponding_key(root_topic)
+                root_key = self._generate_topic_name_key(root_topic)
                 root_counts[root_key] += 1
                 root_original.setdefault(root_key, str(root_topic))
             if not root_counts:
@@ -2270,7 +2264,7 @@ class MemoryNodeManager:
                 matched_facts = [
                     fact
                     for fact in episode_facts
-                    if self._generate_topic_name_corresponding_key(
+                    if self._generate_topic_name_key(
                         self._normalize_topic_name(fact.get("fact_root_topic")) or "general"
                     ) == root_key
                 ]
@@ -2299,9 +2293,9 @@ class MemoryNodeManager:
                 parent_topics = [
                     topic
                     for topic in parent_topics
-                    if self._generate_topic_name_corresponding_key(topic) != self._generate_topic_name_corresponding_key(root_name)
-                    and self._generate_topic_name_corresponding_key(topic) not in {
-                        self._generate_topic_name_corresponding_key(aspect)
+                    if self._generate_topic_name_key(topic) != self._generate_topic_name_key(root_name)
+                    and self._generate_topic_name_key(topic) not in {
+                        self._generate_topic_name_key(aspect)
                         for aspect in aspect_topics
                     }
                 ]
@@ -2344,7 +2338,7 @@ class MemoryNodeManager:
         return candidates
 
     @staticmethod
-    def _generate_topic_name_corresponding_key(value: Any) -> str:
+    def _generate_topic_name_key(value: Any) -> str:
         text = _compact_whitespace(value).lower()
         text = re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff]+", "", text)
         return text or "general"
@@ -2382,7 +2376,7 @@ class MemoryNodeManager:
             topic = self._normalize_topic_name(value)
             if not topic:
                 continue
-            key = self._generate_topic_name_corresponding_key(topic)
+            key = self._generate_topic_name_key(topic)
             if key in seen:
                 continue
             seen.add(key)
@@ -2415,7 +2409,7 @@ class MemoryNodeManager:
                 continue
             if clean in generic:
                 continue
-            key = self._generate_topic_name_corresponding_key(clean)
+            key = self._generate_topic_name_key(clean)
             if key in seen:
                 continue
             seen.add(key)
@@ -2459,7 +2453,7 @@ class MemoryNodeManager:
             or _compact_whitespace(candidate.get("topic_key") or "")
             or "general"
         )
-        candidate_root_key = self._generate_topic_name_corresponding_key(
+        candidate_root_key = self._generate_topic_name_key(
             candidate.get("topic_key") or candidate_root_name
         )
         candidate_aspect_topics = self._normalize_unique_topic_names(
@@ -2467,9 +2461,9 @@ class MemoryNodeManager:
             limit=16,
         )
         candidate_aspect_keys = {
-            self._generate_topic_name_corresponding_key(topic)
+            self._generate_topic_name_key(topic)
             for topic in candidate_aspect_topics
-            if self._generate_topic_name_corresponding_key(topic)
+            if self._generate_topic_name_key(topic)
         }
         candidate_identity_text = (
             _compact_whitespace(candidate.get("candidate_identity_text") or "")
@@ -2500,15 +2494,15 @@ class MemoryNodeManager:
                 ),
             ], limit=16)
             state_aspect_keys = {
-                self._generate_topic_name_corresponding_key(topic)
+                self._generate_topic_name_key(topic)
                 for topic in state_aspect_topics
-                if self._generate_topic_name_corresponding_key(topic)
+                if self._generate_topic_name_key(topic)
             }
             state_root_name = (
                 self._normalize_topic_name(state.get("canonical_name"))
                 or "general"
             )
-            state_root_key = self._generate_topic_name_corresponding_key(state_root_name)
+            state_root_key = self._generate_topic_name_key(state_root_name)
             exact_root_match = candidate_root_key == state_root_key
             matched_aspect_keys = candidate_aspect_keys & state_aspect_keys
             exact_aspect_match = bool(matched_aspect_keys)
@@ -2598,9 +2592,9 @@ class MemoryNodeManager:
     ) -> float:
         best = 0.0
         for left in left_aliases:
-            left_key = self._generate_topic_name_corresponding_key(left)
+            left_key = self._generate_topic_name_key(left)
             for right in right_aliases:
-                right_key = self._generate_topic_name_corresponding_key(right)
+                right_key = self._generate_topic_name_key(right)
                 if left_key and right_key and left_key == right_key:
                     return 1.0
                 if (
@@ -2842,7 +2836,7 @@ class MemoryNodeManager:
                 evidence_ids = []
             if not name:
                 continue
-            key = self._generate_topic_name_corresponding_key(name)
+            key = self._generate_topic_name_key(name)
             if key in seen:
                 continue
             seen.add(key)
@@ -3268,16 +3262,10 @@ class MemoryNodeManager:
         candidates = self._build_entity_state_candidates_from_facts(facts)
         updated = 0
         for candidate in candidates:
-            existing_state, match_info = self._match_entity_state_candidate(
+            existing_state, match_info = self._match_entity_state_candidate_existing_states(
                 candidate=candidate,
                 existing_entity_states=existing_entity_states,
             )
-            if existing_state:
-                candidate["canonical_name"] = str(
-                    existing_state.get("canonical_name")
-                    or candidate.get("canonical_name")
-                    or "general"
-                )
             state_update = self._extract_entity_state_update_with_llm(
                 candidate=candidate,
                 existing_state=existing_state,
@@ -3332,13 +3320,11 @@ class MemoryNodeManager:
                 "state_scope": candidate.get("state_scope"),
                 "state_type": candidate.get("state_type"),
                 "source_type": candidate.get("source_type"),
-                "canonical_name": candidate.get("canonical_name"),
                 "entity": candidate.get("entity"),
                 "entity_key": candidate.get("entity_key"),
                 "attribute_name": candidate.get("attribute_name"),
                 "candidate_source": candidate.get("candidate_source"),
                 "fact_ids": candidate.get("fact_ids") or [],
-                "entity_alias_names": candidate.get("entity_alias_names") or [],
             },
             "existing_state": self._state_log_view(existing_state),
             "participating_facts": [
@@ -3421,8 +3407,8 @@ class MemoryNodeManager:
                     if not attribute_name:
                         continue
                     for entity in entities[:1]:
-                        entity_key = self._entity_state_key(entity)
-                        attribute_key = self._generate_topic_name_corresponding_key(attribute_name)
+                        entity_key = self._generate_entity_name_key(entity)
+                        attribute_key = self._generate_topic_name_key(attribute_name)
                         key = (source_type, state_type, entity_key, attribute_key)
                         item = grouped.setdefault(key, {
                             "source_type": source_type,
@@ -3430,23 +3416,14 @@ class MemoryNodeManager:
                             "state_type": state_type,
                             "entity": entity,
                             "entity_key": entity_key,
-                            "canonical_name": self._entity_state_candidate_name(
-                                attribute_name=attribute_name,
-                            ),
                             "attribute_key": attribute_key,
                             "attribute_name": attribute_name,
                             "attribute_aliases": [attribute_name],
                             "facts": [],
                             "fact_ids": [],
-                            "entity_alias_names": self._normalize_unique_labels([entity, attribute_name], limit=10),
                             "state_aspects": [],
                             "candidate_source": "state_aspects",
                         })
-                        item["attribute_aliases"] = self._normalize_unique_labels([
-                            *(item.get("attribute_aliases") or []),
-                            attribute_name,
-                            *self._fact_topic_names(fact),
-                        ], limit=10)
                         item["facts"].append(fact)
                         fact_id = None
                         if str(fact.get("id") or "").strip().isdigit():
@@ -3458,50 +3435,6 @@ class MemoryNodeManager:
                             "fact_summary": fact.get("summary") or "",
                             "fact_time_key": fact.get("time_key") or "",
                         })
-                continue
-
-            state_types = self._infer_entity_scoped_state_types_for_fact(fact)
-            if not state_types:
-                continue
-            for state_type in state_types:
-                entities = self._entities_for_entity_state_fact(
-                    fact,
-                    state_type=state_type,
-                )
-                if not entities:
-                    continue
-                attribute_topics = self._entity_state_attribute_topics(fact)
-                for entity in entities[:1]:
-                    entity_key = self._entity_state_key(entity)
-                    for attribute_name in attribute_topics:
-                        attribute_key = self._generate_topic_name_corresponding_key(attribute_name)
-                        key = (source_type, state_type, entity_key, attribute_key)
-                        canonical_name = self._entity_state_candidate_name(
-                            attribute_name=attribute_name,
-                        )
-                        item = grouped.setdefault(key, {
-                            "source_type": source_type,
-                            "state_scope": "entity_state",
-                            "state_type": state_type,
-                            "entity": entity,
-                            "entity_key": entity_key,
-                            "canonical_name": canonical_name,
-                            "attribute_key": attribute_key,
-                            "attribute_name": attribute_name,
-                            "attribute_aliases": [attribute_name],
-                            "facts": [],
-                            "fact_ids": [],
-                            "entity_alias_names": self._normalize_unique_labels([entity, attribute_name], limit=10),
-                            "state_aspects": [],
-                            "candidate_source": "heuristic",
-                        })
-                        item["attribute_aliases"] = self._normalize_unique_labels([
-                            *(item.get("attribute_aliases") or []),
-                            *self._fact_topic_names(fact),
-                        ], limit=10)
-                        item["facts"].append(fact)
-                        if str(fact.get("id") or "").strip().isdigit():
-                            item["fact_ids"].append(int(fact["id"]))
         candidates: List[Dict[str, Any]] = []
         for item in grouped.values():
             item["fact_ids"] = list(dict.fromkeys(item.get("fact_ids") or []))
@@ -3555,37 +3488,9 @@ class MemoryNodeManager:
             return [name]
         return self._entities_for_entity_state_fact(fact)
 
-    def _entity_state_attribute_topics(self, fact: Dict[str, Any]) -> List[str]:
-        topics = self._fact_topic_names(fact)
-        if not topics:
-            fallback = self._topic_candidates(str(fact.get("summary") or ""))
-            topics = [self._normalize_topic_name(topic) for topic in fallback if topic]
-        return topics[:3] or ["general"]
-
-    def _infer_entity_scoped_state_types_for_fact(self, fact: Dict[str, Any]) -> List[str]:
-        kind = str(fact.get("fact_kind") or "").strip().lower()
-        subject = str(fact.get("fact_subject") or "").strip().lower()
-        summary = str(fact.get("summary") or "").lower()
-        state_types: List[str] = []
-        if kind == "preference" or any(marker in summary for marker in ("偏好", "喜欢", "倾向", "更愿意", "prefer", "likes", "tends to")):
-            state_types.append("preference")
-        if any(marker in summary for marker in ("习惯", "经常", "通常", "每天", "每周", "routine", "usually", "often")):
-            state_types.append("routine")
-        if kind in {"context", "instruction"} and subject in {"user", "project", "world", "other"}:
-            state_types.append("profile")
-        if kind == "risk" or any(marker in summary for marker in ("约束", "限制", "不能", "预算", "deadline", "constraint", "limited", "budget")):
-            state_types.append("constraint")
-        if kind == "risk" or any(marker in summary for marker in ("风险", "担心", "隐患", "risk", "concern", "hazard")):
-            state_types.append("risk")
-        if any(marker in summary for marker in ("关系", "同事", "朋友", "家人", "老板", "客户", "relationship", "colleague", "friend", "family", "client")):
-            state_types.append("relationship")
-        return [item for item in dict.fromkeys(state_types) if item in self._entity_scoped_state_types()]
-
     def _entities_for_entity_state_fact(
         self,
         fact: Dict[str, Any],
-        *,
-        state_type: Optional[str] = None,
     ) -> List[str]:
         metadata = fact.get("metadata") if isinstance(fact.get("metadata"), dict) else {}
         primary_entity = fact.get("primary_entity") or metadata.get("primary_entity")
@@ -3629,26 +3534,19 @@ class MemoryNodeManager:
         return out[:1]
 
     @staticmethod
-    def _entity_state_key(value: Any) -> str:
+    def _generate_entity_name_key(value: Any) -> str:
         return _compact_whitespace(value).lower()
 
-    @staticmethod
-    def _entity_state_candidate_name(
-        *,
-        attribute_name: str,
-    ) -> str:
-        return _compact_whitespace(attribute_name) or "general"
-
-    def _match_entity_state_candidate(
+    def _match_entity_state_candidate_existing_states(
         self,
         *,
         candidate: Dict[str, Any],
         existing_entity_states: List[Dict[str, Any]],
     ) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
-        candidate_name = str(candidate.get("canonical_name") or "")
+        candidate_name = str(candidate.get("attribute_name") or "")
         candidate_entity = str(candidate.get("entity") or "")
         candidate_type = str(candidate.get("state_type") or "")
-        candidate_entity_key = self._entity_state_key(candidate.get("entity_key") or candidate_entity)
+        candidate_entity_key = self._generate_entity_name_key(candidate.get("entity_key") or candidate_entity)
         candidate_attribute_aliases = self._normalize_unique_labels([
             candidate.get("attribute_name"),
             *(candidate.get("attribute_aliases") or []),
@@ -3666,7 +3564,7 @@ class MemoryNodeManager:
             if str(state.get("state_type") or "") != candidate_type:
                 continue
             metadata = state.get("metadata") or {}
-            state_entity_key = self._entity_state_key(
+            state_entity_key = self._generate_entity_name_key(
                 metadata.get("entity_key")
                 or metadata.get("entity")
                 or candidate_entity
@@ -3692,7 +3590,6 @@ class MemoryNodeManager:
             state_attribute_aliases = self._normalize_unique_labels([
                 metadata.get("attribute_name"),
                 *(metadata.get("attribute_aliases") or []),
-                *(metadata.get("canonical_topics") or []),
                 state.get("canonical_name"),
             ], limit=16)
             attribute_overlap = self._topic_name_overlap(
@@ -3712,7 +3609,7 @@ class MemoryNodeManager:
                 canonical_name_embedding_similarity,
             )
             exact_attribute_match = any(
-                self._generate_topic_name_corresponding_key(left) == self._generate_topic_name_corresponding_key(right)
+                self._generate_topic_name_key(left) == self._generate_topic_name_key(right)
                 for left in candidate_attribute_aliases
                 for right in state_attribute_aliases
                 if left and right
@@ -3788,11 +3685,9 @@ class MemoryNodeManager:
                 "entity": candidate.get("entity"),
                 "entity_key": candidate.get("entity_key"),
                 "state_type": candidate.get("state_type"),
-                "canonical_name_hint": candidate.get("canonical_name"),
                 "attribute_name": candidate.get("attribute_name"),
                 "attribute_key": candidate.get("attribute_key"),
                 "attribute_aliases": candidate.get("attribute_aliases", []),
-                "entity_alias_names": candidate.get("entity_alias_names", []),
                 "candidate_source": candidate.get("candidate_source") or "heuristic",
                 "state_aspect_summaries": [
                     {
@@ -3832,6 +3727,26 @@ class MemoryNodeManager:
                 return normalized
         return self._fallback_entity_state_update(candidate, existing_state, match_info)
 
+    def _entity_state_canonical_topics_from_facts(
+        self,
+        *,
+        candidate: Dict[str, Any],
+        existing_state: Optional[Dict[str, Any]],
+    ) -> List[str]:
+        fact_topics = [
+            topic
+            for fact in candidate.get("facts") or []
+            if isinstance(fact, dict)
+            for topic in (
+                fact.get("fact_root_topic"),
+                fact.get("fact_aspect_topic"),
+            )
+        ]
+        return self._normalize_unique_topic_names([
+            *fact_topics,
+            *((existing_state or {}).get("canonical_topics") or []),
+        ], limit=24)
+
     def _normalize_entity_state_update_payload(
         self,
         raw: Dict[str, Any],
@@ -3863,19 +3778,20 @@ class MemoryNodeManager:
         evidence_ids = list(dict.fromkeys([*existing_ids, *evidence_ids]))[:80]
         canonical_name = (
             _compact_whitespace((existing_state or {}).get("canonical_name") or "")
-            or _compact_whitespace(candidate.get("canonical_name") or "")
-            or _compact_whitespace(raw.get("canonical_name") or "")
             or _compact_whitespace(candidate.get("attribute_name") or "")
+            or _compact_whitespace(raw.get("canonical_name") or "")
         )
         if canonical_name.lower() in self._entity_scoped_state_types() or len(canonical_name) < 3:
-            canonical_name = _compact_whitespace(candidate.get("canonical_name") or "")
-        canonical_topics = self._normalize_unique_labels(
-            [
-                *(raw.get("canonical_topics") or []),
-                candidate.get("attribute_name"),
-                *(candidate.get("attribute_aliases") or []),
-            ],
-            limit=8,
+            canonical_name = _compact_whitespace(candidate.get("attribute_name") or "")
+        existing_metadata = dict((existing_state or {}).get("metadata") or {})
+        attribute_aliases = self._normalize_unique_labels([
+            existing_metadata.get("attribute_name"),
+            *(existing_metadata.get("attribute_aliases") or []),
+            candidate.get("attribute_name"),
+        ], limit=16)
+        canonical_topics = self._entity_state_canonical_topics_from_facts(
+            candidate=candidate,
+            existing_state=existing_state,
         )
         time_line = self._build_state_time_line(
             raw_updates=raw.get("time_line"),
@@ -3902,10 +3818,9 @@ class MemoryNodeManager:
             "metadata": {
                 "entity": candidate.get("entity"),
                 "entity_key": candidate.get("entity_key"),
-                "entity_aliases": candidate.get("entity_alias_names", []),
                 "attribute_key": candidate.get("attribute_key"),
                 "attribute_name": candidate.get("attribute_name"),
-                "attribute_aliases": candidate.get("attribute_aliases", []),
+                "attribute_aliases": attribute_aliases,
                 "candidate_source": candidate.get("candidate_source") or "heuristic",
                 "state_aspects": candidate.get("state_aspects") or [],
                 "entity_state_identity_text": candidate.get("attribute_text") or "",
@@ -3940,6 +3855,16 @@ class MemoryNodeManager:
             else update_text or base or _compact_whitespace(candidate.get("summary_text") or "")
         )
         summary = self._normalize_state_summary(summary_source, max_chars=120)
+        existing_metadata = dict((existing_state or {}).get("metadata") or {})
+        attribute_aliases = self._normalize_unique_labels([
+            existing_metadata.get("attribute_name"),
+            *(existing_metadata.get("attribute_aliases") or []),
+            candidate.get("attribute_name"),
+        ], limit=16)
+        canonical_topics = self._entity_state_canonical_topics_from_facts(
+            candidate=candidate,
+            existing_state=existing_state,
+        )
         existing_ids = [
             int(value)
             for value in ((existing_state or {}).get("evidence_fact_ids") or [])
@@ -3952,7 +3877,6 @@ class MemoryNodeManager:
             "source_type": candidate.get("source_type") or (existing_state or {}).get("source_type") or "unified",
             "canonical_name": _compact_whitespace(
                 (existing_state or {}).get("canonical_name")
-                or candidate.get("canonical_name")
                 or candidate.get("attribute_name")
                 or "general"
             ),
@@ -3965,20 +3889,16 @@ class MemoryNodeManager:
             "evidence_fact_ids": evidence_ids,
             "keywords": self._keywords(summary, limit=18),
             "entities": [candidate.get("entity")] if candidate.get("entity") else [],
-            "canonical_topics": self._normalize_unique_labels([
-                candidate.get("attribute_name"),
-                *(candidate.get("attribute_aliases") or []),
-            ], limit=8),
+            "canonical_topics": canonical_topics,
             "importance": 0.66,
             "confidence": 0.58,
             "status": "active",
             "metadata": {
                 "entity": candidate.get("entity"),
                 "entity_key": candidate.get("entity_key"),
-                "entity_aliases": candidate.get("entity_alias_names", []),
                 "attribute_key": candidate.get("attribute_key"),
                 "attribute_name": candidate.get("attribute_name"),
-                "attribute_aliases": candidate.get("attribute_aliases", []),
+                "attribute_aliases": attribute_aliases,
                 "candidate_source": candidate.get("candidate_source") or "heuristic",
                 "state_aspects": candidate.get("state_aspects") or [],
                 "entity_state_identity_text": candidate.get("attribute_text") or "",
@@ -4010,7 +3930,7 @@ class MemoryNodeManager:
 
         entity_key = ""
         if state_scope == "entity_state":
-            entity_key = self._entity_state_key(
+            entity_key = self._generate_entity_name_key(
                 state_metadata.get("entity_key")
                 or state_metadata.get("entity")
                 or ""
@@ -5426,7 +5346,6 @@ class MemoryNodeManager:
             entity_values.extend([
                 raw.get("entity_key"),
                 metadata.get("entity"),
-                *(metadata.get("entity_aliases") or []),
                 *(metadata.get("context_entities") or []),
                 *(metadata.get("entities") or []),
             ])

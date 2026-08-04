@@ -341,7 +341,6 @@ Output schema:
   ],
   "keywords": ["keyword1", "keyword2"],
   "entities": ["entity1", "entity2"],
-  "canonical_topics": ["topic1"],
   "evidence_fact_ids": [1, 2],
   "importance": 0.8,
   "confidence": 0.85,
