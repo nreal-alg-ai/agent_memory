@@ -171,6 +171,12 @@ def parse_args() -> argparse.Namespace:
         help="Recall traversal budget passed to MemoryNodeManager.recall().",
     )
     parser.add_argument(
+        "--recall-path",
+        default="normal",
+        choices=["stage1", "stage2", "normal"],
+        help="Recall path passed to MemoryNodeManager.recall().",
+    )
+    parser.add_argument(
         "--recall-gate-mode",
         default=None,
         choices=["auto", "force"],
@@ -1194,6 +1200,7 @@ def build_instance_memory_context(
             budget=str(args.recall_budget),
             time_end=effective_question_date_text,
             recall_gate_mode=str(args.recall_gate_mode),
+            recall_path=str(args.recall_path),
         )
         memory_context = str(recall_report.get("memory_context") or "")
 

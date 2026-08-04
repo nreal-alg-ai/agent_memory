@@ -4,7 +4,8 @@
 This script builds an isolated memory DB per benchmark instance, replays the
 timestamped history into ``MemoryNodeManager``, runs reflection, recalls memory
 for the benchmark question, and uses a reader LLM to produce a final
-``hypothesis`` answer.
+``hypothesis`` answer. It can also reuse an existing per-question memory DB to
+run only recall and reader answering.
 
 The output format matches LongMemEval's evaluator expectations:
 ``{"question_id": "...", "hypothesis": "..."}``
@@ -74,6 +75,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--state-dir", type=Path)
+    parser.add_argument(
+        "--existing-state-dir",
+        type=Path,
+        help=(
+            "Reuse existing per-question DBs from "
+            "<dir>/<question_id>/memory.db. When set, skip history replay, "
+            "store, and reflect; only rerun recall and reader answering."
+        ),
+    )
     parser.add_argument("--log-path", type=Path)
     parser.add_argument("--detail-output", type=Path, help="Optional per-instance detail JSON.")
     parser.add_argument("--start", type=int, default=0)
@@ -152,6 +162,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         choices=["low", "mid", "high"],
         help="Recall traversal budget passed to MemoryNodeManager.recall().",
+    )
+    parser.add_argument(
+        "--recall-path",
+        default="normal",
+        choices=["stage1", "stage2", "normal"],
+        help="Recall path passed to MemoryNodeManager.recall().",
     )
     parser.add_argument(
         "--recall-gate-mode",
@@ -1029,13 +1045,26 @@ def replay_sessions_into_memory(
     enable_reflect: bool,
     reflect_every_sessions: int,
     reflect_limit: int,
-) -> Tuple[SessionReplayStats, int]:
+) -> Tuple[SessionReplayStats, int, Dict[str, Any]]:
     seen_timestamps: set[str] = set()
     turn_pairs_total = 0
     stored_pairs = 0
     skipped_assistant_only = 0
     orphan_user_chunks = 0
     reflect_runs = 0
+    store_turn_calls = 0
+    store_turn_total_elapsed_ms = 0.0
+    store_flushes = 0
+    store_flush_total_elapsed_ms = 0.0
+    reflect_total_elapsed_ms = 0.0
+
+    def flush_pending_store_turns() -> bool:
+        nonlocal store_flushes, store_flush_total_elapsed_ms
+        flush_started_at = time.monotonic()
+        stored = bool(manager.flush_pending_interaction_turns())
+        store_flushes += 1
+        store_flush_total_elapsed_ms += (time.monotonic() - flush_started_at) * 1000
+        return stored
 
     for session_position, (session_id, session_dt, session_turns, _original_index) in enumerate(sessions, 1):
         pairs, skipped, orphaned = session_turn_pairs(session_turns)
@@ -1048,7 +1077,7 @@ def replay_sessions_into_memory(
                 session_dt + timedelta(seconds=pair_index),
                 seen_keys=seen_timestamps,
             )
-            stored = manager.store_turn(
+            store_report = manager.store_turn(
                 user_message,
                 assistant_response,
                 tags=[
@@ -1060,7 +1089,11 @@ def replay_sessions_into_memory(
                 ],
                 turn_timestamp=turn_dt,
             )
-            if stored.get("stored"):
+            store_turn_calls += 1
+            store_turn_total_elapsed_ms += float(
+                store_report.get("total_elapsed_ms") or 0.0
+            )
+            if store_report.get("stored"):
                 stored_pairs += 1
 
         if enable_reflect and session_position % reflect_every_sessions == 0:
@@ -1068,31 +1101,37 @@ def replay_sessions_into_memory(
                 session_dt + timedelta(seconds=max(len(pairs), 1)),
                 seen_keys=seen_timestamps,
             )
-            manager.reflect(
+            reflect_report = manager.reflect(
                 limit=reflect_limit,
                 reflect_timestamp=reflect_ts,
             )
             reflect_runs += 1
+            reflect_total_elapsed_ms += float(
+                reflect_report.get("total_elapsed_ms") or 0.0
+            )
     
     if manager._pending_interaction_turns:
-        flushed = manager.flush_pending_interaction_turns()
+        flushed = flush_pending_store_turns()
         if flushed:
             stored_pairs += 1
     
     if enable_reflect and sessions:
         if manager._pending_interaction_turns:
-            flushed = manager.flush_pending_interaction_turns()
+            flushed = flush_pending_store_turns()
             if flushed:
                 stored_pairs += 1
         final_ts = normalize_unique_timestamp(
             sessions[-1][1] + timedelta(seconds=3599),
             seen_keys=seen_timestamps,
         )
-        manager.reflect(
+        reflect_report = manager.reflect(
             limit=reflect_limit,
             reflect_timestamp=final_ts,
         )
         reflect_runs += 1
+        reflect_total_elapsed_ms += float(
+            reflect_report.get("total_elapsed_ms") or 0.0
+        )
     
     if manager._pending_interaction_turns:
         logging.warning(
@@ -1109,6 +1148,17 @@ def replay_sessions_into_memory(
             orphan_user_chunks=orphan_user_chunks,
         ),
         reflect_runs,
+        {
+            "store_turn_calls": store_turn_calls,
+            "store_turn_total_elapsed_ms": round(store_turn_total_elapsed_ms, 2),
+            "store_flushes": store_flushes,
+            "store_flush_total_elapsed_ms": round(store_flush_total_elapsed_ms, 2),
+            "store_total_elapsed_ms": round(
+                store_turn_total_elapsed_ms + store_flush_total_elapsed_ms,
+                2,
+            ),
+            "reflect_total_elapsed_ms": round(reflect_total_elapsed_ms, 2),
+        },
     )
 
 
@@ -1127,7 +1177,17 @@ def build_instance_memory_context(
 
     question_state_dir = args.state_dir / question_id
     question_state_dir.mkdir(parents=True, exist_ok=True)
-    db_path = question_state_dir / "memory.db"
+    reused_existing_db = args.existing_state_dir is not None
+    db_path = (
+        Path(args.existing_state_dir) / question_id / "memory.db"
+        if reused_existing_db
+        else question_state_dir / "memory.db"
+    )
+    if reused_existing_db and not db_path.is_file():
+        raise FileNotFoundError(
+            "Existing memory DB not found for question "
+            f"{question_id}: {db_path}"
+        )
 
     with question_memory_logging(
         question_state_dir,
@@ -1151,14 +1211,31 @@ def build_instance_memory_context(
             validate_runtime(manager)
 
             sessions = sorted_history_sessions(item, max_sessions=int(args.max_sessions))
-            replay_stats, reflect_runs = replay_sessions_into_memory(
-                manager=manager,
-                item=item,
-                sessions=sessions,
-                enable_reflect=args.enable_reflect,
-                reflect_every_sessions=max(1, int(args.reflect_every_sessions)),
-                reflect_limit=int(args.reflect_limit),
-            )
+            if reused_existing_db:
+                replay_stats = SessionReplayStats(
+                    turn_pairs_total=0,
+                    stored_pairs=0,
+                    skipped_assistant_only=0,
+                    orphan_user_chunks=0,
+                )
+                reflect_runs = 0
+                replay_timing = {
+                    "store_turn_calls": 0,
+                    "store_turn_total_elapsed_ms": 0.0,
+                    "store_flushes": 0,
+                    "store_flush_total_elapsed_ms": 0.0,
+                    "store_total_elapsed_ms": 0.0,
+                    "reflect_total_elapsed_ms": 0.0,
+                }
+            else:
+                replay_stats, reflect_runs, replay_timing = replay_sessions_into_memory(
+                    manager=manager,
+                    item=item,
+                    sessions=sessions,
+                    enable_reflect=args.enable_reflect,
+                    reflect_every_sessions=max(1, int(args.reflect_every_sessions)),
+                    reflect_limit=int(args.reflect_limit),
+                )
             effective_question_dt = effective_question_datetime(question_dt, sessions)
             effective_question_date_text = format_memory_time(effective_question_dt)
             counts = db_counts(db)
@@ -1169,8 +1246,10 @@ def build_instance_memory_context(
                 time_end=effective_question_date_text,
                 recall_gate_mode=str(args.recall_gate_mode),
                 memory_source_override=args.recall_memory_source,
+                recall_path=str(args.recall_path),
             )
             memory_context = str(recall_report.get("memory_context") or "")
+            recall_total_elapsed_ms = float(recall_report.get("elapsed_ms") or 0.0)
 
             return {
                 "question_id": question_id,
@@ -1186,11 +1265,42 @@ def build_instance_memory_context(
                 "orphan_user_chunks": replay_stats.orphan_user_chunks,
                 "reflect_runs": reflect_runs,
                 "db_path": str(db_path),
+                "reused_existing_db": reused_existing_db,
                 "memory_log_path": str(memory_log_path),
                 "db_counts": counts,
                 "recall_context_chars": len(memory_context or ""),
                 "recall_context": memory_context,
                 "recall_memory_source_override": list(args.recall_memory_source or []),
+                "recall_path": str(args.recall_path),
+                "requested_recall_path": str(
+                    recall_report.get("requested_recall_path") or args.recall_path
+                ),
+                "actual_recall_path": str(
+                    recall_report.get("actual_recall_path") or "unknown"
+                ),
+                "recall_status": str(
+                    recall_report.get("status")
+                    or ("ok" if memory_context else "empty")
+                ),
+                "store_turn_calls": int(replay_timing["store_turn_calls"]),
+                "store_turn_total_elapsed_ms": float(
+                    replay_timing["store_turn_total_elapsed_ms"]
+                ),
+                "store_flushes": int(replay_timing["store_flushes"]),
+                "store_flush_total_elapsed_ms": float(
+                    replay_timing["store_flush_total_elapsed_ms"]
+                ),
+                "store_total_elapsed_ms": float(replay_timing["store_total_elapsed_ms"]),
+                "reflect_total_elapsed_ms": float(
+                    replay_timing["reflect_total_elapsed_ms"]
+                ),
+                "recall_total_elapsed_ms": recall_total_elapsed_ms,
+                "memory_total_elapsed_ms": round(
+                    float(replay_timing["store_total_elapsed_ms"])
+                    + float(replay_timing["reflect_total_elapsed_ms"])
+                    + recall_total_elapsed_ms,
+                    2,
+                ),
             }
         finally:
             db.close()
@@ -1288,6 +1398,17 @@ def main() -> int:
     args = parse_args()
     resolve_llm_args(args)
     brief_output, detail_output = resolve_output_paths(args)
+    if args.existing_state_dir:
+        args.existing_state_dir = Path(args.existing_state_dir)
+        if not args.existing_state_dir.is_dir():
+            raise FileNotFoundError(
+                f"--existing-state-dir does not exist: {args.existing_state_dir}"
+            )
+        if args.existing_state_dir.resolve() == args.state_dir.resolve():
+            raise ValueError(
+                "--existing-state-dir must differ from --state-dir so existing "
+                "memory DBs are not removed with this run's outputs."
+            )
     remove_existing_outputs(
         output_path=brief_output,
         detail_output_path=detail_output,
@@ -1459,6 +1580,7 @@ def main() -> int:
         "output": str(brief_output),
         "detail_output": str(detail_output),
         "state_dir": str(args.state_dir),
+        "existing_state_dir": str(args.existing_state_dir or ""),
         "log_path": str(args.log_path),
         "instances_requested": len(selected),
         "instances_succeeded": success_count,
