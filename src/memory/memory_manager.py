@@ -2486,11 +2486,7 @@ class MemoryNodeManager:
         for state in existing_topic_states:
             state_metadata = state.get("metadata") if isinstance(state.get("metadata"), dict) else {}
             state_aspect_topics = self._normalize_unique_topic_names([
-                *(
-                    aspect.get("name")
-                    for aspect in (state_metadata.get("aspects") or [])
-                    if isinstance(aspect, dict)
-                ),
+                *(state_metadata.get("aspect_topic_names") or []),
             ], limit=16)
             state_aspect_keys = {
                 self._generate_topic_name_key(topic)
@@ -2792,59 +2788,6 @@ class MemoryNodeManager:
             return text[: boundary + 1]
         return text[:max_chars].rstrip("，,；; ") + "..."
 
-    def _normalize_topic_aspects(
-        self,
-        value: Any,
-        *,
-        fallback_names: Sequence[Any],
-        existing: Optional[Sequence[Any]] = None,
-        limit: int = 16,
-    ) -> List[Dict[str, Any]]:
-        rows: List[Dict[str, Any]] = []
-        seen: set[str] = set()
-        raw_values = [*(existing or []), *(value if isinstance(value, list) else [])]
-        raw_values.extend({"name": name} for name in fallback_names if name)
-        for raw in raw_values:
-            if isinstance(raw, dict):
-                name = self._normalize_topic_name(
-                    raw.get("name")
-                    or raw.get("aspect")
-                    or raw.get("canonical_name")
-                    or raw.get("topic")
-                )
-                summary = self._normalize_state_summary(
-                    raw.get("summary") or raw.get("aspect_summary") or "",
-                    max_chars=180,
-                )
-                status = _compact_whitespace(raw.get("status") or "active") or "active"
-                evidence_ids = [
-                    int(item)
-                    for item in (raw.get("evidence_fact_ids") or raw.get("fact_ids") or [])
-                    if str(item).strip().isdigit()
-                ][:24]
-            else:
-                name = self._normalize_topic_name(raw)
-                summary = ""
-                status = "active"
-                evidence_ids = []
-            if not name:
-                continue
-            key = self._generate_topic_name_key(name)
-            if key in seen:
-                continue
-            seen.add(key)
-            item: Dict[str, Any] = {
-                "name": name,
-                "summary": summary,
-                "status": status,
-            }
-            if evidence_ids:
-                item["evidence_fact_ids"] = list(dict.fromkeys(evidence_ids))
-            rows.append(item)
-            if len(rows) >= max(1, int(limit or 16)):
-                break
-        return rows
-
     @staticmethod
     def _normalize_time_line(
         value: Any,
@@ -3039,15 +2982,10 @@ class MemoryNodeManager:
             *(candidate.get("context_entities") or []),
             *(raw.get("entities") or []),
         ], limit=18)
-        aspects = self._normalize_topic_aspects(
-            raw.get("aspects"),
-            fallback_names=(
-                candidate.get("aspect_topics")
-                or []
-            ),
-            existing=existing_metadata.get("aspects") or [],
-        )
-        aspect_names = [str(item.get("name") or "") for item in aspects if item.get("name")]
+        aspect_topic_names = self._normalize_unique_topic_names([
+            *(existing_metadata.get("aspect_topic_names") or []),
+            *(candidate.get("aspect_topics") or []),
+        ], limit=16)
         aspect_fact_ids: Dict[str, List[int]] = {
             str(key): [
                 int(value)
@@ -3065,21 +3003,17 @@ class MemoryNodeManager:
             current_ids = aspect_fact_ids.setdefault(str(aspect), [])
             current_ids.append(int(fact_id))
             aspect_fact_ids[str(aspect)] = list(dict.fromkeys(current_ids))[-80:]
-        for aspect in aspects:
-            name = str(aspect.get("name") or "")
-            if name and aspect_fact_ids.get(name):
-                aspect["evidence_fact_ids"] = aspect_fact_ids[name][-24:]
         canonical_topics = self._normalize_unique_topic_names([
             canonical_name,
             *(raw.get("canonical_topics") or []),
             *parent_topics,
-            *aspect_names,
+            *aspect_topic_names,
         ], limit=8)
         keywords = self._normalize_unique_labels([
             *self._normalize_string_list(raw.get("keywords"), limit=18),
             *(candidate.get("candidate_identity_keywords") or []),
             *parent_topics,
-            *aspect_names,
+            *aspect_topic_names,
             *context_entities,
         ], limit=24)
         time_line = self._build_state_time_line(
@@ -3103,7 +3037,7 @@ class MemoryNodeManager:
             "status": _compact_whitespace(raw.get("status") or "active") or "active",
             "metadata": {
                 "parent_topics": parent_topics,
-                "aspects": aspects,
+                "aspect_topic_names": aspect_topic_names,
                 "aspect_fact_ids": aspect_fact_ids,
                 "context_entities": context_entities,
             },
@@ -3154,15 +3088,10 @@ class MemoryNodeManager:
             *(existing_metadata.get("context_entities") or []),
             *(candidate.get("context_entities") or []),
         ], limit=18)
-        aspects = self._normalize_topic_aspects(
-            None,
-            fallback_names=(
-                candidate.get("aspect_topics")
-                or []
-            ),
-            existing=existing_metadata.get("aspects") or [],
-        )
-        aspect_names = [str(item.get("name") or "") for item in aspects if item.get("name")]
+        aspect_topic_names = self._normalize_unique_topic_names([
+            *(existing_metadata.get("aspect_topic_names") or []),
+            *(candidate.get("aspect_topics") or []),
+        ], limit=16)
         aspect_fact_ids: Dict[str, List[int]] = {
             str(key): [
                 int(value)
@@ -3180,10 +3109,6 @@ class MemoryNodeManager:
             current_ids = aspect_fact_ids.setdefault(str(aspect), [])
             current_ids.append(int(fact_id))
             aspect_fact_ids[str(aspect)] = list(dict.fromkeys(current_ids))[-80:]
-        for aspect in aspects:
-            name = str(aspect.get("name") or "")
-            if name and aspect_fact_ids.get(name):
-                aspect["evidence_fact_ids"] = aspect_fact_ids[name][-24:]
         return {
             "state_scope": "topic_state",
             "state_type": "topic",
@@ -3200,14 +3125,14 @@ class MemoryNodeManager:
                 *self._keywords(summary, limit=18),
                 *(candidate.get("candidate_identity_keywords") or []),
                 *parent_topics,
-                *aspect_names,
+                *aspect_topic_names,
                 *context_entities,
             ], limit=24),
             "entities": context_entities or self._entities(summary),
             "canonical_topics": self._normalize_unique_topic_names([
                 canonical_name,
                 *parent_topics,
-                *aspect_names,
+                *aspect_topic_names,
             ], limit=8),
             "importance": 0.7,
             "confidence": 0.58,
@@ -3215,7 +3140,7 @@ class MemoryNodeManager:
             "metadata": {
                 "extractor": "fallback_topic_state_update",
                 "parent_topics": parent_topics,
-                "aspects": aspects,
+                "aspect_topic_names": aspect_topic_names,
                 "aspect_fact_ids": aspect_fact_ids,
                 "context_entities": context_entities,
             },
@@ -3917,15 +3842,10 @@ class MemoryNodeManager:
             f"entities: {', '.join(entities)}",
         ])
         if state_scope == "topic_state":
-            aspect_names = [
-                str(aspect.get("name") or "")
-                for aspect in state_metadata.get("aspects") or []
-                if isinstance(aspect, dict) and aspect.get("name")
-            ]
             embedding_text = "\n".join([
                 embedding_text,
                 f"parent_topics: {', '.join(state_metadata.get('parent_topics') or [])}",
-                f"aspects: {', '.join(aspect_names)}",
+                f"aspects: {', '.join(state_metadata.get('aspect_topic_names') or [])}",
                 f"context_entities: {', '.join(state_metadata.get('context_entities') or [])}",
             ])
         embedding = self._generate_embedding_vector(embedding_text)
@@ -5303,11 +5223,7 @@ class MemoryNodeManager:
                     raw.get("canonical_name"),
                     *(metadata.get("canonical_topics") or []),
                     *(metadata.get("parent_topics") or []),
-                    *(
-                        aspect.get("name")
-                        for aspect in (metadata.get("aspects") or [])
-                        if isinstance(aspect, dict)
-                    ),
+                    *(metadata.get("aspect_topic_names") or []),
                 ])
             else:
                 name_values.extend([
@@ -5773,11 +5689,7 @@ class MemoryNodeManager:
                         row.get("canonical_name"),
                         *(state_metadata.get("canonical_topics") or []),
                         *(state_metadata.get("parent_topics") or []),
-                        *(
-                            aspect.get("name")
-                            for aspect in (state_metadata.get("aspects") or [])
-                            if isinstance(aspect, dict)
-                        ),
+                        *(state_metadata.get("aspect_topic_names") or []),
                     ], limit=24)
                     state_keywords = self._normalize_string_list(
                         state_metadata.get("keywords"),
@@ -5977,11 +5889,7 @@ class MemoryNodeManager:
                     raw.get("state_scope"), raw.get("state_type"),
                     raw.get("entity_key"), raw.get("time_line"),
                     (raw.get("metadata") or {}).get("parent_topics"),
-                    [
-                        aspect.get("name")
-                        for aspect in ((raw.get("metadata") or {}).get("aspects") or [])
-                        if isinstance(aspect, dict)
-                    ],
+                    (raw.get("metadata") or {}).get("aspect_topic_names"),
                     (raw.get("metadata") or {}).get("context_entities"),
                 )
             else:
@@ -6481,26 +6389,6 @@ class MemoryNodeManager:
                 elif group_key == "state":
                     timeline = self._format_state_timeline(raw.get("time_line"))
                     state_metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
-                    aspect_text = ""
-                    # if raw.get("state_scope") == "entity_state":
-                    #     state_aspects = self._normalize_state_aspects(
-                    #         state_metadata.get("state_aspects"),
-                    #         limit=8,
-                    #     )
-                    #     aspect_text = "; ".join(
-                    #         f"{item.get('attribute_name')}: {item.get('aspect_summary')}"
-                    #         for item in state_aspects
-                    #         if item.get("attribute_name") and item.get("aspect_summary")
-                    #     )
-                    # else:
-                    #     aspect_states = state_metadata.get("aspect_states") or []
-                    #     aspect_text = "; ".join(
-                    #         f"{item.get('name')}: {item.get('summary')}"
-                    #         if isinstance(item, dict) and item.get("summary")
-                    #         else str(item.get("name") if isinstance(item, dict) else item)
-                    #         for item in aspect_states[:8]
-                    #         if item
-                    #     )
                     block_lines = [
                         f"{index}. [{time_text}] long-term state",
                         f"   state_scope: {raw.get('state_scope') or ''}; state_type: {raw.get('state_type') or ''}",
@@ -6508,8 +6396,6 @@ class MemoryNodeManager:
                         f"   entity: {raw.get('entity_key') or ''}",
                         f"   summary: {raw.get('summary') or ''}",
                     ]
-                    if aspect_text:
-                        block_lines.append(f"   aspects: {aspect_text}")
                     context_entities = values_text(state_metadata.get("context_entities"))
                     if context_entities:
                         block_lines.append(f"   context_entities: {context_entities}")

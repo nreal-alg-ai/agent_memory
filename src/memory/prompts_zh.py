@@ -250,28 +250,19 @@ UNIFIED_TOPIC_STATE_UPDATE_PROMPT_ZH = """你是 AI 眼镜长期记忆系统中�
 
 规则：
 1. 给定的 canonical_topic 是根主题，只围绕这个根主题更新，不要把无关 facts 合并进来。
-2. 不要为每个 aspect 创建独立 topic_state；将本次 facts 涉及的具体 aspects 作为根主题下的局部进展返回。
-3. summary 需要体现根主题的长期状态：背景、最近变化、关键参与者、已经形成的决定/偏好/约束、仍未解决的问题和下一步。
-4. 如果 existing_topic_state 已有内容，要增量融合，不要简单拼接，不要丢失仍然有效的长期信息。
-5. 不要把单句 fact 改写成另一句 fact；topic_state 必须比 fact 更抽象、更稳定。
-6. summary 必须是简短的当前状态快照，最多 1-2 句话，建议不超过 120 个中文字符；不要把历史 timeline 或所有 aspects 拼接进 summary。
-7. aspects 只返回本次输入中有证据支持的具体方面，每个 aspect 包含名称、当前进展摘要和状态。
-8. time_line_updates 只记录本次 facts 带来的状态变化，输出 0-3 条；每条包含发生时间、变化类型、简短变化说明和 fact_ids。不要重复输出已有 timeline，也不要把没有变化的内容写入 timeline。
-9. evidence_fact_ids 必须引用输入 facts 中支撑本次更新的 fact ID。
-10. 只返回 JSON，不要 markdown。
+2. summary 需要体现根主题的长期状态：背景、最近变化、关键参与者、已经形成的决定/偏好/约束、仍未解决的问题和下一步。
+3. 如果 existing_topic_state 已有内容，要增量融合，不要简单拼接，不要丢失仍然有效的长期信息。
+4. 不要把单句 fact 改写成另一句 fact；topic_state 必须比 fact 更抽象、更稳定。
+5. summary 必须是简短的当前状态快照，最多 1-2 句话，建议不超过 120 个中文字符；不要把历史 timeline 拼接进 summary。
+6. time_line_updates 只记录本次 facts 带来的状态变化，输出 0-3 条；每条包含发生时间、变化类型、简短变化说明和 fact_ids。不要重复输出已有 timeline，也不要把没有变化的内容写入 timeline。
+7. evidence_fact_ids 必须引用输入 facts 中支撑本次更新的 fact ID。
+8. 只返回 JSON，不要 markdown。
 
 输出格式：
 {
   "update_needed": true,
   "canonical_name": "稳定主题名",
   "summary": "简短的当前长期 topic_state 快照",
-  "aspects": [
-    {
-      "name": "具体方面",
-      "summary": "该方面当前进展",
-      "status": "active|stable|resolved|uncertain"
-    }
-  ],
   "time_line_updates": [
     {
       "occurred_at": "",
