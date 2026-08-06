@@ -3,7 +3,7 @@
 
 Samples can come from a history_dialogue.json file or from
 PYTHON_TEST_SAMPLES below. Both sources are normalized into the same turn
-stream, fed to MemoryNodeManager.store_turn(), and saved in an isolated
+stream, fed to MemoryRuntime.store_interaction_turns(), and saved in an isolated
 SessionDB under tmp/ by default. Fact extraction follows the batching interval
 configured in the project-level config.yaml.
 """
@@ -28,8 +28,14 @@ for import_root in (SRC_ROOT, REPO_ROOT):
     if str(import_root) not in sys.path:
         sys.path.insert(0, str(import_root))
 
-from memory.memory_manager import DEFAULT_LLM_BASE_URL, DEFAULT_LLM_MODEL, MemoryNodeManager
+from memory.memory_manager import (
+    DEFAULT_LLM_BASE_URL,
+    DEFAULT_LLM_MODEL,
+    MemoryNodeManager,
+    MemoryOperationReporter,
+)
 from memory.memory_database import SessionDB
+from memory.memory_runtime import MemoryRuntime
 
 
 DEFAULT_INPUT = Path("/Users/zhouboyu/Documents/agent_memory/test_data/user_dialogue/history_dialogue.json")
@@ -344,7 +350,7 @@ def _expand_env_refs(value: Any) -> Any:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Exercise MemoryNodeManager.store_turn fact extraction against JSON or in-file Python samples."
+        description="Exercise MemoryRuntime.store_interaction_turns fact extraction against JSON or in-file Python samples."
     )
     parser.add_argument("--config", type=Path, default=REPO_ROOT / "config.yaml")
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
@@ -618,14 +624,6 @@ def log_memory_index_state(db: SessionDB, event: str) -> None:
     )
 
 
-def store_turns_character_count(turns: List[Dict[str, Any]]) -> int:
-    return sum(
-        len(str(item.get("user_message") or ""))
-        + len(str(item.get("assistant_response") or ""))
-        for item in turns
-    )
-
-
 def main() -> int:
     args = parse_args()
     db_path, report_path = resolve_output_paths(args)
@@ -661,6 +659,7 @@ def main() -> int:
     memory_config["max_dialogue_chars_before_store"] = args.max_dialogue_chars_before_store
     memory_config["llm_timeout"] = args.llm_timeout
     memory_config["enable_entity_extraction"] = False
+    operation_reporter = MemoryOperationReporter()
     manager = StoreFactExtractionManager(
         db,
         embedding_config=embedding_config,
@@ -668,11 +667,13 @@ def main() -> int:
         llm_model=args.llm_model,
         llm_base_url=args.llm_base_url,
         llm_api_key=args.llm_api_key,
+        operation_reporter=operation_reporter,
         report_rows=report_rows,
         llm_max_tokens=args.llm_max_tokens,
         llm_thinking=args.llm_thinking,
         llm_json_mode=args.llm_json_mode,
     )
+    runtime = MemoryRuntime(manager, memory_config=memory_config)
     try:
         validate_embedding_runtime(manager, db, embedding_config)
         log_memory_index_state(db, "initialized")
@@ -693,26 +694,28 @@ def main() -> int:
                 # does not collide on "#00" across turns in the same sample.
                 turn_timestamp = base_turn_timestamp + timedelta(hours=hour_offset, seconds=turn_index)
                 before_id = db._conn.execute("SELECT COALESCE(MAX(id), 0) AS max_id FROM memory_facts").fetchone()["max_id"]
-                pending_before = list(manager._pending_interaction_turns)
+                pending_before = [dict(turn) for turn in runtime._pending_interaction_turns]
                 pending_with_current = pending_before + [{
                     "user_message": user,
                     "assistant_response": assistant,
                 }]
-                pending_character_count = store_turns_character_count(pending_with_current)
-                extraction_due = (
-                    len(pending_before) + 1
-                    >= manager._min_dialogue_turns_before_store
-                    or pending_character_count
-                    >= manager._max_dialogue_chars_before_store
+                pending_character_count = (
+                    runtime.interaction_turns_character_count(pending_with_current)
                 )
-                ok = manager.store_turn(
+                extraction_due = runtime.should_flush_pending_interaction_turns(
+                    pending_with_current
+                )
+                ok = runtime.store_interaction_turns(
                     user,
                     assistant,
                     tags=["store_fact_test", f"sample:{sample_id}", f"turn:{turn_index}"],
                     turn_timestamp=turn_timestamp,
                 )
+                if ok.get("queued") and not runtime.flush_store_queue():
+                    raise RuntimeError("Timed out while draining queued memory stores")
                 nodes = list(iter_stored_nodes(db, before_id))
-                if ok.get("stored"):
+                store_operation_report = operation_reporter.latest_report("store_episode")
+                if ok.get("queued"):
                     stored_turns += 1
                     stored_facts += len(nodes)
                 row = {
@@ -723,16 +726,18 @@ def main() -> int:
                     "sample_hour_offset": hour_offset,
                     "turn_second_offset": turn_index,
                     "turn_timestamp": turn_timestamp.isoformat(),
-                    "min_dialogue_turns_before_store": manager._min_dialogue_turns_before_store,
-                    "max_dialogue_chars_before_store": manager._max_dialogue_chars_before_store,
+                    "min_dialogue_turns_before_store": runtime._min_dialogue_turns_before_store,
+                    "max_dialogue_chars_before_store": runtime._max_dialogue_chars_before_store,
                     "pending_character_count": pending_character_count,
                     "fact_extraction_due": extraction_due,
                     "source_turn_count": (
                         len(pending_before) + 1 if extraction_due else 0
                     ),
-                    "pending_turn_count": len(manager._pending_interaction_turns),
-                    "stored": bool(ok.get("stored")),
-                    "store_total_elapsed_ms": float(ok.get("total_elapsed_ms") or 0.0),
+                    "pending_turn_count": len(runtime._pending_interaction_turns),
+                    "queued": bool(ok.get("queued")),
+                    "store_total_elapsed_ms": float(
+                        store_operation_report.get("elapsed_ms") or 0.0
+                    ),
                     "fact_count": len(nodes),
                     "user": user,
                     "assistant": assistant,
@@ -749,7 +754,7 @@ def main() -> int:
                     turn_index,
                     extraction_due,
                     len(pending_before) + 1 if extraction_due else 0,
-                    len(manager._pending_interaction_turns),
+                    len(runtime._pending_interaction_turns),
                     ok,
                     len(nodes),
                 )
@@ -760,15 +765,21 @@ def main() -> int:
                         "Running reflect after sample %s",
                         sample_id,
                     )
-                    reflect_report = manager.reflect(
+                    reflect_submit = runtime.reflect_async(
                         reflect_timestamp=turn_timestamp,
                     )
-                    reflect_runs += 1
+                    if reflect_submit.get("accepted") and not runtime.flush_store_queue():
+                        raise RuntimeError("Timed out while draining queued memory reflect")
+                    reflect_report = (
+                        operation_reporter.latest_report("reflect")
+                        or reflect_submit
+                    )
                     reflect_row = {
                         "event": "reflect",
                         "after_sample_id": sample_id,
                         "after_flat_index": flat_index,
                         "report": reflect_report,
+                        "submit_report": reflect_submit,
                     }
                     report.write(json.dumps(reflect_row, ensure_ascii=False, default=str) + "\n")
                     report.flush()
@@ -782,6 +793,10 @@ def main() -> int:
         log_memory_index_state(db, "finished")
         db.close()
 
+    memory_operation_report = operation_reporter.snapshot()
+    operation_counts = memory_operation_report.get("counts") or {}
+    store_operation_report = operation_counts.get("store_episode") or {}
+    reflect_operation_report = operation_counts.get("reflect") or {}
     summary = {
         "sample_source": args.sample_source,
         "input": str(args.input) if args.sample_source == "json" else "PYTHON_TEST_SAMPLES",
@@ -793,10 +808,14 @@ def main() -> int:
         "turns_processed": len(turns),
         "turns_with_facts": stored_turns,
         "facts_stored": stored_facts,
-        "min_dialogue_turns_before_store": manager._min_dialogue_turns_before_store,
-        "max_dialogue_chars_before_store": manager._max_dialogue_chars_before_store,
-        "pending_turns": len(manager._pending_interaction_turns),
-        "reflect_runs": reflect_runs,
+        "min_dialogue_turns_before_store": runtime._min_dialogue_turns_before_store,
+        "max_dialogue_chars_before_store": runtime._max_dialogue_chars_before_store,
+        "pending_turns": len(runtime._pending_interaction_turns),
+        "store_episode_submitted": int(store_operation_report.get("submitted") or 0),
+        "store_episode_succeeded": int(store_operation_report.get("succeeded") or 0),
+        "store_total_elapsed_ms": float(store_operation_report.get("total_elapsed_ms") or 0.0),
+        "reflect_runs": int(reflect_operation_report.get("submitted") or 0),
+        "reflect_total_elapsed_ms": float(reflect_operation_report.get("total_elapsed_ms") or 0.0),
         "llm_model": args.llm_model,
         "llm_base_url": args.llm_base_url,
         "llm_max_tokens": args.llm_max_tokens,

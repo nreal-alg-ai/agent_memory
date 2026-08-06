@@ -12,7 +12,7 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Sequence
+from typing import Any, Dict, List, Sequence
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -21,7 +21,13 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from memory.memory_database import SessionDB
-from memory.memory_manager import DEFAULT_LLM_BASE_URL, DEFAULT_LLM_MODEL, MemoryNodeManager
+from memory.memory_manager import (
+    DEFAULT_LLM_BASE_URL,
+    DEFAULT_LLM_MODEL,
+    MemoryNodeManager,
+    MemoryOperationReporter,
+)
+from memory.memory_runtime import MemoryRuntime
 
 
 DEFAULT_TEXTGRID = (
@@ -63,7 +69,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-segments-per-episode", type=int, default=0)
     parser.add_argument("--max-chars-per-episode", type=int, default=0)
     parser.add_argument("--max-gap-seconds", type=float, default=-1.0)
-    parser.add_argument("--enable-reflect", action="store_true", help="Run manager.reflect() after storing episodes.")
+    parser.add_argument("--enable-reflect", action="store_true", help="Run memory reflection after storing episodes.")
     parser.add_argument("--disable-llm", action="store_true", help="Use heuristic fallback extraction only.")
     parser.add_argument("--llm-model")
     parser.add_argument("--llm-base-url")
@@ -79,21 +85,14 @@ def main() -> None:
     embedding_config = dict(config.get("embedding") or {})
     if args.disable_llm:
         memory_config["llm_api_key"] = ""
-    max_segments = int(
-        args.max_segments_per_episode
-        or memory_config.get("transcript_episode_max_segments")
-        or 80
-    )
-    max_chars = int(
-        args.max_chars_per_episode
-        or memory_config.get("transcript_episode_max_chars")
-        or 12000
-    )
-    max_gap_s = (
-        float(args.max_gap_seconds)
-        if args.max_gap_seconds >= 0
-        else float(memory_config.get("transcript_episode_max_gap_seconds") or 60.0)
-    )
+    if args.max_segments_per_episode:
+        memory_config["transcript_episode_max_segments"] = (
+            args.max_segments_per_episode
+        )
+    if args.max_chars_per_episode:
+        memory_config["transcript_episode_max_chars"] = args.max_chars_per_episode
+    if args.max_gap_seconds >= 0:
+        memory_config["transcript_episode_max_gap_seconds"] = args.max_gap_seconds
 
     textgrid_path = args.textgrid.expanduser().resolve()
     if not textgrid_path.exists():
@@ -115,12 +114,6 @@ def main() -> None:
         for index, item in enumerate(segments, 1)
     ]
     write_transcript_txt(transcript_path, memory_segments)
-    chunks = list(chunk_memory_segments(
-        memory_segments,
-        max_segments=max_segments,
-        max_chars=max_chars,
-        max_gap_s=max_gap_s,
-    ))
 
     llm_model = args.llm_model or memory_config.get("llm_name") or DEFAULT_LLM_MODEL
     llm_base_url = args.llm_base_url or memory_config.get("llm_base_url") or DEFAULT_LLM_BASE_URL
@@ -128,6 +121,7 @@ def main() -> None:
     llm_api_key = expand_env_refs(llm_api_key)
 
     db = SessionDB(db_path)
+    operation_reporter = MemoryOperationReporter()
     manager = MemoryNodeManager(
         db,
         embedding_config=embedding_config,
@@ -135,27 +129,27 @@ def main() -> None:
         llm_model=llm_model,
         llm_base_url=llm_base_url,
         llm_api_key=llm_api_key,
+        operation_reporter=operation_reporter,
     )
+    runtime = MemoryRuntime(manager, memory_config=memory_config)
 
-    stored_count = 0
-    for chunk_index, chunk in enumerate(chunks, 1):
-        source_ref = f"{textgrid_path.name}#chunk_{chunk_index:03d}"
-        ok = manager.store_transcript_segments(
-            chunk,
+    queued_episode_count = 0
+    source_ref = textgrid_path.name
+    for segment_index, segment in enumerate(memory_segments, 1):
+        ok = runtime.store_transcript_segments(
+            segment,
             source_type=args.source_type,
             episode_type=args.episode_type,
             source_ref=source_ref,
             tags=["Eval_Ali", textgrid_path.stem],
         )
-        stored_count += int(ok)
-        logging.info(
-            "Stored transcript chunk %s/%s segments=%s chars=%s ok=%s",
-            chunk_index,
-            len(chunks),
-            len(chunk),
-            sum(len(item.get("text", "")) for item in chunk),
-            ok,
-        )
+        queued_episode_count += int(bool(ok.get("queued")))
+        if ok.get("queued"):
+            logging.info(
+                "Queued transcript episode while processing segment %s/%s",
+                segment_index,
+                len(memory_segments),
+            )
 
     reflect_result: Dict[str, Any] = {}
     if args.enable_reflect:
@@ -164,16 +158,41 @@ def main() -> None:
             if memory_segments
             else session_start.isoformat()
         )
-        reflect_result = manager.reflect(reflect_timestamp=reflect_timestamp)
+        reflect_submit = runtime.reflect_async(
+            reflect_timestamp=reflect_timestamp,
+        )
+        if reflect_submit.get("accepted") and not runtime.flush_store_queue():
+            raise RuntimeError("Timed out while draining queued memory reflect")
+        reflect_result = operation_reporter.latest_report("reflect") or reflect_submit
+        queued_episode_count += int(
+            bool((reflect_submit.get("pending_transcript_flush") or {}).get("queued"))
+        )
         logging.info("Reflect result: %s", reflect_result)
+    else:
+        pending_transcript_count = len(runtime._pending_transcript_segments)
+        runtime.flush_store_queue()
+        queued_episode_count += int(
+            pending_transcript_count > 0
+            and not runtime._pending_transcript_segments
+        )
+    store_operation_report = operation_reporter.operation_report("store_episode")
+    logging.info(
+        "Transcript input complete segments=%s pending=%s queued_episodes=%s stored_episodes=%s",
+        len(memory_segments),
+        len(runtime._pending_transcript_segments),
+        queued_episode_count,
+        store_operation_report["succeeded"],
+    )
 
     report = {
         "textgrid": str(textgrid_path),
         "db_path": str(db_path),
         "transcript_path": str(transcript_path),
         "segment_count": len(memory_segments),
-        "chunk_count": len(chunks),
-        "stored_episode_count": stored_count,
+        "queued_episode_count": queued_episode_count,
+        "stored_episode_count": store_operation_report["succeeded"],
+        "store_operation_report": store_operation_report,
+        "memory_operation_report": operation_reporter.snapshot(),
         "source_type": args.source_type,
         "episode_type": args.episode_type,
         "session_start": session_start.isoformat(),
@@ -298,46 +317,6 @@ def textgrid_segment_to_memory_segment(
             "audio_end_s": round(segment.end_s, 3),
         },
     }
-
-
-def chunk_memory_segments(
-    segments: Sequence[Dict[str, Any]],
-    *,
-    max_segments: int,
-    max_chars: int,
-    max_gap_s: float,
-) -> Iterable[List[Dict[str, Any]]]:
-    chunk: List[Dict[str, Any]] = []
-    chunk_chars = 0
-    previous_end = ""
-    for segment in segments:
-        text_len = len(segment.get("text", ""))
-        gap_s = timestamp_gap_seconds(previous_end, str(segment.get("started_at") or ""))
-        should_flush = bool(chunk) and (
-            len(chunk) >= max(1, max_segments)
-            or chunk_chars + text_len > max(1, max_chars)
-            or (max_gap_s >= 0 and gap_s is not None and gap_s > max_gap_s)
-        )
-        if should_flush:
-            yield chunk
-            chunk = []
-            chunk_chars = 0
-        chunk.append(dict(segment))
-        chunk_chars += text_len
-        previous_end = str(segment.get("ended_at") or segment.get("started_at") or "")
-    if chunk:
-        yield chunk
-
-
-def timestamp_gap_seconds(previous_end: str, current_start: str) -> float | None:
-    if not previous_end or not current_start:
-        return None
-    try:
-        previous = datetime.fromisoformat(previous_end.replace("Z", "+00:00"))
-        current = datetime.fromisoformat(current_start.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    return (current - previous).total_seconds()
 
 
 def write_transcript_txt(path: Path, segments: Sequence[Dict[str, Any]]) -> None:

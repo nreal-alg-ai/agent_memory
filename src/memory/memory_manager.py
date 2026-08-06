@@ -26,7 +26,9 @@ import json
 import logging
 import math
 import os
+import queue
 import re
+import threading
 import time
 from collections import Counter
 from datetime import datetime, timedelta, timezone
@@ -184,6 +186,242 @@ def _json_safe(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
 
 
+class MemoryOperationReporter:
+    """Collect asynchronous memory operation results for benchmark callers."""
+
+    def __init__(self, *, recent_task_limit: int = 200) -> None:
+        self._lock = threading.Lock()
+        self._task_seq = 0
+        self._recent_task_limit = max(1, int(recent_task_limit or 200))
+        self._counts: Dict[str, Dict[str, Any]] = {}
+        self._latest_reports: Dict[str, Dict[str, Any]] = {}
+        self._recent_tasks: List[Dict[str, Any]] = []
+
+    @staticmethod
+    def _empty_counts() -> Dict[str, Any]:
+        return {
+            "submitted": 0,
+            "completed": 0,
+            "succeeded": 0,
+            "failed": 0,
+            "rejected": 0,
+            "inflight": 0,
+            "total_elapsed_ms": 0.0,
+        }
+
+    def next_task_id(self, operation_type: str) -> str:
+        clean_type = str(operation_type or "memory_task").strip() or "memory_task"
+        with self._lock:
+            self._task_seq += 1
+            return f"{clean_type}-{self._task_seq}"
+
+    def on_task_submitted(
+        self,
+        *,
+        operation_type: str,
+        task_id: str,
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        safe_payload = self._json_compatible(payload or {})
+        with self._lock:
+            counts = self._counts.setdefault(operation_type, self._empty_counts())
+            counts["submitted"] += 1
+            counts["inflight"] += 1
+            self._append_recent_locked({
+                "event": "submitted",
+                "operation_type": operation_type,
+                "task_id": task_id,
+                "payload": safe_payload,
+                "timestamp": _now_text(),
+            })
+
+    def on_task_rejected(
+        self,
+        *,
+        operation_type: str,
+        task_id: str,
+        reason: str,
+    ) -> None:
+        report = {
+            "accepted": False,
+            "status": "rejected",
+            "reason": reason,
+            "task_id": task_id,
+        }
+        with self._lock:
+            counts = self._counts.setdefault(operation_type, self._empty_counts())
+            counts["rejected"] += 1
+            self._latest_reports[operation_type] = dict(report)
+            self._append_recent_locked({
+                "event": "rejected",
+                "operation_type": operation_type,
+                "task_id": task_id,
+                "reason": reason,
+                "timestamp": _now_text(),
+            })
+
+    def on_task_finished(
+        self,
+        *,
+        operation_type: str,
+        task_id: str,
+        started_at: float,
+        result: Any = None,
+        error: Optional[BaseException] = None,
+    ) -> None:
+        elapsed_ms = round((time.monotonic() - started_at) * 1000, 2)
+        succeeded = error is None and self._operation_succeeded(operation_type, result)
+        report = self._operation_result_report(
+            operation_type=operation_type,
+            task_id=task_id,
+            result=result,
+            error=error,
+            succeeded=succeeded,
+            elapsed_ms=elapsed_ms,
+        )
+        with self._lock:
+            counts = self._counts.setdefault(operation_type, self._empty_counts())
+            counts["completed"] += 1
+            counts["inflight"] = max(0, int(counts.get("inflight") or 0) - 1)
+            counts["total_elapsed_ms"] = round(
+                float(counts.get("total_elapsed_ms") or 0.0) + elapsed_ms,
+                2,
+            )
+            counts["succeeded" if succeeded else "failed"] += 1
+            self._latest_reports[operation_type] = dict(report)
+            recent_event = {
+                "event": "finished",
+                "operation_type": operation_type,
+                "task_id": task_id,
+                "status": report.get("status"),
+                "succeeded": succeeded,
+                "elapsed_ms": elapsed_ms,
+                "timestamp": _now_text(),
+            }
+            if error is not None:
+                recent_event["error"] = str(error)
+                recent_event["error_type"] = type(error).__name__
+            self._append_recent_locked(recent_event)
+
+    def on_recall_finished(self, report: Dict[str, Any]) -> None:
+        elapsed_ms = float(report.get("elapsed_ms") or 0.0)
+        status = str(report.get("status") or "").strip().lower()
+        succeeded = status not in {"error", "failed"}
+        recall_report = {
+            key: value
+            for key, value in report.items()
+            if key != "memory_context"
+        }
+        with self._lock:
+            counts = self._counts.setdefault("recall", self._empty_counts())
+            counts["submitted"] += 1
+            counts["completed"] += 1
+            counts["total_elapsed_ms"] = round(
+                float(counts.get("total_elapsed_ms") or 0.0) + elapsed_ms,
+                2,
+            )
+            counts["succeeded" if succeeded else "failed"] += 1
+            self._latest_reports["recall"] = recall_report
+            self._append_recent_locked({
+                "event": "finished",
+                "operation_type": "recall",
+                "task_id": f"recall-{counts['completed']}",
+                "status": recall_report.get("status"),
+                "actual_recall_path": recall_report.get("actual_recall_path"),
+                "elapsed_ms": elapsed_ms,
+                "timestamp": _now_text(),
+            })
+
+    def operation_report(self, operation_type: str) -> Dict[str, Any]:
+        with self._lock:
+            counts = dict(
+                self._counts.get(operation_type) or self._empty_counts()
+            )
+            latest = self._latest_reports.get(operation_type)
+        if latest:
+            counts["latest_report"] = dict(latest)
+        return counts
+
+    def latest_report(self, operation_type: str) -> Dict[str, Any]:
+        with self._lock:
+            return dict(self._latest_reports.get(operation_type) or {})
+
+    def snapshot(self) -> Dict[str, Any]:
+        with self._lock:
+            return {
+                "counts": {
+                    key: dict(value)
+                    for key, value in self._counts.items()
+                },
+                "latest_reports": {
+                    key: dict(value)
+                    for key, value in self._latest_reports.items()
+                },
+                "recent_tasks": [dict(item) for item in self._recent_tasks],
+            }
+
+    def _append_recent_locked(self, event: Dict[str, Any]) -> None:
+        self._recent_tasks.append(event)
+        if len(self._recent_tasks) > self._recent_task_limit:
+            del self._recent_tasks[: len(self._recent_tasks) - self._recent_task_limit]
+
+    @classmethod
+    def _json_compatible(cls, value: Any) -> Any:
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        if isinstance(value, datetime):
+            return _to_timestamp_text(value)
+        if isinstance(value, dict):
+            return {
+                str(key): cls._json_compatible(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, (list, tuple)):
+            return [cls._json_compatible(item) for item in value]
+        return str(value)
+
+    @staticmethod
+    def _operation_succeeded(operation_type: str, result: Any) -> bool:
+        if operation_type == "store_episode":
+            return bool(result)
+        if operation_type == "reflect":
+            if not isinstance(result, dict):
+                return False
+            return str(result.get("status") or "ok") != "queue_rejected"
+        return True
+
+    @staticmethod
+    def _operation_result_report(
+        *,
+        operation_type: str,
+        task_id: str,
+        result: Any,
+        error: Optional[BaseException],
+        succeeded: bool,
+        elapsed_ms: float,
+    ) -> Dict[str, Any]:
+        if isinstance(result, dict):
+            report = dict(result)
+            original_elapsed_ms = report.get("total_elapsed_ms")
+            if original_elapsed_ms is not None:
+                report["worker_elapsed_ms"] = original_elapsed_ms
+        else:
+            report = {"result": result}
+        report.update({
+            "accepted": True,
+            "task_id": task_id,
+            "operation_type": operation_type,
+            "status": "ok" if succeeded else "failed",
+            "total_elapsed_ms": elapsed_ms,
+        })
+        if operation_type == "store_episode":
+            report["stored"] = bool(result) if error is None else False
+        if error is not None:
+            report["error_type"] = type(error).__name__
+            report["error"] = str(error)
+        return report
+
+
 class MemoryNodeManager:
     """Compatibility manager backed by a unified index-first memory line."""
 
@@ -196,8 +434,10 @@ class MemoryNodeManager:
         llm_model: Optional[str] = None,
         llm_base_url: Optional[str] = None,
         llm_api_key: Optional[str] = None,
+        operation_reporter: Optional[MemoryOperationReporter] = None,
     ) -> None:
         self._db = db
+        self._operation_reporter = operation_reporter or MemoryOperationReporter()
         self._embedding_cfg = dict(embedding_config or {})
         self._memory_cfg = dict(memory_config or {})
         self._llm_model = llm_model or DEFAULT_LLM_MODEL
@@ -253,25 +493,6 @@ class MemoryNodeManager:
             "mid": max(320, int(self._memory_cfg.get("recall_entry_chars_mid", 760) or 760)),
             "high": max(420, int(self._memory_cfg.get("recall_entry_chars_high", 1100) or 1100)),
         }
-        self._min_dialogue_turns_before_store = max(
-            1,
-            int(
-                self._memory_cfg.get("min_dialogue_turns_before_store")
-                or self._memory_cfg.get("min_dilaogue_turns_before_store")
-                or self._memory_cfg.get("min_turns_before_store")
-                or 1
-            ),
-        )
-        self._max_dialogue_chars_before_store = max(
-            1,
-            int(
-                self._memory_cfg.get("max_dialogue_chars_before_store")
-                or self._memory_cfg.get("max_dilaogue_chars_before_store")
-                or self._memory_cfg.get("max_chars_before_store")
-                or 2000
-            ),
-        )
-        self._pending_interaction_turns: List[Dict[str, Any]] = []
         self._embedding_client: Optional[EmbeddingClient] = None
         self._enable_topic_state_resolution = self._config_bool(
             self._memory_cfg.get("enable_topic_state_resolution", True),
@@ -302,6 +523,17 @@ class MemoryNodeManager:
             self._memory_cfg.get("enable_entity_scoped_state_resolution", True),
             True,
         )
+        self._store_queue_maxsize = max(
+            1,
+            int(self._memory_cfg.get("store_queue_maxsize", 100) or 100),
+        )
+        self._store_queue: queue.Queue[Dict[str, Any]] = queue.Queue(
+            maxsize=self._store_queue_maxsize,
+        )
+        self._store_worker_thread: Optional[threading.Thread] = None
+        self._store_worker_lock = threading.Lock()
+        self._store_shutdown_event = threading.Event()
+        self._memory_operation_lock = threading.RLock()
         self._entity_state_max_entities_per_fact = max(
             1,
             int(self._memory_cfg.get("entity_state_max_entities_per_fact", 4) or 4),
@@ -379,102 +611,182 @@ class MemoryNodeManager:
             return 0.0
         return float(np.dot(av, bv) / denom)
 
-    # ── Store path: raw turn -> episode -> facts -> index cards ──────────
+    # ── Store path: raw segments -> episode -> facts -> index cards ──────
 
-    def store_turn(
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+
+    def _store_worker_loop(self) -> None:
+        while not self._store_shutdown_event.is_set() or not self._store_queue.empty():
+            try:
+                task = self._store_queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            task_kind = str(task.get("kind") or "")
+            task_id = str(task.get("task_id") or "")
+            started_at = float(task.get("started_at") or time.monotonic())
+            try:
+                with self._memory_operation_lock:
+                    if task_kind == "store_episode":
+                        result = self._store_memory_episode_sync(**task["payload"])
+                    elif task_kind == "reflect":
+                        result = self._reflect_sync(**task["payload"])
+                    else:
+                        raise ValueError(f"Unsupported memory async task: {task_kind}")
+                self._operation_reporter.on_task_finished(
+                    operation_type=task_kind,
+                    task_id=task_id,
+                    started_at=started_at,
+                    result=result,
+                )
+            except Exception as exc:
+                logger.exception("Async memory %s failed: %s", task.get("kind"), exc)
+                self._operation_reporter.on_task_finished(
+                    operation_type=task_kind,
+                    task_id=task_id,
+                    started_at=started_at,
+                    error=exc,
+                )
+            finally:
+                self._store_queue.task_done()
+
+    def _ensure_store_worker_locked(self) -> None:
+        if self._store_worker_thread and self._store_worker_thread.is_alive():
+            return
+        self._store_worker_thread = threading.Thread(
+            target=self._store_worker_loop,
+            daemon=True,
+            name="memory-node-worker",
+        )
+        self._store_worker_thread.start()
+
+    def _submit_memory_task(
         self,
-        user_message: str,
-        assistant_response: str = "",
         *,
-        tags: Optional[List[str]] = None,
-        turn_timestamp: Optional[Any] = None,
-        **extra: Any,
+        task_kind: str,
+        payload: Dict[str, Any],
     ) -> Dict[str, Any]:
-        store_started_at = time.monotonic()
-        if not self._enabled:
-            return {
-                "stored": False,
-                "total_elapsed_ms": round((time.monotonic() - store_started_at) * 1000, 2),
-            }
-        if turn_timestamp is None:
-            turn_timestamp = extra.get("timestamp")
-        turn = {
-            "user_message": _compact_whitespace(user_message),
-            "assistant_response": _compact_whitespace(assistant_response),
-            "tags": list(tags or []),
-            "turn_timestamp": _to_timestamp_text(turn_timestamp) or _now_text(),
-        }
-        if not turn["user_message"] and not turn["assistant_response"]:
-            return {
-                "stored": False,
-                "total_elapsed_ms": round((time.monotonic() - store_started_at) * 1000, 2),
-            }
-        self._pending_interaction_turns.append(turn)
-        pending_chars = sum(
-            len(item.get("user_message", "")) + len(item.get("assistant_response", ""))
-            for item in self._pending_interaction_turns
-        )
-        if (
-            len(self._pending_interaction_turns) >= self._min_dialogue_turns_before_store
-            or pending_chars >= self._max_dialogue_chars_before_store
-        ):
-            stored = self.flush_pending_interaction_turns()
-        else:
-            stored = False
+        task_id = self._operation_reporter.next_task_id(task_kind)
+        with self._store_worker_lock:
+            if self._store_shutdown_event.is_set():
+                logger.warning("Memory worker is shut down; dropping %s task", task_kind)
+                return self._reject_memory_task(
+                    task_kind=task_kind,
+                    task_id=task_id,
+                    reason="worker_shutdown",
+                )
+            try:
+                self._store_queue.put_nowait({
+                    "kind": task_kind,
+                    "payload": payload,
+                    "task_id": task_id,
+                    "started_at": time.monotonic(),
+                })
+            except queue.Full:
+                logger.warning(
+                    "Memory task queue is full; dropping %s (maxsize=%d)",
+                    task_kind,
+                    self._store_queue_maxsize,
+                )
+                return self._reject_memory_task(
+                    task_kind=task_kind,
+                    task_id=task_id,
+                    reason="worker_queue_full",
+                )
+            self._operation_reporter.on_task_submitted(
+                operation_type=task_kind,
+                task_id=task_id,
+                payload={
+                    key: value
+                    for key, value in payload.items()
+                    if key != "raw_segments"
+                },
+            )
+            self._ensure_store_worker_locked()
         return {
-            "stored": bool(stored),
-            "total_elapsed_ms": round((time.monotonic() - store_started_at) * 1000, 2),
+            "accepted": True,
+            "queued": True,
+            "status": "queued",
+            "task_id": task_id,
+            "operation_type": task_kind,
         }
 
-    def flush_pending_interaction_turns(self) -> bool:
-        if not self._pending_interaction_turns:
-            return False
-        turns = list(self._pending_interaction_turns)
-        self._pending_interaction_turns.clear()
-        return self._process_interaction_turns(turns)
-
-    def _process_interaction_turns(self, turns: List[Dict[str, Any]]) -> bool:
-        raw_segments = self._convert_interaction_turns_to_memory_raw_segments(turns)
-        tags = sorted({tag for turn in turns for tag in turn.get("tags", [])})
-        return self._store_memory_episode(
-            raw_segments=raw_segments,
-            source_type="assistant_wakeup",
-            episode_type="interaction",
-            tags=tags,
-            source_ref="store_turn",
-        )
-
-    def store_transcript_segments(
+    def _reject_memory_task(
         self,
-        segments: Sequence[Dict[str, Any]],
         *,
-        source_type: str = "allday_recording",
-        episode_type: str = "ambient_transcript",
-        source_ref: str = "",
-        tags: Optional[List[str]] = None,
+        task_kind: str,
+        task_id: str,
+        reason: str,
+    ) -> Dict[str, Any]:
+        self._operation_reporter.on_task_rejected(
+            operation_type=task_kind,
+            task_id=task_id,
+            reason=reason,
+        )
+        return {
+            "accepted": False,
+            "queued": False,
+            "status": "rejected",
+            "reason": reason,
+            "task_id": task_id,
+            "operation_type": task_kind,
+        }
+    
+    def flush_store_queue(self, timeout: Optional[float] = None) -> bool:
+        """Wait until all accepted asynchronous memory tasks finish."""
+        deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
+        while self._store_queue.unfinished_tasks:
+            if deadline is not None and time.monotonic() >= deadline:
+                return False
+            time.sleep(0.01)
+        return True
+
+    def shutdown_store_worker(
+        self,
+        *,
+        wait: bool = True,
+        timeout: Optional[float] = 5.0,
     ) -> bool:
-        """Store a multi-speaker transcript episode using the unified pipeline."""
-        if not self._enabled:
-            return False
-        raw_segments = self._normalize_transcript_segments_into_memory_raw_segments(segments)
-        if not raw_segments:
-            return False
-        return self._store_memory_episode(
-            raw_segments=raw_segments,
-            source_type=source_type,
-            episode_type=episode_type,
-            tags=list(tags or []),
-            source_ref=source_ref,
+        """Stop accepting tasks and optionally drain the memory worker."""
+        with self._store_worker_lock:
+            self._store_shutdown_event.set()
+            worker = self._store_worker_thread
+        if not wait or worker is None:
+            return not self._store_queue.unfinished_tasks
+        worker.join(timeout=None if timeout is None else max(0.0, timeout))
+        return not worker.is_alive() and not self._store_queue.unfinished_tasks
+
+    def _store_memory_episode_async(
+        self,
+        *,
+        raw_segments: List[Dict[str, Any]],
+        source_type: str,
+        episode_type: str,
+        tags: List[str],
+        source_ref: str = "",
+    ) -> Dict[str, Any]:
+        """Queue one normalized episode for ordered background storage."""
+        if not self._enabled or not raw_segments:
+            reason = "memory_disabled" if not self._enabled else "no_raw_segments"
+            task_id = self._operation_reporter.next_task_id("store_episode")
+            return self._reject_memory_task(
+                task_kind="store_episode",
+                task_id=task_id,
+                reason=reason,
+            )
+        return self._submit_memory_task(
+            task_kind="store_episode",
+            payload={
+                "raw_segments": raw_segments,
+                "source_type": source_type,
+                "episode_type": episode_type,
+                "tags": tags,
+                "source_ref": source_ref,
+            },
         )
 
-    def process_transcript_segments(
-        self,
-        segments: Sequence[Dict[str, Any]],
-        **kwargs: Any,
-    ) -> bool:
-        return self.store_transcript_segments(segments, **kwargs)
-
-    def _store_memory_episode(
+    def _store_memory_episode_sync(
         self,
         *,
         raw_segments: List[Dict[str, Any]],
@@ -1176,91 +1488,6 @@ class MemoryNodeManager:
             )
         return "\n\n".join(blocks)
 
-    def _convert_interaction_turns_to_memory_raw_segments(self, turns: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        segments: List[Dict[str, Any]] = []
-        for turn_index, turn in enumerate(turns, 1):
-            timestamp = _to_timestamp_text(turn.get("turn_timestamp")) or _now_text()
-            tags = list(turn.get("tags") or [])
-            user_text = _compact_whitespace(turn.get("user_message") or "")
-            assistant_text = _compact_whitespace(turn.get("assistant_response") or "")
-            if user_text:
-                segments.append({
-                    "speaker": "user",
-                    "role": "user",
-                    "text": user_text,
-                    "started_at": timestamp,
-                    "ended_at": timestamp,
-                    "tags": tags,
-                    "turn_index": turn_index,
-                })
-            if assistant_text:
-                segments.append({
-                    "speaker": "assistant",
-                    "role": "assistant",
-                    "text": assistant_text,
-                    "started_at": timestamp,
-                    "ended_at": timestamp,
-                    "tags": tags,
-                    "turn_index": turn_index,
-                })
-        return segments
-
-    def _normalize_transcript_segments_into_memory_raw_segments(
-        self,
-        segments: Sequence[Dict[str, Any]],
-    ) -> List[Dict[str, Any]]:
-        normalized: List[Dict[str, Any]] = []
-        for index, segment in enumerate(segments, 1):
-            if not isinstance(segment, dict):
-                continue
-            text = _compact_whitespace(
-                segment.get("text")
-                or segment.get("asr_text")
-                or segment.get("reference_text")
-                or segment.get("utterance")
-                or ""
-            )
-            if not text:
-                continue
-            speaker = _compact_whitespace(
-                segment.get("speaker")
-                or segment.get("speaker_name")
-                or segment.get("speaker_id")
-                or "unknown_speaker"
-            )
-            role = _compact_whitespace(segment.get("role") or speaker or "speaker")
-            started_at = _to_timestamp_text(
-                segment.get("started_at")
-                or segment.get("start_timestamp")
-                or segment.get("timestamp")
-                or segment.get("start")
-            )
-            ended_at = _to_timestamp_text(
-                segment.get("ended_at")
-                or segment.get("end_timestamp")
-                or segment.get("timestamp_end")
-                or segment.get("end")
-                or started_at
-            )
-            normalized.append({
-                "speaker": speaker or "unknown_speaker",
-                "role": role or "speaker",
-                "text": text,
-                "started_at": started_at or _now_text(),
-                "ended_at": ended_at or started_at or _now_text(),
-                "tags": list(segment.get("tags") or []),
-                "segment_index": int(segment.get("segment_index") or index),
-                "metadata": dict(segment.get("metadata") or {}),
-            })
-        return sorted(
-            normalized,
-            key=lambda item: (
-                str(item.get("started_at") or ""),
-                str(item.get("ended_at") or ""),
-                str(item.get("speaker") or ""),
-            ),
-        )
-
     @staticmethod
     def _parse_participants_from_raw_segments(raw_segments: List[Dict[str, Any]]) -> List[str]:
         participants: List[str] = []
@@ -1902,20 +2129,23 @@ class MemoryNodeManager:
 
     # ── Reflection: facts -> evolving states ─────────────────────────────
 
-    def reflect(self, *_, **kwargs: Any) -> Dict[str, Any]:
+    def reflect_async(self, *_, **kwargs: Any) -> Dict[str, Any]:
+        """Queue reflection after all previously accepted memory tasks."""
+        if not self._enabled:
+            task_id = self._operation_reporter.next_task_id("reflect")
+            return self._reject_memory_task(
+                task_kind="reflect",
+                task_id=task_id,
+                reason="memory_disabled",
+            )
+        return self._submit_memory_task(
+            task_kind="reflect",
+            payload=dict(kwargs),
+        )
+
+    def _reflect_sync(self, *_, **kwargs: Any) -> Dict[str, Any]:
         """Update topic/entity projections and actionable items from recent facts."""
         reflect_started_at = time.monotonic()
-        if self._pending_interaction_turns:
-            pending_count = len(self._pending_interaction_turns)
-            pending_flush_started_at = time.monotonic()
-            self.flush_pending_interaction_turns()
-            self._log_info("memory_reflect", "pending_interactions_flushed", {
-                "pending_interaction_count": pending_count,
-                "elapsed_ms": round(
-                    (time.monotonic() - pending_flush_started_at) * 1000,
-                    2,
-                ),
-            })
         if not self._enabled:
             skipped_payload = {
                 "reason": "memory_disabled",
@@ -4760,16 +4990,44 @@ class MemoryNodeManager:
         memory_source_override: Optional[Sequence[str]] = None,
         recall_path: str = "normal",
     ) -> Dict[str, Any]:
+        """Run recall immediately against the current stored memory."""
+        with self._memory_operation_lock:
+            return self._recall_sync(
+                query=query,
+                top_k=top_k,
+                budget=budget,
+                tags=tags,
+                time_start=time_start,
+                time_end=time_end,
+                recall_gate_mode=recall_gate_mode,
+                memory_source_override=memory_source_override,
+                recall_path=recall_path,
+            )
+
+    def _recall_sync(
+        self,
+        query: str,
+        top_k: int = None,
+        budget: str = None,
+        tags: Optional[List[str]] = None,
+        time_start: Optional[str] = None,
+        time_end: Optional[str] = None,
+        recall_gate_mode: Optional[str] = None,
+        memory_source_override: Optional[Sequence[str]] = None,
+        recall_path: str = "normal",
+    ) -> Dict[str, Any]:
         requested_recall_path = str(recall_path or "normal").strip().lower()
         started_at = time.monotonic()
         if not self._enabled or not str(query or "").strip():
-            return {
+            recall_report = {
                 "memory_context": "",
                 "requested_recall_path": requested_recall_path,
                 "actual_recall_path": "none",
                 "status": "empty",
                 "elapsed_ms": round((time.monotonic() - started_at) * 1000, 2),
             }
+            self._operation_reporter.on_recall_finished(recall_report)
+            return recall_report
         try:
             normalized_recall_path = requested_recall_path
             if normalized_recall_path not in {"stage1", "stage2", "normal"}:
@@ -4884,6 +5142,7 @@ class MemoryNodeManager:
                 "recall_context_chars": len(memory_text or ""),
                 "recall_context": memory_text,
             })
+            self._operation_reporter.on_recall_finished(recall_report)
             return recall_report
         except Exception as exc:
             self._log_info("memory_recall", "error", {

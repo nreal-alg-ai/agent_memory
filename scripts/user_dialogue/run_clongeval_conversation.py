@@ -26,7 +26,6 @@ import logging
 import re
 import shutil
 import sys
-import time
 from collections import OrderedDict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timedelta
@@ -41,6 +40,8 @@ for import_root in (SRC_ROOT, REPO_ROOT, SCRIPT_ROOT):
         sys.path.insert(0, str(import_root))
 
 from memory.memory_database import SessionDB
+from memory.memory_manager import MemoryOperationReporter
+from memory.memory_runtime import MemoryRuntime
 from test_memory_store_fact_extraction import (
     StoreFactExtractionManager,
     configure_logging,
@@ -129,7 +130,7 @@ def parse_args() -> argparse.Namespace:
         "--recall-path",
         choices=("stage1", "stage2", "normal"),
         default="normal",
-        help="Recall path passed to MemoryNodeManager.recall().",
+        help="Recall path passed to the memory runtime.",
     )
     parser.add_argument("--skip-embedding-validation", action="store_true")
     parser.add_argument(
@@ -295,7 +296,7 @@ def db_counts(db: SessionDB) -> Dict[str, int]:
 
 def replay_context_into_memory(
     *,
-    manager: StoreFactExtractionManager,
+    runtime: MemoryRuntime,
     db: SessionDB,
     days: Sequence[Dict[str, Any]],
     group_id: str,
@@ -306,25 +307,19 @@ def replay_context_into_memory(
     seen_timestamps: set[str] = set()
     pair_count = 0
     store_batches = 0
-    store_turn_calls = 0
-    store_turn_total_elapsed_ms = 0.0
-    store_flushes = 0
-    store_flush_total_elapsed_ms = 0.0
     reflect_runs = 0
-    reflect_total_elapsed_ms = 0.0
     reflect_reports: List[Dict[str, Any]] = []
     last_reflected_day = 0
     every_days = max(1, int(reflect_every_days or 1))
 
     def flush_pending_store_turns() -> bool:
-        nonlocal store_batches, store_flushes, store_flush_total_elapsed_ms
-        flush_started_at = time.monotonic()
-        stored = bool(manager.flush_pending_interaction_turns())
-        store_flushes += 1
-        store_flush_total_elapsed_ms += (time.monotonic() - flush_started_at) * 1000
-        if stored:
+        nonlocal store_batches
+        pending_before_flush = len(runtime._pending_interaction_turns)
+        stored = bool(pending_before_flush and runtime.flush_store_queue())
+        if stored and not runtime._pending_interaction_turns:
             store_batches += 1
-        return stored
+            return True
+        return False
 
     for day_index, day in enumerate(days, 1):
         last_timestamp: Optional[datetime] = None
@@ -335,7 +330,7 @@ def replay_context_into_memory(
                 seen_timestamps,
             )
             last_timestamp = turn_timestamp
-            store_report = manager.store_turn(
+            store_report = runtime.store_interaction_turns(
                 user,
                 assistant,
                 tags=[
@@ -346,34 +341,31 @@ def replay_context_into_memory(
                 ],
                 turn_timestamp=turn_timestamp,
             )
-            store_turn_calls += 1
-            store_turn_total_elapsed_ms += float(
-                store_report.get("total_elapsed_ms") or 0.0
-            )
-            if store_report.get("stored"):
+            if store_report.get("queued"):
                 store_batches += 1
 
         should_reflect = enable_reflect and (
             day_index % every_days == 0 or day_index == len(days)
         )
         if should_reflect:
-            if manager._pending_interaction_turns:
-                flush_pending_store_turns()
             reflect_timestamp = last_timestamp or day["date"]
-            report = manager.reflect(
+            reflect_submit = runtime.reflect_async(
                 limit=max(1, int(reflect_limit or 100)),
                 reflect_timestamp=reflect_timestamp,
             )
+            if (reflect_submit.get("pending_interaction_flush") or {}).get("queued"):
+                store_batches += 1
+            if reflect_submit.get("accepted") and not runtime.flush_store_queue():
+                raise RuntimeError("Timed out while draining queued memory reflect")
             reflect_runs += 1
-            reflect_total_elapsed_ms += float(report.get("total_elapsed_ms") or 0.0)
             last_reflected_day = day_index
             reflect_reports.append({
                 "day_index": day_index,
                 "date": day["date_text"],
-                "report": report,
+                "report": reflect_submit,
             })
 
-    if manager._pending_interaction_turns:
+    if runtime._pending_interaction_turns:
         flush_pending_store_turns()
 
     return {
@@ -383,17 +375,6 @@ def replay_context_into_memory(
         "reflect_runs": reflect_runs,
         "last_reflected_day": last_reflected_day,
         "reflect_reports": reflect_reports,
-        "timing": {
-            "store_turn_calls": store_turn_calls,
-            "store_turn_total_elapsed_ms": round(store_turn_total_elapsed_ms, 2),
-            "store_flushes": store_flushes,
-            "store_flush_total_elapsed_ms": round(store_flush_total_elapsed_ms, 2),
-            "store_total_elapsed_ms": round(
-                store_turn_total_elapsed_ms + store_flush_total_elapsed_ms,
-                2,
-            ),
-            "reflect_total_elapsed_ms": round(reflect_total_elapsed_ms, 2),
-        },
         "db_counts": db_counts(db),
     }
 
@@ -560,6 +541,7 @@ def process_context_group(
             len(group_records),
             len(days),
         )
+        operation_reporter = MemoryOperationReporter()
         manager = StoreFactExtractionManager(
             db,
             embedding_config=embedding_config,
@@ -567,16 +549,18 @@ def process_context_group(
             llm_model=args.llm_model,
             llm_base_url=args.llm_base_url,
             llm_api_key=args.llm_api_key,
+            operation_reporter=operation_reporter,
             report_rows=[],
             llm_max_tokens=args.llm_max_tokens,
             llm_thinking=args.llm_thinking or "disabled",
             llm_json_mode=args.llm_json_mode,
         )
+        runtime = MemoryRuntime(manager, memory_config=memory_config)
         if not args.skip_embedding_validation:
             validate_embedding_runtime(manager, db, embedding_config)
         log_memory_index_state(db, f"before_context:{group_id}")
         replay_stats = replay_context_into_memory(
-            manager=manager,
+            runtime=runtime,
             db=db,
             days=days,
             group_id=group_id,
@@ -584,11 +568,20 @@ def process_context_group(
             reflect_every_days=args.reflect_every_days,
             reflect_limit=args.reflect_limit,
         )
+        if not runtime.flush_store_queue():
+            raise RuntimeError("Timed out while draining queued memory stores")
         log_memory_index_state(db, f"after_context:{group_id}")
         counts = db_counts(db)
+        memory_operation_report = operation_reporter.snapshot()
+        operation_counts = memory_operation_report.get("counts") or {}
+        store_operation_report = operation_counts.get("store_episode") or {}
+        reflect_operation_report = operation_counts.get("reflect") or {}
+        replay_stats["store_batches"] = int(store_operation_report.get("succeeded") or 0)
+        replay_stats["reflect_runs"] = int(reflect_operation_report.get("submitted") or 0)
+        replay_stats["store_flushes"] = int(store_operation_report.get("submitted") or 0)
 
         for record_index, record in enumerate(group_records, 1):
-            recall_report = manager.recall(
+            recall_report = runtime.recall(
                 str(record["query"]),
                 top_k=args.recall_top_k,
                 budget=args.recall_budget,
@@ -608,8 +601,14 @@ def process_context_group(
             actual_recall_path = str(
                 recall_report.get("actual_recall_path") or "unknown"
             )
-            replay_timing = dict(replay_stats.get("timing") or {})
-            recall_total_elapsed_ms = float(recall_report.get("elapsed_ms") or 0.0)
+            memory_operation_report = operation_reporter.snapshot()
+            operation_counts = memory_operation_report.get("counts") or {}
+            recall_operation_report = operation_counts.get("recall") or {}
+            recall_total_elapsed_ms = float(
+                operation_reporter.latest_report("recall").get("elapsed_ms")
+                or recall_report.get("elapsed_ms")
+                or 0.0
+            )
             result = {
                 "id": record["id"],
                 "source_line": record.get("_source_line"),
@@ -625,22 +624,12 @@ def process_context_group(
                     recall_report.get("status")
                     or ("ok" if recall_context else "empty")
                 ),
-                "store_turn_total_elapsed_ms": float(
-                    replay_timing.get("store_turn_total_elapsed_ms") or 0.0
-                ),
-                "store_flush_total_elapsed_ms": float(
-                    replay_timing.get("store_flush_total_elapsed_ms") or 0.0
-                ),
-                "store_total_elapsed_ms": float(
-                    replay_timing.get("store_total_elapsed_ms") or 0.0
-                ),
-                "reflect_total_elapsed_ms": float(
-                    replay_timing.get("reflect_total_elapsed_ms") or 0.0
-                ),
+                "store_total_elapsed_ms": float(store_operation_report.get("total_elapsed_ms") or 0.0),
+                "reflect_total_elapsed_ms": float(reflect_operation_report.get("total_elapsed_ms") or 0.0),
                 "recall_total_elapsed_ms": recall_total_elapsed_ms,
                 "memory_total_elapsed_ms": round(
-                    float(replay_timing.get("store_total_elapsed_ms") or 0.0)
-                    + float(replay_timing.get("reflect_total_elapsed_ms") or 0.0)
+                    float(store_operation_report.get("total_elapsed_ms") or 0.0)
+                    + float(reflect_operation_report.get("total_elapsed_ms") or 0.0)
                     + recall_total_elapsed_ms,
                     2,
                 ),
@@ -673,6 +662,7 @@ def process_context_group(
             "days": len(days),
             "replay": replay_stats,
             "db_counts": counts,
+            "memory_operation_report": operation_reporter.snapshot(),
             "results": results,
         }
     finally:

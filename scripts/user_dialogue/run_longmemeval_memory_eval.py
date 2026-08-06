@@ -36,7 +36,13 @@ for import_root in (SRC_ROOT, REPO_ROOT):
     if str(import_root) not in sys.path:
         sys.path.insert(0, str(import_root))
 
-from memory.memory_manager import DEFAULT_LLM_BASE_URL, DEFAULT_LLM_MODEL, MemoryNodeManager
+from memory.memory_manager import (
+    DEFAULT_LLM_BASE_URL,
+    DEFAULT_LLM_MODEL,
+    MemoryNodeManager,
+    MemoryOperationReporter,
+)
+from memory.memory_runtime import MemoryRuntime
 import memory.memory_database as memory_database_module
 from memory.memory_database import SessionDB
 
@@ -54,7 +60,6 @@ DEFAULT_OUTPUT_ROOT_DIR = REPO_ROOT / "tmp" / "longmemeval"
 @dataclass(frozen=True)
 class SessionReplayStats:
     turn_pairs_total: int
-    stored_pairs: int
     skipped_assistant_only: int
     orphan_user_chunks: int
 
@@ -155,19 +160,19 @@ def parse_args() -> argparse.Namespace:
         "--recall-top-k",
         type=int,
         default=8,
-        help="Top-k passed to MemoryNodeManager.recall().",
+        help="Top-k passed to the memory runtime recall.",
     )
     parser.add_argument(
         "--recall-budget",
         default=None,
         choices=["low", "mid", "high"],
-        help="Recall traversal budget passed to MemoryNodeManager.recall().",
+        help="Recall traversal budget passed to the memory runtime.",
     )
     parser.add_argument(
         "--recall-path",
         default="normal",
         choices=["stage1", "stage2", "normal"],
-        help="Recall path passed to MemoryNodeManager.recall().",
+        help="Recall path passed to the memory runtime.",
     )
     parser.add_argument(
         "--recall-gate-mode",
@@ -183,7 +188,7 @@ def parse_args() -> argparse.Namespace:
         action="append",
         choices=["assistant_wakeup", "allday_recording"],
         help=(
-            "Force MemoryNodeManager.recall() to search the specified memory source. "
+            "Force memory recall to search the specified memory source. "
             "Can be passed multiple times. When omitted, recall uses LLM source analysis."
         ),
     )
@@ -210,7 +215,7 @@ def parse_args() -> argparse.Namespace:
         "--reflect-limit",
         type=int,
         default=100,
-        help="Limit passed to MemoryNodeManager.reflect().",
+        help="Limit passed to memory reflection.",
     )
     parser.add_argument(
         "--fact-extraction-interval",
@@ -1039,32 +1044,17 @@ def answer_question_with_reader(
 
 def replay_sessions_into_memory(
     *,
-    manager: MemoryNodeManager,
+    runtime: MemoryRuntime,
     item: Dict[str, Any],
     sessions: Sequence[Tuple[str, datetime, List[Dict[str, Any]], int]],
     enable_reflect: bool,
     reflect_every_sessions: int,
     reflect_limit: int,
-) -> Tuple[SessionReplayStats, int, Dict[str, Any]]:
+) -> SessionReplayStats:
     seen_timestamps: set[str] = set()
     turn_pairs_total = 0
-    stored_pairs = 0
     skipped_assistant_only = 0
     orphan_user_chunks = 0
-    reflect_runs = 0
-    store_turn_calls = 0
-    store_turn_total_elapsed_ms = 0.0
-    store_flushes = 0
-    store_flush_total_elapsed_ms = 0.0
-    reflect_total_elapsed_ms = 0.0
-
-    def flush_pending_store_turns() -> bool:
-        nonlocal store_flushes, store_flush_total_elapsed_ms
-        flush_started_at = time.monotonic()
-        stored = bool(manager.flush_pending_interaction_turns())
-        store_flushes += 1
-        store_flush_total_elapsed_ms += (time.monotonic() - flush_started_at) * 1000
-        return stored
 
     for session_position, (session_id, session_dt, session_turns, _original_index) in enumerate(sessions, 1):
         pairs, skipped, orphaned = session_turn_pairs(session_turns)
@@ -1077,7 +1067,7 @@ def replay_sessions_into_memory(
                 session_dt + timedelta(seconds=pair_index),
                 seen_keys=seen_timestamps,
             )
-            store_report = manager.store_turn(
+            runtime.store_interaction_turns(
                 user_message,
                 assistant_response,
                 tags=[
@@ -1089,76 +1079,46 @@ def replay_sessions_into_memory(
                 ],
                 turn_timestamp=turn_dt,
             )
-            store_turn_calls += 1
-            store_turn_total_elapsed_ms += float(
-                store_report.get("total_elapsed_ms") or 0.0
-            )
-            if store_report.get("stored"):
-                stored_pairs += 1
 
         if enable_reflect and session_position % reflect_every_sessions == 0:
             reflect_ts = normalize_unique_timestamp(
                 session_dt + timedelta(seconds=max(len(pairs), 1)),
                 seen_keys=seen_timestamps,
             )
-            reflect_report = manager.reflect(
+            reflect_submit = runtime.reflect_async(
                 limit=reflect_limit,
                 reflect_timestamp=reflect_ts,
             )
-            reflect_runs += 1
-            reflect_total_elapsed_ms += float(
-                reflect_report.get("total_elapsed_ms") or 0.0
-            )
-    
-    if manager._pending_interaction_turns:
-        flushed = flush_pending_store_turns()
-        if flushed:
-            stored_pairs += 1
+            if reflect_submit.get("accepted") and not runtime.flush_store_queue():
+                raise RuntimeError("Timed out while draining queued memory reflect")
     
     if enable_reflect and sessions:
-        if manager._pending_interaction_turns:
-            flushed = flush_pending_store_turns()
-            if flushed:
-                stored_pairs += 1
         final_ts = normalize_unique_timestamp(
             sessions[-1][1] + timedelta(seconds=3599),
             seen_keys=seen_timestamps,
         )
-        reflect_report = manager.reflect(
+        reflect_submit = runtime.reflect_async(
             limit=reflect_limit,
             reflect_timestamp=final_ts,
         )
-        reflect_runs += 1
-        reflect_total_elapsed_ms += float(
-            reflect_report.get("total_elapsed_ms") or 0.0
-        )
+        if reflect_submit.get("accepted") and not runtime.flush_store_queue():
+            raise RuntimeError("Timed out while draining queued memory reflect")
     
-    if manager._pending_interaction_turns:
-        logging.warning(
-            "Replay finished with %s pending turns still buffered. "
-            "The final batch could not be force-stored.",
-            len(manager._pending_interaction_turns),
-        )
+    if runtime._pending_interaction_turns:
+        pending_before_flush = len(runtime._pending_interaction_turns)
+        if not runtime.flush_store_queue():
+            raise RuntimeError("Timed out while draining queued memory stores")
+        if runtime._pending_interaction_turns:
+            logging.warning(
+                "Replay finished with %s pending turns still buffered. "
+                "The final batch could not be force-stored.",
+                pending_before_flush,
+            )
 
-    return (
-        SessionReplayStats(
-            turn_pairs_total=turn_pairs_total,
-            stored_pairs=stored_pairs,
-            skipped_assistant_only=skipped_assistant_only,
-            orphan_user_chunks=orphan_user_chunks,
-        ),
-        reflect_runs,
-        {
-            "store_turn_calls": store_turn_calls,
-            "store_turn_total_elapsed_ms": round(store_turn_total_elapsed_ms, 2),
-            "store_flushes": store_flushes,
-            "store_flush_total_elapsed_ms": round(store_flush_total_elapsed_ms, 2),
-            "store_total_elapsed_ms": round(
-                store_turn_total_elapsed_ms + store_flush_total_elapsed_ms,
-                2,
-            ),
-            "reflect_total_elapsed_ms": round(reflect_total_elapsed_ms, 2),
-        },
+    return SessionReplayStats(
+        turn_pairs_total=turn_pairs_total,
+        skipped_assistant_only=skipped_assistant_only,
+        orphan_user_chunks=orphan_user_chunks,
     )
 
 
@@ -1200,6 +1160,7 @@ def build_instance_memory_context(
         )
         db = SessionDB(db_path=db_path)
         try:
+            operation_reporter = MemoryOperationReporter()
             manager = MemoryNodeManager(
                 db,
                 embedding_config=embedding_config,
@@ -1207,39 +1168,33 @@ def build_instance_memory_context(
                 llm_model=args.llm_model,
                 llm_base_url=args.llm_base_url,
                 llm_api_key=args.llm_api_key,
+                operation_reporter=operation_reporter,
             )
+            runtime = MemoryRuntime(manager, memory_config=memory_config)
             validate_runtime(manager)
 
             sessions = sorted_history_sessions(item, max_sessions=int(args.max_sessions))
             if reused_existing_db:
                 replay_stats = SessionReplayStats(
                     turn_pairs_total=0,
-                    stored_pairs=0,
                     skipped_assistant_only=0,
                     orphan_user_chunks=0,
                 )
-                reflect_runs = 0
-                replay_timing = {
-                    "store_turn_calls": 0,
-                    "store_turn_total_elapsed_ms": 0.0,
-                    "store_flushes": 0,
-                    "store_flush_total_elapsed_ms": 0.0,
-                    "store_total_elapsed_ms": 0.0,
-                    "reflect_total_elapsed_ms": 0.0,
-                }
             else:
-                replay_stats, reflect_runs, replay_timing = replay_sessions_into_memory(
-                    manager=manager,
+                replay_stats = replay_sessions_into_memory(
+                    runtime=runtime,
                     item=item,
                     sessions=sessions,
                     enable_reflect=args.enable_reflect,
                     reflect_every_sessions=max(1, int(args.reflect_every_sessions)),
                     reflect_limit=int(args.reflect_limit),
                 )
+            if not runtime.flush_store_queue():
+                raise RuntimeError("Timed out while draining queued memory stores")
             effective_question_dt = effective_question_datetime(question_dt, sessions)
             effective_question_date_text = format_memory_time(effective_question_dt)
             counts = db_counts(db)
-            recall_report = manager.recall(
+            recall_report = runtime.recall(
                 question,
                 top_k=int(args.recall_top_k),
                 budget=str(args.recall_budget),
@@ -1249,7 +1204,25 @@ def build_instance_memory_context(
                 recall_path=str(args.recall_path),
             )
             memory_context = str(recall_report.get("memory_context") or "")
-            recall_total_elapsed_ms = float(recall_report.get("elapsed_ms") or 0.0)
+            memory_operation_report = operation_reporter.snapshot()
+            operation_counts = memory_operation_report.get("counts") or {}
+            store_operation_report = operation_counts.get("store_episode") or {}
+            reflect_operation_report = operation_counts.get("reflect") or {}
+            recall_operation_report = operation_counts.get("recall") or {}
+            store_turn_calls = replay_stats.turn_pairs_total
+            stored_pairs = int(store_operation_report.get("submitted") or 0)
+            reflect_runs = int(reflect_operation_report.get("submitted") or 0)
+            store_total_elapsed_ms = float(
+                store_operation_report.get("total_elapsed_ms") or 0.0
+            )
+            reflect_total_elapsed_ms = float(
+                reflect_operation_report.get("total_elapsed_ms") or 0.0
+            )
+            recall_total_elapsed_ms = float(
+                recall_operation_report.get("total_elapsed_ms")
+                or recall_report.get("elapsed_ms")
+                or 0.0
+            )
 
             return {
                 "question_id": question_id,
@@ -1260,7 +1233,7 @@ def build_instance_memory_context(
                 "answer": str(item.get("answer") or ""),
                 "history_session_count": len(sessions),
                 "replayed_turn_pairs": replay_stats.turn_pairs_total,
-                "turn_pairs_with_stored_facts": replay_stats.stored_pairs,
+                "turn_pairs_with_stored_facts": stored_pairs,
                 "skipped_assistant_only_turns": replay_stats.skipped_assistant_only,
                 "orphan_user_chunks": replay_stats.orphan_user_chunks,
                 "reflect_runs": reflect_runs,
@@ -1282,22 +1255,16 @@ def build_instance_memory_context(
                     recall_report.get("status")
                     or ("ok" if memory_context else "empty")
                 ),
-                "store_turn_calls": int(replay_timing["store_turn_calls"]),
-                "store_turn_total_elapsed_ms": float(
-                    replay_timing["store_turn_total_elapsed_ms"]
-                ),
-                "store_flushes": int(replay_timing["store_flushes"]),
-                "store_flush_total_elapsed_ms": float(
-                    replay_timing["store_flush_total_elapsed_ms"]
-                ),
-                "store_total_elapsed_ms": float(replay_timing["store_total_elapsed_ms"]),
-                "reflect_total_elapsed_ms": float(
-                    replay_timing["reflect_total_elapsed_ms"]
-                ),
+                "store_turn_calls": store_turn_calls,
+                "store_episode_submitted": stored_pairs,
+                "store_flushes": stored_pairs,
+                "store_total_elapsed_ms": store_total_elapsed_ms,
+                "reflect_total_elapsed_ms": reflect_total_elapsed_ms,
                 "recall_total_elapsed_ms": recall_total_elapsed_ms,
+                "memory_operation_report": memory_operation_report,
                 "memory_total_elapsed_ms": round(
-                    float(replay_timing["store_total_elapsed_ms"])
-                    + float(replay_timing["reflect_total_elapsed_ms"])
+                    store_total_elapsed_ms
+                    + reflect_total_elapsed_ms
                     + recall_total_elapsed_ms,
                     2,
                 ),
@@ -1383,13 +1350,13 @@ def run_instance_memory_context_worker(
 def write_jsonl_row(path: Path, row: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+        handle.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
 
 
 def write_json_output(path: Path, rows: Iterable[Dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
-        json.dumps(list(rows), ensure_ascii=False, indent=2),
+        json.dumps(list(rows), ensure_ascii=False, indent=2, default=str),
         encoding="utf-8",
     )
 

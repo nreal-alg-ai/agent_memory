@@ -18,7 +18,6 @@ import os
 import re
 import shutil
 import sys
-import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -34,7 +33,13 @@ for import_root in (SRC_ROOT, REPO_ROOT):
     if str(import_root) not in sys.path:
         sys.path.insert(0, str(import_root))
 
-from memory.memory_manager import DEFAULT_LLM_BASE_URL, DEFAULT_LLM_MODEL, MemoryNodeManager
+from memory.memory_manager import (
+    DEFAULT_LLM_BASE_URL,
+    DEFAULT_LLM_MODEL,
+    MemoryNodeManager,
+    MemoryOperationReporter,
+)
+from memory.memory_runtime import MemoryRuntime
 import memory.memory_database as memory_database_module
 from memory.memory_database import SessionDB
 
@@ -386,24 +391,14 @@ def validate_runtime(manager: MemoryNodeManager) -> None:
 
 
 def replay_sample_into_memory(
-    manager: MemoryNodeManager,
+    runtime: MemoryRuntime,
     sample: Dict[str, Any],
     sessions: Sequence[Tuple[int, datetime, str, List[Dict[str, Any]]]],
     args: argparse.Namespace,
-) -> Tuple[LocomoReplayStats, int, Dict[str, float]]:
+) -> Tuple[LocomoReplayStats, int]:
     sample_id = str(sample.get("sample_id") or "unknown_sample")
     seen_timestamps: set[str] = set()
-    dialog_turns = turn_pairs = stored_pairs = orphan_turns = reflect_runs = 0
-    store_elapsed_ms = reflect_elapsed_ms = flush_elapsed_ms = 0.0
-    store_calls = flushes = 0
-
-    def flush_pending() -> bool:
-        nonlocal flushes, flush_elapsed_ms
-        started = time.monotonic()
-        stored = bool(manager.flush_pending_interaction_turns())
-        flushes += 1
-        flush_elapsed_ms += (time.monotonic() - started) * 1000
-        return stored
+    dialog_turns = turn_pairs = orphan_turns = reflect_runs = 0
 
     for session_position, (session_id, session_dt, date_text, turns) in enumerate(sessions, 1):
         dialog_turns += len(turns)
@@ -411,42 +406,46 @@ def replay_sample_into_memory(
         orphan_turns += orphaned
         for pair_index, (user_message, assistant_response, dia_ids) in enumerate(pairs):
             turn_pairs += 1
-            report = manager.store_turn(
+            report = runtime.store_interaction_turns(
                 user_message,
                 assistant_response,
                 tags=["locomo", f"sample_id:{sample_id}", f"session_id:S{session_id}", *[f"dia_id:{dia_id}" for dia_id in dia_ids]],
                 turn_timestamp=unique_timestamp(session_dt + timedelta(seconds=pair_index), seen_timestamps),
             )
-            store_calls += 1
-            store_elapsed_ms += float(report.get("total_elapsed_ms") or 0.0)
-            if report.get("stored"):
-                stored_pairs += 1
         if args.enable_reflect and session_position % max(1, int(args.reflect_every_sessions)) == 0:
-            started = time.monotonic()
-            manager.reflect(limit=int(args.reflect_limit), reflect_timestamp=unique_timestamp(session_dt + timedelta(seconds=max(1, len(pairs))), seen_timestamps))
-            reflect_elapsed_ms += (time.monotonic() - started) * 1000
+            reflect_submit = runtime.reflect_async(
+                limit=int(args.reflect_limit),
+                reflect_timestamp=unique_timestamp(
+                    session_dt + timedelta(seconds=max(1, len(pairs))),
+                    seen_timestamps,
+                ),
+            )
+            if reflect_submit.get("accepted") and not runtime.flush_store_queue():
+                raise RuntimeError("Timed out while draining queued memory reflect")
             reflect_runs += 1
 
-    if manager._pending_interaction_turns and flush_pending():
-        stored_pairs += 1
+    if runtime._pending_interaction_turns and not runtime.flush_store_queue():
+        raise RuntimeError("Timed out while draining queued memory stores")
     if args.enable_reflect and sessions:
-        started = time.monotonic()
-        manager.reflect(limit=int(args.reflect_limit), reflect_timestamp=unique_timestamp(sessions[-1][1] + timedelta(seconds=3599), seen_timestamps))
-        reflect_elapsed_ms += (time.monotonic() - started) * 1000
+        reflect_submit = runtime.reflect_async(
+            limit=int(args.reflect_limit),
+            reflect_timestamp=unique_timestamp(
+                sessions[-1][1] + timedelta(seconds=3599),
+                seen_timestamps,
+            ),
+        )
+        if reflect_submit.get("accepted") and not runtime.flush_store_queue():
+            raise RuntimeError("Timed out while draining queued memory reflect")
         reflect_runs += 1
-    if manager._pending_interaction_turns:
-        logging.warning("Replay finished with %s pending turns for %s", len(manager._pending_interaction_turns), sample_id)
+    if runtime._pending_interaction_turns:
+        logging.warning(
+            "Replay finished with %s pending turns for %s",
+            len(runtime._pending_interaction_turns),
+            sample_id,
+        )
     return (
-        LocomoReplayStats(dialog_turns, turn_pairs, stored_pairs, orphan_turns),
+        LocomoReplayStats(dialog_turns, turn_pairs, 0, orphan_turns),
         reflect_runs,
-        {
-            "store_turn_calls": float(store_calls),
-            "store_turn_total_elapsed_ms": round(store_elapsed_ms, 2),
-            "store_flushes": float(flushes),
-            "store_flush_total_elapsed_ms": round(flush_elapsed_ms, 2),
-            "store_total_elapsed_ms": round(store_elapsed_ms + flush_elapsed_ms, 2),
-            "reflect_total_elapsed_ms": round(reflect_elapsed_ms, 2),
-        },
     )
 
 
@@ -470,18 +469,40 @@ def build_sample_memory_context(
     with sample_memory_logging(sample_state_dir, args.manager_log_level) as memory_log_path:
         db = SessionDB(db_path=db_path)
         try:
-            manager = MemoryNodeManager(db, embedding_config=embedding_config, memory_config=memory_config, llm_model=args.llm_model, llm_base_url=args.llm_base_url, llm_api_key=args.llm_api_key)
+            operation_reporter = MemoryOperationReporter()
+            manager = MemoryNodeManager(
+                db,
+                embedding_config=embedding_config,
+                memory_config=memory_config,
+                llm_model=args.llm_model,
+                llm_base_url=args.llm_base_url,
+                llm_api_key=args.llm_api_key,
+                operation_reporter=operation_reporter,
+            )
+            runtime = MemoryRuntime(manager, memory_config=memory_config)
             validate_runtime(manager)
             sessions = sorted_locomo_sessions(sample, int(args.max_sessions))
-            replay_stats, reflect_runs, timing = replay_sample_into_memory(manager, sample, sessions, args)
+            replay_stats, _ = replay_sample_into_memory(runtime, sample, sessions, args)
+            if not runtime.flush_store_queue():
+                raise RuntimeError("Timed out while draining queued memory stores")
+            memory_operation_report = operation_reporter.snapshot()
+            operation_counts = memory_operation_report.get("counts") or {}
+            store_operation_report = operation_counts.get("store_episode") or {}
+            reflect_operation_report = operation_counts.get("reflect") or {}
+            replay_stats = LocomoReplayStats(
+                replay_stats.dialog_turns_total,
+                replay_stats.turn_pairs_total,
+                int(store_operation_report.get("succeeded") or 0),
+                replay_stats.orphan_dialog_turns,
+            )
+            reflect_runs = int(reflect_operation_report.get("submitted") or 0)
             counts = db_counts(db)
             recall_time_end = format_memory_time(sessions[-1][1] + timedelta(hours=1)) if sessions else None
             output_qas = json.loads(json.dumps(sample.get("qa") or []))
             detail_rows: List[Dict[str, Any]] = []
-            recall_total_ms = 0.0
             for qa_index, qa in selected_qas(sample, args):
                 question = str(qa.get("question") or "").strip()
-                recall_report = manager.recall(
+                recall_report = runtime.recall(
                     question,
                     top_k=int(args.recall_top_k),
                     budget=str(args.recall_budget),
@@ -492,8 +513,12 @@ def build_sample_memory_context(
                     recall_path=str(args.recall_path),
                 )
                 memory_context = str(recall_report.get("memory_context") or "")
-                recall_elapsed_ms = float(recall_report.get("elapsed_ms") or 0.0)
-                recall_total_ms += recall_elapsed_ms
+                recall_operation_report = operation_reporter.latest_report("recall")
+                recall_elapsed_ms = float(
+                    recall_operation_report.get("elapsed_ms")
+                    or recall_report.get("elapsed_ms")
+                    or 0.0
+                )
                 output_qas[qa_index][args.context_key] = memory_context
                 detail_rows.append({
                     "sample_id": sample_id,
@@ -526,14 +551,20 @@ def build_sample_memory_context(
                     "orphan_dialog_turns": replay_stats.orphan_dialog_turns,
                     "reflect_runs": reflect_runs,
                     "db_counts": counts,
-                    "store_turn_calls": int(timing["store_turn_calls"]),
-                    "store_turn_total_elapsed_ms": timing["store_turn_total_elapsed_ms"],
-                    "store_flushes": int(timing["store_flushes"]),
-                    "store_flush_total_elapsed_ms": timing["store_flush_total_elapsed_ms"],
-                    "store_total_elapsed_ms": timing["store_total_elapsed_ms"],
-                    "reflect_total_elapsed_ms": timing["reflect_total_elapsed_ms"],
-                    "recall_total_elapsed_ms": round(recall_total_ms, 2),
-                    "memory_total_elapsed_ms": round(timing["store_total_elapsed_ms"] + timing["reflect_total_elapsed_ms"] + recall_total_ms, 2),
+                    "store_turn_calls": replay_stats.turn_pairs_total,
+                    "store_flushes": int(store_operation_report.get("submitted") or 0),
+                    "store_total_elapsed_ms": float(store_operation_report.get("total_elapsed_ms") or 0.0),
+                    "reflect_total_elapsed_ms": float(reflect_operation_report.get("total_elapsed_ms") or 0.0),
+                    "recall_total_elapsed_ms": float(
+                        operation_reporter.operation_report("recall").get("total_elapsed_ms") or 0.0
+                    ),
+                    "memory_operation_report": operation_reporter.snapshot(),
+                    "memory_total_elapsed_ms": round(
+                        float(store_operation_report.get("total_elapsed_ms") or 0.0)
+                        + float(reflect_operation_report.get("total_elapsed_ms") or 0.0)
+                        + float(operation_reporter.operation_report("recall").get("total_elapsed_ms") or 0.0),
+                        2,
+                    ),
                 },
             }
             return output, detail_rows
