@@ -2172,7 +2172,7 @@ class MemoryNodeManager:
         updated = 0
         unresolved = 0
         for candidate in candidates:
-            matched_state, match_info = self._match_topic_candidate_to_existing_state(
+            matched_state, match_info = self._match_topic_state_candidate_to_existing_state(
                 candidate=candidate,
                 existing_topic_states=existing_topic_states,
             )
@@ -2278,13 +2278,13 @@ class MemoryNodeManager:
                 continue
             root_topic_name = str(group["root_topic_name"])
             root_topic_key = str(group["root_topic_key"])
-            aspect_topics = self._normalize_unique_topic_names([
+            aspect_topics = self._normalize_unique_labels([
                 self._normalize_topic_name(fact.get("fact_aspect_topic"))
                 or self._normalize_topic_name(fact.get("fact_root_topic"))
                 or "general"
                 for fact in matched_facts
             ], limit=16)
-            parent_topics = self._normalize_unique_topic_names([
+            parent_topics = self._normalize_unique_labels([
                 topic
                 for fact in matched_facts
                 for topic in (
@@ -2306,25 +2306,28 @@ class MemoryNodeManager:
                 for fact in matched_facts
                 for entity in fact.get("entities") or []
             ], limit=18)
-            candidate_identity_keywords = self._generate_topic_candidate_identity_keywords(
+            keywords = self._generate_topic_candidate_identity_keywords(
                 matched_facts,
                 limit=12,
             )
-            candidate_identity_keywords = self._normalize_unique_labels([
-                *candidate_identity_keywords,
-                *context_entities,
-            ], limit=18)
-            candidate_identity_text = self._generate_topic_candidate_identity_text(
+            fact_summaries = [
+                _compact_whitespace(fact.get("summary") or "")
+                for fact in matched_facts
+                if _compact_whitespace(fact.get("summary") or "")
+            ]
+            identity_text = self._generate_topic_candidate_identity_text(
                 canonical_name=root_topic_name,
-                keywords=candidate_identity_keywords,
+                keywords=keywords,
+                fact_summaries=fact_summaries,
                 context_topics=[*parent_topics, *aspect_topics],
                 context_entities=context_entities,
             )
             candidates.append({
                 "topic_key": root_topic_key,
                 "topic_name": root_topic_name,
-                "candidate_identity_keywords": candidate_identity_keywords,
-                "candidate_identity_text": candidate_identity_text,
+                "keywords": keywords,
+                "fact_summaries": fact_summaries,
+                "identity_text": identity_text,
                 "aspect_topics": aspect_topics,
                 "parent_topics": parent_topics,
                 "context_entities": context_entities,
@@ -2364,27 +2367,6 @@ class MemoryNodeManager:
                 break
         return labels
 
-    def _normalize_unique_topic_names(
-        self,
-        values: Sequence[Any],
-        *,
-        limit: int = 20,
-    ) -> List[str]:
-        topics: List[str] = []
-        seen: set[str] = set()
-        for value in values:
-            topic = self._normalize_topic_name(value)
-            if not topic:
-                continue
-            key = self._generate_topic_name_key(topic)
-            if key in seen:
-                continue
-            seen.add(key)
-            topics.append(topic)
-            if len(topics) >= limit:
-                break
-        return topics
-
     def _generate_topic_candidate_identity_keywords(
         self,
         facts: Sequence[Dict[str, Any]],
@@ -2394,7 +2376,6 @@ class MemoryNodeManager:
         values: List[str] = []
         for fact in facts:
             values.extend(str(fact.get("keywords") or "").split())
-            values.extend(str(entity) for entity in (fact.get("entities") or []))
         generic = {
             "用户", "助手", "建议", "认为", "表示", "接受", "拒绝", "尝试",
             "方案", "问题", "工作", "时间", "方法", "讨论", "不现实",
@@ -2423,12 +2404,16 @@ class MemoryNodeManager:
         *,
         canonical_name: Any,
         keywords: Sequence[Any],
+        fact_summaries: Optional[Sequence[Any]] = None,
         context_topics: Optional[Sequence[Any]] = None,
         context_entities: Optional[Sequence[Any]] = None,
     ) -> str:
         canonical = self._normalize_topic_name(canonical_name) or _compact_whitespace(canonical_name)
         keyword_values = self._normalize_unique_labels(keywords, limit=12)
-        context_topic_values = self._normalize_unique_topic_names(context_topics or [], limit=8)
+        raw_summaries = [fact_summaries] if isinstance(fact_summaries, str) else fact_summaries or []
+        summary_values = self._normalize_unique_labels(raw_summaries, limit=5)
+        summary_values = [value[:320] for value in summary_values]
+        context_topic_values = self._normalize_unique_labels(context_topics or [], limit=8)
         context_entity_values = self._normalize_entity_names(
             list(context_entities or []),
             limit=12,
@@ -2437,10 +2422,11 @@ class MemoryNodeManager:
             f"root_topic: {canonical}",
             f"context_topics: {', '.join(context_topic_values)}",
             f"context_entities: {', '.join(context_entity_values)}",
-            f"anchor_terms: {', '.join(keyword_values)}",
+            f"keywords: {', '.join(keyword_values)}",
+            f"fact_summaries: {' | '.join(summary_values)}",
         ])
 
-    def _match_topic_candidate_to_existing_state(
+    def _match_topic_state_candidate_to_existing_state(
         self,
         *,
         candidate: Dict[str, Any],
@@ -2456,7 +2442,7 @@ class MemoryNodeManager:
         candidate_root_key = self._generate_topic_name_key(
             candidate.get("topic_key") or candidate_root_name
         )
-        candidate_aspect_topics = self._normalize_unique_topic_names(
+        candidate_aspect_topics = self._normalize_unique_labels(
             candidate.get("aspect_topics") or [],
             limit=16,
         )
@@ -2466,17 +2452,21 @@ class MemoryNodeManager:
             if self._generate_topic_name_key(topic)
         }
         candidate_identity_text = (
-            _compact_whitespace(candidate.get("candidate_identity_text") or "")
+            _compact_whitespace(candidate.get("identity_text") or "")
             or self._generate_topic_candidate_identity_text(
                 canonical_name=candidate_root_name,
-                keywords=candidate.get("candidate_identity_keywords") or [],
+                keywords=candidate.get("keywords") or [],
+                fact_summaries=candidate.get("fact_summaries") or candidate.get("summary_text"),
             )
         )
         best_state: Optional[Dict[str, Any]] = None
         best_info: Dict[str, Any] = {"score": 0.0}
         candidate_identity_embedding: Optional[np.ndarray] = None
         candidate_name_embedding: Optional[np.ndarray] = None
-        if any(state.get("embedding") is not None for state in existing_topic_states):
+        if any(
+            state.get("identity_text_embedding") is not None
+            for state in existing_topic_states
+        ):
             candidate_identity_embedding = self._generate_embedding_vector(candidate_identity_text)
         if any(
             state.get("canonical_name_embedding") is not None
@@ -2485,7 +2475,7 @@ class MemoryNodeManager:
             candidate_name_embedding = self._generate_embedding_vector(candidate_root_name)
         for state in existing_topic_states:
             state_metadata = state.get("metadata") if isinstance(state.get("metadata"), dict) else {}
-            state_aspect_topics = self._normalize_unique_topic_names([
+            state_aspect_topics = self._normalize_unique_labels([
                 *(state_metadata.get("aspect_topic_names") or []),
             ], limit=16)
             state_aspect_keys = {
@@ -2507,16 +2497,16 @@ class MemoryNodeManager:
                 [state_root_name],
                 allow_substring=False,
             )
-            state_embedding_similarity = self._cal_embedding_similarity(
+            identity_embedding_similarity = self._cal_embedding_similarity(
                 candidate_identity_embedding,
-                state.get("embedding"),
+                state.get("identity_text_embedding"),
             )
             canonical_name_embedding_similarity = self._cal_embedding_similarity(
                 candidate_name_embedding,
                 state.get("canonical_name_embedding"),
             )
             embedding_similarity = max(
-                state_embedding_similarity,
+                identity_embedding_similarity,
                 canonical_name_embedding_similarity,
             )
             strong_name_match = root_name_overlap >= self._topic_state_resolution_similarity_threshold
@@ -2559,7 +2549,7 @@ class MemoryNodeManager:
                     "existing_root_topic": state_root_name,
                     "root_name_overlap": round(root_name_overlap, 4),
                     "embedding_similarity": round(embedding_similarity, 4),
-                    "state_embedding_similarity": round(state_embedding_similarity, 4),
+                    "identity_embedding_similarity": round(identity_embedding_similarity, 4),
                     "canonical_name_embedding_similarity": round(
                         canonical_name_embedding_similarity,
                         4,
@@ -2719,11 +2709,7 @@ class MemoryNodeManager:
             .replace("{canonical_topic}", json.dumps({
                 "canonical_name": candidate.get("topic_name"),
                 "topic_key": candidate.get("topic_key"),
-                "candidate_identity_keywords": candidate.get("candidate_identity_keywords", []),
-                "candidate_identity_text": candidate.get("candidate_identity_text") or "",
-                "aspect_topics": candidate.get("aspect_topics") or [],
-                "parent_topics": candidate.get("parent_topics", []),
-                "context_entities": candidate.get("context_entities", []),
+                "identity_text": candidate.get("identity_text") or "",
             }, ensure_ascii=False, indent=2))
             .replace("{existing_topic_state}", json.dumps(
                 self._format_existing_topic_state_for_prompt(existing_state),
@@ -2973,7 +2959,7 @@ class MemoryNodeManager:
             or "general"
         )
         existing_metadata = dict((existing_state or {}).get("metadata") or {})
-        parent_topics = self._normalize_unique_topic_names([
+        parent_topics = self._normalize_unique_labels([
             *(existing_metadata.get("parent_topics") or []),
             *(candidate.get("parent_topics") or []),
         ], limit=12)
@@ -2982,7 +2968,7 @@ class MemoryNodeManager:
             *(candidate.get("context_entities") or []),
             *(raw.get("entities") or []),
         ], limit=18)
-        aspect_topic_names = self._normalize_unique_topic_names([
+        aspect_topic_names = self._normalize_unique_labels([
             *(existing_metadata.get("aspect_topic_names") or []),
             *(candidate.get("aspect_topics") or []),
         ], limit=16)
@@ -3003,7 +2989,7 @@ class MemoryNodeManager:
             current_ids = aspect_fact_ids.setdefault(str(aspect), [])
             current_ids.append(int(fact_id))
             aspect_fact_ids[str(aspect)] = list(dict.fromkeys(current_ids))[-80:]
-        canonical_topics = self._normalize_unique_topic_names([
+        canonical_topics = self._normalize_unique_labels([
             canonical_name,
             *(raw.get("canonical_topics") or []),
             *parent_topics,
@@ -3011,7 +2997,7 @@ class MemoryNodeManager:
         ], limit=8)
         keywords = self._normalize_unique_labels([
             *self._normalize_string_list(raw.get("keywords"), limit=18),
-            *(candidate.get("candidate_identity_keywords") or []),
+            *(candidate.get("keywords") or []),
             *parent_topics,
             *aspect_topic_names,
             *context_entities,
@@ -3075,12 +3061,12 @@ class MemoryNodeManager:
         existing_metadata = dict((existing_state or {}).get("metadata") or {})
         for key in (
             "topic_key",
-            "candidate_identity_text",
-            "candidate_identity_keywords",
+            "identity_text",
+            "keywords",
             "episode_id",
         ):
             existing_metadata.pop(key, None)
-        parent_topics = self._normalize_unique_topic_names([
+        parent_topics = self._normalize_unique_labels([
             *(existing_metadata.get("parent_topics") or []),
             *(candidate.get("parent_topics") or []),
         ], limit=12)
@@ -3088,7 +3074,7 @@ class MemoryNodeManager:
             *(existing_metadata.get("context_entities") or []),
             *(candidate.get("context_entities") or []),
         ], limit=18)
-        aspect_topic_names = self._normalize_unique_topic_names([
+        aspect_topic_names = self._normalize_unique_labels([
             *(existing_metadata.get("aspect_topic_names") or []),
             *(candidate.get("aspect_topics") or []),
         ], limit=16)
@@ -3123,13 +3109,13 @@ class MemoryNodeManager:
             "evidence_fact_ids": evidence_ids,
             "keywords": self._normalize_unique_labels([
                 *self._keywords(summary, limit=18),
-                *(candidate.get("candidate_identity_keywords") or []),
+                *(candidate.get("keywords") or []),
                 *parent_topics,
                 *aspect_topic_names,
                 *context_entities,
             ], limit=24),
             "entities": context_entities or self._entities(summary),
-            "canonical_topics": self._normalize_unique_topic_names([
+            "canonical_topics": self._normalize_unique_labels([
                 canonical_name,
                 *parent_topics,
                 *aspect_topic_names,
@@ -3361,7 +3347,7 @@ class MemoryNodeManager:
                 aspect_summaries
                 or [str(fact.get("summary") or "") for fact in item.get("facts") or []]
             )[:2400]
-            item["attribute_text"] = "\n".join([
+            item["identity_text"] = "\n".join([
                 str(item.get("attribute_name") or ""),
                 " ".join(item.get("attribute_name_aliases") or []),
                 item["summary_text"],
@@ -3458,7 +3444,7 @@ class MemoryNodeManager:
             candidate.get("attribute_name"),
             *(candidate.get("attribute_name_aliases") or []),
         ], limit=12)
-        candidate_text = str(candidate.get("attribute_text") or candidate.get("summary_text") or "")
+        candidate_identity_text = str(candidate.get("identity_text") or candidate.get("summary_text") or "")
         best_state: Optional[Dict[str, Any]] = None
         best_score = 0.0
         best_info: Dict[str, Any] = {"matched": False, "score": 0.0}
@@ -3484,13 +3470,16 @@ class MemoryNodeManager:
             return None, best_info
 
         candidate_name_embedding: Optional[np.ndarray] = None
-        candidate_summary_embedding: Optional[np.ndarray] = None
+        candidate_identity_embedding: Optional[np.ndarray] = None
         if any(state.get("canonical_name_embedding") is not None for state in matching_states):
             candidate_name_embedding = self._generate_embedding_vector(
                 candidate.get("attribute_name") or candidate_name
             )
-        if any(state.get("embedding") is not None for state in matching_states):
-            candidate_summary_embedding = self._generate_embedding_vector(candidate_text[:1600])
+        if any(
+            state.get("identity_text_embedding") is not None
+            for state in matching_states
+        ):
+            candidate_identity_embedding = self._generate_embedding_vector(candidate_identity_text[:1600])
 
         for state in matching_states:
             metadata = state.get("metadata") or {}
@@ -3502,16 +3491,16 @@ class MemoryNodeManager:
                 candidate_attribute_aliases,
                 state_attribute_aliases,
             )
-            summary_embedding_similarity = self._cal_embedding_similarity(
-                candidate_summary_embedding,
-                state.get("embedding"),
+            identity_embedding_similarity = self._cal_embedding_similarity(
+                candidate_identity_embedding,
+                state.get("identity_text_embedding"),
             )
             canonical_name_embedding_similarity = self._cal_embedding_similarity(
                 candidate_name_embedding,
                 state.get("canonical_name_embedding"),
             )
             embedding_similarity = max(
-                summary_embedding_similarity,
+                identity_embedding_similarity,
                 canonical_name_embedding_similarity,
             )
             exact_attribute_match = any(
@@ -3541,7 +3530,7 @@ class MemoryNodeManager:
                     "score": round(score, 4),
                     "attribute_overlap": round(attribute_overlap, 4),
                     "embedding_similarity": round(embedding_similarity, 4),
-                    "summary_embedding_similarity": round(summary_embedding_similarity, 4),
+                    "identity_embedding_similarity": round(identity_embedding_similarity, 4),
                     "canonical_name_embedding_similarity": round(
                         canonical_name_embedding_similarity,
                         4,
@@ -3558,8 +3547,8 @@ class MemoryNodeManager:
                 "existing_canonical_name": best_state.get("canonical_name"),
                 "attribute_overlap": best_info.get("attribute_overlap", 0.0),
                 "embedding_similarity": best_info.get("embedding_similarity", 0.0),
-                "summary_embedding_similarity": best_info.get(
-                    "summary_embedding_similarity",
+                "identity_embedding_similarity": best_info.get(
+                    "identity_embedding_similarity",
                     0.0,
                 ),
                 "canonical_name_embedding_similarity": best_info.get(
@@ -3646,7 +3635,7 @@ class MemoryNodeManager:
                 fact.get("fact_aspect_topic"),
             )
         ]
-        return self._normalize_unique_topic_names([
+        return self._normalize_unique_labels([
             *fact_topics,
             *((existing_state or {}).get("canonical_topics") or []),
         ], limit=24)
@@ -3833,22 +3822,20 @@ class MemoryNodeManager:
             names=entity_names,
             facts=evidence_facts,
         )
-        embedding_text = "\n".join([
+        identity_text = "\n".join([
             state["canonical_name"],
             state["summary"],
-            f"state_scope: {state_scope}",
-            f"state_type: {state_type}",
             f"keywords: {' '.join(keywords)}",
             f"entities: {', '.join(entities)}",
         ])
         if state_scope == "topic_state":
-            embedding_text = "\n".join([
-                embedding_text,
+            identity_text = "\n".join([
+                identity_text,
                 f"parent_topics: {', '.join(state_metadata.get('parent_topics') or [])}",
                 f"aspects: {', '.join(state_metadata.get('aspect_topic_names') or [])}",
                 f"context_entities: {', '.join(state_metadata.get('context_entities') or [])}",
             ])
-        embedding = self._generate_embedding_vector(embedding_text)
+        identity_text_embedding = self._generate_embedding_vector(identity_text)
         canonical_name_embedding = self._generate_embedding_vector(state["canonical_name"])
         state_id = self._db.upsert_state(
             state_scope=state_scope,
@@ -3870,9 +3857,9 @@ class MemoryNodeManager:
                 "importance": state["importance"],
                 "status": state["status"],
             },
-            embedding=embedding,
+            identity_text_embedding=identity_text_embedding,
             canonical_name_embedding=canonical_name_embedding,
-            embedding_text=embedding_text,
+            identity_text=identity_text,
         )
         # if state_id:
         #     memory_path = f"{state['source_type']}/states/{state_scope}/{state_type}"
@@ -5670,7 +5657,7 @@ class MemoryNodeManager:
                     summary = _compact_whitespace(row.get("summary") or "")
                     time_value = self._normalize_event_time_text(row.get("time_key"))
                     entities = row.get("entities") or []
-                    topics = self._normalize_unique_topic_names([
+                    topics = self._normalize_unique_labels([
                         row.get("fact_root_topic"),
                         row.get("fact_aspect_topic"),
                     ], limit=12)
@@ -5685,7 +5672,7 @@ class MemoryNodeManager:
                         *(state_metadata.get("entities") or []),
                     ]
                     entities = self._normalize_entity_names(entities, limit=18)
-                    topics = self._normalize_unique_topic_names([
+                    topics = self._normalize_unique_labels([
                         row.get("canonical_name"),
                         *(state_metadata.get("canonical_topics") or []),
                         *(state_metadata.get("parent_topics") or []),
@@ -5729,8 +5716,15 @@ class MemoryNodeManager:
                 else:
                     time_end_value = time_value
 
+                candidate_embedding = (
+                    row.get("identity_text_embedding")
+                    if table == "memory_states"
+                    else row.get("embedding")
+                )
                 hydrated = dict(row)
                 hydrated.pop("embedding", None)
+                hydrated.pop("identity_text_embedding", None)
+                hydrated.pop("canonical_name_embedding", None)
                 metadata = dict(row.get("metadata") or {})
                 metadata["_matched_via"] = ["direct"]
                 candidate = {
@@ -5752,7 +5746,7 @@ class MemoryNodeManager:
                     "time_end": time_end_value,
                     "importance": row.get("importance") or 0.5,
                     "confidence": row.get("confidence") or 0.8,
-                    "embedding": row.get("embedding"),
+                    "embedding": candidate_embedding,
                     "metadata": metadata,
                     "_hydrated": hydrated,
                     "_supporting_facts": support_facts,

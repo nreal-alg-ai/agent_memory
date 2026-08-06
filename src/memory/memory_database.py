@@ -150,9 +150,9 @@ class SessionDB:
                 evidence_fact_ids TEXT NOT NULL DEFAULT '[]',
                 confidence REAL NOT NULL DEFAULT 0.75,
                 metadata TEXT NOT NULL DEFAULT '{}',
-                embedding BLOB,
+                identity_text_embedding BLOB,
                 canonical_name_embedding BLOB,
-                embedding_text TEXT NOT NULL DEFAULT '',
+                identity_text TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 UNIQUE(source_type, state_scope, state_type, entity_key, canonical_name)
@@ -313,9 +313,9 @@ class SessionDB:
                 evidence_fact_ids TEXT NOT NULL DEFAULT '[]',
                 confidence REAL NOT NULL DEFAULT 0.75,
                 metadata TEXT NOT NULL DEFAULT '{}',
-                embedding BLOB,
+                identity_text_embedding BLOB,
                 canonical_name_embedding BLOB,
-                embedding_text TEXT NOT NULL DEFAULT '',
+                identity_text TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 UNIQUE(source_type, state_scope, state_type, entity_key, canonical_name)
@@ -337,7 +337,8 @@ class SessionDB:
                 INSERT INTO memory_states (
                     id, state_scope, state_type, source_type, entity_key,
                     canonical_name, summary, time_line, entity_ids, evidence_fact_ids,
-                    confidence, metadata, embedding, canonical_name_embedding, embedding_text,
+                    confidence, metadata, identity_text_embedding, canonical_name_embedding,
+                    identity_text,
                     created_at, updated_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
@@ -346,11 +347,11 @@ class SessionDB:
                     row["source_type"], entity_key, row["canonical_name"],
                     row["summary"], row["time_line"], row["entity_ids"],
                     row["evidence_fact_ids"], row["confidence"], row["metadata"],
-                    row["embedding"],
+                    row["identity_text_embedding"],
                     row["canonical_name_embedding"]
                     if "canonical_name_embedding" in row.keys()
                     else None,
-                    row["embedding_text"], row["created_at"],
+                    row["identity_text"], row["created_at"],
                     row["updated_at"],
                 ),
             )
@@ -532,9 +533,9 @@ class SessionDB:
         evidence_fact_ids: Sequence[int],
         confidence: float,
         metadata: Optional[Dict[str, Any]],
-        embedding: Optional[np.ndarray],
+        identity_text_embedding: Optional[np.ndarray],
         canonical_name_embedding: Optional[np.ndarray],
-        embedding_text: str,
+        identity_text: str,
     ) -> int:
         now = utc_now_text()
         normalized_scope = str(state_scope or "entity_state").strip()
@@ -554,9 +555,9 @@ class SessionDB:
             _json_dumps([int(value) for value in evidence_fact_ids or []]),
             float(confidence),
             _json_dumps(metadata or {}),
-            _embedding_to_blob(embedding),
+            _embedding_to_blob(identity_text_embedding),
             _embedding_to_blob(canonical_name_embedding),
-            str(embedding_text or ""),
+            str(identity_text or ""),
         )
         existing = self._conn.execute(
             """
@@ -574,7 +575,8 @@ class SessionDB:
                 """
                 UPDATE memory_states
                 SET summary = ?, time_line = ?, entity_ids = ?, evidence_fact_ids = ?, confidence = ?,
-                    metadata = ?, embedding = ?, canonical_name_embedding = ?, embedding_text = ?, updated_at = ?
+                    metadata = ?, identity_text_embedding = ?, canonical_name_embedding = ?,
+                    identity_text = ?, updated_at = ?
                 WHERE id = ?
                 """,
                 (*values[5:], now, int(existing["id"])),
@@ -584,8 +586,9 @@ class SessionDB:
                 """
                 INSERT INTO memory_states (
                     state_scope, state_type, source_type, entity_key, canonical_name, summary,
-                    time_line, entity_ids, evidence_fact_ids, confidence, metadata, embedding,
-                    canonical_name_embedding, embedding_text, created_at, updated_at
+                    time_line, entity_ids, evidence_fact_ids, confidence, metadata,
+                    identity_text_embedding, canonical_name_embedding, identity_text,
+                    created_at, updated_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (*values, now, now),
@@ -1221,7 +1224,7 @@ class SessionDB:
             table="memory_states",
             searchable_fields=(
                 "canonical_name", "summary", "time_line", "entity_ids", "entity_key",
-                "state_scope", "state_type", "embedding_text", "metadata",
+                "state_scope", "state_type", "identity_text", "metadata",
             ),
             time_field="updated_at",
             terms=terms,
@@ -1318,7 +1321,11 @@ class SessionDB:
         ):
             if key in item:
                 item[key] = _json_loads(item[key], [] if key != "metadata" else {})
-        for key in ("embedding", "canonical_name_embedding"):
+        for key in (
+            "embedding",
+            "identity_text_embedding",
+            "canonical_name_embedding",
+        ):
             if key in item:
                 item[key] = _blob_to_embedding(item[key])
         return item
