@@ -444,27 +444,28 @@ class MemoryNodeManager:
         db: SessionDB,
         *,
         embedding_config: Optional[Dict[str, Any]] = None,
-        memory_config: Optional[Dict[str, Any]] = None,
-        llm_model: Optional[str] = None,
-        llm_base_url: Optional[str] = None,
-        llm_api_key: Optional[str] = None,
+        memory_manager_config: Optional[Dict[str, Any]] = None,
+        llm_config: Optional[Dict[str, Any]] = None,
         operation_reporter: Optional[MemoryOperationReporter] = None,
     ) -> None:
         self._db = db
         self._operation_reporter = operation_reporter or MemoryOperationReporter()
         self._embedding_cfg = dict(embedding_config or {})
-        self._memory_cfg = dict(memory_config or {})
-        self._llm_model = llm_model or DEFAULT_LLM_MODEL
-        self._llm_base_url = self._normalize_llm_base_url(llm_base_url or DEFAULT_LLM_BASE_URL)
-        self._llm_api_key = llm_api_key or ""
-        if not self._llm_api_key:
-            self._llm_api_key = self._resolve_env(self._memory_cfg.get("llm_api_key"))
-        self._llm_timeout = int(self._memory_cfg.get("llm_timeout", 120) or 120)
+        self._memory_cfg = dict(memory_manager_config or {})
+        self._llm_cfg = dict(llm_config or {})
+        self._llm_model = str(self._llm_cfg.get("llm_name") or DEFAULT_LLM_MODEL)
+        self._llm_base_url = self._normalize_llm_base_url(
+            str(self._llm_cfg.get("llm_base_url") or DEFAULT_LLM_BASE_URL)
+        )
+        self._llm_api_key = self._resolve_env(self._llm_cfg.get("llm_api_key"))
+        self._llm_timeout = int(self._llm_cfg.get("llm_timeout", 120) or 120)
         self._llm_json_mode = self._config_bool(
-            self._memory_cfg.get("llm_json_mode", True),
+            self._llm_cfg.get("llm_json_mode", True),
             True,
         )
-        self._llm_thinking = str(self._memory_cfg.get("llm_thinking", "disabled") or "disabled")
+        self._llm_thinking = str(
+            self._llm_cfg.get("llm_thinking", "disabled") or "disabled"
+        )
         self._memory_prompt_language = str(
             self._memory_cfg.get("memory_prompt_language_mode")
             or self._memory_cfg.get("prompt_language_mode")

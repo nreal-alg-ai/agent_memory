@@ -42,6 +42,7 @@ for import_root in (SRC_ROOT, REPO_ROOT, SCRIPT_ROOT):
 from memory.memory_database import SessionDB
 from memory.memory_manager import MemoryOperationReporter
 from memory.memory_runtime import MemoryRuntime
+from memory.config import split_memory_config
 from test_memory_store_fact_extraction import (
     StoreFactExtractionManager,
     configure_logging,
@@ -105,7 +106,7 @@ def parse_args() -> argparse.Namespace:
         "--llm-thinking",
         choices=("disabled", "enabled", "auto"),
         default=None,
-        help="Defaults to memory.llm_thinking in config.yaml.",
+        help="Defaults to memory_manager.llm.llm_thinking in config.yaml.",
     )
     parser.add_argument(
         "--no-llm-json-mode",
@@ -423,23 +424,27 @@ def run_reader(manager: StoreFactExtractionManager, query: str, memory_context: 
     return str(raw or "").strip()
 
 
-def prepare_runtime(args: argparse.Namespace) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+def prepare_runtime(
+    args: argparse.Namespace,
+) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
     resolve_llm_args(args)
     config = load_project_config(args.config)
-    embedding_config = dict(config.get("embedding") or {}) if isinstance(config.get("embedding"), dict) else {}
-    memory_config = dict(config.get("memory") or {}) if isinstance(config.get("memory"), dict) else {}
+    memory_runtime_config, memory_manager_config, llm_config, embedding_config = split_memory_config(config)
     if args.llm_thinking is None:
-        args.llm_thinking = str(memory_config.get("llm_thinking") or "disabled")
+        args.llm_thinking = str(llm_config.get("llm_thinking") or "disabled")
     if args.llm_json_mode is None:
-        args.llm_json_mode = bool(memory_config.get("llm_json_mode", True))
-    args.reflect_limit = max(1, int(args.reflect_limit or memory_config.get("reflect_limit", 100) or 100))
-    args.recall_top_k = max(1, int(args.recall_top_k or memory_config.get("retrieval_top_k", 8) or 8))
-    args.recall_budget = str(args.recall_budget or memory_config.get("recall_budget", "mid") or "mid")
-    memory_config["min_dialogue_turns_before_store"] = args.min_dialogue_turns_before_store
-    memory_config["max_dialogue_chars_before_store"] = args.max_dialogue_chars_before_store
-    memory_config["llm_timeout"] = args.llm_timeout
-    memory_config["enable_entity_extraction"] = False
-    return embedding_config, memory_config
+        args.llm_json_mode = bool(llm_config.get("llm_json_mode", True))
+    args.reflect_limit = max(1, int(args.reflect_limit or memory_manager_config.get("reflect_limit", 100) or 100))
+    args.recall_top_k = max(1, int(args.recall_top_k or memory_manager_config.get("retrieval_top_k", 8) or 8))
+    args.recall_budget = str(args.recall_budget or memory_manager_config.get("recall_budget", "mid") or "mid")
+    memory_runtime_config["min_dialogue_turns_before_store"] = args.min_dialogue_turns_before_store
+    memory_runtime_config["max_dialogue_chars_before_store"] = args.max_dialogue_chars_before_store
+    llm_config["llm_name"] = str(args.llm_model)
+    llm_config["llm_base_url"] = str(args.llm_base_url)
+    llm_config["llm_api_key"] = str(args.llm_api_key or "")
+    llm_config["llm_timeout"] = args.llm_timeout
+    memory_manager_config["enable_entity_extraction"] = False
+    return memory_runtime_config, memory_manager_config, llm_config, embedding_config
 
 
 def resolve_output_dir(args: argparse.Namespace) -> Path:
@@ -513,8 +518,10 @@ def process_context_group(
     total_records: int,
     context: str,
     group_records: Sequence[Dict[str, Any]],
+    memory_runtime_config: Dict[str, Any],
+    memory_manager_config: Dict[str, Any],
+    llm_config: Dict[str, Any],
     embedding_config: Dict[str, Any],
-    memory_config: Dict[str, Any],
 ) -> Dict[str, Any]:
     """Replay, reflect, recall, and optionally answer one isolated context."""
     group_id = context_group_id(context, group_index)
@@ -545,17 +552,18 @@ def process_context_group(
         manager = StoreFactExtractionManager(
             db,
             embedding_config=embedding_config,
-            memory_config=memory_config,
-            llm_model=args.llm_model,
-            llm_base_url=args.llm_base_url,
-            llm_api_key=args.llm_api_key,
+            memory_manager_config=memory_manager_config,
+            llm_config=llm_config,
             operation_reporter=operation_reporter,
             report_rows=[],
             llm_max_tokens=args.llm_max_tokens,
             llm_thinking=args.llm_thinking or "disabled",
             llm_json_mode=args.llm_json_mode,
         )
-        runtime = MemoryRuntime(manager, memory_config=memory_config)
+        runtime = MemoryRuntime(
+            manager,
+            memory_runtime_config=memory_runtime_config,
+        )
         if not args.skip_embedding_validation:
             validate_embedding_runtime(manager, db, embedding_config)
         log_memory_index_state(db, f"before_context:{group_id}")
@@ -585,7 +593,7 @@ def process_context_group(
                 str(record["query"]),
                 top_k=args.recall_top_k,
                 budget=args.recall_budget,
-                recall_gate_mode=str(memory_config.get("recall_gate_mode") or "auto"),
+                recall_gate_mode=str(memory_manager_config.get("recall_gate_mode") or "auto"),
                 recall_path=args.recall_path,
             )
             recall_context = str(recall_report.get("memory_context") or "")
@@ -681,6 +689,8 @@ def run_context_group_worker(
         argparse.Namespace,
         Dict[str, Any],
         Dict[str, Any],
+        Dict[str, Any],
+        Dict[str, Any],
     ],
 ) -> Tuple[int, Dict[str, Any]]:
     """Process one CLongEval context in an isolated worker process."""
@@ -691,8 +701,10 @@ def run_context_group_worker(
         context,
         group_records,
         args,
+        memory_runtime_config,
+        memory_manager_config,
+        llm_config,
         embedding_config,
-        memory_config,
     ) = payload
     group_id = context_group_id(context, group_index)
     group_dir = args.output_dir / group_id
@@ -715,8 +727,10 @@ def run_context_group_worker(
         total_records=total_records,
         context=context,
         group_records=group_records,
+        memory_runtime_config=memory_runtime_config,
+        memory_manager_config=memory_manager_config,
+        llm_config=llm_config,
         embedding_config=embedding_config,
-        memory_config=memory_config,
     )
     logging.info(
         "Worker finished context group %s/%s id=%s recall_results=%s",
@@ -743,7 +757,12 @@ def main() -> int:
     configure_logging(log_path, args.log_level, args.manager_log_level)
     logging.info("Loaded CLongEval records=%s input=%s", len(records), args.input)
 
-    embedding_config, memory_config = prepare_runtime(args)
+    (
+        memory_runtime_config,
+        memory_manager_config,
+        llm_config,
+        embedding_config,
+    ) = prepare_runtime(args)
     groups = group_records_by_context(records)
     results_path = output_dir / "clongeval_conversation_results.json"
     results: List[Dict[str, Any]] = []
@@ -770,8 +789,10 @@ def main() -> int:
                 context,
                 list(group_records),
                 args,
+                memory_runtime_config,
+                memory_manager_config,
+                llm_config,
                 embedding_config,
-                memory_config,
             )
             for group_index, (context, group_records) in enumerate(groups, 1)
         ]
@@ -782,7 +803,7 @@ def main() -> int:
             }
             for future in as_completed(futures):
                 payload = futures[future]
-                group_index, _total, _records, context, group_records, _args, _embedding, _memory = payload
+                group_index, _total, _records, context, group_records, *_configs = payload
                 group_id = context_group_id(context, group_index)
                 try:
                     result_index, group_result = future.result()
@@ -816,8 +837,10 @@ def main() -> int:
                     total_records=len(records),
                     context=context,
                     group_records=group_records,
+                    memory_runtime_config=memory_runtime_config,
+                    memory_manager_config=memory_manager_config,
+                    llm_config=llm_config,
                     embedding_config=embedding_config,
-                    memory_config=memory_config,
                 )
             except Exception as exc:
                 group_id = context_group_id(context, group_index)

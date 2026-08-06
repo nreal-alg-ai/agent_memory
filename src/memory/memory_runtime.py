@@ -26,10 +26,10 @@ class MemoryRuntime:
         self,
         manager: MemoryNodeManager,
         *,
-        memory_config: Optional[Dict[str, Any]] = None,
+        memory_runtime_config: Optional[Dict[str, Any]] = None,
     ) -> None:
         self._manager = manager
-        config = dict(memory_config or {})
+        config = dict(memory_runtime_config or {})
         self._min_dialogue_turns_before_store = max(
             1,
             int(

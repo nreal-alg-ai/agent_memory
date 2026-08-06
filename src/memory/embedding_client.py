@@ -40,8 +40,9 @@ def _load_project_config() -> Dict[str, Any]:
 
         config_path = Path(__file__).resolve().parents[2] / "config.yaml"
         loaded = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
-        if isinstance(loaded, dict) and isinstance(loaded.get("embedding"), dict):
-            return dict(loaded["embedding"])
+        manager_config = loaded.get("memory_manager")
+        if isinstance(manager_config, dict) and isinstance(manager_config.get("embedding"), dict):
+            return dict(manager_config["embedding"])
     except Exception:
         pass
     return {}

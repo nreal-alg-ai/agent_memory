@@ -28,6 +28,7 @@ from memory.memory_manager import (
     MemoryOperationReporter,
 )
 from memory.memory_runtime import MemoryRuntime
+from memory.config import split_memory_config
 
 
 DEFAULT_TEXTGRID = (
@@ -81,18 +82,22 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     config = load_project_config(args.config)
-    memory_config = dict(config.get("memory") or {})
-    embedding_config = dict(config.get("embedding") or {})
+    (
+        memory_runtime_config,
+        memory_manager_config,
+        llm_config,
+        embedding_config,
+    ) = split_memory_config(config)
     if args.disable_llm:
-        memory_config["llm_api_key"] = ""
+        llm_config["llm_api_key"] = ""
     if args.max_segments_per_episode:
-        memory_config["transcript_episode_max_segments"] = (
+        memory_runtime_config["transcript_episode_max_segments"] = (
             args.max_segments_per_episode
         )
     if args.max_chars_per_episode:
-        memory_config["transcript_episode_max_chars"] = args.max_chars_per_episode
+        memory_runtime_config["transcript_episode_max_chars"] = args.max_chars_per_episode
     if args.max_gap_seconds >= 0:
-        memory_config["transcript_episode_max_gap_seconds"] = args.max_gap_seconds
+        memory_runtime_config["transcript_episode_max_gap_seconds"] = args.max_gap_seconds
 
     textgrid_path = args.textgrid.expanduser().resolve()
     if not textgrid_path.exists():
@@ -115,23 +120,24 @@ def main() -> None:
     ]
     write_transcript_txt(transcript_path, memory_segments)
 
-    llm_model = args.llm_model or memory_config.get("llm_name") or DEFAULT_LLM_MODEL
-    llm_base_url = args.llm_base_url or memory_config.get("llm_base_url") or DEFAULT_LLM_BASE_URL
-    llm_api_key = args.llm_api_key or memory_config.get("llm_api_key") or ""
-    llm_api_key = expand_env_refs(llm_api_key)
+    llm_config["llm_name"] = args.llm_model or llm_config.get("llm_name") or DEFAULT_LLM_MODEL
+    llm_config["llm_base_url"] = args.llm_base_url or llm_config.get("llm_base_url") or DEFAULT_LLM_BASE_URL
+    llm_config["llm_api_key"] = args.llm_api_key or llm_config.get("llm_api_key") or ""
+    llm_config["llm_api_key"] = expand_env_refs(llm_config["llm_api_key"])
 
     db = SessionDB(db_path)
     operation_reporter = MemoryOperationReporter()
     manager = MemoryNodeManager(
         db,
         embedding_config=embedding_config,
-        memory_config=memory_config,
-        llm_model=llm_model,
-        llm_base_url=llm_base_url,
-        llm_api_key=llm_api_key,
+        memory_manager_config=memory_manager_config,
+        llm_config=llm_config,
         operation_reporter=operation_reporter,
     )
-    runtime = MemoryRuntime(manager, memory_config=memory_config)
+    runtime = MemoryRuntime(
+        manager,
+        memory_runtime_config=memory_runtime_config,
+    )
 
     queued_episode_count = 0
     source_ref = textgrid_path.name

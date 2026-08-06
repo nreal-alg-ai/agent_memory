@@ -41,6 +41,7 @@ from memory.memory_manager import (
     MemoryOperationReporter,
 )
 from memory.memory_runtime import MemoryRuntime
+from memory.config import split_memory_config
 import memory.memory_database as memory_database_module
 from memory.memory_database import SessionDB
 
@@ -221,7 +222,7 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help=(
-            "Override memory.min_dialogue_turns_before_store from config.yaml. "
+            "Override memory_runtime.min_dialogue_turns_before_store from config.yaml. "
             "When omitted, use the config.yaml value."
         ),
     )
@@ -230,7 +231,7 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help=(
-            "Override memory.max_dialogue_chars_before_store from config.yaml. "
+            "Override memory_runtime.max_dialogue_chars_before_store from config.yaml. "
             "When omitted, use the config.yaml value."
         ),
     )
@@ -296,20 +297,20 @@ def _expand_env_refs(value: Any) -> Any:
 def resolve_llm_args(args: argparse.Namespace) -> None:
     config = load_project_config(args.config)
     model_config = config.get("model", {}) if isinstance(config.get("model"), dict) else {}
-    memory_config = config.get("memory", {}) if isinstance(config.get("memory"), dict) else {}
+    _runtime_config, manager_config, llm_config, _embedding_config = split_memory_config(config)
     chat_config = config.get("chat", {}) if isinstance(config.get("chat"), dict) else {}
 
     args.llm_model = (
         args.llm_model
-        or str(memory_config.get("llm_name") or "")
-        or str(memory_config.get("model") or "")
+        or str(llm_config.get("llm_name") or "")
+        or str(llm_config.get("model") or "")
         or str(model_config.get("default") or "")
         or DEFAULT_LLM_MODEL
     )
     args.llm_base_url = (
         args.llm_base_url
-        or str(memory_config.get("llm_base_url") or "")
-        or str(memory_config.get("base_url") or "")
+        or str(llm_config.get("llm_base_url") or "")
+        or str(llm_config.get("base_url") or "")
         or str(model_config.get("base_url") or "")
         or DEFAULT_LLM_BASE_URL
     )
@@ -317,42 +318,42 @@ def resolve_llm_args(args: argparse.Namespace) -> None:
         args.llm_base_url = "https://api.deepseek.com/v1"
     args.llm_api_key = (
         args.llm_api_key
-        or str(memory_config.get("llm_api_key") or "")
-        or str(memory_config.get("api_key") or "")
+        or str(llm_config.get("llm_api_key") or "")
+        or str(llm_config.get("api_key") or "")
         or str(model_config.get("api_key") or "")
         or ""
     )
     args.llm_timeout = (
         args.llm_timeout
-        or int(str(memory_config.get("llm_timeout", 120)))
+        or int(str(llm_config.get("llm_timeout", 120)))
     )
     args.llm_thinking = (
         args.llm_thinking
-        or str(memory_config.get("llm_thinking") or memory_config.get("thinking") or "disabled")
+        or str(llm_config.get("llm_thinking") or llm_config.get("thinking") or "disabled")
     )
     args.memory_prompt_language = (
         args.memory_prompt_language
         or str(
-            memory_config.get("memory_prompt_language_mode")
-            or memory_config.get("prompt_language_mode")
+            manager_config.get("memory_prompt_language_mode")
+            or manager_config.get("prompt_language_mode")
             or "source"
         )
     )
     args.memory_output_language = (
         args.memory_output_language
         or str(
-            memory_config.get("memory_output_language_mode")
-            or memory_config.get("output_language_mode")
+            manager_config.get("memory_output_language_mode")
+            or manager_config.get("output_language_mode")
             or "source"
         )
     )
     args.recall_budget = (
         args.recall_budget
-        or str(memory_config.get("recall_budget") or "mid")
+        or str(manager_config.get("recall_budget") or "mid")
     )
     args.recall_gate_mode = (
         args.recall_gate_mode
-        or str(memory_config.get("recall_gate_mode") or memory_config.get("recall_mode") or "force")
+        or str(manager_config.get("recall_gate_mode") or manager_config.get("recall_mode") or "force")
     )
 
     args.reader_model = (
@@ -380,13 +381,13 @@ def resolve_llm_args(args: argparse.Namespace) -> None:
 
     if not args.llm_api_key and args.llm_base_url.rstrip("/") == DEFAULT_LLM_BASE_URL:
         raise RuntimeError(
-            "No API key configured for memory LLM. Set memory.llm_api_key "
+            "No API key configured for memory LLM. Set memory_manager.llm.llm_api_key "
             "in config.yaml or pass --llm-api-key."
         )
     if not args.reader_api_key and args.reader_base_url.rstrip("/") == DEFAULT_LLM_BASE_URL:
         raise RuntimeError(
             "No API key configured for reader LLM. Set chat.llm_api_key or "
-            "memory.llm_api_key in config.yaml, or pass --reader-api-key."
+            "memory_manager.llm.llm_api_key in config.yaml, or pass --reader-api-key."
         )
 
 
@@ -650,21 +651,12 @@ def session_turn_pairs(session: Sequence[Dict[str, Any]]) -> Tuple[List[Tuple[st
 
 def prepare_runtime_configs(
     args: argparse.Namespace,
-) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
     config = load_project_config(args.config)
-    embedding_config = (
-        dict(config.get("embedding") or {})
-        if isinstance(config.get("embedding"), dict)
-        else {}
-    )
-    memory_config = (
-        dict(config.get("memory") or {})
-        if isinstance(config.get("memory"), dict)
-        else {}
-    )
-    configured_min_turns = memory_config.get("min_dialogue_turns_before_store")
+    memory_runtime_config, memory_manager_config, llm_config, embedding_config = split_memory_config(config)
+    configured_min_turns = memory_runtime_config.get("min_dialogue_turns_before_store")
     if configured_min_turns in (None, ""):
-        configured_min_turns = memory_config.get("min_turns_before_store", 1)
+        configured_min_turns = memory_runtime_config.get("min_turns_before_store", 1)
     min_turns_before_store = max(
         1,
         int(
@@ -674,11 +666,11 @@ def prepare_runtime_configs(
         ),
     )
     args.fact_extraction_interval = min_turns_before_store
-    memory_config["min_turns_before_store"] = min_turns_before_store
-    memory_config["min_dialogue_turns_before_store"] = min_turns_before_store
-    configured_max_chars = memory_config.get("max_dialogue_chars_before_store")
+    memory_runtime_config["min_turns_before_store"] = min_turns_before_store
+    memory_runtime_config["min_dialogue_turns_before_store"] = min_turns_before_store
+    configured_max_chars = memory_runtime_config.get("max_dialogue_chars_before_store")
     if configured_max_chars in (None, ""):
-        configured_max_chars = memory_config.get("max_chars_before_store")
+        configured_max_chars = memory_runtime_config.get("max_chars_before_store")
     if args.fact_extraction_max_chars is not None or configured_max_chars not in (None, ""):
         max_chars_before_store = max(
             1,
@@ -689,18 +681,21 @@ def prepare_runtime_configs(
             ),
         )
         args.fact_extraction_max_chars = max_chars_before_store
-        memory_config["max_chars_before_store"] = max_chars_before_store
-        memory_config["max_dialogue_chars_before_store"] = max_chars_before_store
-    memory_config["llm_timeout"] = int(args.llm_timeout)
-    memory_config["llm_thinking"] = str(args.llm_thinking)
-    memory_config["llm_json_mode"] = bool(args.llm_json_mode)
-    memory_config["memory_prompt_language_mode"] = str(args.memory_prompt_language)
-    memory_config["memory_output_language_mode"] = str(args.memory_output_language)
-    memory_config["enable_interpretation_feedback"] = bool(
+        memory_runtime_config["max_chars_before_store"] = max_chars_before_store
+        memory_runtime_config["max_dialogue_chars_before_store"] = max_chars_before_store
+    llm_config["llm_name"] = str(args.llm_model)
+    llm_config["llm_base_url"] = str(args.llm_base_url)
+    llm_config["llm_api_key"] = str(args.llm_api_key or "")
+    llm_config["llm_timeout"] = int(args.llm_timeout)
+    llm_config["llm_thinking"] = str(args.llm_thinking)
+    llm_config["llm_json_mode"] = bool(args.llm_json_mode)
+    memory_manager_config["memory_prompt_language_mode"] = str(args.memory_prompt_language)
+    memory_manager_config["memory_output_language_mode"] = str(args.memory_output_language)
+    memory_manager_config["enable_interpretation_feedback"] = bool(
         args.enable_feedback_analysis
     )
-    memory_config["recall_gate_mode"] = str(args.recall_gate_mode)
-    return embedding_config, memory_config
+    memory_manager_config["recall_gate_mode"] = str(args.recall_gate_mode)
+    return memory_runtime_config, memory_manager_config, llm_config, embedding_config
 
 
 def validate_runtime(manager: MemoryNodeManager) -> None:
@@ -1145,8 +1140,10 @@ def build_instance_memory_context(
     *,
     args: argparse.Namespace,
     item: Dict[str, Any],
+    memory_runtime_config: Dict[str, Any],
+    memory_manager_config: Dict[str, Any],
+    llm_config: Dict[str, Any],
     embedding_config: Dict[str, Any],
-    memory_config: Dict[str, Any],
 ) -> Dict[str, Any]:
     question_id = str(item.get("question_id") or "unknown_question")
     question = str(item.get("question") or "").strip()
@@ -1164,13 +1161,14 @@ def build_instance_memory_context(
         manager = MemoryNodeManager(
             db,
             embedding_config=embedding_config,
-            memory_config=memory_config,
-            llm_model=args.llm_model,
-            llm_base_url=args.llm_base_url,
-            llm_api_key=args.llm_api_key,
+            memory_manager_config=memory_manager_config,
+            llm_config=llm_config,
             operation_reporter=operation_reporter,
         )
-        runtime = MemoryRuntime(manager, memory_config=memory_config)
+        runtime = MemoryRuntime(
+            manager,
+            memory_runtime_config=memory_runtime_config,
+        )
         validate_runtime(manager)
 
         all_sessions = sorted_history_sessions(item)
@@ -1278,22 +1276,44 @@ def run_instance(
     *,
     args: argparse.Namespace,
     item: Dict[str, Any],
+    memory_runtime_config: Dict[str, Any],
+    memory_manager_config: Dict[str, Any],
+    llm_config: Dict[str, Any],
     embedding_config: Dict[str, Any],
-    memory_config: Dict[str, Any],
 ) -> Dict[str, Any]:
     memory_result = build_instance_memory_context(
         args=args,
         item=item,
+        memory_runtime_config=memory_runtime_config,
+        memory_manager_config=memory_manager_config,
+        llm_config=llm_config,
         embedding_config=embedding_config,
-        memory_config=memory_config,
     )
     return answer_instance_from_memory_context(args=args, result=memory_result)
 
 
 def run_instance_memory_context_worker(
-    payload: Tuple[int, int, Dict[str, Any], argparse.Namespace, Dict[str, Any], Dict[str, Any]],
+    payload: Tuple[
+        int,
+        int,
+        Dict[str, Any],
+        argparse.Namespace,
+        Dict[str, Any],
+        Dict[str, Any],
+        Dict[str, Any],
+        Dict[str, Any],
+    ],
 ) -> Tuple[int, Dict[str, Any]]:
-    index, total, item, args, embedding_config, memory_config = payload
+    (
+        index,
+        total,
+        item,
+        args,
+        memory_runtime_config,
+        memory_manager_config,
+        llm_config,
+        embedding_config,
+    ) = payload
     question_id = str(item.get("question_id") or f"item_{index}")
     question_state_dir = args.state_dir / question_id
     question_state_dir.mkdir(parents=True, exist_ok=True)
@@ -1313,8 +1333,10 @@ def run_instance_memory_context_worker(
     result = build_instance_memory_context(
         args=args,
         item=item,
+        memory_runtime_config=memory_runtime_config,
+        memory_manager_config=memory_manager_config,
+        llm_config=llm_config,
         embedding_config=embedding_config,
-        memory_config=memory_config,
     )
     logging.info(
         "[%s/%s] Finished %s: sessions=%s episodes=%s facts=%s states=%s actionable_items=%s index_entries=%s recall_chars=%s",
@@ -1452,7 +1474,12 @@ def main() -> int:
         print(json.dumps(summary, ensure_ascii=False, indent=2))
         return 0
 
-    embedding_config, memory_config = prepare_runtime_configs(args)
+    (
+        memory_runtime_config,
+        memory_manager_config,
+        llm_config,
+        embedding_config,
+    ) = prepare_runtime_configs(args)
     success_count = 0
     failure_count = 0
     memory_results_by_index: Dict[int, Dict[str, Any]] = {}
@@ -1466,7 +1493,16 @@ def main() -> int:
             workers,
         )
         payloads = [
-            (index, len(selected), item, args, embedding_config, memory_config)
+            (
+                index,
+                len(selected),
+                item,
+                args,
+                memory_runtime_config,
+                memory_manager_config,
+                llm_config,
+                embedding_config,
+            )
             for index, item in enumerate(selected, 1)
         ]
         with ProcessPoolExecutor(max_workers=workers) as executor:
@@ -1475,7 +1511,7 @@ def main() -> int:
                 for payload in payloads
             }
             for future in as_completed(futures):
-                index, _total, item, _args, _embedding_config, _memory_config = futures[future]
+                index, _total, item, *_configs = futures[future]
                 question_id = str(item.get("question_id") or f"item_{index}")
                 try:
                     result_index, result = future.result()
@@ -1514,8 +1550,10 @@ def main() -> int:
                 memory_results_by_index[index] = build_instance_memory_context(
                     args=args,
                     item=item,
+                    memory_runtime_config=memory_runtime_config,
+                    memory_manager_config=memory_manager_config,
+                    llm_config=llm_config,
                     embedding_config=embedding_config,
-                    memory_config=memory_config,
                 )
                 result = memory_results_by_index[index]
                 logging.info(

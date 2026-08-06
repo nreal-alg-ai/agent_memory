@@ -36,6 +36,7 @@ from memory.memory_manager import (
 )
 from memory.memory_database import SessionDB
 from memory.memory_runtime import MemoryRuntime
+from memory.config import split_memory_config
 
 
 DEFAULT_INPUT = Path("/Users/zhouboyu/Documents/agent_memory/test_data/user_dialogue/history_dialogue.json")
@@ -409,7 +410,7 @@ def parse_args() -> argparse.Namespace:
         type=int,
         help=(
             "Extract facts once per N completed turns. Defaults to "
-            "memory.min_dialogue_turns_before_store from config.yaml."
+            "memory_runtime.min_dialogue_turns_before_store from config.yaml."
         ),
     )
     parser.add_argument(
@@ -417,7 +418,7 @@ def parse_args() -> argparse.Namespace:
         type=int,
         help=(
             "Extract facts early when pending dialogue exceeds this many "
-            "characters. Defaults to memory.max_dialogue_chars_before_store."
+            "characters. Defaults to memory_runtime.max_dialogue_chars_before_store."
         ),
     )
     parser.add_argument(
@@ -480,33 +481,33 @@ def remove_existing_outputs(db_path: Path, report_path: Path, overwrite: bool) -
 
 def resolve_llm_args(args: argparse.Namespace) -> None:
     config = load_project_config(args.config)
-    memory_config = config.get("memory", {}) if isinstance(config.get("memory"), dict) else {}
+    _runtime_config, _manager_config, llm_config, _embedding_config = split_memory_config(config)
     args.llm_model = (
         args.llm_model
-        or str(memory_config.get("llm_name") or "")
+        or str(llm_config.get("llm_name") or "")
         or DEFAULT_LLM_MODEL
     )
     args.llm_base_url = (
         args.llm_base_url
-        or str(memory_config.get("llm_base_url") or "")
+        or str(llm_config.get("llm_base_url") or "")
         or DEFAULT_LLM_BASE_URL
     )
     if args.llm_base_url.rstrip("/") == "https://api.deepseek.com":
         args.llm_base_url = "https://api.deepseek.com/v1"
     args.llm_api_key = (
         args.llm_api_key
-        or str(memory_config.get("llm_api_key") or "")
+        or str(llm_config.get("llm_api_key") or "")
         or ""
     )
     args.llm_timeout = (
         args.llm_timeout
-        or int(str(memory_config.get("llm_timeout", 120)))
+        or int(str(llm_config.get("llm_timeout", 120)))
     )
     args.min_dialogue_turns_before_store = max(
         1,
         int(
             args.min_dialogue_turns_before_store
-            or memory_config.get("min_dialogue_turns_before_store", 1)
+            or _runtime_config.get("min_dialogue_turns_before_store", 1)
             or 1
         ),
     )
@@ -514,7 +515,7 @@ def resolve_llm_args(args: argparse.Namespace) -> None:
         1,
         int(
             args.max_dialogue_chars_before_store
-            or memory_config.get("max_dialogue_chars_before_store", 2000)
+            or _runtime_config.get("max_dialogue_chars_before_store", 2000)
             or 2000
         ),
     )
@@ -569,8 +570,9 @@ def validate_embedding_runtime(
     ):
         logging.warning(
             "Embedding API key environment variable is not set: "
-            f"{configured_api_key_env}. config.yaml configures embedding.api_key "
-            f"or embedding.api_key_env to use this variable. The agent_memory "
+            f"{configured_api_key_env}. config.yaml configures "
+            f"memory_manager.embedding.api_key or memory_manager.embedding.api_key_env "
+            f"to use this variable. The agent_memory "
             f"EmbeddingClient will use deterministic local fallback vectors."
         )
     if not manager._ensure_embedding_client():
@@ -582,7 +584,7 @@ def validate_embedding_runtime(
     if probe is None:
         raise RuntimeError(
             "The configured embedding provider returned no vector. Check "
-            "config.yaml embedding credentials, base_url, and model."
+            "config.yaml memory_manager.embedding credentials, base_url, and model."
         )
     probe_vector = manager._as_embedding_vector(probe)
     if probe_vector is None:
@@ -645,35 +647,35 @@ def main() -> int:
     report_rows: List[Dict[str, Any]] = []
     db = SessionDB(db_path=db_path)
     config = load_project_config(args.config)
-    embedding_config = (
-        dict(config.get("embedding") or {})
-        if isinstance(config.get("embedding"), dict)
-        else {}
-    )
-    memory_config = (
-        dict(config.get("memory") or {})
-        if isinstance(config.get("memory"), dict)
-        else {}
-    )
-    memory_config["min_dialogue_turns_before_store"] = args.min_dialogue_turns_before_store
-    memory_config["max_dialogue_chars_before_store"] = args.max_dialogue_chars_before_store
-    memory_config["llm_timeout"] = args.llm_timeout
-    memory_config["enable_entity_extraction"] = False
+    (
+        memory_runtime_config,
+        memory_manager_config,
+        llm_config,
+        embedding_config,
+    ) = split_memory_config(config)
+    memory_runtime_config["min_dialogue_turns_before_store"] = args.min_dialogue_turns_before_store
+    memory_runtime_config["max_dialogue_chars_before_store"] = args.max_dialogue_chars_before_store
+    llm_config["llm_name"] = str(args.llm_model)
+    llm_config["llm_base_url"] = str(args.llm_base_url)
+    llm_config["llm_api_key"] = str(args.llm_api_key or "")
+    llm_config["llm_timeout"] = args.llm_timeout
+    memory_manager_config["enable_entity_extraction"] = False
     operation_reporter = MemoryOperationReporter()
     manager = StoreFactExtractionManager(
         db,
         embedding_config=embedding_config,
-        memory_config=memory_config,
-        llm_model=args.llm_model,
-        llm_base_url=args.llm_base_url,
-        llm_api_key=args.llm_api_key,
+        memory_manager_config=memory_manager_config,
+        llm_config=llm_config,
         operation_reporter=operation_reporter,
         report_rows=report_rows,
         llm_max_tokens=args.llm_max_tokens,
         llm_thinking=args.llm_thinking,
         llm_json_mode=args.llm_json_mode,
     )
-    runtime = MemoryRuntime(manager, memory_config=memory_config)
+    runtime = MemoryRuntime(
+        manager,
+        memory_runtime_config=memory_runtime_config,
+    )
     try:
         validate_embedding_runtime(manager, db, embedding_config)
         log_memory_index_state(db, "initialized")
@@ -789,6 +791,14 @@ def main() -> int:
                         reflect_report.get("states_updated"),
                         reflect_report.get("actionable_items_updated"),
                     )
+        pending_before_final_flush = len(runtime._pending_interaction_turns)
+        if not runtime.flush_store_queue():
+            raise RuntimeError("Timed out while draining final pending memory stores")
+        logging.info(
+            "Final memory runtime flush completed pending_before=%s pending_after=%s",
+            pending_before_final_flush,
+            len(runtime._pending_interaction_turns),
+        )
     finally:
         log_memory_index_state(db, "finished")
         db.close()
