@@ -406,14 +406,14 @@ def replay_sample_into_memory(
         orphan_turns += orphaned
         for pair_index, (user_message, assistant_response, dia_ids) in enumerate(pairs):
             turn_pairs += 1
-            report = runtime.store_interaction_turns(
+            report = runtime.accept_single_interaction_turn(
                 user_message,
                 assistant_response,
                 tags=["locomo", f"sample_id:{sample_id}", f"session_id:S{session_id}", *[f"dia_id:{dia_id}" for dia_id in dia_ids]],
                 turn_timestamp=unique_timestamp(session_dt + timedelta(seconds=pair_index), seen_timestamps),
             )
         if args.enable_reflect and session_position % max(1, int(args.reflect_every_sessions)) == 0:
-            reflect_submit = runtime.reflect_async(
+            reflect_submit = runtime.trigger_memory_reflect(
                 limit=int(args.reflect_limit),
                 reflect_timestamp=unique_timestamp(
                     session_dt + timedelta(seconds=max(1, len(pairs))),
@@ -427,7 +427,7 @@ def replay_sample_into_memory(
     if runtime._pending_interaction_turns and not runtime.flush_store_queue():
         raise RuntimeError("Timed out while draining queued memory stores")
     if args.enable_reflect and sessions:
-        reflect_submit = runtime.reflect_async(
+        reflect_submit = runtime.trigger_memory_reflect(
             limit=int(args.reflect_limit),
             reflect_timestamp=unique_timestamp(
                 sessions[-1][1] + timedelta(seconds=3599),
@@ -487,8 +487,8 @@ def build_sample_memory_context(
                 raise RuntimeError("Timed out while draining queued memory stores")
             memory_operation_report = operation_reporter.snapshot()
             operation_counts = memory_operation_report.get("counts") or {}
-            store_operation_report = operation_counts.get("store_episode") or {}
-            reflect_operation_report = operation_counts.get("reflect") or {}
+            store_operation_report = operation_counts.get("memory_store") or {}
+            reflect_operation_report = operation_counts.get("memory_reflect") or {}
             replay_stats = LocomoReplayStats(
                 replay_stats.dialog_turns_total,
                 replay_stats.turn_pairs_total,
@@ -502,7 +502,7 @@ def build_sample_memory_context(
             detail_rows: List[Dict[str, Any]] = []
             for qa_index, qa in selected_qas(sample, args):
                 question = str(qa.get("question") or "").strip()
-                recall_report = runtime.recall(
+                recall_report = runtime.trigger_memory_recall(
                     question,
                     top_k=int(args.recall_top_k),
                     budget=str(args.recall_budget),

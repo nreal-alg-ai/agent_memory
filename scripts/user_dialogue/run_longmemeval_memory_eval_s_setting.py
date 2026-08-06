@@ -1085,7 +1085,7 @@ def replay_sessions_into_memory(
                 session_dt + timedelta(seconds=pair_index),
                 seen_keys=seen_timestamps,
             )
-            runtime.store_interaction_turns(
+            runtime.accept_single_interaction_turn(
                 user_message,
                 assistant_response,
                 tags=[
@@ -1103,7 +1103,7 @@ def replay_sessions_into_memory(
                 session_dt + timedelta(seconds=max(len(pairs), 1)),
                 seen_keys=seen_timestamps,
             )
-            reflect_submit = runtime.reflect_async(
+            reflect_submit = runtime.trigger_memory_reflect(
                 limit=reflect_limit,
                 reflect_timestamp=reflect_ts,
             )
@@ -1115,7 +1115,7 @@ def replay_sessions_into_memory(
             sessions[-1][1] + timedelta(seconds=3599),
             seen_keys=seen_timestamps,
         )
-        reflect_submit = runtime.reflect_async(
+        reflect_submit = runtime.trigger_memory_reflect(
             limit=reflect_limit,
             reflect_timestamp=final_ts,
         )
@@ -1194,8 +1194,8 @@ def build_instance_memory_context(
             raise RuntimeError("Timed out while draining queued memory stores")
         memory_operation_report = operation_reporter.snapshot()
         operation_counts = memory_operation_report.get("counts") or {}
-        store_operation_report = operation_counts.get("store_episode") or {}
-        reflect_operation_report = operation_counts.get("reflect") or {}
+        store_operation_report = operation_counts.get("memory_store") or {}
+        reflect_operation_report = operation_counts.get("memory_reflect") or {}
         replay_stats = SessionReplayStats(
             turn_pairs_total=replay_stats.turn_pairs_total,
             stored_pairs=int(store_operation_report.get("succeeded") or 0),
@@ -1206,7 +1206,7 @@ def build_instance_memory_context(
         effective_question_dt = effective_question_datetime(question_dt, sessions)
         effective_question_date_text = format_memory_time(effective_question_dt)
         counts = db_counts(db)
-        recall_report = runtime.recall(
+        recall_report = runtime.trigger_memory_recall(
             question,
             top_k=int(args.recall_top_k),
             budget=str(args.recall_budget),

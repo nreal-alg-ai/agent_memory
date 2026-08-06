@@ -64,7 +64,7 @@ class MemoryRuntime:
         self._pending_transcript_segments: List[Dict[str, Any]] = []
         self._pending_transcript_context: Optional[Dict[str, Any]] = None
 
-    def store_interaction_turns(
+    def accept_single_interaction_turn(
         self,
         user_message: str,
         assistant_response: str = "",
@@ -138,7 +138,7 @@ class MemoryRuntime:
             ),
         }
 
-    def store_transcript_segments(
+    def accept_single_transcript_segment(
         self,
         segment: Dict[str, Any],
         *,
@@ -217,19 +217,19 @@ class MemoryRuntime:
             ),
         }
 
-    def reflect_async(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+    def trigger_memory_reflect(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
         """Queue reflection after pending interaction and transcript storage."""
         interaction_flush_report = self._flush_pending_interaction_turns()
         transcript_flush_report = self._flush_pending_transcript_segments()
 
-        report = dict(self._manager.reflect_async(*args, **kwargs) or {})
+        report = self._manager.submit_memory_reflect_task(*args, **kwargs) or {}
         report["pending_interaction_flush"] = interaction_flush_report
         report["pending_transcript_flush"] = transcript_flush_report
         
         return report
     
-    def recall(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-        return self._manager.recall(*args, **kwargs)
+    def trigger_memory_recall(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        return self._manager.process_memory_recall_immediately(*args, **kwargs)
 
     def flush_store_queue(self, timeout: Optional[float] = None) -> bool:
         """Wait for queued store and reflection tasks at an explicit boundary."""
@@ -242,7 +242,7 @@ class MemoryRuntime:
     def _process_interaction_turns(self, turns: List[Dict[str, Any]]) -> Dict[str, Any]:
         raw_segments = self._normalize_interaction_turns_to_memory_raw_segments(turns)
         tags = sorted({tag for turn in turns for tag in turn.get("tags", [])})
-        return self._manager._store_memory_episode_async(
+        return self._manager.submit_memory_store_task(
             raw_segments=raw_segments,
             source_type="assistant_wakeup",
             episode_type="interaction",
@@ -266,7 +266,7 @@ class MemoryRuntime:
                 for tag in segment.get("tags") or []
                 if tag is not None and str(tag).strip()
             )
-        return self._manager._store_memory_episode_async(
+        return self._manager.submit_memory_store_task(
             raw_segments=list(raw_segments),
             source_type=str(context.get("source_type") or "allday_recording"),
             episode_type=str(context.get("episode_type") or "ambient_transcript"),

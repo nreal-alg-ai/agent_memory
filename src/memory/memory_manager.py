@@ -382,12 +382,24 @@ class MemoryOperationReporter:
 
     @staticmethod
     def _operation_succeeded(operation_type: str, result: Any) -> bool:
-        if operation_type == "store_episode":
-            return bool(result)
-        if operation_type == "reflect":
+        if operation_type == "memory_store":
+            if not isinstance(result, dict):
+                return bool(result)
+            return str(result.get("status") or "ok").strip().lower() not in {
+                "failed",
+                "skipped",
+                "error",
+                "queue_rejected",
+            }
+        if operation_type == "memory_reflect":
             if not isinstance(result, dict):
                 return False
-            return str(result.get("status") or "ok") != "queue_rejected"
+            return str(result.get("status") or "ok").strip().lower() not in {
+                "failed",
+                "error",
+                "queue_rejected",
+                "skipped",
+            }
         return True
 
     @staticmethod
@@ -402,20 +414,22 @@ class MemoryOperationReporter:
     ) -> Dict[str, Any]:
         if isinstance(result, dict):
             report = dict(result)
-            original_elapsed_ms = report.get("total_elapsed_ms")
-            if original_elapsed_ms is not None:
-                report["worker_elapsed_ms"] = original_elapsed_ms
         else:
             report = {"result": result}
+        result_status = str(report.get("status") or "").strip().lower()
         report.update({
             "accepted": True,
             "task_id": task_id,
             "operation_type": operation_type,
-            "status": "ok" if succeeded else "failed",
+            "status": (
+                "failed"
+                if error is not None or not succeeded
+                else (result_status or "ok")
+            ),
             "total_elapsed_ms": elapsed_ms,
         })
-        if operation_type == "store_episode":
-            report["stored"] = bool(result) if error is None else False
+        if operation_type == "memory_store":
+            report["stored"] = bool(succeeded and error is None)
         if error is not None:
             report["error_type"] = type(error).__name__
             report["error"] = str(error)
@@ -628,10 +642,10 @@ class MemoryNodeManager:
             started_at = float(task.get("started_at") or time.monotonic())
             try:
                 with self._memory_operation_lock:
-                    if task_kind == "store_episode":
-                        result = self._store_memory_episode_sync(**task["payload"])
-                    elif task_kind == "reflect":
-                        result = self._reflect_sync(**task["payload"])
+                    if task_kind == "memory_store":
+                        result = self.process_memory_store_task(**task["payload"])
+                    elif task_kind == "memory_reflect":
+                        result = self.process_memory_reflect_task(**task["payload"])
                     else:
                         raise ValueError(f"Unsupported memory async task: {task_kind}")
                 self._operation_reporter.on_task_finished(
@@ -757,7 +771,7 @@ class MemoryNodeManager:
         worker.join(timeout=None if timeout is None else max(0.0, timeout))
         return not worker.is_alive() and not self._store_queue.unfinished_tasks
 
-    def _store_memory_episode_async(
+    def submit_memory_store_task(
         self,
         *,
         raw_segments: List[Dict[str, Any]],
@@ -769,14 +783,14 @@ class MemoryNodeManager:
         """Queue one normalized episode for ordered background storage."""
         if not self._enabled or not raw_segments:
             reason = "memory_disabled" if not self._enabled else "no_raw_segments"
-            task_id = self._operation_reporter.next_task_id("store_episode")
+            task_id = self._operation_reporter.next_task_id("memory_store")
             return self._reject_memory_task(
-                task_kind="store_episode",
+                task_kind="memory_store",
                 task_id=task_id,
                 reason=reason,
             )
         return self._submit_memory_task(
-            task_kind="store_episode",
+            task_kind="memory_store",
             payload={
                 "raw_segments": raw_segments,
                 "source_type": source_type,
@@ -786,7 +800,7 @@ class MemoryNodeManager:
             },
         )
 
-    def _store_memory_episode_sync(
+    def process_memory_store_task(
         self,
         *,
         raw_segments: List[Dict[str, Any]],
@@ -794,7 +808,7 @@ class MemoryNodeManager:
         episode_type: str,
         tags: List[str],
         source_ref: str = "",
-    ) -> bool:
+    ) -> Dict[str, Any]:
         store_started_at = time.monotonic()
         self._log_info("memory_store", "start", {
             "source_type": source_type,
@@ -803,34 +817,37 @@ class MemoryNodeManager:
             "source_segment_count": len(raw_segments),
         })
         if not raw_segments:
+            elapsed_ms = round((time.monotonic() - store_started_at) * 1000, 2)
             self._log_info("memory_store", "finish", {
                 "status": "skipped",
                 "reason": "no_raw_segments",
-                "elapsed_ms": round((time.monotonic() - store_started_at) * 1000, 2),
+                "total_elapsed_ms": elapsed_ms,
             })
-            return False
-        participants = self._parse_participants_from_raw_segments(raw_segments)
-        started_at = raw_segments[0].get("started_at") or _now_text()
-        ended_at = raw_segments[-1].get("ended_at") or started_at
-        extraction_started_at = time.monotonic()
-        extracted = self._extract_memory_fact_from_raw_segments(raw_segments)
+            return {
+                "status": "skipped",
+                "reason": "no_raw_segments",
+                "new_episode_count": 0,
+                "new_fact_count": 0,
+                "total_elapsed_ms": elapsed_ms,
+            }
+        episode_participants = self._parse_participants_from_raw_segments(raw_segments)
+        episode_started_at = raw_segments[0].get("started_at") or _now_text()
+        episode_ended_at = raw_segments[-1].get("ended_at") or episode_started_at
+        extracted_info = self._extract_memory_fact_from_raw_segments(raw_segments)
         episode_title = (
-            _compact_whitespace(extracted.get("episode_title") or "")
+            _compact_whitespace(extracted_info.get("episode_title") or "")
             or self._fallback_generate_episode_title_from_raw_segments(raw_segments)
         )
         episode_summary = (
-            _compact_whitespace(extracted.get("episode_summary") or "")
+            _compact_whitespace(extracted_info.get("episode_summary") or "")
             or self._fallback_generate_episode_summary_from_raw_segments(raw_segments)
         )
         episode_canonical_topics = (
-            extracted.get("canonical_topics")
+            extracted_info.get("canonical_topics")
             or self._topic_candidates(episode_summary)
             or ["general"]
         )
-        facts = list(extracted.get("facts") or [])
-        self._log_info("memory_store", "fact_extraction_finish", {
-            "elapsed_ms": round((time.monotonic() - extraction_started_at) * 1000, 2,),
-        })
+        facts = list(extracted_info.get("facts") or [])
 
         self._log_extracted_fact_info(
             raw_segments=raw_segments,
@@ -840,8 +857,8 @@ class MemoryNodeManager:
             source_ref=source_ref,
         )
 
-        episode_info = self._store_extracted_episode_info(
-            participants=participants,
+        save_episode_info = self._store_extracted_memory_episode_into_db(
+            participants=episode_participants,
             raw_segments=raw_segments,
             facts=facts,
             source_type=source_type,
@@ -851,37 +868,32 @@ class MemoryNodeManager:
             episode_title=episode_title,
             episode_summary=episode_summary,
             canonical_topics=episode_canonical_topics,
-            started_at=started_at,
-            ended_at=ended_at,
+            started_at=episode_started_at,
+            ended_at=episode_ended_at,
         )
-        episode_id = int(episode_info["episode_id"])
-        episode_participants = list(episode_info["participants"])
-
-        fact_ids = self._store_facts_info(
-            episode_id=episode_id,
+        save_fact_info = self._store_extracted_memory_facts_into_db(
+            episode_id=int(save_episode_info["episode_id"]),
             facts=facts,
             tags=tags,
             source_type=source_type,
-            participants=episode_participants,
             episode_context_topics=episode_canonical_topics,
-            episode_context_entities=episode_info["entity_names"],
+            episode_context_entities=save_episode_info["entity_names"],
         )
-        self._log_info("memory_store", "finish", {
+        report = {
             "status": "ok",
-            "episode_id": episode_id,
+            "new_episode_count": 1,
+            "new_fact_count": len(list(save_fact_info.get("fact_ids") or [])),
+            "total_elapsed_ms": round((time.monotonic() - store_started_at) * 1000, 2),
+        }
+        self._log_info("memory_store", "finish", {
+            **report,
             "source_type": source_type,
             "episode_type": episode_type,
             "source_segment_count": len(raw_segments),
-            "fact_count": len(facts),
-            "fact_ids": fact_ids,
-            "total_elapsed_ms": round(
-                (time.monotonic() - store_started_at) * 1000,
-                2,
-            ),
         })
-        return bool(episode_id)
+        return report
 
-    def _store_extracted_episode_info(
+    def _store_extracted_memory_episode_into_db(
         self,
         *,
         participants: List[str],
@@ -2021,17 +2033,16 @@ class MemoryNodeManager:
         )
         return any(marker in lower for marker in acknowledgement_markers)
 
-    def _store_facts_info(
+    def _store_extracted_memory_facts_into_db(
         self,
         *,
         episode_id: int,
         facts: List[Dict[str, Any]],
         tags: List[str],
         source_type: str,
-        participants: List[str],
         episode_context_topics: Optional[Sequence[str]] = None,
         episode_context_entities: Optional[Sequence[str]] = None,
-    ) -> List[int]:
+    ) -> Dict[str, Any]:
         fact_ids: List[int] = []
         for fact in facts:
             keywords = fact.get("keywords") or ""
@@ -2125,44 +2136,29 @@ class MemoryNodeManager:
             #     metadata=fact_metadata,
             # )
             fact_ids.append(fact_id)
-        return fact_ids
+        return {
+            "fact_ids": fact_ids,
+        }
 
     # ── Reflection: facts -> evolving states ─────────────────────────────
 
-    def reflect_async(self, *_, **kwargs: Any) -> Dict[str, Any]:
+    def submit_memory_reflect_task(self, *_, **kwargs: Any) -> Dict[str, Any]:
         """Queue reflection after all previously accepted memory tasks."""
         if not self._enabled:
-            task_id = self._operation_reporter.next_task_id("reflect")
+            task_id = self._operation_reporter.next_task_id("memory_reflect")
             return self._reject_memory_task(
-                task_kind="reflect",
+                task_kind="memory_reflect",
                 task_id=task_id,
                 reason="memory_disabled",
             )
         return self._submit_memory_task(
-            task_kind="reflect",
+            task_kind="memory_reflect",
             payload=dict(kwargs),
         )
 
-    def _reflect_sync(self, *_, **kwargs: Any) -> Dict[str, Any]:
+    def process_memory_reflect_task(self, *_, **kwargs: Any) -> Dict[str, Any]:
         """Update topic/entity projections and actionable items from recent facts."""
         reflect_started_at = time.monotonic()
-        if not self._enabled:
-            skipped_payload = {
-                "reason": "memory_disabled",
-                "elapsed_ms": round(
-                    (time.monotonic() - reflect_started_at) * 1000,
-                    2,
-                ),
-            }
-            self._log_info("memory_reflect", "finish", {
-                **skipped_payload,
-                "status": "skipped",
-            })
-            return {
-                "states_updated": 0,
-                "actionable_items_updated": 0,
-                "total_elapsed_ms": skipped_payload["elapsed_ms"],
-            }
         limit = max(1, int(kwargs.get("limit") or self._memory_cfg.get("reflect_limit") or 100))
         reflect_timestamp = kwargs.get("reflect_timestamp")
         if reflect_timestamp is None:
@@ -2187,10 +2183,12 @@ class MemoryNodeManager:
             }
             self._log_info("memory_reflect", "finish", {
                 **facts_loaded_payload,
-                "status": "empty",
+                "status": "fact_empty",
             })
             return {
-                "states_updated": 0,
+                "status": "empty",
+                "topic_states_updated": 0,
+                "entity_states_updated": 0,
                 "actionable_items_updated": 0,
                 "total_elapsed_ms": facts_loaded_payload["total_elapsed_ms"],
             }
@@ -2231,6 +2229,7 @@ class MemoryNodeManager:
         )
         facts_marked_processed = self._db.mark_facts_processed_for_memory_state(fact_ids)
         report = {
+            "status": "ok",
             "states_updated": (
                 int(topic_report.get("updated", 0) or 0)
                 + int(entity_report.get("updated", 0) or 0)
@@ -4978,7 +4977,7 @@ class MemoryNodeManager:
 
     # ── Recall path: raw candidates -> unified rerank -> formatted evidence ─
 
-    def recall(
+    def process_memory_recall_immediately(
         self,
         query: str,
         top_k: int = None,

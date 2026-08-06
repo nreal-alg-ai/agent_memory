@@ -330,7 +330,7 @@ def replay_context_into_memory(
                 seen_timestamps,
             )
             last_timestamp = turn_timestamp
-            store_report = runtime.store_interaction_turns(
+            store_report = runtime.accept_single_interaction_turn(
                 user,
                 assistant,
                 tags=[
@@ -349,7 +349,7 @@ def replay_context_into_memory(
         )
         if should_reflect:
             reflect_timestamp = last_timestamp or day["date"]
-            reflect_submit = runtime.reflect_async(
+            reflect_submit = runtime.trigger_memory_reflect(
                 limit=max(1, int(reflect_limit or 100)),
                 reflect_timestamp=reflect_timestamp,
             )
@@ -574,14 +574,14 @@ def process_context_group(
         counts = db_counts(db)
         memory_operation_report = operation_reporter.snapshot()
         operation_counts = memory_operation_report.get("counts") or {}
-        store_operation_report = operation_counts.get("store_episode") or {}
-        reflect_operation_report = operation_counts.get("reflect") or {}
+        store_operation_report = operation_counts.get("memory_store") or {}
+        reflect_operation_report = operation_counts.get("memory_reflect") or {}
         replay_stats["store_batches"] = int(store_operation_report.get("succeeded") or 0)
         replay_stats["reflect_runs"] = int(reflect_operation_report.get("submitted") or 0)
         replay_stats["store_flushes"] = int(store_operation_report.get("submitted") or 0)
 
         for record_index, record in enumerate(group_records, 1):
-            recall_report = runtime.recall(
+            recall_report = runtime.trigger_memory_recall(
                 str(record["query"]),
                 top_k=args.recall_top_k,
                 budget=args.recall_budget,

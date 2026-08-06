@@ -3,7 +3,7 @@
 
 Samples can come from a history_dialogue.json file or from
 PYTHON_TEST_SAMPLES below. Both sources are normalized into the same turn
-stream, fed to MemoryRuntime.store_interaction_turns(), and saved in an isolated
+stream, fed to MemoryRuntime.accept_single_interaction_turn(), and saved in an isolated
 SessionDB under tmp/ by default. Fact extraction follows the batching interval
 configured in the project-level config.yaml.
 """
@@ -350,7 +350,7 @@ def _expand_env_refs(value: Any) -> Any:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Exercise MemoryRuntime.store_interaction_turns fact extraction against JSON or in-file Python samples."
+        description="Exercise MemoryRuntime.accept_single_interaction_turn fact extraction against JSON or in-file Python samples."
     )
     parser.add_argument("--config", type=Path, default=REPO_ROOT / "config.yaml")
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
@@ -705,7 +705,7 @@ def main() -> int:
                 extraction_due = runtime.should_flush_pending_interaction_turns(
                     pending_with_current
                 )
-                ok = runtime.store_interaction_turns(
+                ok = runtime.accept_single_interaction_turn(
                     user,
                     assistant,
                     tags=["store_fact_test", f"sample:{sample_id}", f"turn:{turn_index}"],
@@ -714,7 +714,7 @@ def main() -> int:
                 if ok.get("queued") and not runtime.flush_store_queue():
                     raise RuntimeError("Timed out while draining queued memory stores")
                 nodes = list(iter_stored_nodes(db, before_id))
-                store_operation_report = operation_reporter.latest_report("store_episode")
+                store_operation_report = operation_reporter.latest_report("memory_store")
                 if ok.get("queued"):
                     stored_turns += 1
                     stored_facts += len(nodes)
@@ -765,17 +765,17 @@ def main() -> int:
                         "Running reflect after sample %s",
                         sample_id,
                     )
-                    reflect_submit = runtime.reflect_async(
+                    reflect_submit = runtime.trigger_memory_reflect(
                         reflect_timestamp=turn_timestamp,
                     )
                     if reflect_submit.get("accepted") and not runtime.flush_store_queue():
                         raise RuntimeError("Timed out while draining queued memory reflect")
                     reflect_report = (
-                        operation_reporter.latest_report("reflect")
+                        operation_reporter.latest_report("memory_reflect")
                         or reflect_submit
                     )
                     reflect_row = {
-                        "event": "reflect",
+                        "event": "memory_reflect",
                         "after_sample_id": sample_id,
                         "after_flat_index": flat_index,
                         "report": reflect_report,
@@ -795,8 +795,8 @@ def main() -> int:
 
     memory_operation_report = operation_reporter.snapshot()
     operation_counts = memory_operation_report.get("counts") or {}
-    store_operation_report = operation_counts.get("store_episode") or {}
-    reflect_operation_report = operation_counts.get("reflect") or {}
+    store_operation_report = operation_counts.get("memory_store") or {}
+    reflect_operation_report = operation_counts.get("memory_reflect") or {}
     summary = {
         "sample_source": args.sample_source,
         "input": str(args.input) if args.sample_source == "json" else "PYTHON_TEST_SAMPLES",

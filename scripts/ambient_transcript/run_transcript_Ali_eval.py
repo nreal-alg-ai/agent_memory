@@ -136,7 +136,7 @@ def main() -> None:
     queued_episode_count = 0
     source_ref = textgrid_path.name
     for segment_index, segment in enumerate(memory_segments, 1):
-        ok = runtime.store_transcript_segments(
+        ok = runtime.accept_single_transcript_segment(
             segment,
             source_type=args.source_type,
             episode_type=args.episode_type,
@@ -158,12 +158,12 @@ def main() -> None:
             if memory_segments
             else session_start.isoformat()
         )
-        reflect_submit = runtime.reflect_async(
+        reflect_submit = runtime.trigger_memory_reflect(
             reflect_timestamp=reflect_timestamp,
         )
         if reflect_submit.get("accepted") and not runtime.flush_store_queue():
             raise RuntimeError("Timed out while draining queued memory reflect")
-        reflect_result = operation_reporter.latest_report("reflect") or reflect_submit
+        reflect_result = operation_reporter.latest_report("memory_reflect") or reflect_submit
         queued_episode_count += int(
             bool((reflect_submit.get("pending_transcript_flush") or {}).get("queued"))
         )
@@ -175,7 +175,7 @@ def main() -> None:
             pending_transcript_count > 0
             and not runtime._pending_transcript_segments
         )
-    store_operation_report = operation_reporter.operation_report("store_episode")
+    store_operation_report = operation_reporter.operation_report("memory_store")
     logging.info(
         "Transcript input complete segments=%s pending=%s queued_episodes=%s stored_episodes=%s",
         len(memory_segments),
