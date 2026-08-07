@@ -1,0 +1,17 @@
+# Android / Gradle
+.gradle/
+build/
+app/build/
+captures/
+local.properties
+*.iml
+
+# Python
+__pycache__/
+*.pyc
+
+# 本机数据与诊断
+*.db
+*.log
+diagnostics*.zip
+.DS_Store

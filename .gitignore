@@ -12,3 +12,11 @@ models/
 outputs/
 tmp/
 docs
+
+# Android / Gradle（agent_memory_android_test 子项目）
+.gradle/
+build/
+app/build/
+captures/
+local.properties
+*.iml

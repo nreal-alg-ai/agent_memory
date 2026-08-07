@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>Agent Memory 测试</title>
+    <link rel="stylesheet" href="/static/styles.css?v=agent-memory-1" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="chat-pane" aria-label="聊天">
+        <header class="topbar" aria-label="会话状态">
+          <div>
+            <h1>Agent Memory 测试</h1>
+            <p id="runtime-description">记忆引擎：agent_memory · 数据独立保存</p>
+          </div>
+          <button id="settings-toggle" class="mobile-icon-button mobile-settings-toggle" type="button" aria-label="打开设置" aria-controls="settings-pane" aria-expanded="false" data-tooltip="打开设置">
+            <svg aria-hidden="true" viewBox="0 0 24 24">
+              <circle cx="12" cy="12" r="3"></circle>
+              <path d="M19.4 15a1.7 1.7 0 0 0 .34 1.88l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06A1.7 1.7 0 0 0 15 19.4a1.7 1.7 0 0 0-1 .6 1.7 1.7 0 0 0-.4 1.1V21a2 2 0 1 1-4 0v-.09A1.7 1.7 0 0 0 8.5 19.4a1.7 1.7 0 0 0-1.88.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.7 1.7 0 0 0 4.6 15a1.7 1.7 0 0 0-.6-1 1.7 1.7 0 0 0-1.1-.4H3a2 2 0 1 1 0-4h.09A1.7 1.7 0 0 0 4.6 8.5a1.7 1.7 0 0 0-.34-1.88l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-.6 1.7 1.7 0 0 0 .4-1.1V3a2 2 0 1 1 4 0v.09A1.7 1.7 0 0 0 15.5 4.6a1.7 1.7 0 0 0 1.88-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.7 1.7 0 0 0 19.4 9c.14.37.35.7.6 1 .3.3.7.45 1.1.4H21a2 2 0 1 1 0 4h-.09a1.7 1.7 0 0 0-1.51.6Z"></path>
+            </svg>
+          </button>
+          <div id="settings-pane" class="topbar-actions" aria-label="应用设置">
+            <div class="settings-mobile-header">
+              <button id="settings-close" class="mobile-icon-button" type="button" aria-label="关闭设置">
+                <svg aria-hidden="true" viewBox="0 0 24 24"><path d="m15 18-6-6 6-6"></path></svg>
+              </button>
+              <div><h2>设置</h2><p>管理应用功能和本机状态</p></div>
+            </div>
+            <p class="settings-section-title">账户与个性化</p>
+            <div class="setting-row">
+              <div class="setting-copy"><strong>本机体验者</strong><span id="owner-setting-summary">读取中…</span></div>
+              <span class="setting-static-value" id="owner-setting-value">-</span>
+            </div>
+            <div class="setting-row">
+              <div class="setting-copy"><strong>参考声纹</strong><span id="speaker-setting-summary">尚未录入</span></div>
+              <button id="speaker-enroll-button" class="ghost" type="button" aria-controls="speaker-enroll-modal" aria-expanded="false" data-tooltip="管理当前用户的参考声纹">声纹设置</button>
+            </div>
+            <div class="setting-row">
+              <div class="setting-copy"><strong>语音播报</strong><span>自动朗读系统回复</span></div>
+              <button id="voice-toggle" class="ghost setting-switch" type="button" role="switch" aria-checked="true" data-tooltip="关闭语音播报">播报开</button>
+            </div>
+            <p class="settings-section-title">应用功能</p>
+            <div class="setting-row">
+              <div class="setting-copy"><strong>记忆管理</strong><span>查看 agent_memory 的事实/状态/待办/片段</span></div>
+              <button id="memory-toggle" class="ghost memory-toggle" type="button" aria-controls="memory-pane" aria-expanded="false" data-tooltip="打开记忆管理">记忆</button>
+            </div>
+            <div class="setting-row">
+              <div class="setting-copy"><strong>召回调试</strong><span>查看最近一次聊天召回的记忆上下文</span></div>
+              <button id="debug-toggle" class="ghost" type="button" aria-controls="debug-pane" aria-expanded="false" data-tooltip="查看召回调试">Debug</button>
+            </div>
+            <section class="settings-status-panel" aria-label="语音与待机状态">
+              <strong>语音与待机状态</strong>
+              <p id="settings-audio-details">正在检测本机语音能力…</p>
+            </section>
+            <div class="setting-row native-only-setting">
+              <div class="setting-copy"><strong>模型与服务配置</strong><span>管理模型、API、自检和加密诊断导出</span></div>
+              <button id="native-settings-button" class="ghost" type="button">高级设置</button>
+            </div>
+          </div>
+        </header>
+
+        <div id="messages" class="messages"></div>
+
+        <p id="voice-status" class="voice-status" aria-live="polite">等待语音输入</p>
+        <section class="ambient-bar" aria-label="收音待机">
+          <div>
+            <strong id="ambient-mode-label">收音待机未启动</strong>
+            <p id="ambient-status">准备开始收音；原始 PCM 不持久化。</p>
+          </div>
+          <div class="ambient-actions">
+            <button id="ambient-standby-toggle" class="ghost" type="button" data-tooltip="开启或停止全天收音待机">开启全天待机</button>
+          </div>
+        </section>
+        <form id="chat-form" class="composer">
+          <input
+            id="message-input"
+            type="text"
+            autocomplete="off"
+            placeholder="输入一句话，例如：记住我下周要和 Alex 一起出差"
+          />
+          <button id="send-button" type="submit" aria-label="发送" data-tooltip="发送消息">发送</button>
+        </form>
+      </section>
+
+      <aside id="memory-pane" class="memory-pane" aria-label="记忆管理">
+        <div class="pane-header">
+          <button id="memory-close" class="mobile-icon-button mobile-pane-back" type="button" aria-label="返回聊天主界面">
+            <svg aria-hidden="true" viewBox="0 0 24 24"><path d="m15 18-6-6 6-6"></path></svg>
+          </button>
+          <div>
+            <h2 id="memory-pane-title">agent_memory 记忆</h2>
+            <p id="memory-count">0 条</p>
+          </div>
+          <button id="refresh-memory" class="ghost" type="button" data-tooltip="刷新记忆列表">刷新</button>
+        </div>
+
+        <div id="memory-stats" class="memory-stats" aria-label="记忆统计">
+          <div class="memory-stat-chip"><span class="memory-stat-value" id="stat-facts">0</span><span class="memory-stat-label">事实</span></div>
+          <div class="memory-stat-chip"><span class="memory-stat-value" id="stat-states">0</span><span class="memory-stat-label">状态</span></div>
+          <div class="memory-stat-chip"><span class="memory-stat-value" id="stat-actionables">0</span><span class="memory-stat-label">待办</span></div>
+          <div class="memory-stat-chip"><span class="memory-stat-value" id="stat-episodes">0</span><span class="memory-stat-label">片段</span></div>
+          <p id="memory-reflect-info" class="memory-reflect-info">最近反思：暂无</p>
+        </div>
+
+        <div class="memory-actions">
+          <button id="trigger-reflect" class="ghost" type="button" data-tooltip="触发一次 Fact -> State/Actionable 反思">触发反思</button>
+          <form id="memory-import-form" class="memory-import-form">
+            <input id="memory-import-text" type="text" maxlength="500" autocomplete="off" placeholder="手动导入一条记忆文本" />
+            <button type="submit" class="ghost">导入</button>
+          </form>
+        </div>
+
+        <div class="memory-view-tabs" role="tablist" aria-label="记忆视图">
+          <button id="memory-tab-facts" type="button" role="tab" aria-selected="true">事实</button>
+          <button id="memory-tab-states" type="button" role="tab" aria-selected="false">状态</button>
+          <button id="memory-tab-actionables" type="button" role="tab" aria-selected="false">待办</button>
+          <button id="memory-tab-episodes" type="button" role="tab" aria-selected="false">片段</button>
+        </div>
+        <div class="memory-search-row">
+          <input id="memory-search" type="search" autocomplete="off" placeholder="在当前分类中搜索…" />
+        </div>
+        <div id="memory-list" class="memory-list" aria-live="polite"></div>
+      </aside>
+
+      <aside id="debug-pane" class="debug-pane" aria-label="Debug 面板">
+        <div class="pane-header">
+          <div>
+            <h2>召回调试</h2>
+            <p>最近一次聊天的召回上下文</p>
+          </div>
+          <div class="debug-actions">
+            <button id="clear-debug" class="ghost" type="button" data-tooltip="清空调试内容">清空</button>
+            <button id="close-debug" class="ghost" type="button" aria-label="关闭 Debug 面板" data-tooltip="关闭 Debug 面板">关闭</button>
+          </div>
+        </div>
+        <pre id="debug-output" class="debug-output">等待用户发送 query...</pre>
+      </aside>
+    </main>
+    <div id="settings-backdrop" class="surface-backdrop" hidden></div>
+    <div id="memory-backdrop" class="surface-backdrop" hidden></div>
+    <div id="speaker-enroll-modal" class="modal-backdrop" hidden>
+      <section class="modal-card" aria-label="声纹录入">
+        <header class="modal-header">
+          <div>
+            <h2>用户声纹录入</h2>
+            <p id="speaker-enroll-summary">当前还没有参考声纹。</p>
+          </div>
+          <button id="speaker-enroll-close" class="ghost" type="button" data-tooltip="关闭声纹录入">关闭</button>
+        </header>
+        <div class="modal-body">
+          <p id="speaker-enroll-progress" class="speaker-enroll-progress">当前进度：0 / 3</p>
+          <p id="speaker-enroll-phrase-label" class="speaker-fixed-phrase-label">第 1 段朗读内容</p>
+          <blockquote id="speaker-enroll-phrase" class="speaker-fixed-phrase">你好小忆，现在开始录入我的声音。</blockquote>
+          <p id="speaker-enroll-status" class="speaker-enroll-status">点击开始录入后，完成当前段朗读内容即可；暂时不录也不影响文字聊天。</p>
+        </div>
+        <footer class="modal-actions">
+          <button id="speaker-enroll-start" type="button">开始录入</button>
+          <button id="speaker-enroll-retry" class="ghost" type="button">重新录入</button>
+          <button id="speaker-enroll-cancel" class="ghost" type="button">稍后再录，先用文字聊天</button>
+        </footer>
+      </section>
+    </div>
+    <div id="debug-backdrop" class="debug-backdrop" hidden></div>
+    <div id="button-tooltip" class="button-tooltip" role="tooltip" hidden></div>
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    <script src="/static/app.js?v=agent-memory-1"></script>
+  </body>
+</html>
