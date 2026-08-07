@@ -30,21 +30,17 @@ class MemoryRuntime:
     ) -> None:
         self._manager = manager
         config = dict(memory_runtime_config or {})
-        self._min_dialogue_turns_before_store = max(
+        self._max_pending_interaction_turns = max(
             1,
             int(
-                config.get("min_dialogue_turns_before_store")
-                or config.get("min_dilaogue_turns_before_store")
-                or config.get("min_turns_before_store")
+                config.get("max_pending_interaction_turns")
                 or 1
             ),
         )
-        self._max_dialogue_chars_before_store = max(
+        self._max_pending_interaction_chars = max(
             1,
             int(
-                config.get("max_dialogue_chars_before_store")
-                or config.get("max_dilaogue_chars_before_store")
-                or config.get("max_chars_before_store")
+                config.get("max_pending_interaction_chars")
                 or 2000
             ),
         )
@@ -105,9 +101,9 @@ class MemoryRuntime:
         if not pending_turns:
             return False
         return (
-            len(pending_turns) >= self._min_dialogue_turns_before_store
+            len(pending_turns) >= self._max_pending_interaction_turns
             or self.interaction_turns_character_count(pending_turns)
-            >= self._max_dialogue_chars_before_store
+            >= self._max_pending_interaction_chars
         )
 
     @staticmethod
@@ -126,7 +122,7 @@ class MemoryRuntime:
             return {"queued": False, "reason": "no_pending_turns"}
         turns = list(self._pending_interaction_turns)
         queue_report = self._process_interaction_turns(turns)
-        queued = bool(queue_report.get("accepted"))
+        queued = bool(queue_report.get("queued"))
         if queued:
             self._pending_interaction_turns.clear()
         return {
@@ -143,8 +139,6 @@ class MemoryRuntime:
         segment: Dict[str, Any],
         *,
         source_type: str = "allday_recording",
-        episode_type: str = "ambient_transcript",
-        source_ref: str = "",
         tags: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """Buffer one transcript segment and queue completed transcript episodes."""
@@ -157,8 +151,6 @@ class MemoryRuntime:
 
         context = {
             "source_type": str(source_type or "allday_recording"),
-            "episode_type": str(episode_type or "ambient_transcript"),
-            "source_ref": str(source_ref or ""),
             "tags": sorted(
                 {
                     str(tag)
@@ -169,25 +161,18 @@ class MemoryRuntime:
         }
         queued = False
         reason = "threshold_not_reached"
-        if (
-            self._pending_transcript_segments
-            and self._pending_transcript_context != context
-        ):
-            flush_report = self._flush_pending_transcript_segments()
-            queued = bool(flush_report.get("queued"))
-            reason = "" if queued else str(flush_report.get("reason") or "queue_rejected")
-            if self._pending_transcript_segments:
-                return {"queued": queued, "reason": reason}
-
-        if self._should_flush_pending_transcript_before(segment):
+        should_flush = self._should_flush_pending_transcript_before(segment, context)
+        if should_flush:
             flush_report = self._flush_pending_transcript_segments()
             queued = bool(flush_report.get("queued")) or queued
             if queued:
                 reason = ""
             elif flush_report.get("reason"):
                 reason = str(flush_report.get("reason"))
-        if self._pending_transcript_context is None:
-            self._pending_transcript_context = dict(context)
+            if self._pending_transcript_segments:
+                return {"queued": queued, "reason": reason}
+
+        self._pending_transcript_context = dict(context)
         self._pending_transcript_segments.append(dict(segment))
         return {"queued": queued, "reason": "" if queued else reason}
 
@@ -204,7 +189,7 @@ class MemoryRuntime:
             self._pending_transcript_context = None
             return {"queued": False, "reason": "invalid_pending_segments"}
         queue_report = self._process_transcript_segments(raw_segments, context)
-        queued = bool(queue_report.get("accepted"))
+        queued = bool(queue_report.get("queued"))
         if queued:
             self._pending_transcript_segments.clear()
             self._pending_transcript_context = None
@@ -231,13 +216,13 @@ class MemoryRuntime:
     def trigger_memory_recall(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
         return self._manager.process_memory_recall_immediately(*args, **kwargs)
 
-    def flush_store_queue(self, timeout: Optional[float] = None) -> bool:
+    def flush_task_queue(self, timeout: Optional[float] = None) -> bool:
         """Wait for queued store and reflection tasks at an explicit boundary."""
         if self._pending_interaction_turns:
             self._flush_pending_interaction_turns()
         if self._pending_transcript_segments:
             self._flush_pending_transcript_segments()
-        return self._manager.flush_store_queue(timeout=timeout)
+        return self._manager.flush_task_queue(timeout=timeout)
 
     def _process_interaction_turns(self, turns: List[Dict[str, Any]]) -> Dict[str, Any]:
         raw_segments = self._normalize_interaction_turns_to_memory_raw_segments(turns)
@@ -245,9 +230,7 @@ class MemoryRuntime:
         return self._manager.submit_memory_store_task(
             raw_segments=raw_segments,
             source_type="assistant_wakeup",
-            episode_type="interaction",
             tags=tags,
-            source_ref="store_turn",
         )
 
     def _process_transcript_segments(
@@ -269,17 +252,18 @@ class MemoryRuntime:
         return self._manager.submit_memory_store_task(
             raw_segments=list(raw_segments),
             source_type=str(context.get("source_type") or "allday_recording"),
-            episode_type=str(context.get("episode_type") or "ambient_transcript"),
             tags=sorted(tags),
-            source_ref=str(context.get("source_ref") or ""),
         )
 
     def _should_flush_pending_transcript_before(
         self,
         next_segment: Dict[str, Any],
+        next_context: Dict[str, Any],
     ) -> bool:
         if not self._pending_transcript_segments:
             return False
+        if self._pending_transcript_context != next_context:
+            return True
         pending_chars = sum(
             len(self._transcript_segment_text(segment))
             for segment in self._pending_transcript_segments

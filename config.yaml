@@ -123,8 +123,8 @@ remote_audio:
   user_reference_audio_dir: assets/user_reference_audio_files
 
 memory_runtime:
-  min_dialogue_turns_before_store: 5
-  max_dialogue_chars_before_store: 2000
+  max_pending_interaction_turns: 5
+  max_pending_interaction_chars: 2000
   transcript_episode_max_gap_seconds: 60.0
   transcript_episode_max_segments: 80
   transcript_episode_max_chars: 12000

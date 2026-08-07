@@ -538,16 +538,16 @@ class MemoryNodeManager:
             self._memory_cfg.get("enable_entity_scoped_state_resolution", True),
             True,
         )
-        self._store_queue_maxsize = max(
+        self._task_queue_maxsize = max(
             1,
             int(self._memory_cfg.get("store_queue_maxsize", 100) or 100),
         )
-        self._store_queue: queue.Queue[Dict[str, Any]] = queue.Queue(
-            maxsize=self._store_queue_maxsize,
+        self._task_queue: queue.Queue[Dict[str, Any]] = queue.Queue(
+            maxsize=self._task_queue_maxsize,
         )
-        self._store_worker_thread: Optional[threading.Thread] = None
-        self._store_worker_lock = threading.Lock()
-        self._store_shutdown_event = threading.Event()
+        self._task_worker_thread: Optional[threading.Thread] = None
+        self._task_worker_lock = threading.Lock()
+        self._task_shutdown_event = threading.Event()
         self._memory_operation_lock = threading.RLock()
         self._entity_state_max_entities_per_fact = max(
             1,
@@ -589,6 +589,15 @@ class MemoryNodeManager:
         if text == "https://api.deepseek.com":
             return "https://api.deepseek.com/v1"
         return text or DEFAULT_LLM_BASE_URL
+
+    @staticmethod
+    def _episode_type_for_source_type(source_type: str) -> str:
+        normalized = str(source_type or "").strip().lower()
+        if normalized == "assistant_wakeup":
+            return "interaction"
+        if normalized == "allday_recording":
+            return "ambient_transcript"
+        return normalized or "memory"
 
     # ── Runtime helpers used by benchmark scripts ───────────────────────
 
@@ -632,10 +641,10 @@ class MemoryNodeManager:
     def enabled(self) -> bool:
         return self._enabled
 
-    def _store_worker_loop(self) -> None:
-        while not self._store_shutdown_event.is_set() or not self._store_queue.empty():
+    def _task_worker_loop(self) -> None:
+        while not self._task_shutdown_event.is_set() or not self._task_queue.empty():
             try:
-                task = self._store_queue.get(timeout=0.2)
+                task = self._task_queue.get(timeout=0.2)
             except queue.Empty:
                 continue
             task_kind = str(task.get("kind") or "")
@@ -664,17 +673,17 @@ class MemoryNodeManager:
                     error=exc,
                 )
             finally:
-                self._store_queue.task_done()
+                self._task_queue.task_done()
 
-    def _ensure_store_worker_locked(self) -> None:
-        if self._store_worker_thread and self._store_worker_thread.is_alive():
+    def _ensure_task_worker_locked(self) -> None:
+        if self._task_worker_thread and self._task_worker_thread.is_alive():
             return
-        self._store_worker_thread = threading.Thread(
-            target=self._store_worker_loop,
+        self._task_worker_thread = threading.Thread(
+            target=self._task_worker_loop,
             daemon=True,
             name="memory-node-worker",
         )
-        self._store_worker_thread.start()
+        self._task_worker_thread.start()
 
     def _submit_memory_task(
         self,
@@ -683,8 +692,8 @@ class MemoryNodeManager:
         payload: Dict[str, Any],
     ) -> Dict[str, Any]:
         task_id = self._operation_reporter.next_task_id(task_kind)
-        with self._store_worker_lock:
-            if self._store_shutdown_event.is_set():
+        with self._task_worker_lock:
+            if self._task_shutdown_event.is_set():
                 logger.warning("Memory worker is shut down; dropping %s task", task_kind)
                 return self._reject_memory_task(
                     task_kind=task_kind,
@@ -692,7 +701,7 @@ class MemoryNodeManager:
                     reason="worker_shutdown",
                 )
             try:
-                self._store_queue.put_nowait({
+                self._task_queue.put_nowait({
                     "kind": task_kind,
                     "payload": payload,
                     "task_id": task_id,
@@ -702,7 +711,7 @@ class MemoryNodeManager:
                 logger.warning(
                     "Memory task queue is full; dropping %s (maxsize=%d)",
                     task_kind,
-                    self._store_queue_maxsize,
+                    self._task_queue_maxsize,
                 )
                 return self._reject_memory_task(
                     task_kind=task_kind,
@@ -718,9 +727,8 @@ class MemoryNodeManager:
                     if key != "raw_segments"
                 },
             )
-            self._ensure_store_worker_locked()
+            self._ensure_task_worker_locked()
         return {
-            "accepted": True,
             "queued": True,
             "status": "queued",
             "task_id": task_id,
@@ -740,7 +748,6 @@ class MemoryNodeManager:
             reason=reason,
         )
         return {
-            "accepted": False,
             "queued": False,
             "status": "rejected",
             "reason": reason,
@@ -748,38 +755,36 @@ class MemoryNodeManager:
             "operation_type": task_kind,
         }
     
-    def flush_store_queue(self, timeout: Optional[float] = None) -> bool:
-        """Wait until all accepted asynchronous memory tasks finish."""
+    def flush_task_queue(self, timeout: Optional[float] = None) -> bool:
+        """Wait until all queued asynchronous memory tasks finish."""
         deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
-        while self._store_queue.unfinished_tasks:
+        while self._task_queue.unfinished_tasks:
             if deadline is not None and time.monotonic() >= deadline:
                 return False
             time.sleep(0.01)
         return True
 
-    def shutdown_store_worker(
+    def shutdown_task_worker(
         self,
         *,
         wait: bool = True,
         timeout: Optional[float] = 5.0,
     ) -> bool:
         """Stop accepting tasks and optionally drain the memory worker."""
-        with self._store_worker_lock:
-            self._store_shutdown_event.set()
-            worker = self._store_worker_thread
+        with self._task_worker_lock:
+            self._task_shutdown_event.set()
+            worker = self._task_worker_thread
         if not wait or worker is None:
-            return not self._store_queue.unfinished_tasks
+            return not self._task_queue.unfinished_tasks
         worker.join(timeout=None if timeout is None else max(0.0, timeout))
-        return not worker.is_alive() and not self._store_queue.unfinished_tasks
+        return not worker.is_alive() and not self._task_queue.unfinished_tasks
 
     def submit_memory_store_task(
         self,
         *,
         raw_segments: List[Dict[str, Any]],
         source_type: str,
-        episode_type: str,
         tags: List[str],
-        source_ref: str = "",
     ) -> Dict[str, Any]:
         """Queue one normalized episode for ordered background storage."""
         if not self._enabled or not raw_segments:
@@ -795,9 +800,7 @@ class MemoryNodeManager:
             payload={
                 "raw_segments": raw_segments,
                 "source_type": source_type,
-                "episode_type": episode_type,
                 "tags": tags,
-                "source_ref": source_ref,
             },
         )
 
@@ -806,15 +809,13 @@ class MemoryNodeManager:
         *,
         raw_segments: List[Dict[str, Any]],
         source_type: str,
-        episode_type: str,
         tags: List[str],
-        source_ref: str = "",
     ) -> Dict[str, Any]:
         store_started_at = time.monotonic()
+        episode_type = self._episode_type_for_source_type(source_type)
         self._log_info("memory_store", "start", {
             "source_type": source_type,
             "episode_type": episode_type,
-            "source_ref": source_ref,
             "source_segment_count": len(raw_segments),
         })
         if not raw_segments:
@@ -855,7 +856,6 @@ class MemoryNodeManager:
             facts=facts,
             source_type=source_type,
             episode_type=episode_type,
-            source_ref=source_ref,
         )
 
         save_episode_info = self._store_extracted_memory_episode_into_db(
@@ -865,7 +865,6 @@ class MemoryNodeManager:
             source_type=source_type,
             episode_type=episode_type,
             tags=tags,
-            source_ref=source_ref,
             episode_title=episode_title,
             episode_summary=episode_summary,
             canonical_topics=episode_canonical_topics,
@@ -903,7 +902,6 @@ class MemoryNodeManager:
         source_type: str,
         episode_type: str,
         tags: List[str],
-        source_ref: str,
         episode_title: str,
         episode_summary: str,
         canonical_topics: List[str],
@@ -931,7 +929,6 @@ class MemoryNodeManager:
                 "tags": tags,
                 "segment_count": len(raw_segments),
                 "entities": episode_entity_names,
-                "source_ref": source_ref,
             },
         )
         # self._index_episode(
@@ -945,7 +942,6 @@ class MemoryNodeManager:
         #     tags=tags,
         #     canonical_topics=canonical_topics,
         #     participants=participants,
-        #     source_ref=source_ref,
         # )
 
         return {
@@ -965,7 +961,6 @@ class MemoryNodeManager:
         facts: List[Dict[str, Any]],
         source_type: str,
         episode_type: str,
-        source_ref: str,
     ) -> None:
         if not facts:
             return
@@ -975,7 +970,6 @@ class MemoryNodeManager:
             {
                 "source_type": source_type,
                 "episode_type": episode_type,
-                "source_ref": source_ref,
                 "raw_segments": self._build_memory_segments_for_prompt(
                     raw_segments,
                     prompt_language=self._resolve_prompt_language_from_segments(raw_segments),
@@ -1967,7 +1961,6 @@ class MemoryNodeManager:
         tags: List[str],
         canonical_topics: List[str],
         participants: List[str],
-        source_ref: str = "",
     ) -> None:
         keywords = " ".join(self._keywords(summary, limit=24))
         memory_path = f"{source_type}/episodes/{episode_type}"
@@ -1999,7 +1992,7 @@ class MemoryNodeManager:
             confidence=0.8,
             embedding=embedding,
             embedding_text=embedding_text,
-            metadata={"tags": tags, "source_ref": source_ref},
+            metadata={"tags": tags},
         )
         
     def _is_low_value_assistant_closing(self, text: str) -> bool:

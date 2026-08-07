@@ -406,19 +406,19 @@ def parse_args() -> argparse.Namespace:
     )
     parser.set_defaults(llm_json_mode=True)
     parser.add_argument(
-        "--min-dialogue-turns-before-store",
+        "--max-pending-interaction-turns",
         type=int,
         help=(
             "Extract facts once per N completed turns. Defaults to "
-            "memory_runtime.min_dialogue_turns_before_store from config.yaml."
+            "memory_runtime.max_pending_interaction_turns from config.yaml."
         ),
     )
     parser.add_argument(
-        "--max-dialogue-chars-before-store",
+        "--max-pending-interaction-chars",
         type=int,
         help=(
             "Extract facts early when pending dialogue exceeds this many "
-            "characters. Defaults to memory_runtime.max_dialogue_chars_before_store."
+            "characters. Defaults to memory_runtime.max_pending_interaction_chars."
         ),
     )
     parser.add_argument(
@@ -503,19 +503,19 @@ def resolve_llm_args(args: argparse.Namespace) -> None:
         args.llm_timeout
         or int(str(llm_config.get("llm_timeout", 120)))
     )
-    args.min_dialogue_turns_before_store = max(
+    args.max_pending_interaction_turns = max(
         1,
         int(
-            args.min_dialogue_turns_before_store
-            or _runtime_config.get("min_dialogue_turns_before_store", 1)
+            args.max_pending_interaction_turns
+            or _runtime_config.get("max_pending_interaction_turns", 1)
             or 1
         ),
     )
-    args.max_dialogue_chars_before_store = max(
+    args.max_pending_interaction_chars = max(
         1,
         int(
-            args.max_dialogue_chars_before_store
-            or _runtime_config.get("max_dialogue_chars_before_store", 2000)
+            args.max_pending_interaction_chars
+            or _runtime_config.get("max_pending_interaction_chars", 2000)
             or 2000
         ),
     )
@@ -653,8 +653,8 @@ def main() -> int:
         llm_config,
         embedding_config,
     ) = split_memory_config(config)
-    memory_runtime_config["min_dialogue_turns_before_store"] = args.min_dialogue_turns_before_store
-    memory_runtime_config["max_dialogue_chars_before_store"] = args.max_dialogue_chars_before_store
+    memory_runtime_config["max_pending_interaction_turns"] = args.max_pending_interaction_turns
+    memory_runtime_config["max_pending_interaction_chars"] = args.max_pending_interaction_chars
     llm_config["llm_name"] = str(args.llm_model)
     llm_config["llm_base_url"] = str(args.llm_base_url)
     llm_config["llm_api_key"] = str(args.llm_api_key or "")
@@ -713,7 +713,7 @@ def main() -> int:
                     tags=["store_fact_test", f"sample:{sample_id}", f"turn:{turn_index}"],
                     turn_timestamp=turn_timestamp,
                 )
-                if ok.get("queued") and not runtime.flush_store_queue():
+                if ok.get("queued") and not runtime.flush_task_queue():
                     raise RuntimeError("Timed out while draining queued memory stores")
                 nodes = list(iter_stored_nodes(db, before_id))
                 store_operation_report = operation_reporter.latest_report("memory_store")
@@ -728,8 +728,8 @@ def main() -> int:
                     "sample_hour_offset": hour_offset,
                     "turn_second_offset": turn_index,
                     "turn_timestamp": turn_timestamp.isoformat(),
-                    "min_dialogue_turns_before_store": runtime._min_dialogue_turns_before_store,
-                    "max_dialogue_chars_before_store": runtime._max_dialogue_chars_before_store,
+                    "max_pending_interaction_turns": runtime._max_pending_interaction_turns,
+                    "max_pending_interaction_chars": runtime._max_pending_interaction_chars,
                     "pending_character_count": pending_character_count,
                     "fact_extraction_due": extraction_due,
                     "source_turn_count": (
@@ -770,7 +770,7 @@ def main() -> int:
                     reflect_submit = runtime.trigger_memory_reflect(
                         reflect_timestamp=turn_timestamp,
                     )
-                    if reflect_submit.get("accepted") and not runtime.flush_store_queue():
+                    if reflect_submit.get("queued") and not runtime.flush_task_queue():
                         raise RuntimeError("Timed out while draining queued memory reflect")
                     reflect_report = (
                         operation_reporter.latest_report("memory_reflect")
@@ -792,7 +792,7 @@ def main() -> int:
                         reflect_report.get("actionable_items_updated"),
                     )
         pending_before_final_flush = len(runtime._pending_interaction_turns)
-        if not runtime.flush_store_queue():
+        if not runtime.flush_task_queue():
             raise RuntimeError("Timed out while draining final pending memory stores")
         logging.info(
             "Final memory runtime flush completed pending_before=%s pending_after=%s",
@@ -818,8 +818,8 @@ def main() -> int:
         "turns_processed": len(turns),
         "turns_with_facts": stored_turns,
         "facts_stored": stored_facts,
-        "min_dialogue_turns_before_store": runtime._min_dialogue_turns_before_store,
-        "max_dialogue_chars_before_store": runtime._max_dialogue_chars_before_store,
+        "max_pending_interaction_turns": runtime._max_pending_interaction_turns,
+        "max_pending_interaction_chars": runtime._max_pending_interaction_chars,
         "pending_turns": len(runtime._pending_interaction_turns),
         "store_episode_submitted": int(store_operation_report.get("submitted") or 0),
         "store_episode_succeeded": int(store_operation_report.get("succeeded") or 0),

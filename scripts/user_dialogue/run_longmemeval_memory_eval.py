@@ -223,7 +223,7 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help=(
-            "Override memory_runtime.min_dialogue_turns_before_store from config.yaml. "
+            "Override memory_runtime.max_pending_interaction_turns from config.yaml. "
             "When omitted, use the config.yaml value."
         ),
     )
@@ -232,7 +232,7 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help=(
-            "Override memory_runtime.max_dialogue_chars_before_store from config.yaml. "
+            "Override memory_runtime.max_pending_interaction_chars from config.yaml. "
             "When omitted, use the config.yaml value."
         ),
     )
@@ -636,25 +636,25 @@ def prepare_runtime_configs(
 ) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
     config = load_project_config(args.config)
     memory_runtime_config, memory_manager_config, llm_config, embedding_config = split_memory_config(config)
-    configured_min_turns = memory_runtime_config.get("min_dialogue_turns_before_store")
-    if configured_min_turns in (None, ""):
-        configured_min_turns = memory_runtime_config.get("min_turns_before_store", 1)
-    min_turns_before_store = max(
+    configured_max_turns = memory_runtime_config.get("max_pending_interaction_turns")
+    if configured_max_turns in (None, ""):
+        configured_max_turns = memory_runtime_config.get("max_pending_interaction_turns", 1)
+    max_pending_interaction_turns = max(
         1,
         int(
             args.fact_extraction_interval
             if args.fact_extraction_interval is not None
-            else configured_min_turns
+            else configured_max_turns
         ),
     )
-    args.fact_extraction_interval = min_turns_before_store
-    memory_runtime_config["min_turns_before_store"] = min_turns_before_store
-    memory_runtime_config["min_dialogue_turns_before_store"] = min_turns_before_store
-    configured_max_chars = memory_runtime_config.get("max_dialogue_chars_before_store")
+    args.fact_extraction_interval = max_pending_interaction_turns
+    memory_runtime_config["max_pending_interaction_turns"] = max_pending_interaction_turns
+    memory_runtime_config["max_pending_interaction_turns"] = max_pending_interaction_turns
+    configured_max_chars = memory_runtime_config.get("max_pending_interaction_chars")
     if configured_max_chars in (None, ""):
-        configured_max_chars = memory_runtime_config.get("max_chars_before_store")
+        configured_max_chars = memory_runtime_config.get("max_pending_interaction_chars")
     if args.fact_extraction_max_chars is not None or configured_max_chars not in (None, ""):
-        max_chars_before_store = max(
+        max_pending_interaction_chars = max(
             1,
             int(
                 args.fact_extraction_max_chars
@@ -662,9 +662,8 @@ def prepare_runtime_configs(
                 else configured_max_chars
             ),
         )
-        args.fact_extraction_max_chars = max_chars_before_store
-        memory_runtime_config["max_chars_before_store"] = max_chars_before_store
-        memory_runtime_config["max_dialogue_chars_before_store"] = max_chars_before_store
+        args.fact_extraction_max_chars = max_pending_interaction_chars
+        memory_runtime_config["max_pending_interaction_chars"] = max_pending_interaction_chars
     llm_config["llm_name"] = str(args.llm_model)
     llm_config["llm_base_url"] = str(args.llm_base_url)
     llm_config["llm_api_key"] = str(args.llm_api_key or "")
@@ -1084,7 +1083,7 @@ def replay_sessions_into_memory(
                 limit=reflect_limit,
                 reflect_timestamp=reflect_ts,
             )
-            if reflect_submit.get("accepted") and not runtime.flush_store_queue():
+            if reflect_submit.get("queued") and not runtime.flush_task_queue():
                 raise RuntimeError("Timed out while draining queued memory reflect")
     
     if enable_reflect and sessions:
@@ -1096,12 +1095,12 @@ def replay_sessions_into_memory(
             limit=reflect_limit,
             reflect_timestamp=final_ts,
         )
-        if reflect_submit.get("accepted") and not runtime.flush_store_queue():
+        if reflect_submit.get("queued") and not runtime.flush_task_queue():
             raise RuntimeError("Timed out while draining queued memory reflect")
     
     if runtime._pending_interaction_turns:
         pending_before_flush = len(runtime._pending_interaction_turns)
-        if not runtime.flush_store_queue():
+        if not runtime.flush_task_queue():
             raise RuntimeError("Timed out while draining queued memory stores")
         if runtime._pending_interaction_turns:
             logging.warning(
@@ -1187,7 +1186,7 @@ def build_instance_memory_context(
                     reflect_every_sessions=max(1, int(args.reflect_every_sessions)),
                     reflect_limit=int(args.reflect_limit),
                 )
-            if not runtime.flush_store_queue():
+            if not runtime.flush_task_queue():
                 raise RuntimeError("Timed out while draining queued memory stores")
             effective_question_dt = effective_question_datetime(question_dt, sessions)
             effective_question_date_text = format_memory_time(effective_question_dt)

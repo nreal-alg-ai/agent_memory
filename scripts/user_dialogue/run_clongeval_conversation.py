@@ -115,8 +115,8 @@ def parse_args() -> argparse.Namespace:
         help="Do not request provider-enforced JSON output.",
     )
     parser.set_defaults(llm_json_mode=None)
-    parser.add_argument("--min-dialogue-turns-before-store", type=int)
-    parser.add_argument("--max-dialogue-chars-before-store", type=int)
+    parser.add_argument("--max-pending-interaction-interactions", type=int)
+    parser.add_argument("--max-pending-interaction-chars", type=int)
     parser.add_argument("--enable-reflect", action="store_true")
     parser.add_argument(
         "--reflect-every-days",
@@ -316,7 +316,7 @@ def replay_context_into_memory(
     def flush_pending_store_turns() -> bool:
         nonlocal store_batches
         pending_before_flush = len(runtime._pending_interaction_turns)
-        stored = bool(pending_before_flush and runtime.flush_store_queue())
+        stored = bool(pending_before_flush and runtime.flush_task_queue())
         if stored and not runtime._pending_interaction_turns:
             store_batches += 1
             return True
@@ -356,7 +356,7 @@ def replay_context_into_memory(
             )
             if (reflect_submit.get("pending_interaction_flush") or {}).get("queued"):
                 store_batches += 1
-            if reflect_submit.get("accepted") and not runtime.flush_store_queue():
+            if reflect_submit.get("queued") and not runtime.flush_task_queue():
                 raise RuntimeError("Timed out while draining queued memory reflect")
             reflect_runs += 1
             last_reflected_day = day_index
@@ -437,8 +437,8 @@ def prepare_runtime(
     args.reflect_limit = max(1, int(args.reflect_limit or memory_manager_config.get("reflect_limit", 100) or 100))
     args.recall_top_k = max(1, int(args.recall_top_k or memory_manager_config.get("retrieval_top_k", 8) or 8))
     args.recall_budget = str(args.recall_budget or memory_manager_config.get("recall_budget", "mid") or "mid")
-    memory_runtime_config["min_dialogue_turns_before_store"] = args.min_dialogue_turns_before_store
-    memory_runtime_config["max_dialogue_chars_before_store"] = args.max_dialogue_chars_before_store
+    memory_runtime_config["max_pending_interaction_turns"] = args.max_pending_interaction_turns
+    memory_runtime_config["max_pending_interaction_chars"] = args.max_pending_interaction_chars
     llm_config["llm_name"] = str(args.llm_model)
     llm_config["llm_base_url"] = str(args.llm_base_url)
     llm_config["llm_api_key"] = str(args.llm_api_key or "")
@@ -576,7 +576,7 @@ def process_context_group(
             reflect_every_days=args.reflect_every_days,
             reflect_limit=args.reflect_limit,
         )
-        if not runtime.flush_store_queue():
+        if not runtime.flush_task_queue():
             raise RuntimeError("Timed out while draining queued memory stores")
         log_memory_index_state(db, f"after_context:{group_id}")
         counts = db_counts(db)

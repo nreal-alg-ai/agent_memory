@@ -66,7 +66,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--db-name", default="memory.db")
     parser.add_argument("--session-start", default="", help="ISO timestamp used as audio time zero.")
     parser.add_argument("--source-type", default="allday_recording")
-    parser.add_argument("--episode-type", default="ambient_transcript")
     parser.add_argument("--max-segments-per-episode", type=int, default=0)
     parser.add_argument("--max-chars-per-episode", type=int, default=0)
     parser.add_argument("--max-gap-seconds", type=float, default=-1.0)
@@ -140,13 +139,10 @@ def main() -> None:
     )
 
     queued_episode_count = 0
-    source_ref = textgrid_path.name
     for segment_index, segment in enumerate(memory_segments, 1):
         ok = runtime.accept_single_transcript_segment(
             segment,
             source_type=args.source_type,
-            episode_type=args.episode_type,
-            source_ref=source_ref,
             tags=["Eval_Ali", textgrid_path.stem],
         )
         queued_episode_count += int(bool(ok.get("queued")))
@@ -167,7 +163,7 @@ def main() -> None:
         reflect_submit = runtime.trigger_memory_reflect(
             reflect_timestamp=reflect_timestamp,
         )
-        if reflect_submit.get("accepted") and not runtime.flush_store_queue():
+        if reflect_submit.get("queued") and not runtime.flush_task_queue():
             raise RuntimeError("Timed out while draining queued memory reflect")
         reflect_result = operation_reporter.latest_report("memory_reflect") or reflect_submit
         queued_episode_count += int(
@@ -176,7 +172,7 @@ def main() -> None:
         logging.info("Reflect result: %s", reflect_result)
     else:
         pending_transcript_count = len(runtime._pending_transcript_segments)
-        runtime.flush_store_queue()
+        runtime.flush_task_queue()
         queued_episode_count += int(
             pending_transcript_count > 0
             and not runtime._pending_transcript_segments
@@ -200,7 +196,6 @@ def main() -> None:
         "store_operation_report": store_operation_report,
         "memory_operation_report": operation_reporter.snapshot(),
         "source_type": args.source_type,
-        "episode_type": args.episode_type,
         "session_start": session_start.isoformat(),
         "reflect_result": reflect_result,
     }
