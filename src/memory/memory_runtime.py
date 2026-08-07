@@ -28,6 +28,7 @@ class MemoryRuntime:
         *,
         memory_runtime_config: Optional[Dict[str, Any]] = None,
     ) -> None:
+        """Initialize the runtime buffers and batching thresholds."""
         self._manager = manager
         config = dict(memory_runtime_config or {})
         self._max_pending_interaction_turns = max(
@@ -118,6 +119,7 @@ class MemoryRuntime:
         )
 
     def _flush_pending_interaction_turns(self) -> Dict[str, Any]:
+        """Submit the buffered interaction turns and clear them when queued."""
         if not self._pending_interaction_turns:
             return {"queued": False, "reason": "no_pending_turns"}
         turns = list(self._pending_interaction_turns)
@@ -177,6 +179,7 @@ class MemoryRuntime:
         return {"queued": queued, "reason": "" if queued else reason}
 
     def _flush_pending_transcript_segments(self) -> Dict[str, Any]:
+        """Normalize and submit buffered transcript segments as one episode."""
         if not self._pending_transcript_segments:
             return {"queued": False, "reason": "no_pending_segments"}
         segments = list(self._pending_transcript_segments)
@@ -214,6 +217,7 @@ class MemoryRuntime:
         return report
     
     def trigger_memory_recall(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        """Run recall immediately through the manager without adding buffering."""
         return self._manager.process_memory_recall_immediately(*args, **kwargs)
 
     def flush_task_queue(self, timeout: Optional[float] = None) -> bool:
@@ -225,6 +229,7 @@ class MemoryRuntime:
         return self._manager.flush_task_queue(timeout=timeout)
 
     def _process_interaction_turns(self, turns: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Convert interaction turns and submit them as an assistant episode."""
         raw_segments = self._normalize_interaction_turns_to_memory_raw_segments(turns)
         tags = sorted({tag for turn in turns for tag in turn.get("tags", [])})
         return self._manager.submit_memory_store_task(
@@ -238,6 +243,7 @@ class MemoryRuntime:
         raw_segments: Sequence[Dict[str, Any]],
         context: Dict[str, Any],
     ) -> Dict[str, Any]:
+        """Submit normalized transcript segments with their source context."""
         tags = {
             str(tag)
             for tag in context.get("tags") or []
@@ -260,6 +266,7 @@ class MemoryRuntime:
         next_segment: Dict[str, Any],
         next_context: Dict[str, Any],
     ) -> bool:
+        """Check whether the next segment must start a new transcript episode."""
         if not self._pending_transcript_segments:
             return False
         if self._pending_transcript_context != next_context:
@@ -288,6 +295,7 @@ class MemoryRuntime:
 
     @staticmethod
     def _transcript_segment_text(segment: Dict[str, Any]) -> str:
+        """Extract and compact the transcript text from supported input fields."""
         return _compact_whitespace(
             segment.get("text")
             or segment.get("asr_text")
@@ -298,6 +306,7 @@ class MemoryRuntime:
 
     @staticmethod
     def _transcript_segment_start_time(segment: Dict[str, Any]) -> str:
+        """Extract the normalized start timestamp from a transcript segment."""
         return _to_timestamp_text(
             segment.get("started_at")
             or segment.get("start_timestamp")
@@ -307,6 +316,7 @@ class MemoryRuntime:
 
     @staticmethod
     def _transcript_segment_end_time(segment: Dict[str, Any]) -> str:
+        """Extract the normalized end timestamp, falling back to the start time."""
         started_at = MemoryRuntime._transcript_segment_start_time(segment)
         return _to_timestamp_text(
             segment.get("ended_at")
@@ -321,6 +331,7 @@ class MemoryRuntime:
         previous_end: Any,
         current_start: Any,
     ) -> Optional[float]:
+        """Return the gap between timestamps, or None when either is invalid."""
         if not previous_end or not current_start:
             return None
         try:
@@ -338,6 +349,7 @@ class MemoryRuntime:
         self,
         turns: Sequence[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
+        """Convert frontend interaction turns into manager-compatible segments."""
         segments: List[Dict[str, Any]] = []
         for turn_index, turn in enumerate(turns, 1):
             timestamp = _to_timestamp_text(turn.get("turn_timestamp")) or _now_text()
@@ -370,6 +382,7 @@ class MemoryRuntime:
         self,
         segments: Sequence[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
+        """Validate and normalize transcript segments for episode storage."""
         normalized: List[Dict[str, Any]] = []
         for index, segment in enumerate(segments, 1):
             if not isinstance(segment, dict):
