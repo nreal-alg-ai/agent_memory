@@ -2209,17 +2209,23 @@ class MemoryNodeManager:
                 fact.get("id") for fact in entity_facts if fact.get("id") is not None
             ],
         })
-        topic_report = self._resolve_and_update_topic_states_from_facts(
-            facts=topic_facts,
-        )
-        entity_report = self._resolve_and_update_entity_scoped_states_from_facts(
-            facts=entity_facts,
-        )
+        # Keep the projection apply atomic. The expensive extraction and
+        # embedding work still happens inside the existing worker, while all
+        # state/actionable writes and processed markers share one commit point.
+        with self._db.transaction():
+            topic_report = self._resolve_and_update_topic_states_from_facts(
+                facts=topic_facts,
+            )
+            entity_report = self._resolve_and_update_entity_scoped_states_from_facts(
+                facts=entity_facts,
+            )
 
-        actionable_report = self._update_memory_actionable_items_using_facts(
-            facts=facts,
-        )
-        facts_marked_processed = self._db.mark_facts_processed_for_memory_state(fact_ids)
+            actionable_report = self._update_memory_actionable_items_using_facts(
+                facts=facts,
+            )
+            facts_marked_processed = self._db.mark_facts_processed_for_memory_state(
+                fact_ids,
+            )
         report = {
             "status": "ok",
             "states_updated": (
@@ -4977,8 +4983,11 @@ class MemoryNodeManager:
         memory_source_override: Optional[Sequence[str]] = None,
         recall_path: str = "normal",
     ) -> Dict[str, Any]:
-        """Run recall immediately against the current stored memory."""
-        with self._memory_operation_lock:
+        """Run recall immediately against the latest committed memory snapshot."""
+        # Recall is read-only and must not wait for the store/reflect worker's
+        # long-running LLM or embedding work. A separate WAL reader gives it
+        # a consistent committed snapshot without sharing the writer connection.
+        with self._db.reader_transaction() as reader_db:
             return self._recall_sync(
                 query=query,
                 top_k=top_k,
@@ -4989,6 +4998,7 @@ class MemoryNodeManager:
                 recall_gate_mode=recall_gate_mode,
                 memory_source_override=memory_source_override,
                 recall_path=recall_path,
+                database=reader_db,
             )
 
     def _recall_sync(
@@ -5002,6 +5012,7 @@ class MemoryNodeManager:
         recall_gate_mode: Optional[str] = None,
         memory_source_override: Optional[Sequence[str]] = None,
         recall_path: str = "normal",
+        database: Optional[SessionDB] = None,
     ) -> Dict[str, Any]:
         requested_recall_path = str(recall_path or "normal").strip().lower()
         started_at = time.monotonic()
@@ -5076,6 +5087,7 @@ class MemoryNodeManager:
                     memory_source_override=memory_source_override,
                     parsed_time_start=parsed_time_start,
                     parsed_time_end=parsed_time_end,
+                    database=database,
                 )
             else:
                 has_explicit_time_window = bool(
@@ -5093,6 +5105,7 @@ class MemoryNodeManager:
                         if has_explicit_time_window
                         else datetime.now(timezone.utc).isoformat()
                     ),
+                    database=database,
                 )
                 if normalized_recall_path == "stage1":
                     actual_recall_path = "stage1"
@@ -5108,6 +5121,7 @@ class MemoryNodeManager:
                         memory_source_override=memory_source_override,
                         parsed_time_start=parsed_time_start,
                         parsed_time_end=parsed_time_end,
+                        database=database,
                     )
                 else:
                     memory_text = stage1_text
@@ -5150,6 +5164,7 @@ class MemoryNodeManager:
         time_end: Optional[str],
         memory_source_override: Optional[Sequence[str]] = None,
         recent_reference_time: Optional[str] = None,
+        database: Optional[SessionDB] = None,
     ) -> Optional[str]:
         """Run a deterministic, no-LLM recall path for high-confidence hits.
 
@@ -5190,6 +5205,7 @@ class MemoryNodeManager:
                 time_start=time_start,
                 time_end=time_end,
                 raw_candidate_limits=raw_candidate_limits,
+                database=database,
             )
         )
         filtered_candidates: List[Dict[str, Any]] = []
@@ -5700,6 +5716,7 @@ class MemoryNodeManager:
         memory_source_override: Optional[Sequence[str]] = None,
         parsed_time_start: Optional[str] = None,
         parsed_time_end: Optional[str] = None,
+        database: Optional[SessionDB] = None,
     ) -> str:
         """Run the existing LLM and semantic-search recall pipeline.
 
@@ -5789,6 +5806,7 @@ class MemoryNodeManager:
             time_start=time_start,
             time_end=time_end,
             raw_candidate_limits=raw_candidate_limits,
+            database=database,
         )
         self._log_info("memory_recall_stage2", "candidates_found", {
             "facts": self._recall_log_candidate_items(fact_candidates),
@@ -5841,6 +5859,7 @@ class MemoryNodeManager:
         time_start: Optional[str],
         time_end: Optional[str],
         raw_candidate_limits: Dict[str, int],
+        database: Optional[SessionDB] = None,
     ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
         """Build separate raw candidate groups before type-specific ranking.
 
@@ -5848,10 +5867,11 @@ class MemoryNodeManager:
         path. Each candidate still points to its source row, so formatting and
         evidence hydration remain shared with the index-based implementation.
         """
+        db = database or self._db
         table_specs = (
-            ("memory_facts", "fact", self._db.search_memory_facts),
-            ("memory_states", "state", self._db.search_memory_states),
-            ("memory_actionable_items", "actionable_item", self._db.search_memory_actionable_items),
+            ("memory_facts", "fact", db.search_memory_facts),
+            ("memory_states", "state", db.search_memory_states),
+            ("memory_actionable_items", "actionable_item", db.search_memory_actionable_items),
         )
         rows_by_table: Dict[str, List[Dict[str, Any]]] = {}
         raw_limit_keys = {
@@ -5882,7 +5902,7 @@ class MemoryNodeManager:
                         evidence_ids.append(fact_id)
         evidence_by_id = {
             int(fact["id"]): fact
-            for fact in self._db.memory_facts_by_ids(evidence_ids)
+            for fact in db.memory_facts_by_ids(evidence_ids)
             if fact.get("id") is not None
         }
 

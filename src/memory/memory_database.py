@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
@@ -86,12 +87,66 @@ class SessionDB:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+        self._transaction_depth = 0
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._init_schema()
 
     def close(self) -> None:
         self._conn.close()
+
+    def open_reader(self) -> "SessionDB":
+        """Open a query-only connection without running schema initialization."""
+        reader = object.__new__(SessionDB)
+        reader.db_path = self.db_path
+        reader._conn = sqlite3.connect(
+            str(self.db_path),
+            check_same_thread=False,
+            timeout=5.0,
+        )
+        reader._conn.row_factory = sqlite3.Row
+        reader._transaction_depth = 0
+        reader._conn.execute("PRAGMA query_only=ON")
+        reader._conn.execute("PRAGMA foreign_keys=ON")
+        reader._conn.execute("PRAGMA busy_timeout=5000")
+        return reader
+
+    @contextmanager
+    def reader_transaction(self):
+        """Read one committed SQLite snapshot and close its connection."""
+        reader = self.open_reader()
+        try:
+            reader._conn.execute("BEGIN")
+            yield reader
+        finally:
+            try:
+                reader._conn.rollback()
+            finally:
+                reader.close()
+
+    @contextmanager
+    def transaction(self):
+        """Group database mutations into one commit or rollback boundary."""
+        is_outermost = self._transaction_depth == 0
+        if is_outermost:
+            self._conn.execute("BEGIN")
+        self._transaction_depth += 1
+        try:
+            yield self
+        except Exception:
+            self._transaction_depth -= 1
+            if is_outermost:
+                self._conn.rollback()
+            raise
+        else:
+            self._transaction_depth -= 1
+            if is_outermost:
+                self._conn.commit()
+
+    def _commit_if_needed(self) -> None:
+        """Commit standalone writes while deferring commits in a transaction."""
+        if self._transaction_depth == 0:
+            self._conn.commit()
 
     def _init_schema(self) -> None:
         self._conn.executescript(
@@ -230,7 +285,7 @@ class SessionDB:
         self._ensure_memory_states_entity_key_schema()
         self._ensure_memory_states_canonical_name_embedding_schema()
         self._init_index_fts()
-        self._conn.commit()
+        self._commit_if_needed()
 
     def _ensure_entity_ids_schema(self) -> None:
         """Ensure all primary memory tables expose direct entity id mappings."""
@@ -516,7 +571,7 @@ class SessionDB:
                 now,
             ),
         )
-        self._conn.commit()
+        self._commit_if_needed()
         return int(cur.lastrowid)
 
     def upsert_state(
@@ -593,7 +648,7 @@ class SessionDB:
                 """,
                 (*values, now, now),
             )
-        self._conn.commit()
+        self._commit_if_needed()
         row = self._conn.execute(
             """
             SELECT id FROM memory_states
@@ -666,7 +721,7 @@ class SessionDB:
                 now,
             ),
         )
-        self._conn.commit()
+        self._commit_if_needed()
         row = self._conn.execute(
             """
             SELECT id FROM memory_actionable_items
@@ -725,7 +780,7 @@ class SessionDB:
             """,
             (utc_now_text(), *ids),
         )
-        self._conn.commit()
+        self._commit_if_needed()
         return int(cur.rowcount or 0)
 
     def get_recent_memory_states(
@@ -830,7 +885,7 @@ class SessionDB:
                 now,
             ),
         )
-        self._conn.commit()
+        self._commit_if_needed()
         return int(cur.lastrowid)
 
     def upsert_index_entry(
@@ -905,7 +960,7 @@ class SessionDB:
                 now,
             ),
         )
-        self._conn.commit()
+        self._commit_if_needed()
         row = self._conn.execute(
             """
             SELECT id FROM memory_index_entries
@@ -925,7 +980,7 @@ class SessionDB:
                 participants=participants,
                 memory_path=memory_path,
             )
-        self._conn.commit()
+        self._commit_if_needed()
         return row_id
 
     def add_entity_names(self, names: Iterable[str]) -> Dict[str, int]:
@@ -940,7 +995,7 @@ class SessionDB:
                 "INSERT OR IGNORE INTO entity_nodes (name, type, created_at) VALUES (?, ?, ?)",
                 (clean, "OTHER", now),
             )
-        self._conn.commit()
+        self._commit_if_needed()
         if not normalized:
             return {}
         placeholders = ",".join("?" for _ in normalized)
