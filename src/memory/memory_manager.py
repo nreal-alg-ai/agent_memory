@@ -858,10 +858,16 @@ class MemoryNodeManager:
             episode_type=episode_type,
         )
 
-        save_episode_info = self._store_extracted_memory_episode_into_db(
+        save_entity_info = self._store_extracted_memory_entities_into_db(
             participants=episode_participants,
             raw_segments=raw_segments,
             facts=facts,
+            episode_summary=episode_summary,
+        )
+        save_episode_info = self._store_extracted_memory_episode_into_db(
+            participants=episode_participants,
+            raw_segments=raw_segments,
+            entity_info=save_entity_info,
             source_type=source_type,
             episode_type=episode_type,
             tags=tags,
@@ -877,7 +883,7 @@ class MemoryNodeManager:
             tags=tags,
             source_type=source_type,
             episode_context_topics=episode_canonical_topics,
-            episode_context_entities=save_episode_info["entity_names"],
+            entity_info=save_entity_info,
         )
         report = {
             "status": "ok",
@@ -898,7 +904,7 @@ class MemoryNodeManager:
         *,
         participants: List[str],
         raw_segments: List[Dict[str, Any]],
-        facts: List[Dict[str, Any]],
+        entity_info: Dict[str, int],
         source_type: str,
         episode_type: str,
         tags: List[str],
@@ -908,13 +914,12 @@ class MemoryNodeManager:
         started_at: str,
         ended_at: str,
     ) -> Dict[str, Any]:
-        episode_entity_names = self._episode_entity_names(
-            participants=participants,
-            segments=raw_segments,
-            facts=facts,
-            summary=episode_summary,
-        )
-        episode_entity_ids = self._entity_ids_for_names(episode_entity_names)
+        episode_entity_names = list(entity_info.keys())
+        episode_entity_ids = [
+            int(entity_id)
+            for entity_id in entity_info.values()
+            if str(entity_id).strip().isdigit()
+        ]
         episode_id = self._db.insert_episode(
             source_type=source_type,
             episode_type=episode_type,
@@ -949,9 +954,32 @@ class MemoryNodeManager:
             "participants": participants,
             "entity_names": episode_entity_names,
             "entity_ids": episode_entity_ids,
+            "entity_info": entity_info,
             "title": episode_title,
             "summary": episode_summary,
             "canonical_topics": canonical_topics,
+        }
+
+    def _store_extracted_memory_entities_into_db(
+        self,
+        *,
+        participants: List[str],
+        raw_segments: List[Dict[str, Any]],
+        facts: List[Dict[str, Any]],
+        episode_summary: str,
+    ) -> Dict[str, int]:
+        """Persist all episode entities once and return name-to-id mappings."""
+        entity_names = self._episode_entity_names(
+            participants=participants,
+            segments=raw_segments,
+            facts=facts,
+            summary=episode_summary,
+        )
+        mapping = self._db.add_entity_names(entity_names)
+        return {
+            str(entity_name): int(entity_id)
+            for entity_name, entity_id in mapping.items()
+            if str(entity_name).strip() and str(entity_id).strip().isdigit()
         }
 
     def _log_extracted_fact_info(
@@ -2036,9 +2064,15 @@ class MemoryNodeManager:
         tags: List[str],
         source_type: str,
         episode_context_topics: Optional[Sequence[str]] = None,
-        episode_context_entities: Optional[Sequence[str]] = None,
+        entity_info: Optional[Dict[str, int]] = None,
     ) -> Dict[str, Any]:
         fact_ids: List[int] = []
+        normalized_entity_info = {
+            str(entity_name): int(entity_id)
+            for entity_name, entity_id in (entity_info or {}).items()
+            if str(entity_name).strip() and str(entity_id).strip().isdigit()
+        }
+        episode_context_entities = list(normalized_entity_info.keys())
         for fact in facts:
             keywords = fact.get("keywords") or ""
             if isinstance(keywords, (list, tuple, set)):
@@ -2069,7 +2103,11 @@ class MemoryNodeManager:
             ])
             identity_text_embedding = self._generate_embedding_vector(identity_text)
             fact_entities = self._fact_entity_names(fact, entities=entities)
-            entity_ids = self._entity_ids_for_names(fact_entities)
+            entity_ids = [
+                normalized_entity_info[entity_name]
+                for entity_name in fact_entities
+                if entity_name in normalized_entity_info
+            ]
             fact_metadata = {
                 **metadata,
                 "tags": tags,
