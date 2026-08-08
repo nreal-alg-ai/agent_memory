@@ -471,7 +471,7 @@ class MemoryNodeManager:
             or self._memory_cfg.get("prompt_language_mode")
             or "source"
         )
-        self._enabled = bool(self._memory_cfg.get("memory_enabled", True))
+        self._memory_enabled = bool(self._memory_cfg.get("memory_enabled", True))
         self._top_k = int(self._memory_cfg.get("retrieval_top_k", 8) or 8)
         self._recall_budget = str(self._memory_cfg.get("recall_budget", "mid") or "mid")
         self._recall_fact_min_embedding_similarity = self._clamp_float(
@@ -639,7 +639,7 @@ class MemoryNodeManager:
 
     @property
     def enabled(self) -> bool:
-        return self._enabled
+        return self._memory_enabled
 
     def _task_worker_loop(self) -> None:
         while not self._task_shutdown_event.is_set() or not self._task_queue.empty():
@@ -787,8 +787,8 @@ class MemoryNodeManager:
         tags: List[str],
     ) -> Dict[str, Any]:
         """Queue one normalized episode for ordered background storage."""
-        if not self._enabled or not raw_segments:
-            reason = "memory_disabled" if not self._enabled else "no_raw_segments"
+        if not self._memory_enabled or not raw_segments:
+            reason = "memory_disabled" if not self._memory_enabled else "no_raw_segments"
             task_id = self._operation_reporter.next_task_id("memory_store")
             return self._reject_memory_task(
                 task_kind="memory_store",
@@ -1082,7 +1082,6 @@ class MemoryNodeManager:
             if prompt_language == "en"
             else UNIFIED_MEMORY_EXTRACTION_PROMPT_ZH
         )
-        topic_candidates = self._collect_long_term_topic_candidates(limit=60)
         memory_state_context = self._collect_memory_state_context(limit=12)
         prompt = (
             prompt_template
@@ -1098,6 +1097,8 @@ class MemoryNodeManager:
                 ),
             )
         )
+        topic_candidates = self._collect_long_term_topic_candidates(limit=60)
+        
         for attempt in range(2):
             result = self._call_llm(prompt)
             parsed = self._parse_json_object_from_llm_text(result or "")
@@ -2047,8 +2048,6 @@ class MemoryNodeManager:
             entities = self._normalize_entity_names(fact.get("entities"))
             raw_metadata = fact.get("metadata")
             metadata = dict(raw_metadata) if isinstance(raw_metadata, dict) else {}
-            metadata.pop("topic_context", None)
-            metadata.pop("topic_hierarchy", None)
             fallback_topics = self._topic_candidates(fact["summary"])
             fact_root_topic = self._normalize_topic_name(
                 fact.get("fact_root_topic")
@@ -2060,15 +2059,15 @@ class MemoryNodeManager:
                 fact.get("fact_aspect_topic")
                 or fact_root_topic
             ) or fact_root_topic
-            embedding_text = "\n".join([
-                fact["summary"],
+            identity_text = "\n".join([
+                f"summary: {_compact_whitespace(fact['summary'])}",
                 f"keywords: {keywords}",
                 f"entities: {', '.join(entities)}",
                 f"primary_entity: {(fact.get('primary_entity') or {}).get('name', '') if isinstance(fact.get('primary_entity'), dict) else ''}",
                 f"fact_root_topic: {fact_root_topic}",
                 f"fact_aspect_topic: {fact_aspect_topic}",
             ])
-            embedding = self._generate_embedding_vector(embedding_text)
+            identity_text_embedding = self._generate_embedding_vector(identity_text)
             fact_entities = self._fact_entity_names(fact, entities=entities)
             entity_ids = self._entity_ids_for_names(fact_entities)
             fact_metadata = {
@@ -2096,8 +2095,8 @@ class MemoryNodeManager:
                 confidence=fact["confidence"],
                 importance=fact["importance"],
                 metadata=fact_metadata,
-                embedding=embedding,
-                embedding_text=embedding_text,
+                identity_text_embedding=identity_text_embedding,
+                identity_text=identity_text,
             )
             # memory_path = f"{source_type}/facts/{fact['fact_subject']}/{fact['fact_kind']}"
             # summary_card = self._truncate_index_text(fact["summary"], max_chars=760)
@@ -2138,7 +2137,7 @@ class MemoryNodeManager:
 
     def submit_memory_reflect_task(self, *_, **kwargs: Any) -> Dict[str, Any]:
         """Queue reflection after all previously accepted memory tasks."""
-        if not self._enabled:
+        if not self._memory_enabled:
             task_id = self._operation_reporter.next_task_id("memory_reflect")
             return self._reject_memory_task(
                 task_kind="memory_reflect",
@@ -2170,10 +2169,6 @@ class MemoryNodeManager:
                 "fact_count": 0,
                 "limit": limit,
                 "reflect_timestamp": reflect_timestamp,
-                "total_elapsed_ms": round(
-                    (time.monotonic() - reflect_started_at) * 1000,
-                    2,
-                ),
             }
             self._log_info("memory_reflect", "finish", {
                 **facts_loaded_payload,
@@ -2184,7 +2179,10 @@ class MemoryNodeManager:
                 "topic_states_updated": 0,
                 "entity_states_updated": 0,
                 "actionable_items_updated": 0,
-                "total_elapsed_ms": facts_loaded_payload["total_elapsed_ms"],
+                "total_elapsed_ms": round(
+                    (time.monotonic() - reflect_started_at) * 1000,
+                    2,
+                ),
             }
         fact_ids = [
             int(fact["id"])
@@ -2380,10 +2378,6 @@ class MemoryNodeManager:
             }
             self._log_info("memory_reflect", "topic_state_update_finish", {
                 **report,
-                "elapsed_ms": round(
-                    (time.monotonic() - update_started_at) * 1000,
-                    2,
-                ),
             })
             return report
         existing_topic_states = [
@@ -5011,7 +5005,7 @@ class MemoryNodeManager:
     ) -> Dict[str, Any]:
         requested_recall_path = str(recall_path or "normal").strip().lower()
         started_at = time.monotonic()
-        if not self._enabled or not str(query or "").strip():
+        if not self._memory_enabled or not str(query or "").strip():
             recall_report = {
                 "memory_context": "",
                 "requested_recall_path": requested_recall_path,
@@ -5968,11 +5962,12 @@ class MemoryNodeManager:
                 else:
                     time_end_value = time_value
 
-                candidate_embedding = (
-                    row.get("identity_text_embedding")
-                    if table == "memory_states"
-                    else row.get("embedding")
-                )
+                if table == "memory_states":
+                    candidate_embedding = row.get("identity_text_embedding")
+                elif table == "memory_facts":
+                    candidate_embedding = row.get("identity_text_embedding")
+                else:
+                    candidate_embedding = row.get("embedding")
                 hydrated = dict(row)
                 hydrated.pop("embedding", None)
                 hydrated.pop("identity_text_embedding", None)
@@ -6068,7 +6063,7 @@ class MemoryNodeManager:
         summary = _compact_whitespace(fact.get("summary") or "")
         time_value = self._normalize_event_time_text(fact.get("time_key"))
         hydrated = dict(fact)
-        hydrated.pop("embedding", None)
+        hydrated.pop("identity_text_embedding", None)
         metadata = dict(fact.get("metadata") or {})
         metadata["_matched_via"] = [candidate_source]
         return {
@@ -6086,7 +6081,7 @@ class MemoryNodeManager:
             "time_end": time_value,
             "importance": fact.get("importance") or 0.5,
             "confidence": fact.get("confidence") or 0.8,
-            "embedding": fact.get("embedding"),
+            "embedding": fact.get("identity_text_embedding"),
             "metadata": metadata,
             "_hydrated": hydrated,
             "_supporting_facts": [],

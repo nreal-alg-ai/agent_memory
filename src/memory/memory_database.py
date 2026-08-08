@@ -130,8 +130,8 @@ class SessionDB:
                 importance REAL NOT NULL DEFAULT 0.5,
                 processed_for_memory_state INTEGER NOT NULL DEFAULT 0,
                 metadata TEXT NOT NULL DEFAULT '{}',
-                embedding BLOB,
-                embedding_text TEXT NOT NULL DEFAULT '',
+                identity_text_embedding BLOB,
+                identity_text TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 FOREIGN KEY(episode_id) REFERENCES memory_episodes(id) ON DELETE CASCADE
@@ -794,8 +794,8 @@ class SessionDB:
         confidence: float,
         importance: float,
         metadata: Optional[Dict[str, Any]],
-        embedding: Optional[np.ndarray],
-        embedding_text: str,
+        identity_text_embedding: Optional[np.ndarray],
+        identity_text: str,
     ) -> int:
         now = utc_now_text()
         cur = self._conn.execute(
@@ -804,7 +804,7 @@ class SessionDB:
                 episode_id, source_type, fact_type, fact_kind, fact_subject,
                 summary, keywords, entities, entity_ids, fact_root_topic,
                 fact_aspect_topic, time_key,
-                confidence, importance, metadata, embedding, embedding_text,
+                confidence, importance, metadata, identity_text_embedding, identity_text,
                 created_at, updated_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
@@ -824,8 +824,8 @@ class SessionDB:
                 float(confidence),
                 float(importance),
                 _json_dumps(metadata or {}),
-                _embedding_to_blob(embedding),
-                embedding_text,
+                _embedding_to_blob(identity_text_embedding),
+                identity_text,
                 now,
                 now,
             ),
@@ -1201,7 +1201,7 @@ class SessionDB:
             searchable_fields=(
                 "summary", "keywords", "entities", "entity_ids", "fact_root_topic",
                 "fact_aspect_topic", "fact_kind", "fact_subject",
-                "embedding_text", "metadata",
+                "identity_text", "metadata",
             ),
             time_field="time_key",
             terms=terms,
