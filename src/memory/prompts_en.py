@@ -105,9 +105,19 @@ Core Hindsight-style narrative fact requirements:
 - Each fact must naturally include the five dimensions in its text: what (complete event/topic/plan/conclusion), when (conversation timestamp or explicit time anchor), where (location/setting/platform/project scope; if absent, say no specific location/setting was mentioned), who (user, assistant, and other key people/organizations with their roles), and why (explicit reason, motivation, concern, disagreement, constraint, implication, conclusion, or follow-up).
 - For a roughly five-turn dialogue batch or a coherent multi-speaker transcript segment, usually produce 1-3 facts. Only split when the batch truly contains multiple unrelated events/topics. In most cases, do not exceed 5 facts.
 
+fact_type classification:
+- `semantic` is reusable stable knowledge or long-term information that does not depend on one particular experience, such as project structure, concept definitions, system conventions, common knowledge, a user's long-term preference, a persistent instruction, or a durable constraint. It describes what is generally true or remains valid across conversations.
+- `episodic` is a concrete experience or event that happened at a particular time, such as the user making a request in one turn, the assistant modifying or testing something, one failure or success, a decision made at a point in time, a state change, or an emotional reaction. It describes what happened on that occasion; it can still be episodic even when it concerns a long-running project.
+- The key test is whether the fact depends on one particular experience to be true, not whether its topic is long-running, important, or potentially useful later. One-off requests, recommendations, modifications, test results, decisions, and risk events are `episodic` by default. Use `semantic` only when the evidence supports knowledge or a pattern that is stable and reusable across contexts and time.
+- Do not label a fact `semantic` merely because its fact_kind is preference, risk, or decision. A preference expressed in one situation, a temporary risk, or a single decision remains `episodic`; a repeatedly observed or explicitly long-term preference, constraint, or instruction may be `semantic`.
+
 Temporal fidelity requirements:
 - Preserve sequence and ordering expressions exactly when they affect meaning: first, first time, second, previous, next, later, earlier, before, after, once, again, subsequent, prior, last, most recent, and similar wording. Do not paraphrase away order. For example, keep "serviced for the first time on March 15" rather than reducing it to "had a good service experience".
 - Preserve relative time expressions in text and keywords: yesterday, last Saturday, previous week, two months ago, about a month ago, mid-February, recently, shortly after, and similar phrases. If the expression is tied to a known Conversation timestamp, also write the resolved date or conservative date range into occurred_start/occurred_end.
+- `occurred_start` is the real-world start time or occurrence time of the event described by the fact; `occurred_end` is the real-world end time or upper bound of the event interval. They are not the dialogue-turn time, extraction time, or current system time.
+- For a point event, one-off action, or event whose duration cannot be established, fill only `occurred_start` and leave `occurred_end` as an empty string. Fill `occurred_end` only when the evidence clearly indicates a duration, ending, or upper bound.
+- Prefer explicit dates, times, weekdays, and relative time expressions from the evidence. Resolve a relative expression to an absolute date only when the Conversation timestamp makes the resolution unambiguous; otherwise do not guess, leave the time field empty, and set `time_confidence` to `unknown`. Never fabricate an event time from the current time.
+- If one fact contains multiple events with different time ranges, split them into separate facts instead of using one interval to hide unrelated events. Use both fields only for the start and end of the same event.
 - If an event's answerability depends on temporal order, the fact text must include both the event object and the time anchor or order marker. Do not store only the topic name.
 - If multiple events in the batch may later be compared by before/after/first/which happened earlier, either keep them in one narrative fact that explicitly states their relative order, or split them into separate complete facts with their own time anchors. Avoid keeping only one side of a comparison.
 - Personal events mentioned as side context remain important when they include time anchors or ordering words, such as purchases, service/maintenance, repairs, appointments, attendance, travel, meetings, tests, failures, and decisions.
@@ -121,13 +131,12 @@ Rules:
 6. Use only the dialogue evidence. Do not invent completion, intent, or reasons.
 7. Keep assistant recommendations that contain concrete future-answerable items inside the relevant exchange narrative, and include whether the user accepted, rejected, hesitated, or added constraints when supported.
 8. priority is 0-100. Keep only facts worth at least 60.
-9. fact_type must be semantic or episodic.
-10. fact_subject must be user, assistant, world, project, system, or other.
-11. fact_kind must be preference, decision, request, recommendation, action, commitment, open_question, risk, error, context, instruction, or other.
-12. Do not output short facts like "the user said X" or "the assistant suggested Y". If deleting the topic background, reason, disagreement, or conclusion would make the text a vague short note, add those details back; if the dialogue does not support them, omit the fact.
-13. Do not store assistant pleasantries, generic closings, or low-information encouragement as standalone facts, e.g. "hope this helps", "let me know if you have other questions", "okay", or "you're welcome", unless they explicitly change a decision, commitment, or next step.
-14. keywords must be short retrieval terms: entities, topics, symptoms, plans, constraints, decisions, and important time/order anchors. For time-sensitive facts, include the original or resolved time phrase such as "March 15 2023", "first service", "3/22", "last Saturday", or "two months ago". Do not put full sentences, pleasantries, filler, generic encouragement, or phrases like "hope this method helps you" into keywords.
-15. Return JSON only. No markdown.
+9. fact_type must be semantic or episodic, using the stable-knowledge/long-term-information versus one-specific-event boundary above.
+10. fact_kind must be preference, decision, request, recommendation, action, commitment, open_question, risk, error, context, instruction, or other.
+11. Do not output short facts like "the user said X" or "the assistant suggested Y". If deleting the topic background, reason, disagreement, or conclusion would make the text a vague short note, add those details back; if the dialogue does not support them, omit the fact.
+12. Do not store assistant pleasantries, generic closings, or low-information encouragement as standalone facts, e.g. "hope this helps", "let me know if you have other questions", "okay", or "you're welcome", unless they explicitly change a decision, commitment, or next step.
+13. keywords must be short retrieval terms: entities, topics, symptoms, plans, constraints, decisions, and important time/order anchors. For time-sensitive facts, include the original or resolved time phrase such as "March 15 2023", "first service", "3/22", "last Saturday", or "two months ago". Do not put full sentences, pleasantries, filler, generic encouragement, or phrases like "hope this method helps you" into keywords.
+14. Return JSON only. No markdown.
 
 state_aspects rules:
 - `fact_kind` remains the primary semantic type of the fact. `state_aspects` are projection slices showing how this fact can contribute to multiple entity_state types.
@@ -161,13 +170,12 @@ Output schema:
       "primary_entity": {"name": "the single primary entity of this fact", "type": "PERSON|ORGANIZATION|LOCATION|PRODUCT|PROJECT|TECHNOLOGY|CONCEPT|TOPIC|PREFERENCE|OTHER"},
       "fact_root_topic": "stable product/project/long-running issue root topic",
       "fact_aspect_topic": "specific aspect discussed by this fact",
-      "fact_type": "semantic|episodic",
-      "fact_subject": "user|assistant|world|project|system|other",
+      "fact_type": "semantic|episodic; semantic=reusable stable knowledge or long-term information, episodic=an event or state change tied to a specific experience",
       "fact_kind": "preference|decision|request|recommendation|action|commitment|open_question|risk|error|context|instruction|other",
       "priority": 80,
-      "occurred_start": "",
-      "occurred_end": "",
-      "time_confidence": "explicit|inferred_from_turn|unknown",
+      "occurred_start": "real-world event start time or point-event time; empty when it cannot be determined",
+      "occurred_end": "real-world event end time or interval upper bound; empty for point events",
+      "time_confidence": "explicit|inferred_from_turn|unknown; explicit evidence, inferred from the current conversation time, or undetermined",
       "where": "",
       "state_aspects": [
         {
@@ -408,7 +416,7 @@ RECALL_QUERY_ANALYSIS_PROMPT_EN = """You are the recall query analyzer for the A
 Understand the memory structure before analyzing the query. The default recall path does not use the shared `memory_index_entries` table as its retrieval entry point. It searches the following raw memory tables directly, so do not treat "index" as an additional unified document layer.
 
 Memory structure:
-1. `memory_facts` / fact: traceable, self-contained narrative facts extracted from one conversation episode or all-day transcript. They preserve what happened, participants, time, place or scene, reasons, viewpoint changes, suggestions, acceptance or rejection, constraints, conclusions, and unresolved questions. A fact may contain an explicitly stated preference, routine, profile detail, risk, or constraint, but it remains current conversational evidence rather than a cross-episode long-term summary. Facts usually include `fact_type`, `fact_kind`, `fact_subject`, `summary`, `keywords`, `entities`, `fact_root_topic`, `fact_aspect_topic`, and `time_key`.
+1. `memory_facts` / fact: traceable, self-contained narrative facts extracted from one conversation episode or all-day transcript. They preserve what happened, participants, time, place or scene, reasons, viewpoint changes, suggestions, acceptance or rejection, constraints, conclusions, and unresolved questions. A fact may contain an explicitly stated preference, routine, profile detail, risk, or constraint, but it remains current conversational evidence rather than a cross-episode long-term summary. Facts usually include `fact_type`, `fact_kind`, `primary_entity`, `summary`, `keywords`, `entities`, `fact_root_topic`, `fact_aspect_topic`, and `time_key`.
 2. `memory_states` / state: durable evolving projections updated from multiple facts, not raw dialogue quotations. It contains:
    - `topic_state`: the root state for a project, product, topic, or long-running issue, containing overall background, progress, decisions, constraints, risks, and unresolved issues; fine-grained aspects such as "livestream platform selection" or "gift plan" are stored as root-state context and retrieval aliases and do not necessarily become separate states.
    - `entity_state`: durable properties of an entity, including preference, routine, profile, relationship, constraint, and risk.

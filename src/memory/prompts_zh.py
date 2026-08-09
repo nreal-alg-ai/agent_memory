@@ -92,9 +92,7 @@ memory_states 使用规则：
 - `fact_root_topic` 只有在该 fact 的核心对象、讨论目标和语义范围都与 topic_state 的 canonical_name 相近时，才可以原样复用该名称；`fact_aspect_topic` 应保留该 fact 在根主题下的具体讨论方面。
 - 不要仅因为 fact 与某个 topic_state 同属“健康”“产品”“团队”等宽泛领域，或 fact 中出现了该 topic 的相关背景，就复用该名称。若当前证据不能支持这种严格对应，应使用当前证据中的更具体主题，必要时输出新的保守 topic。
 - 不能因为 entity_state 的名称、summary 或历史 timeline 而改变 fact 的 root_topic；entity_state 只能辅助理解，不得作为 topic 候选直接复用。
-- 每条 fact 必须额外输出一个 `primary_entity`，表示这条 fact 主要描述、影响或归属的唯一实体；它必须是一个实体对象，而不是数组。
-- `primary_entity` 必须来自当前 fact 的 `entities`，不能因为实体只是被提及、提供建议、作为地点/工具或背景，就把它选为主要实体。多人互动时，选择该 fact 主要描述或影响的主体；如果 fact 主要描述用户自身的偏好、习惯、约束或风险，选择用户。
-- `entities` 仍然保留所有与 fact 直接相关的实体，用于完整召回；后续 entity_state 匹配只使用 `primary_entity`，一条 fact 不得同时归属多个实体。
+- `entities` 保留所有与 fact 直接相关的实体，用于完整召回；`primary_entity` 表示这条 fact 主要描述、影响或归属的单一实体，必须来自 `entities`。对于用户自己的偏好、习惯、约束或风险，优先将 `user` 作为 primary_entity。
 
 """ + ENTITY_EXTRACTION_GUIDANCE_ZH + """
 
@@ -104,9 +102,19 @@ Hindsight 风格 narrative fact 的核心要求：
 - 每条 fact 必须在 text 中自然体现五维度信息：what（完整事件/议题/方案/结论）、when（对话时间或明确时间锚点）、where（地点/场景/平台/项目范围；未提及时说明未提及具体地点/场景）、who（用户、助手和其他关键人物/组织及其角色）、why（明确原因、动机、担忧、分歧、约束、影响、结论或后续安排）。
 - 对一个 5 轮左右的对话批次或一段多人转写片段，通常输出 1-3 条 facts；只有当批次中确实存在多个互不相关的事件/议题时才拆开。绝大多数情况下不要超过 5 条。
 
+fact_type 判别规则：
+- `semantic` 表示不依赖某一次具体经历也能复用的稳定知识或长期信息，例如项目结构、概念定义、系统约定、常识、用户长期偏好、长期指令或长期约束。它描述“通常是什么/长期怎样”，重点是跨多次对话仍成立的稳定认识。
+- `episodic` 表示某次具体发生过的经历或事件，例如用户在某轮提出请求、assistant 执行修改或测试、一次失败或通过、某个时间点的决定、状态变化或情绪反应。它描述“某次发生了什么”，即使事件涉及一个长期项目，也仍然可以是 episodic。
+- 判断核心是该 fact 是否依赖一次具体经历才能成立，而不是主题是否长期存在、内容是否重要，或是否可能影响未来。一次性的请求、建议、修改、测试结果、决定或风险事件默认标为 `episodic`；只有证据明确支持跨场景、跨时间可复用的稳定知识或长期模式时才标为 `semantic`。
+- 不要因为 fact 使用了“偏好”“风险”“决定”等 fact_kind 就自动标为 `semantic`：一次具体场景中的偏好表达、临时风险、单次决定仍应标为 `episodic`；反复出现或明确声明长期有效的偏好、约束、指令才可以标为 `semantic`。
+
 时间保真要求：
 - 必须保留影响语义的顺序词和先后关系：first、first time、second、previous、next、later、earlier、before、after、once、again、subsequent、prior、last、most recent，以及“第一次/首次/第二次/之前/之后/此前/随后/后来/更早/最近一次/上一次”等。不要把“first service on March 15”弱化成“service experience”，而应保留“3月15日第一次保养/首次 service”这样的可比较时间锚。
 - 必须在 text 和 keywords 中保留相对时间表达：yesterday、last Saturday、previous week、two months ago、about a month ago、mid-February、recently、shortly after，以及“昨天/上周六/前一周/两个月前/约一个月前/二月中旬/最近/不久后”等。如果它能根据 Conversation timestamp 无歧义换算，应在 occurred_start/occurred_end 写入补全后的日期或保守日期范围。
+- `occurred_start` 表示 fact 所描述事件在现实世界中的实际开始时间或发生时间；`occurred_end` 表示该事件的实际结束时间或区间上界。它们不是对话轮次时间、LLM 提炼时间或当前系统时间。
+- 单点事件、一次发生的动作或无法确认持续区间的事件，只填写 `occurred_start`，`occurred_end` 必须为空字符串；只有证据明确表示事件持续了一段时间或有结束/上界时才填写 `occurred_end`。
+- 优先输出证据中明确给出的日期、时间、星期或相对时间。相对时间只有在结合 Conversation timestamp 可以无歧义换算时才转换为绝对日期；无法判断时不要猜测，留空并将 `time_confidence` 设为 `unknown`。不要用当前时间补造事件时间。
+- 如果同一 fact 包含多个时间不同的事件，按语义拆分 facts，避免用一个开始/结束区间掩盖互不相关的事件；如果只是同一事件的起止过程，则分别填写 start 和 end。
 - 如果未来问题的答案依赖事件先后、间隔、第一次/上一次或“哪个更早”，fact text 必须同时包含事件对象和时间锚/顺序词，不能只存主题名。
 - 如果同一批证据中多个事件可能被未来问题比较先后，应在一条 narrative fact 中明确写出相对顺序，或拆成多条各自带完整背景和时间锚的 facts；不要只保留比较中的一方。
 - 带时间锚或顺序词的个人经历即使只是顺带提到，也应认真保留，例如购买、保养/维修、修理、预约、参加活动、旅行、会议、测试、失败、决定等。
@@ -120,13 +128,12 @@ Hindsight 风格 narrative fact 的核心要求：
 6. 只使用输入证据，不要编造完成状态、意图或原因。
 7. 如果 assistant 的推荐中包含未来可能被问到的具体条目，要放入相关 exchange 的 narrative fact，并写清用户是否接受、拒绝、犹豫或提出约束。
 8. priority 为 0-100，只保留至少 60 分的事实。
-9. fact_type 只能是 semantic 或 episodic。
-10. fact_subject 只能是 user、assistant、world、project、system、other。
-11. fact_kind 只能是 preference、decision、request、recommendation、action、commitment、open_question、risk、error、context、instruction、other。
-12. 不要输出只有“用户说了 X”“助手建议 Y”的短 fact；如果删除议题背景、理由、分歧或结论后会变成泛泛短句，必须补回这些信息；若对话没有足够信息支撑，则不要输出该 fact。
-13. 不要把 assistant 的寒暄、礼貌收尾、泛化鼓励或无具体信息的回复单独作为 fact，例如“希望这个方法能帮到您”“有其他问题可以继续沟通”“好的”“不客气”等；除非它明确改变了用户决定、承诺或下一步。
-14. keywords 只能包含用于检索的短实体、主题、症状、方案、约束、决定和关键时间/顺序锚，通常每个关键词 2-8 个汉字或一个短英文短语；对带时间锚的事件，必须加入原始或补全后的时间词，例如“March 15 2023”“first service”“3/22”“last Saturday”“two months ago”“上周六”“两个月前”。不要把完整句子、寒暄、礼貌话、语气词、泛化表达或“希望这个方法能帮到您”这类文本放入 keywords。
-15. 只返回 JSON，不要 markdown。
+9. fact_type 只能是 semantic 或 episodic，并严格按照上面的稳定知识/长期信息与单次事件边界判断。
+10. fact_kind 只能是 preference、decision、request、recommendation、action、commitment、open_question、risk、error、context、instruction、other。
+11. 不要输出只有“用户说了 X”“助手建议 Y”的短 fact；如果删除议题背景、理由、分歧或结论后会变成泛泛短句，必须补回这些信息；若对话没有足够信息支撑，则不要输出该 fact。
+12. 不要把 assistant 的寒暄、礼貌收尾、泛化鼓励或无具体信息的回复单独作为 fact，例如“希望这个方法能帮到您”“有其他问题可以继续沟通”“好的”“不客气”等；除非它明确改变了用户决定、承诺或下一步。
+13. keywords 只能包含用于检索的短实体、主题、症状、方案、约束、决定和关键时间/顺序锚，通常每个关键词 2-8 个汉字或一个短英文短语；对带时间锚的事件，必须加入原始或补全后的时间词，例如“March 15 2023”“first service”“3/22”“last Saturday”“two months ago”“上周六”“两个月前”。不要把完整句子、寒暄、礼貌话、语气词、泛化表达或“希望这个方法能帮到您”这类文本放入 keywords。
+14. 只返回 JSON，不要 markdown。
 
 state_aspects 输出规则：
 - `fact_kind` 仍然是这条 fact 的主语义类型；`state_aspects` 是这条 fact 对 entity_state 的多个长期状态投影切片。
@@ -157,16 +164,15 @@ actionable_aspects 输出规则：
       "text": "覆盖完整 exchange 的自包含 narrative fact，在一段文本中体现 what/when/where/who/why，包含背景、用户/助手观点或动作流动、理由/分歧/约束/结论/下一步",
       "keywords": ["关键词1", "关键词2"],
       "entities": [{"name": "实体名", "type": "PERSON|ORGANIZATION|LOCATION|PRODUCT|PROJECT|TECHNOLOGY|CONCEPT|TOPIC|PREFERENCE|OTHER"}],
-      "primary_entity": {"name": "该 fact 的唯一主要实体", "type": "PERSON|ORGANIZATION|LOCATION|PRODUCT|PROJECT|TECHNOLOGY|CONCEPT|TOPIC|PREFERENCE|OTHER"},
+      "primary_entity": {"name": "这条 fact 主要描述、影响或归属的单一实体", "type": "PERSON|ORGANIZATION|LOCATION|PRODUCT|PROJECT|TECHNOLOGY|CONCEPT|TOPIC|PREFERENCE|OTHER"},
       "fact_root_topic": "稳定的产品/项目/长期议题根主题",
       "fact_aspect_topic": "当前 fact 讨论的具体方面",
-      "fact_type": "semantic|episodic",
-      "fact_subject": "user|assistant|world|project|system|other",
+      "fact_type": "semantic|episodic；semantic=可跨多次对话复用的稳定知识或长期信息，episodic=依赖某次具体经历的事件或状态变化",
       "fact_kind": "preference|decision|request|recommendation|action|commitment|open_question|risk|error|context|instruction|other",
       "priority": 80,
-      "occurred_start": "",
-      "occurred_end": "",
-      "time_confidence": "explicit|inferred_from_turn|unknown",
+      "occurred_start": "事件实际开始时间或单点发生时间；无法判断时为空字符串",
+      "occurred_end": "事件实际结束时间或区间上界；单点事件为空字符串",
+      "time_confidence": "explicit|inferred_from_turn|unknown；分别表示证据明确给出、根据当前对话时间推断、无法判断",
       "where": "",
       "state_aspects": [
         {
@@ -398,7 +404,7 @@ RECALL_QUERY_ANALYSIS_PROMPT_ZH = """你是 AI 眼镜长期记忆系统中的 re
 请先理解当前记忆结构，再分析用户查询应该优先检索哪些记忆层。当前默认 recall 路径不使用共享的 memory_index_entries 表作为检索入口，而是直接检索以下三类原始记忆表；因此不要把“index”理解为一个额外的统一文档层。
 
 记忆结构：
-1. `memory_facts` / fact：从一次 episode 的对话或全天候转写中提炼出的、可追溯且自包含的 narrative fact。它保留具体发生了什么、谁参与、时间、地点/场景、原因、观点变化、建议、接受/拒绝、约束、结论和未解决问题等证据。fact 可能是一次事件、一次讨论结论，也可能是用户明确表达的偏好、习惯、画像、风险或约束；但它仍然是当前对话证据，不等于跨多次对话融合后的长期状态。fact 通常带有 `fact_type`、`fact_kind`、`fact_subject`、`summary`、`keywords`、`entities`、`fact_root_topic`、`fact_aspect_topic` 和 `time_key`。
+1. `memory_facts` / fact：从一次 episode 的对话或全天候转写中提炼出的、可追溯且自包含的 narrative fact。它保留具体发生了什么、谁参与、时间、地点/场景、原因、观点变化、建议、接受/拒绝、约束、结论和未解决问题等证据。fact 可能是一次事件、一次讨论结论，也可能是用户明确表达的偏好、习惯、画像、风险或约束；但它仍然是当前对话证据，不等于跨多次对话融合后的长期状态。fact 通常带有 `fact_type`、`fact_kind`、`primary_entity`、`summary`、`keywords`、`entities`、`fact_root_topic`、`fact_aspect_topic` 和 `time_key`。
 2. `memory_states` / state：由多个 facts 反思更新出的长期演化状态，不是原始对话引用。它包含两类投影：
    - `topic_state`：某个项目、产品、主题或长期议题的根状态，保存整体背景、进展、决定、约束、风险和未解决问题；细粒度的 aspect（例如“直播平台选择”“赠品方案”）作为根状态的上下文和检索别名，不一定单独形成 state。
    - `entity_state`：某个实体的长期属性，包括 preference（偏好）、routine（习惯/流程）、profile（画像/背景）、relationship（关系）、constraint（约束）和 risk（风险）。

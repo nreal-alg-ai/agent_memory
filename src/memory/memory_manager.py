@@ -1014,9 +1014,7 @@ class MemoryNodeManager:
                     "fact_index": index,
                     "fact_count": len(facts),
                     "summary": fact.get("summary") or "",
-                    "source_text": fact.get("source_text") or "",
                     "fact_type": fact.get("fact_type"),
-                    "fact_subject": fact.get("fact_subject"),
                     "fact_kind": fact.get("fact_kind"),
                     "time_key": fact.get("time_key"),
                     "keywords": fact.get("keywords") or "",
@@ -1262,11 +1260,6 @@ class MemoryNodeManager:
             priority = self._normalize_priority(raw_fact.get("priority", 70))
             if priority < 60:
                 continue
-            fact_subject = self._normalize_fact_subject(raw_fact.get("fact_subject"))
-            if fact_subject == "assistant" and self._is_low_value_assistant_closing(text):
-                continue
-            if fact_subject == "user" and self._is_low_value_user_acknowledgement(text):
-                continue
             keywords = self._normalize_string_list(raw_fact.get("keywords"), limit=18)
             if not keywords:
                 keywords = self._keywords(text, limit=18)
@@ -1276,12 +1269,20 @@ class MemoryNodeManager:
             primary_entity = self._normalize_primary_entity(
                 raw_fact.get("primary_entity"),
                 entities=entities,
-                fact_subject=fact_subject,
             )
             if primary_entity:
                 primary_entity_name = primary_entity["name"]
                 if primary_entity_name not in entities:
                     entities = [primary_entity_name, *entities]
+            primary_entity_name = _compact_whitespace(
+                (primary_entity or {}).get("name") or ""
+            ).lower()
+            if primary_entity_name in {"assistant", "agent", "the assistant", "助手"} \
+                    and self._is_low_value_assistant_closing(text):
+                continue
+            if primary_entity_name in {"user", "the user", "用户"} \
+                    and self._is_low_value_user_acknowledgement(text):
+                continue
             fact_topic_fallback = " ".join(keywords[:3]) if keywords else "general"
             fact_root_topic, fact_aspect_topic = self._normalize_fact_topic_fields(
                 raw_fact.get("fact_root_topic"),
@@ -1296,13 +1297,15 @@ class MemoryNodeManager:
             actionable_aspects = self._normalize_actionable_aspects(
                 raw_fact.get("actionable_aspects"),
             )
+            time_key = f"{fallback_timestamp}#llm:{index:02d}"
+            occurred_start = _compact_whitespace(raw_fact.get("occurred_start") or "")
+            if not occurred_start:
+                occurred_start = time_key
             facts.append({
                 "summary": text,
-                "source_text": text,
-                "fact_subject": fact_subject,
                 "fact_kind": self._normalize_fact_kind(raw_fact.get("fact_kind")),
                 "fact_type": self._normalize_fact_type(raw_fact.get("fact_type")),
-                "time_key": f"{fallback_timestamp}#llm:{index:02d}",
+                "time_key": time_key,
                 "keywords": " ".join(keywords),
                 "entities": entities,
                 "primary_entity": primary_entity,
@@ -1315,11 +1318,10 @@ class MemoryNodeManager:
                 "metadata": {
                     "extractor": "llm",
                     "priority": priority,
-                    "occurred_start": _compact_whitespace(raw_fact.get("occurred_start") or ""),
+                    "occurred_start": occurred_start,
                     "occurred_end": _compact_whitespace(raw_fact.get("occurred_end") or ""),
                     "time_confidence": _compact_whitespace(raw_fact.get("time_confidence") or "unknown"),
                     "where": _compact_whitespace(raw_fact.get("where") or ""),
-                    "primary_entity": primary_entity,
                 },
             })
         return {
@@ -2111,7 +2113,6 @@ class MemoryNodeManager:
             fact_metadata = {
                 **metadata,
                 "tags": tags,
-                "source_text": fact["source_text"],
                 "state_aspects": fact.get("state_aspects") or [],
                 "actionable_aspects": fact.get("actionable_aspects") or [],
                 "episode_context_topics": list(episode_context_topics or []),
@@ -2122,7 +2123,6 @@ class MemoryNodeManager:
                 source_type=source_type,
                 fact_type=fact["fact_type"],
                 fact_kind=fact["fact_kind"],
-                fact_subject=fact["fact_subject"],
                 summary=fact["summary"],
                 keywords=keywords,
                 entities=entities,
@@ -2136,7 +2136,7 @@ class MemoryNodeManager:
                 identity_text_embedding=identity_text_embedding,
                 identity_text=identity_text,
             )
-            # memory_path = f"{source_type}/facts/{fact['fact_subject']}/{fact['fact_kind']}"
+            # memory_path = f"{source_type}/facts/{fact['fact_kind']}"
             # summary_card = self._truncate_index_text(fact["summary"], max_chars=760)
             # index_embedding_text = self._build_index_embedding_text(
             #     title=fact["summary"][:96],
@@ -3502,12 +3502,11 @@ class MemoryNodeManager:
             "source_type": fact.get("source_type"),
             "fact_type": fact.get("fact_type"),
             "fact_kind": fact.get("fact_kind"),
-            "fact_subject": fact.get("fact_subject"),
             "time_key": fact.get("time_key"),
             "summary": self._log_text(fact.get("summary") or "", limit=1200),
             "keywords": fact.get("keywords"),
             "entities": fact.get("entities") or [],
-            "primary_entity": fact.get("primary_entity") or metadata.get("primary_entity"),
+            "primary_entity": fact.get("primary_entity"),
             "fact_root_topic": fact.get("fact_root_topic") or "",
             "fact_aspect_topic": fact.get("fact_aspect_topic") or "",
             "state_aspects": fact.get("state_aspects") or metadata.get("state_aspects") or [],
@@ -3620,7 +3619,7 @@ class MemoryNodeManager:
     def _state_aspects_from_fact(self, fact: Dict[str, Any]) -> List[Dict[str, Any]]:
         metadata = fact.get("metadata") if isinstance(fact.get("metadata"), dict) else {}
         raw = fact.get("state_aspects") or metadata.get("state_aspects")
-        fallback_entity = fact.get("primary_entity") or metadata.get("primary_entity")
+        fallback_entity = fact.get("primary_entity")
         return self._normalize_state_aspects(raw, fallback_entity=fallback_entity)
 
     def _entities_for_state_aspect(
@@ -3647,7 +3646,7 @@ class MemoryNodeManager:
         fact: Dict[str, Any],
     ) -> List[str]:
         metadata = fact.get("metadata") if isinstance(fact.get("metadata"), dict) else {}
-        primary_entity = fact.get("primary_entity") or metadata.get("primary_entity")
+        primary_entity = fact.get("primary_entity")
         if isinstance(primary_entity, dict):
             primary_name = _compact_whitespace(
                 primary_entity.get("name") or primary_entity.get("text") or ""
@@ -3667,12 +3666,7 @@ class MemoryNodeManager:
             for value in (fact.get("entities") or [])
             if _compact_whitespace(value)
         ]
-        subject = str(fact.get("fact_subject") or "").strip().lower()
-        if subject in {"user", "assistant"}:
-            # A fact without an explicit primary_entity still belongs to one
-            # speaker; never fan it out to every mentioned entity.
-            return [subject]
-        if not entities and subject in {"project", "world", "other"}:
+        if not entities:
             entities.extend(self._fact_topic_names(fact))
         out: List[str] = []
         seen: set[str] = set()
@@ -4094,7 +4088,6 @@ class MemoryNodeManager:
                 identity_text,
                 f"parent_topics: {', '.join(state_metadata.get('parent_topics') or [])}",
                 f"aspects: {', '.join(state_metadata.get('aspect_topic_names') or [])}",
-                f"context_entities: {', '.join(state_metadata.get('context_entities') or [])}",
             ])
         identity_text_embedding = self._generate_embedding_vector(identity_text)
         canonical_name_embedding = self._generate_embedding_vector(state["canonical_name"])
@@ -4310,11 +4303,8 @@ class MemoryNodeManager:
     def _fact_can_seed_actionable_item(self, fact: Dict[str, Any]) -> bool:
         kind = str(fact.get("fact_kind") or "").strip().lower()
         fact_type = str(fact.get("fact_type") or "").strip().lower()
-        subject = str(fact.get("fact_subject") or "").strip().lower()
         summary = str(fact.get("summary") or "")
-        metadata = fact.get("metadata") if isinstance(fact.get("metadata"), dict) else {}
-        source_text = str(metadata.get("source_text") or fact.get("source_text") or "")
-        all_text = f"{summary}\n{source_text}".lower()
+        all_text = f"{summary}".lower()
         if not summary:
             return False
         if any(pattern in all_text for pattern in _WEAK_TRY_PATTERNS):
@@ -4328,7 +4318,15 @@ class MemoryNodeManager:
             return self._has_strong_decision_marker(all_text)
         if kind == "risk":
             return self._has_blocking_marker(all_text)
-        if kind == "instruction" and subject in {"user", "assistant", "system"}:
+        primary_entity = fact.get("primary_entity")
+        primary_entity_name = (
+            primary_entity.get("name")
+            if isinstance(primary_entity, dict)
+            else primary_entity
+        )
+        if kind == "instruction" and str(primary_entity_name or "").strip().lower() in {
+            "user", "the user", "用户", "assistant", "the assistant", "助手", "system", "系统",
+        }:
             return True
         if kind == "action" and fact_type == "episodic":
             return self._has_explicit_followup_or_commitment(all_text, item_type="task")
@@ -4567,12 +4565,11 @@ class MemoryNodeManager:
                 "source_type": fact.get("source_type"),
                 "fact_type": fact.get("fact_type"),
                 "fact_kind": fact.get("fact_kind"),
-                "fact_subject": fact.get("fact_subject"),
                 "time_key": fact.get("time_key"),
                 "summary": fact.get("summary"),
                 "keywords": fact.get("keywords"),
                 "entities": fact.get("entities") or [],
-                "primary_entity": fact.get("primary_entity") or metadata.get("primary_entity"),
+                "primary_entity": fact.get("primary_entity"),
                 "fact_root_topic": fact.get("fact_root_topic") or "",
                 "fact_aspect_topic": fact.get("fact_aspect_topic") or "",
             })
@@ -4588,12 +4585,11 @@ class MemoryNodeManager:
                 "source_type": fact.get("source_type"),
                 "fact_type": fact.get("fact_type"),
                 "fact_kind": fact.get("fact_kind"),
-                "fact_subject": fact.get("fact_subject"),
                 "time_key": fact.get("time_key"),
                 "summary": fact.get("summary"),
                 "keywords": fact.get("keywords"),
                 "entities": fact.get("entities") or [],
-                "primary_entity": fact.get("primary_entity") or metadata.get("primary_entity"),
+                "primary_entity": fact.get("primary_entity"),
                 "fact_root_topic": fact.get("fact_root_topic") or "",
                 "fact_aspect_topic": fact.get("fact_aspect_topic") or "",
                 "actionable_aspects": actionable_aspects,
@@ -5530,7 +5526,6 @@ class MemoryNodeManager:
             ])
             entity_values.extend([
                 *(raw.get("entities") or []),
-                metadata.get("primary_entity"),
                 *(metadata.get("episode_context_entities") or []),
             ])
         elif index_level == "actionable_item":
@@ -6178,7 +6173,7 @@ class MemoryNodeManager:
                     entry.get("keywords"), entry.get("entities"),
                     raw.get("fact_root_topic"), raw.get("fact_aspect_topic"),
                     raw.get("fact_kind"),
-                    raw.get("fact_subject"), raw.get("fact_type"), raw.get("time_key"),
+                    raw.get("fact_type"), raw.get("time_key"),
                 )
             elif memory_type == "state":
                 fields = (
@@ -6881,12 +6876,6 @@ class MemoryNodeManager:
         return text if text in {"semantic", "episodic"} else "episodic"
 
     @staticmethod
-    def _normalize_fact_subject(value: Any) -> str:
-        text = str(value or "other").strip().lower()
-        allowed = {"user", "assistant", "world", "project", "system", "other"}
-        return text if text in allowed else "other"
-
-    @staticmethod
     def _normalize_fact_kind(value: Any) -> str:
         text = str(value or "context").strip().lower()
         allowed = {
@@ -7010,7 +6999,6 @@ class MemoryNodeManager:
         value: Any,
         *,
         entities: Sequence[str],
-        fact_subject: str,
     ) -> Optional[Dict[str, str]]:
         """Normalize the single entity used for entity-state assignment."""
         name = ""
@@ -7021,11 +7009,7 @@ class MemoryNodeManager:
         else:
             name = _compact_whitespace(value)
         if not name:
-            subject = str(fact_subject or "").strip().lower()
-            if subject in {"user", "assistant"}:
-                name = subject
-                entity_type = "PERSON"
-            elif entities:
+            if entities:
                 name = _compact_whitespace(entities[0])
         if not name:
             return None

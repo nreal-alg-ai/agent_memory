@@ -173,7 +173,6 @@ class SessionDB:
                 source_type TEXT NOT NULL DEFAULT 'assistant_wakeup',
                 fact_type TEXT NOT NULL DEFAULT 'episodic',
                 fact_kind TEXT NOT NULL DEFAULT 'context',
-                fact_subject TEXT NOT NULL DEFAULT 'user',
                 summary TEXT NOT NULL,
                 keywords TEXT NOT NULL DEFAULT '',
                 entities TEXT NOT NULL DEFAULT '[]',
@@ -546,7 +545,6 @@ class SessionDB:
     ) -> int:
         now = utc_now_text()
         episode_metadata = dict(metadata or {})
-        episode_metadata.pop("canonical_topics", None)
         normalized_topics = list(canonical_topics or [])
         cur = self._conn.execute(
             """
@@ -838,7 +836,6 @@ class SessionDB:
         source_type: str,
         fact_type: str,
         fact_kind: str,
-        fact_subject: str,
         summary: str,
         keywords: str,
         entities: Sequence[str],
@@ -856,19 +853,18 @@ class SessionDB:
         cur = self._conn.execute(
             """
             INSERT INTO memory_facts (
-                episode_id, source_type, fact_type, fact_kind, fact_subject,
+                episode_id, source_type, fact_type, fact_kind,
                 summary, keywords, entities, entity_ids, fact_root_topic,
                 fact_aspect_topic, time_key,
                 confidence, importance, metadata, identity_text_embedding, identity_text,
                 created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 episode_id,
                 source_type,
                 fact_type,
                 fact_kind,
-                fact_subject,
                 summary,
                 keywords,
                 _json_dumps(list(entities or [])),
@@ -1255,7 +1251,7 @@ class SessionDB:
             table="memory_facts",
             searchable_fields=(
                 "summary", "keywords", "entities", "entity_ids", "fact_root_topic",
-                "fact_aspect_topic", "fact_kind", "fact_subject",
+                "fact_aspect_topic", "fact_kind",
                 "identity_text", "metadata",
             ),
             time_field="time_key",
