@@ -97,10 +97,14 @@ class AgentMemoryAdmin:
                     ).fetchall()
                 ]
                 for index_id in index_ids:
-                    self._conn.execute(
-                        "DELETE FROM memory_index_entries_fts WHERE rowid = ?",
-                        (index_id,),
-                    )
+                    try:
+                        self._conn.execute(
+                            "DELETE FROM memory_index_entries_fts WHERE rowid = ?",
+                            (index_id,),
+                        )
+                    except sqlite3.Error:
+                        # 无 FTS5 的嵌入式 SQLite（如 Chaquopy）没有该表，忽略即可
+                        pass
                 deleted_indexes = self._conn.execute(
                     "DELETE FROM memory_index_entries"
                     " WHERE target_table = 'memory_facts' AND target_id = ?",
@@ -134,6 +138,10 @@ class AgentMemoryAdmin:
         result: List[Dict[str, Any]] = []
         for row in rows:
             item = dict(row)
+            for key in list(item.keys()):
+                if isinstance(item[key], (bytes, bytearray)):
+                    # 向量 BLOB 无法 JSON 序列化，面板展示不需要，直接剔除
+                    del item[key]
             for key in (
                 "entities",
                 "entity_ids",

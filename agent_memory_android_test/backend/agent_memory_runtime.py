@@ -24,17 +24,26 @@ class AgentMemoryRuntime:
         from memory.memory_runtime import MemoryRuntime
 
         self._db_path = str(db_path)
-        self._db = SessionDB(db_path=self._db_path)
-        self._manager = MemoryNodeManager(
-            self._db,
-            embedding_config=dict(embedding_config or {}),
-            memory_manager_config=dict(memory_manager_config or {}),
-            llm_config=dict(llm_config or {}),
-        )
-        self._runtime = MemoryRuntime(
-            self._manager,
-            memory_runtime_config=dict(memory_runtime_config or {}),
-        )
+        self._db = None
+        try:
+            self._db = SessionDB(db_path=self._db_path)
+            self._manager = MemoryNodeManager(
+                self._db,
+                embedding_config=dict(embedding_config or {}),
+                memory_manager_config=dict(memory_manager_config or {}),
+                llm_config=dict(llm_config or {}),
+            )
+            self._runtime = MemoryRuntime(
+                self._manager,
+                memory_runtime_config=dict(memory_runtime_config or {}),
+            )
+        except Exception:
+            if self._db is not None:
+                try:
+                    self._db.close()
+                except Exception:
+                    pass
+            raise
         self._lock = threading.RLock()
         self._closed = False
 
