@@ -66,7 +66,14 @@
         <section class="ambient-bar" aria-label="收音待机">
           <div>
             <strong id="ambient-mode-label">收音待机未启动</strong>
+            <span id="ambient-phase-text" class="ambient-phase-text">等待开启</span>
             <p id="ambient-status">准备开始收音；原始 PCM 不持久化。</p>
+            <div class="ambient-meter-row">
+              <div id="ambient-level" class="ambient-level" aria-hidden="true">
+                <span id="ambient-level-fill" class="ambient-level-fill"></span>
+              </div>
+              <span id="ambient-vad-count" class="ambient-vad-count">VAD 语句 0</span>
+            </div>
           </div>
           <div class="ambient-actions">
             <button id="ambient-standby-toggle" class="ghost" type="button" data-tooltip="开启或停止全天收音待机">开启全天待机</button>

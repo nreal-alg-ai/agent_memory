@@ -13,16 +13,30 @@ const state = {
   lastDebug: null,
   enrollment: { sessionId: "", running: false },
   surfaces: { memory: false, debug: false, settings: false },
+  fast: {
+    previousInteraction: "",
+    ackBaselineSet: false,
+    renderedFinalQuerySeq: 0,
+    renderedQueryEventIds: new Set(),
+    interimNode: null,
+  },
 };
 
 const messagesEl = document.getElementById("messages");
 const voiceStatusEl = document.getElementById("voice-status");
 const ambientModeEl = document.getElementById("ambient-mode-label");
 const ambientStatusEl = document.getElementById("ambient-status");
+const ambientPhaseEl = document.getElementById("ambient-phase-text");
+const ambientLevelFillEl = document.getElementById("ambient-level-fill");
+const ambientVadCountEl = document.getElementById("ambient-vad-count");
 const memoryListEl = document.getElementById("memory-list");
 const debugOutputEl = document.getElementById("debug-output");
 const toastEl = document.getElementById("toast");
 const tooltipEl = document.getElementById("button-tooltip");
+
+const WAKE_WORD = "你好小忆";
+const WAKE_ACK_TEXT = "我在，请说";
+const FAST_POLL_MS = 250;
 
 const ENROLL_PHRASES = [
   "你好小忆，现在开始录入我的声音。",
@@ -71,7 +85,8 @@ function appendMessage(role, text) {
   node.className = `message ${role}`;
   const avatar = document.createElement("div");
   avatar.className = "avatar";
-  avatar.textContent = role === "user" ? "你" : role === "assistant" ? "忆" : "!";
+  const isUser = role === "user" || role.startsWith("user ");
+  avatar.textContent = isUser ? "你" : role === "assistant" ? "忆" : "!";
   const bubble = document.createElement("div");
   bubble.className = "bubble";
   bubble.textContent = text;
@@ -134,7 +149,10 @@ function pollCompletedReplies() {
   const replies = callBridge("consumeCompletedReplies");
   if (!Array.isArray(replies) || replies.length === 0) return;
   for (const item of replies) {
-    if (item.query) appendMessage("user", item.query);
+    const eventId = String(item.event_id || "");
+    if (item.query && !state.fast.renderedQueryEventIds.has(eventId)) {
+      appendMessage("user", item.query);
+    }
     if (item.reply) {
       appendMessage("assistant", item.reply);
       speak(item.reply);
@@ -155,7 +173,6 @@ function applyAudioStatus(status) {
     : "未确认";
   const labels = [
     `收音=${deviceLabel}`,
-    `VAD片段=${Number(status.vad_segment_count || 0)}`,
     `ambient final=${Number(status.ambient_final_count || 0)}`,
     `拒绝=${Number(status.speech_rejected_count || 0)}`,
     `模型=${modelState}`,
@@ -180,6 +197,105 @@ async function syncAudioStatus() {
   if (!isNative()) return;
   const status = callBridge("audioStatus");
   if (status) applyAudioStatus(status);
+}
+
+function ambientPhaseFromStatus(status) {
+  const interaction = String(status.interaction_state || "");
+  if (interaction === "wake_detected") {
+    return { phase: "wake", text: "已听到唤醒词，正在回应…" };
+  }
+  if (interaction === "acknowledging") {
+    return { phase: "wake", text: "回应中，请说出您的问题…" };
+  }
+  if (interaction === "waiting_query") {
+    return { phase: "query", text: "请说出您的问题…" };
+  }
+  if (interaction === "query_listening") {
+    return { phase: "query", text: "正在听您的问题…" };
+  }
+  if (interaction === "query_submitted") {
+    return { phase: "processing", text: "正在处理您的问题…" };
+  }
+  return { phase: "active", text: `待机中，说“${WAKE_WORD}”发起问答` };
+}
+
+function renderInterimBubble(text) {
+  if (!text) {
+    if (state.fast.interimNode) {
+      state.fast.interimNode.remove();
+      state.fast.interimNode = null;
+    }
+    return;
+  }
+  if (!state.fast.interimNode) {
+    const node = appendMessage("user interim", `${text}▍`);
+    node.classList.add("interim");
+    state.fast.interimNode = node;
+  } else {
+    const bubble = state.fast.interimNode.querySelector(".bubble");
+    if (bubble) bubble.textContent = `${text}▍`;
+  }
+}
+
+function renderFinalQuery(status) {
+  const sequence = Number(status.final_query_sequence || 0);
+  const eventId = String(status.final_query_event_id || "");
+  const text = String(status.final_query || "").trim();
+  if (!eventId || !text) return;
+  if (sequence <= state.fast.renderedFinalQuerySeq) return;
+  state.fast.renderedFinalQuerySeq = sequence;
+  renderInterimBubble("");
+  appendMessage("user", text);
+  if (state.fast.renderedQueryEventIds.size >= 20) {
+    const oldest = state.fast.renderedQueryEventIds.values().next().value;
+    if (oldest !== undefined) state.fast.renderedQueryEventIds.delete(oldest);
+  }
+  state.fast.renderedQueryEventIds.add(eventId);
+}
+
+function renderWakeAcknowledgement(status) {
+  const interaction = String(status.interaction_state || "");
+  if (!state.fast.ackBaselineSet) {
+    state.fast.ackBaselineSet = true;
+    state.fast.previousInteraction = interaction;
+    return;
+  }
+  if (interaction === "acknowledging" && state.fast.previousInteraction !== "acknowledging") {
+    appendMessage("assistant", WAKE_ACK_TEXT);
+  }
+  state.fast.previousInteraction = interaction;
+}
+
+function fastPollAudioUi() {
+  if (!isNative()) return;
+  const status = callBridge("audioUiStatus");
+  if (!status || typeof status !== "object") return;
+  const running = Boolean(status.running);
+  if (!running) {
+    document.body.removeAttribute("data-ambient");
+    renderInterimBubble("");
+    if (ambientLevelFillEl) ambientLevelFillEl.style.width = "0%";
+    if (ambientVadCountEl) {
+      ambientVadCountEl.textContent = `VAD 语句 ${Number(status.vad_segment_count || 0)}`;
+    }
+    if (ambientPhaseEl) ambientPhaseEl.textContent = "等待开启";
+    return;
+  }
+  const phase = ambientPhaseFromStatus(status);
+  document.body.setAttribute("data-ambient", phase.phase);
+  if (ambientPhaseEl) ambientPhaseEl.textContent = phase.text;
+  const rms = Number(status.audio_rms_dbfs);
+  const level = Number.isFinite(rms) ? Math.max(0, Math.min(1, (rms + 60) / 60)) : 0;
+  if (ambientLevelFillEl) ambientLevelFillEl.style.width = `${Math.round(level * 100)}%`;
+  if (ambientVadCountEl) {
+    ambientVadCountEl.textContent = `VAD 语句 ${Number(status.vad_segment_count || 0)}`;
+  }
+  renderWakeAcknowledgement(status);
+  if (String(status.interaction_state || "") === "query_submitted") {
+    renderFinalQuery(status);
+  } else {
+    renderInterimBubble(String(status.latest_partial || ""));
+  }
 }
 
 async function refreshSpeakerSummary() {
@@ -363,6 +479,7 @@ function syncEnrollmentFromStatus(status) {
 
 function openEnrollment() {
   const modal = document.getElementById("speaker-enroll-modal");
+  document.body.classList.add("speaker-open");
   modal.hidden = false;
   document.getElementById("speaker-enroll-progress").textContent = "当前进度：0 / 3";
   document.getElementById("speaker-enroll-phrase").textContent = ENROLL_PHRASES[0];

@@ -92,6 +92,21 @@ class NativeAudioSnapshotTest {
     }
 
     @Test
+    fun uiSnapshotExposesLevelAndVadCountsWithoutRawAudio() {
+        val ui = NativeAudioSnapshot(
+            audioRmsDbfs = -21.5,
+            audioPeakDbfs = -12.0,
+            vadSegmentCount = 7,
+        ).toUiJson(elapsedRealtimeMillis = 0L)
+
+        assertEquals(-21.5, ui.getDouble("audio_rms_dbfs"), 0.001)
+        assertEquals(-12.0, ui.getDouble("audio_peak_dbfs"), 0.001)
+        assertEquals(7L, ui.getLong("vad_segment_count"))
+        assertFalse(ui.has("captured_samples"))
+        assertFalse(ui.has("pcm"))
+    }
+
+    @Test
     fun connectedWakeKeepsOnlyTheQuestion() {
         assertEquals(
             "我的车停在哪里",
