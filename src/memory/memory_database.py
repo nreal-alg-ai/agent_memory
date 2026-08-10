@@ -3,7 +3,7 @@
 
 The schema deliberately keeps a few legacy table names used by existing
 benchmark scripts (`memory_facts`, `memory_observations`,
-`memory_interpretations`, `entity_nodes`) while adding the new unified line:
+`memory_interpretations`, `memory_entity_nodes`) while adding the new unified line:
 
     memory_episodes -> memory_facts -> memory_states/actionable_items
     -> memory_index_entries
@@ -258,11 +258,22 @@ class SessionDB:
                 UNIQUE(target_table, target_id, index_level)
             );
 
-            CREATE TABLE IF NOT EXISTS entity_nodes (
+            CREATE TABLE IF NOT EXISTS memory_entity_nodes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL UNIQUE,
                 type TEXT NOT NULL DEFAULT 'OTHER',
                 created_at TEXT NOT NULL DEFAULT ''
+            );
+
+            CREATE TABLE IF NOT EXISTS memory_entity_mapping (
+                entity_id INTEGER PRIMARY KEY,
+                episode_id TEXT NOT NULL DEFAULT '[]',
+                fact_id TEXT NOT NULL DEFAULT '[]',
+                state_id TEXT NOT NULL DEFAULT '[]',
+                actionable_item_id TEXT NOT NULL DEFAULT '[]',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(entity_id) REFERENCES memory_entity_nodes(id) ON DELETE CASCADE
             );
 
             CREATE INDEX IF NOT EXISTS idx_memory_facts_time ON memory_facts(time_key);
@@ -569,8 +580,16 @@ class SessionDB:
                 now,
             ),
         )
+        episode_id = int(cur.lastrowid)
+        self.insert_entity_memory_mappings([
+            {
+                "entity_id": int(entity_id),
+                "episode_id": [episode_id],
+            }
+            for entity_id in entity_ids or []
+        ])
         self._commit_if_needed()
-        return int(cur.lastrowid)
+        return episode_id
 
     def upsert_state(
         self,
@@ -646,7 +665,6 @@ class SessionDB:
                 """,
                 (*values, now, now),
             )
-        self._commit_if_needed()
         row = self._conn.execute(
             """
             SELECT id FROM memory_states
@@ -658,7 +676,17 @@ class SessionDB:
                 normalized_entity_key, normalized_name,
             ),
         ).fetchone()
-        return int(row["id"]) if row else 0
+        state_id = int(row["id"]) if row else 0
+        if state_id:
+            self.insert_entity_memory_mappings([
+                {
+                    "entity_id": int(entity_id),
+                    "state_id": [state_id],
+                }
+                for entity_id in entity_ids or []
+            ])
+        self._commit_if_needed()
+        return state_id
 
     def upsert_actionable_item(
         self,
@@ -719,7 +747,6 @@ class SessionDB:
                 now,
             ),
         )
-        self._commit_if_needed()
         row = self._conn.execute(
             """
             SELECT id FROM memory_actionable_items
@@ -731,7 +758,17 @@ class SessionDB:
                 str(canonical_name or "general").strip(),
             ),
         ).fetchone()
-        return int(row["id"]) if row else 0
+        actionable_item_id = int(row["id"]) if row else 0
+        if actionable_item_id:
+            self.insert_entity_memory_mappings([
+                {
+                    "entity_id": int(entity_id),
+                    "actionable_item_id": [actionable_item_id],
+                }
+                for entity_id in entity_ids or []
+            ])
+        self._commit_if_needed()
+        return actionable_item_id
 
     def get_unprocessed_facts_for_states(
         self,
@@ -881,8 +918,17 @@ class SessionDB:
                 now,
             ),
         )
+        fact_id = int(cur.lastrowid)
+        self.insert_entity_memory_mappings([
+            {
+                "entity_id": int(entity_id),
+                "episode_id": [episode_id] if episode_id is not None else [],
+                "fact_id": [fact_id],
+            }
+            for entity_id in entity_ids or []
+        ])
         self._commit_if_needed()
-        return int(cur.lastrowid)
+        return fact_id
 
     def upsert_index_entry(
         self,
@@ -988,7 +1034,7 @@ class SessionDB:
                 continue
             normalized.append(clean)
             self._conn.execute(
-                "INSERT OR IGNORE INTO entity_nodes (name, type, created_at) VALUES (?, ?, ?)",
+                "INSERT OR IGNORE INTO memory_entity_nodes (name, type, created_at) VALUES (?, ?, ?)",
                 (clean, "OTHER", now),
             )
         self._commit_if_needed()
@@ -996,10 +1042,119 @@ class SessionDB:
             return {}
         placeholders = ",".join("?" for _ in normalized)
         rows = self._conn.execute(
-            f"SELECT id, name FROM entity_nodes WHERE name IN ({placeholders})",
+            f"SELECT id, name FROM memory_entity_nodes WHERE name IN ({placeholders})",
             normalized,
         ).fetchall()
         return {str(row["name"]): int(row["id"]) for row in rows}
+
+    def insert_entity_memory_mappings(
+        self,
+        mappings: Sequence[Dict[str, Any]],
+    ) -> int:
+        """Merge episode, fact, and future memory links into one row per entity."""
+        if not mappings:
+            return 0
+
+        mapping_fields = (
+            "episode_id",
+            "fact_id",
+            "state_id",
+            "actionable_item_id",
+        )
+
+        def normalize_ids(value: Any) -> List[int]:
+            if isinstance(value, str):
+                parsed = _json_loads(value, None)
+                values = parsed if isinstance(parsed, list) else [value]
+            else:
+                values = value if isinstance(value, (list, tuple, set)) else [value]
+            normalized: List[int] = []
+            for item in values:
+                if item in (None, ""):
+                    continue
+                try:
+                    item_id = int(item)
+                except (TypeError, ValueError):
+                    continue
+                if item_id not in normalized:
+                    normalized.append(item_id)
+            return normalized
+
+        grouped: Dict[int, Dict[str, List[int]]] = {}
+        for mapping in mappings:
+            try:
+                entity_id = int(mapping["entity_id"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            entity_mapping = grouped.setdefault(
+                entity_id,
+                {field: [] for field in mapping_fields},
+            )
+            for field in mapping_fields:
+                for item_id in normalize_ids(mapping.get(field)):
+                    if item_id not in entity_mapping[field]:
+                        entity_mapping[field].append(item_id)
+
+        if not grouped:
+            return 0
+
+        now = utc_now_text()
+        changed_count = 0
+        for entity_id, mapping in grouped.items():
+            existing = self._conn.execute(
+                """
+                SELECT episode_id, fact_id, state_id, actionable_item_id
+                FROM memory_entity_mapping
+                WHERE entity_id = ?
+                """,
+                (entity_id,),
+            ).fetchone()
+            merged = dict(mapping)
+            if existing:
+                for field in mapping_fields:
+                    previous_ids = normalize_ids(existing[field])
+                    merged[field] = previous_ids + [
+                        item_id
+                        for item_id in mapping[field]
+                        if item_id not in previous_ids
+                    ]
+                self._conn.execute(
+                    """
+                    UPDATE memory_entity_mapping
+                    SET episode_id = ?, fact_id = ?, state_id = ?,
+                        actionable_item_id = ?, updated_at = ?
+                    WHERE entity_id = ?
+                    """,
+                    (
+                        _json_dumps(merged["episode_id"]),
+                        _json_dumps(merged["fact_id"]),
+                        _json_dumps(merged["state_id"]),
+                        _json_dumps(merged["actionable_item_id"]),
+                        now,
+                        entity_id,
+                    ),
+                )
+            else:
+                self._conn.execute(
+                    """
+                    INSERT INTO memory_entity_mapping (
+                        entity_id, episode_id, fact_id, state_id,
+                        actionable_item_id, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        entity_id,
+                        _json_dumps(merged["episode_id"]),
+                        _json_dumps(merged["fact_id"]),
+                        _json_dumps(merged["state_id"]),
+                        _json_dumps(merged["actionable_item_id"]),
+                        now,
+                        now,
+                    ),
+                )
+            changed_count += 1
+        self._commit_if_needed()
+        return changed_count
 
     def search_index_entries(
         self,
