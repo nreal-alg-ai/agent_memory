@@ -2,6 +2,15 @@
 .gradle/
 build/
 app/build/
+!android/app/build/
+android/app/build/*
+!android/app/build/outputs/
+android/app/build/outputs/*
+!android/app/build/outputs/apk/
+android/app/build/outputs/apk/*
+!android/app/build/outputs/apk/debug/
+android/app/build/outputs/apk/debug/*
+!android/app/build/outputs/apk/debug/app-debug.apk
 captures/
 local.properties
 *.iml
