@@ -19,6 +19,9 @@ local.properties
 __pycache__/
 *.pyc
 
+# 本地模型包（不随 git 分发，从 README 下载链接获取）
+android/model-pack/
+
 # 本机数据与诊断
 *.db
 *.log

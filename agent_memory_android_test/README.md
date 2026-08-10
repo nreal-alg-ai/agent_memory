@@ -32,6 +32,8 @@
 adb install -r android/app/build/outputs/apk/debug/app-debug.apk
 ```
 
+> 仅安装 APK 还无法使用语音功能，仍需安装本地模型包；建议直接使用下面的「一键安装」。
+
 ### 方法二：自行构建
 
 ```bash
@@ -49,6 +51,48 @@ APK 输出路径：`android/app/build/outputs/apk/debug/app-debug.apk`
 adb install -r android/app/build/outputs/apk/debug/app-debug.apk
 adb shell am start -n com.agentmemory.test/.MainActivity
 ```
+
+### 一键安装（推荐：APK + 本地模型包）
+
+模型包（约 286MB）不随 git 分发，请从以下链接下载：
+
+```text
+https://xreal.feishu.cn/wiki/TWeJwLMzzilrKTksKIVcyYVln1w
+```
+
+下载得到 `x4000-sherpa-1.13.4-v2.zip` 后解压到：
+
+```text
+android/model-pack/x4000-sherpa-1.13.4-v2/
+├── manifest.json
+├── vad/  kws/  online_asr/  sensevoice/  speaker/
+```
+
+连接手机并授权 USB 调试后，在仓库根目录运行：
+
+```bash
+bash scripts/setup_device.sh --serial <DEVICE_SERIAL>
+```
+
+`<DEVICE_SERIAL>` 是手机的 ADB 设备序列号。手机连接电脑并开启 USB 调试后，运行：
+
+```bash
+adb devices -l
+```
+
+输出第一列即为序列号，例如：
+
+```text
+R5CT3466WGW    device usb:1-1 product:r0qzcx model:SM_S9010 device:r0q
+```
+
+则命令为：
+
+```bash
+bash scripts/setup_device.sh --serial R5CT3466WGW
+```
+
+脚本依次：安装 APK（覆盖安装，保留数据）→ 校验并安装本地模型包 → 启动 App。
 
 ## 首次配置
 
