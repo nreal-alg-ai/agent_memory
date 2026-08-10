@@ -226,8 +226,8 @@ class SessionDB:
                 confidence REAL NOT NULL DEFAULT 0.75,
                 importance REAL NOT NULL DEFAULT 0.6,
                 metadata TEXT NOT NULL DEFAULT '{}',
-                embedding BLOB,
-                embedding_text TEXT NOT NULL DEFAULT '',
+                identity_text_embedding BLOB,
+                identity_text TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 UNIQUE(source_type, item_type, canonical_name)
@@ -675,8 +675,8 @@ class SessionDB:
         confidence: float,
         importance: float,
         metadata: Optional[Dict[str, Any]],
-        embedding: Optional[np.ndarray],
-        embedding_text: str,
+        identity_text_embedding: Optional[np.ndarray],
+        identity_text: str,
     ) -> int:
         now = utc_now_text()
         self._conn.execute(
@@ -684,7 +684,7 @@ class SessionDB:
             INSERT INTO memory_actionable_items (
                 item_type, source_type, canonical_name, summary, owner,
                 status, due_at, entity_ids, evidence_fact_ids, confidence, importance,
-                metadata, embedding, embedding_text, created_at, updated_at
+                metadata, identity_text_embedding, identity_text, created_at, updated_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(source_type, item_type, canonical_name) DO UPDATE SET
                 summary = excluded.summary,
@@ -696,8 +696,8 @@ class SessionDB:
                 confidence = excluded.confidence,
                 importance = excluded.importance,
                 metadata = excluded.metadata,
-                embedding = excluded.embedding,
-                embedding_text = excluded.embedding_text,
+                identity_text_embedding = excluded.identity_text_embedding,
+                identity_text = excluded.identity_text,
                 updated_at = excluded.updated_at
             """,
             (
@@ -713,8 +713,8 @@ class SessionDB:
                 float(confidence),
                 float(importance),
                 _json_dumps(metadata or {}),
-                _embedding_to_blob(embedding),
-                str(embedding_text or ""),
+                _embedding_to_blob(identity_text_embedding),
+                str(identity_text or ""),
                 now,
                 now,
             ),
@@ -1298,7 +1298,7 @@ class SessionDB:
             table="memory_actionable_items",
             searchable_fields=(
                 "canonical_name", "summary", "item_type", "owner", "status",
-                "due_at", "entity_ids", "embedding_text", "metadata",
+                "due_at", "entity_ids", "identity_text", "metadata",
             ),
             time_field="updated_at",
             terms=terms,

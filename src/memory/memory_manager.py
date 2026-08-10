@@ -4482,7 +4482,7 @@ class MemoryNodeManager:
             names=[*entities, item.get("owner") or ""],
             facts=evidence_facts,
         )
-        embedding_text = "\n".join([
+        identity_text = "\n".join([
             item["canonical_name"],
             item["summary"],
             f"item_type: {item['item_type']}",
@@ -4492,7 +4492,7 @@ class MemoryNodeManager:
             f"keywords: {' '.join(keywords)}",
             f"entities: {', '.join(entities)}",
         ])
-        embedding = self._generate_embedding_vector(embedding_text)
+        identity_text_embedding = self._generate_embedding_vector(identity_text)
         item_id = self._db.upsert_actionable_item(
             item_type=item["item_type"],
             source_type=item["source_type"],
@@ -4510,8 +4510,8 @@ class MemoryNodeManager:
                 "entities": entities,
                 "canonical_topics": canonical_topics,
             },
-            embedding=embedding,
-            embedding_text=embedding_text,
+            identity_text_embedding=identity_text_embedding,
+            identity_text=identity_text,
         )
         # if item_id:
         #     memory_path = f"{item['source_type']}/actionable_items/{item['item_type']}"
@@ -6015,12 +6015,7 @@ class MemoryNodeManager:
                 else:
                     time_end_value = time_value
 
-                if table == "memory_states":
-                    candidate_embedding = row.get("identity_text_embedding")
-                elif table == "memory_facts":
-                    candidate_embedding = row.get("identity_text_embedding")
-                else:
-                    candidate_embedding = row.get("embedding")
+                candidate_embedding = row.get("identity_text_embedding")
                 hydrated = dict(row)
                 hydrated.pop("embedding", None)
                 hydrated.pop("identity_text_embedding", None)
