@@ -1699,3 +1699,29 @@ select {
 .toast.success {
   background: rgba(30, 120, 70, 0.92);
 }
+
+/* 顶栏防溢出：系统大字号/字体渲染差异下，标题可收缩省略，右侧按钮不被裁切 */
+.topbar > div:first-child {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.topbar h1 {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+}
+
+.mobile-settings-toggle {
+  flex-shrink: 0;
+}
+
+/* 聊天列显式单列：避免隐式 auto 列按内容 max-content 撑宽导致右侧被裁 */
+.chat-pane {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.chat-pane > * {
+  min-width: 0;

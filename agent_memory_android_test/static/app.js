@@ -375,6 +375,7 @@ function openEnrollment() {
 
 function closeEnrollment() {
   document.getElementById("speaker-enroll-modal").hidden = true;
+  document.body.classList.remove("speaker-open");
 }
 
 function startEnrollment() {
@@ -404,6 +405,13 @@ function toggleSurface(name, force) {
   if (backdrop) backdrop.hidden = !next;
   const button = document.getElementById(`${name}-toggle`);
   if (button) button.setAttribute("aria-expanded", String(next));
+  if (name === "memory" && pane) {
+    pane.classList.toggle("open", next);
+    document.body.classList.toggle("memory-open", next);
+  }
+  if (name === "debug") {
+    document.body.classList.toggle("debug-open", next);
+  }
   if (name === "memory" && next) refreshMemoryPanel();
   if (name === "debug" && next) renderDebug();
 }
@@ -411,6 +419,7 @@ function toggleSurface(name, force) {
 function toggleSettings(force) {
   const next = typeof force === "boolean" ? force : !state.surfaces.settings;
   state.surfaces.settings = next;
+  document.body.classList.toggle("settings-open", next);
   const pane = document.getElementById("settings-pane");
   const backdrop = document.getElementById("settings-backdrop");
   if (pane) pane.hidden = !next;
@@ -418,6 +427,28 @@ function toggleSettings(force) {
   const button = document.getElementById("settings-toggle");
   if (button) button.setAttribute("aria-expanded", String(next));
 }
+
+function aiGlassesHandleBack() {
+  const enrollment = document.getElementById("speaker-enroll-modal");
+  if (enrollment && !enrollment.hidden) {
+    closeEnrollment();
+    return true;
+  }
+  if (state.surfaces.memory) {
+    toggleSurface("memory", false);
+    return true;
+  }
+  if (state.surfaces.debug) {
+    toggleSurface("debug", false);
+    return true;
+  }
+  if (state.surfaces.settings) {
+    toggleSettings(false);
+    return true;
+  }
+  return false;
+}
+window.aiGlassesHandleBack = aiGlassesHandleBack;
 
 /* ---------- 事件绑定 ---------- */
 
@@ -436,16 +467,26 @@ function bindEvents() {
     else callBridge("startAmbient");
   });
 
-  document.getElementById("settings-toggle").addEventListener("click", () => toggleSettings());
+  document.getElementById("settings-toggle").addEventListener("click", () => {
+    if (state.surfaces.memory) toggleSurface("memory", false);
+    if (state.surfaces.debug) toggleSurface("debug", false);
+    toggleSettings();
+  });
   document.getElementById("settings-close").addEventListener("click", () => toggleSettings(false));
   document.getElementById("settings-backdrop").addEventListener("click", () => toggleSettings(false));
 
-  document.getElementById("memory-toggle").addEventListener("click", () => toggleSurface("memory"));
+  document.getElementById("memory-toggle").addEventListener("click", () => {
+    if (state.surfaces.settings) toggleSettings(false);
+    toggleSurface("memory");
+  });
   document.getElementById("memory-close").addEventListener("click", () => toggleSurface("memory", false));
   document.getElementById("memory-backdrop").addEventListener("click", () => toggleSurface("memory", false));
   document.getElementById("refresh-memory").addEventListener("click", refreshMemoryPanel);
 
-  document.getElementById("debug-toggle").addEventListener("click", () => toggleSurface("debug"));
+  document.getElementById("debug-toggle").addEventListener("click", () => {
+    if (state.surfaces.settings) toggleSettings(false);
+    toggleSurface("debug");
+  });
   document.getElementById("close-debug").addEventListener("click", () => toggleSurface("debug", false));
   document.getElementById("debug-backdrop").addEventListener("click", () => toggleSurface("debug", false));
   document.getElementById("clear-debug").addEventListener("click", () => {
@@ -534,6 +575,7 @@ async function init() {
   if (ownerValue) ownerValue.textContent = ownerId();
 
   if (isNative()) {
+    document.body.classList.add(`${String(bridge.platform() || "android")}-native`);
     await syncAudioStatus();
   } else {
     setVoiceStatus("浏览器模式：仅支持文字聊天与记忆面板");
@@ -542,6 +584,7 @@ async function init() {
   if (state.surfaces.memory) refreshMemoryPanel();
   window.setInterval(syncAudioStatus, 1500);
   window.setInterval(pollCompletedReplies, 2000);
+  window.setInterval(fastPollAudioUi, FAST_POLL_MS);
 }
 
 init();
