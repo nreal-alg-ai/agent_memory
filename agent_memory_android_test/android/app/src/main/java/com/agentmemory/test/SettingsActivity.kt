@@ -64,6 +64,14 @@ class SettingsActivity : Activity() {
         val apiKey = field("API 密钥", settings.apiKey()).apply {
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
         }
+        val embeddingProvider = field("Embedding 服务提供商", settings.embeddingProvider())
+        val embeddingModel = field("Embedding 模型", settings.embeddingModel())
+        val embeddingBaseUrl = field("Embedding API 地址（HTTPS）", settings.embeddingBaseUrl()).apply {
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
+        }
+        val embeddingApiKey = field("Embedding API 密钥", settings.embeddingApiKey()).apply {
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+        }
         val modelManifestUrl = field("模型清单 URL（HTTPS）", settings.modelManifestUrl()).apply {
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
         }
@@ -89,6 +97,10 @@ class SettingsActivity : Activity() {
                         baseUrl = baseUrl.text.toString(),
                         apiKey = apiKey.text.toString(),
                         modelManifestUrl = modelManifestUrl.text.toString(),
+                        embeddingProvider = embeddingProvider.text.toString(),
+                        embeddingModel = embeddingModel.text.toString(),
+                        embeddingBaseUrl = embeddingBaseUrl.text.toString(),
+                        embeddingApiKey = embeddingApiKey.text.toString(),
                     )
                 }.onSuccess {
                     Toast.makeText(this@SettingsActivity, "配置已保存", Toast.LENGTH_SHORT).show()
@@ -112,6 +124,10 @@ class SettingsActivity : Activity() {
                         baseUrl = baseUrl.text.toString(),
                         apiKey = apiKey.text.toString(),
                         modelManifestUrl = url,
+                        embeddingProvider = embeddingProvider.text.toString(),
+                        embeddingModel = embeddingModel.text.toString(),
+                        embeddingBaseUrl = embeddingBaseUrl.text.toString(),
+                        embeddingApiKey = embeddingApiKey.text.toString(),
                     )
                     ModelDownloadService.start(this@SettingsActivity, url)
                 }.onSuccess {
@@ -251,6 +267,11 @@ class SettingsActivity : Activity() {
             addLabeledField("模型名称", model)
             addLabeledField("API 地址", baseUrl)
             addLabeledField("API 密钥", apiKey)
+            addView(sectionTitle("Embedding 配置（选填，留空则自动回退）"))
+            addLabeledField("Embedding 服务提供商", embeddingProvider)
+            addLabeledField("Embedding 模型", embeddingModel)
+            addLabeledField("Embedding API 地址", embeddingBaseUrl)
+            addLabeledField("Embedding API 密钥", embeddingApiKey)
             addView(sectionTitle("本地语音模型"))
             addLabeledField("模型清单 URL", modelManifestUrl)
             addView(modelStatus)

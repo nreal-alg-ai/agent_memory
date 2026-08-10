@@ -19,6 +19,10 @@ data class RuntimeConfig(
     val baseUrl: String,
     val apiKey: String,
     val ownerId: String,
+    val embeddingProvider: String,
+    val embeddingModel: String,
+    val embeddingBaseUrl: String,
+    val embeddingApiKey: String,
 )
 
 class SecureSettings(context: Context) {
@@ -35,6 +39,12 @@ class SecureSettings(context: Context) {
 
     fun modelManifestUrl(): String = prefs.getString(KEY_MODEL_MANIFEST_URL, "").orEmpty()
 
+    fun embeddingProvider(): String = prefs.getString(KEY_EMBEDDING_PROVIDER, "").orEmpty()
+
+    fun embeddingModel(): String = prefs.getString(KEY_EMBEDDING_MODEL, "").orEmpty()
+
+    fun embeddingBaseUrl(): String = prefs.getString(KEY_EMBEDDING_BASE_URL, "").orEmpty()
+
     fun ownerId(): String {
         val existing = prefs.getString(KEY_OWNER_ID, null)
         if (!existing.isNullOrBlank()) return existing
@@ -44,8 +54,16 @@ class SecureSettings(context: Context) {
     }
 
     fun apiKey(): String {
-        val encodedCiphertext = prefs.getString(KEY_API_CIPHERTEXT, null) ?: return ""
-        val encodedIv = prefs.getString(KEY_API_IV, null) ?: return ""
+        return decryptValue(KEY_API_CIPHERTEXT, KEY_API_IV)
+    }
+
+    fun embeddingApiKey(): String {
+        return decryptValue(KEY_EMBEDDING_API_CIPHERTEXT, KEY_EMBEDDING_API_IV)
+    }
+
+    private fun decryptValue(ciphertextKey: String, ivKey: String): String {
+        val encodedCiphertext = prefs.getString(ciphertextKey, null) ?: return ""
+        val encodedIv = prefs.getString(ivKey, null) ?: return ""
         return runCatching {
             val cipher = Cipher.getInstance(TRANSFORMATION)
             cipher.init(
@@ -57,7 +75,17 @@ class SecureSettings(context: Context) {
         }.getOrDefault("")
     }
 
-    fun save(provider: String, model: String, baseUrl: String, apiKey: String, modelManifestUrl: String = "") {
+    fun save(
+        provider: String,
+        model: String,
+        baseUrl: String,
+        apiKey: String,
+        modelManifestUrl: String = "",
+        embeddingProvider: String = "",
+        embeddingModel: String = "",
+        embeddingBaseUrl: String = "",
+        embeddingApiKey: String = "",
+    ) {
         val normalizedProvider = provider.trim()
         val normalizedModel = model.trim()
         val normalizedBaseUrl = baseUrl.trim().trimEnd('/')
@@ -71,17 +99,52 @@ class SecureSettings(context: Context) {
             "模型清单 URL 必须使用 HTTPS"
         }
 
+        val normalizedEmbeddingProvider = embeddingProvider.trim().lowercase()
+        val normalizedEmbeddingModel = embeddingModel.trim()
+        val normalizedEmbeddingBaseUrl = embeddingBaseUrl.trim().trimEnd('/')
+        val normalizedEmbeddingApiKey = embeddingApiKey.trim()
+        val embeddingFilledCount = listOf(
+            normalizedEmbeddingProvider,
+            normalizedEmbeddingModel,
+            normalizedEmbeddingBaseUrl,
+            normalizedEmbeddingApiKey,
+        ).count { it.isNotEmpty() }
+        require(embeddingFilledCount == 0 || embeddingFilledCount == 4) {
+            "Embedding 配置必须全部填写或全部留空"
+        }
+        if (embeddingFilledCount == 4) {
+            require(normalizedEmbeddingProvider == "openai") { "Embedding Provider 必须为 openai" }
+            require(normalizedEmbeddingBaseUrl.startsWith("https://")) {
+                "Embedding API 地址必须使用 HTTPS"
+            }
+        }
+
         val cipher = Cipher.getInstance(TRANSFORMATION)
         cipher.init(Cipher.ENCRYPT_MODE, secretKey())
         val ciphertext = cipher.doFinal(normalizedApiKey.toByteArray(Charsets.UTF_8))
-        prefs.edit()
+        val editor = prefs.edit()
             .putString(KEY_PROVIDER, normalizedProvider)
             .putString(KEY_MODEL, normalizedModel)
             .putString(KEY_BASE_URL, normalizedBaseUrl)
             .putString(KEY_API_CIPHERTEXT, Base64.encodeToString(ciphertext, Base64.NO_WRAP))
             .putString(KEY_API_IV, Base64.encodeToString(cipher.iv, Base64.NO_WRAP))
             .putString(KEY_MODEL_MANIFEST_URL, normalizedManifestUrl)
-            .apply()
+            .putString(KEY_EMBEDDING_PROVIDER, normalizedEmbeddingProvider)
+            .putString(KEY_EMBEDDING_MODEL, normalizedEmbeddingModel)
+            .putString(KEY_EMBEDDING_BASE_URL, normalizedEmbeddingBaseUrl)
+        if (normalizedEmbeddingApiKey.isNotEmpty()) {
+            val embeddingCipher = Cipher.getInstance(TRANSFORMATION)
+            embeddingCipher.init(Cipher.ENCRYPT_MODE, secretKey())
+            val embeddingCiphertext = embeddingCipher.doFinal(normalizedEmbeddingApiKey.toByteArray(Charsets.UTF_8))
+            editor
+                .putString(KEY_EMBEDDING_API_CIPHERTEXT, Base64.encodeToString(embeddingCiphertext, Base64.NO_WRAP))
+                .putString(KEY_EMBEDDING_API_IV, Base64.encodeToString(embeddingCipher.iv, Base64.NO_WRAP))
+        } else {
+            editor
+                .remove(KEY_EMBEDDING_API_CIPHERTEXT)
+                .remove(KEY_EMBEDDING_API_IV)
+        }
+        editor.apply()
         ownerId()
     }
 
@@ -93,6 +156,10 @@ class SecureSettings(context: Context) {
         baseUrl = baseUrl(),
         apiKey = apiKey(),
         ownerId = ownerId(),
+        embeddingProvider = embeddingProvider(),
+        embeddingModel = embeddingModel(),
+        embeddingBaseUrl = embeddingBaseUrl(),
+        embeddingApiKey = embeddingApiKey(),
     )
 
     private fun secretKey(): SecretKey {
@@ -124,6 +191,11 @@ class SecureSettings(context: Context) {
         private const val KEY_MODEL_MANIFEST_URL = "model_manifest_url"
         private const val KEY_API_CIPHERTEXT = "api_key_ciphertext"
         private const val KEY_API_IV = "api_key_iv"
+        private const val KEY_EMBEDDING_PROVIDER = "embedding_provider"
+        private const val KEY_EMBEDDING_MODEL = "embedding_model"
+        private const val KEY_EMBEDDING_BASE_URL = "embedding_base_url"
+        private const val KEY_EMBEDDING_API_CIPHERTEXT = "embedding_api_key_ciphertext"
+        private const val KEY_EMBEDDING_API_IV = "embedding_api_key_iv"
         private const val KEY_ALIAS = "ai_glasses_deepseek_key"
         private const val TRANSFORMATION = "AES/GCM/NoPadding"
     }

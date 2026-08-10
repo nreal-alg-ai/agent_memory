@@ -40,11 +40,13 @@ agent_memory_android_test/
   （start / ingest_audio_event / queue_status / classify_speaker / stop 等），Android 外壳 Kotlin 零改动。
 - HTTP API（WebView 前端调用）：
   - `POST /api/chat`：agent_memory recall -> LLM 回复 -> store_interaction，响应含 `debug.recall_context`
+  - `GET /api/embedding/status`：探测当前 embedding 端点，返回 `remote` / `hash_fallback` / `not_configured`
   - `GET /api/agent-memory/stats|facts|states|actionables|episodes`（q/limit）
   - `DELETE /api/agent-memory/facts/{id}`：删除事实及关联索引/FTS 行
   - `POST /api/agent-memory/reflect`、`POST /api/agent-memory/import`
   - 兼容端点：`/api/audio/capabilities`、`/api/speaker/profile`、`/api/runtime`、`/health`
-- LLM/Embedding 配置由 Android 设置页动态注入；Embedding 失败自动降级本地 hash。
+- LLM 配置由 Android 设置页动态注入；Embedding 四项为选填，填齐后独立注入（provider 必须为 `openai`），
+  留空则沿用聊天接口配置；Embedding 远程失败时自动降级本地 hash 向量。
 
 ## 构建
 
@@ -75,6 +77,8 @@ PYTHONDONTWRITEBYTECODE=1 conda run -n hermes python scripts/local_smoke_test.py
 
 ## 真机验收（每场景 3 遍并记录）
 
+0. 设置页填齐聊天四项（Embedding 可填可不填）。若填了 Embedding，`/api/embedding/status` 必须返回
+   `remote_ok=true`；未填则允许 `mode=not_configured`。
 1. 说话 -> Facts 出现且内容正确（需要先在设置页配置 provider/model/base_url/api_key）。
 2. 间隔后提问 -> 回复引用记忆（`debug.recall_context` 非空）。
 3. 记忆面板「触发反思」-> States/Actionables 新增条目。

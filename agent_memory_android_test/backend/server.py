@@ -41,6 +41,10 @@ _CONFIG_KEYS = (
     "base_url",
     "api_key",
     "owner_id",
+    "embedding_provider",
+    "embedding_model",
+    "embedding_base_url",
+    "embedding_api_key",
 )
 
 
@@ -261,6 +265,11 @@ class _BackendRuntime:
         app_home: str,
         static_dir: str,
         llm_config: Dict[str, str],
+        embedding_client_config: Optional[Dict[str, Any]] = None,
+        embedding_configured: bool = False,
+        embedding_provider: str = "",
+        embedding_model: str = "",
+        embedding_base_url: str = "",
     ) -> None:
         self.runtime = runtime
         self.admin = admin
@@ -275,6 +284,37 @@ class _BackendRuntime:
         self.app_home = app_home
         self.static_dir = static_dir
         self.llm_config = llm_config
+        self.embedding_client_config = dict(embedding_client_config or {})
+        self.embedding_configured = bool(embedding_configured)
+        self.embedding_provider = str(embedding_provider or "")
+        self.embedding_model = str(embedding_model or "")
+        self.embedding_base_url = str(embedding_base_url or "")
+
+    def embedding_status(self) -> Dict[str, Any]:
+        """Probe the effective embedding endpoint and report remote vs hash."""
+        info: Dict[str, Any] = {
+            "configured": self.embedding_configured,
+            "provider": self.embedding_provider,
+            "model": self.embedding_model,
+            "dimension": None,
+            "remote_ok": False,
+            "mode": "not_configured" if not self.embedding_configured else "hash_fallback",
+        }
+        if not self.embedding_configured:
+            return info
+        try:
+            from memory.embedding_client import EmbeddingClient
+
+            client = EmbeddingClient(dict(self.embedding_client_config))
+            info["dimension"] = int(client.dimension)
+            # Use the same code path the memory manager exercises at runtime.
+            vector = client._embed_openai("agent-memory-embedding-probe")
+            if vector is not None:
+                info["remote_ok"] = True
+                info["mode"] = "remote"
+        except Exception as exc:
+            info["error"] = str(exc)[:200]
+        return info
 
 
 _lock = threading.RLock()
@@ -305,9 +345,35 @@ def _parse_config(config_json: str) -> Dict[str, str]:
         raise ValueError("agent memory runtime config must be a JSON object")
     config = {key: str(raw.get(key) or "").strip() for key in _CONFIG_KEYS}
     config["platform"] = str(raw.get("platform") or "android").strip().lower()
-    missing = [key for key, value in config.items() if not value]
+    required_keys = (
+        "app_home",
+        "static_dir",
+        "provider",
+        "model",
+        "base_url",
+        "api_key",
+        "owner_id",
+    )
+    missing = [key for key in required_keys if not config[key]]
     if missing:
         raise ValueError("agent memory runtime config missing: " + ", ".join(sorted(missing)))
+    embedding_fields = (
+        "embedding_provider",
+        "embedding_model",
+        "embedding_base_url",
+        "embedding_api_key",
+    )
+    filled_embedding = [key for key in embedding_fields if config[key]]
+    if filled_embedding and len(filled_embedding) != len(embedding_fields):
+        raise ValueError(
+            "embedding config must be all empty or all filled; filled: "
+            + ", ".join(sorted(filled_embedding))
+        )
+    if filled_embedding:
+        if config["embedding_provider"].lower() != "openai":
+            raise ValueError("embedding provider must be 'openai'")
+        if not config["embedding_base_url"].startswith("https://"):
+            raise ValueError("embedding base_url must use https")
     if not config["base_url"].startswith("https://"):
         raise ValueError("agent memory runtime base_url must use https")
     if config["platform"] not in {"android", "ios"}:
@@ -344,6 +410,7 @@ def start(config_json: str) -> str:
     with _lock:
         if _runtime is not None:
             return json.dumps(_public_payload(_runtime), ensure_ascii=False)
+        _log("start begin")
         app_home = Path(config["app_home"])
         data_dir = app_home / "data" / "agent_memory"
         data_dir.mkdir(parents=True, exist_ok=True)
@@ -356,67 +423,119 @@ def start(config_json: str) -> str:
             "llm_timeout": 120,
             "llm_json_mode": True,
         }
-        embedding_config = {
-            "provider": "openai",
-            "model": "text-embedding-3-small",
-            "base_url": config["base_url"],
-            "api_key": config["api_key"],
-            "timeout": 3,
-        }
-        memory_manager_config = {"memory_enabled": True}
-        memory_runtime_config = {
-            "max_pending_interaction_turns": 1,
-            "max_pending_interaction_chars": 2000,
-            "transcript_episode_max_segments": 1,
-            "transcript_episode_max_chars": 2000,
-            "transcript_episode_max_gap_seconds": 60,
-        }
-        runtime = AgentMemoryRuntime(
-            db_path=data_dir / "memory.db",
-            llm_config=llm_config,
-            embedding_config=embedding_config,
-            memory_manager_config=memory_manager_config,
-            memory_runtime_config=memory_runtime_config,
-        )
-        admin = AgentMemoryAdmin(db_path=str(data_dir / "memory.db"))
-        speakers = SpeakerStore(path=str(data_dir / "speaker_profiles.json"))
-        replies = ReplyQueue()
-        captures = CaptureRegistry()
-        token = secrets.token_urlsafe(32)
-        handler = type(
-            "AgentMemoryHandler",
-            (_Handler,),
-            {
-                "local_auth_token": token,
-                "static_dir": config["static_dir"],
-                "platform": config["platform"],
-                "owner_id": config["owner_id"],
-            },
-        )
-        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
-        thread = threading.Thread(target=server.serve_forever, name="agent-memory-local-http", daemon=True)
-        thread.start()
-        _runtime = _BackendRuntime(
-            runtime=runtime,
-            admin=admin,
-            speakers=speakers,
-            replies=replies,
-            captures=captures,
-            server=server,
-            thread=thread,
-            token=token,
-            owner_id=config["owner_id"],
-            platform=config["platform"],
-            app_home=str(app_home),
-            static_dir=config["static_dir"],
-            llm_config={
+        embedding_configured = bool(config["embedding_provider"])
+        if embedding_configured:
+            embedding_config = {
+                "provider": config["embedding_provider"].lower(),
+                "model": config["embedding_model"],
+                "base_url": config["embedding_base_url"],
+                "api_key": config["embedding_api_key"],
+                "timeout": 30,
+            }
+            embedding_provider = embedding_config["provider"]
+            embedding_model = embedding_config["model"]
+            embedding_base_url = embedding_config["base_url"]
+        else:
+            # Fallback keeps the previous behavior: reuse the chat endpoint and
+            # let EmbeddingClient degrade to the deterministic local hash.
+            embedding_config = {
+                "provider": "openai",
+                "model": "text-embedding-3-small",
                 "base_url": config["base_url"],
                 "api_key": config["api_key"],
-                "model": config["model"],
-            },
-        )
-        _log(f"HTTP server bound 127.0.0.1:{server.server_address[1]} thread_alive={thread.is_alive()}")
-        return json.dumps(_public_payload(_runtime), ensure_ascii=False)
+                "timeout": 3,
+            }
+            embedding_provider = embedding_config["provider"]
+            embedding_model = embedding_config["model"]
+            embedding_base_url = embedding_config["base_url"]
+        memory_manager_config = {
+            "memory_enabled": True,
+            "recall_fact_min_embedding_similarity": 0,
+            "memory_prompt_language_mode": "zh",
+        }
+        memory_runtime_config = {
+            "max_pending_interaction_turns": 5,
+            "max_pending_interaction_chars": 2000,
+            "transcript_episode_max_segments": 80,
+            "transcript_episode_max_chars": 12000,
+            "transcript_episode_max_gap_seconds": 60,
+        }
+        runtime: Optional[AgentMemoryRuntime] = None
+        admin: Optional[AgentMemoryAdmin] = None
+        server: Optional[ThreadingHTTPServer] = None
+        try:
+            runtime = AgentMemoryRuntime(
+                db_path=data_dir / "memory.db",
+                llm_config=llm_config,
+                embedding_config=embedding_config,
+                memory_manager_config=memory_manager_config,
+                memory_runtime_config=memory_runtime_config,
+            )
+            _log("start runtime init ok")
+            admin = AgentMemoryAdmin(db_path=str(data_dir / "memory.db"))
+            speakers = SpeakerStore(path=str(data_dir / "speaker_profiles.json"))
+            replies = ReplyQueue()
+            captures = CaptureRegistry()
+            token = secrets.token_urlsafe(32)
+            handler = type(
+                "AgentMemoryHandler",
+                (_Handler,),
+                {
+                    "local_auth_token": token,
+                    "static_dir": config["static_dir"],
+                    "platform": config["platform"],
+                    "owner_id": config["owner_id"],
+                },
+            )
+            server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+            thread = threading.Thread(target=server.serve_forever, name="agent-memory-local-http", daemon=True)
+            thread.start()
+            _runtime = _BackendRuntime(
+                runtime=runtime,
+                admin=admin,
+                speakers=speakers,
+                replies=replies,
+                captures=captures,
+                server=server,
+                thread=thread,
+                token=token,
+                owner_id=config["owner_id"],
+                platform=config["platform"],
+                app_home=str(app_home),
+                static_dir=config["static_dir"],
+                llm_config={
+                    "base_url": config["base_url"],
+                    "api_key": config["api_key"],
+                    "model": config["model"],
+                },
+                embedding_client_config=embedding_config,
+                embedding_configured=embedding_configured,
+                embedding_provider=embedding_provider,
+                embedding_model=embedding_model,
+                embedding_base_url=embedding_base_url,
+            )
+            _log(f"HTTP server bound 127.0.0.1:{server.server_address[1]} thread_alive={thread.is_alive()}")
+            return json.dumps(_public_payload(_runtime), ensure_ascii=False)
+        except Exception as exc:
+            import traceback
+
+            _log(f"start failed: {exc}\n{traceback.format_exc()}")
+            if runtime is not None:
+                try:
+                    runtime.close()
+                except Exception:
+                    pass
+            if admin is not None:
+                try:
+                    admin.close()
+                except Exception:
+                    pass
+            if server is not None:
+                try:
+                    server.server_close()
+                except Exception:
+                    pass
+            raise
 
 
 def status() -> str:
@@ -820,6 +939,9 @@ class _Handler(BaseHTTPRequestHandler):
             user_id = query.get("user_id", [type(self).owner_id])[0]
             self._send_json(self._current().speakers.profile(user_id))
             return
+        if parsed.path == "/api/embedding/status":
+            self._send_json(self._current().embedding_status())
+            return
         if parsed.path == "/api/agent-memory/stats":
             self._send_json(self._current().admin.stats())
             return
@@ -925,6 +1047,7 @@ class _Handler(BaseHTTPRequestHandler):
         self._send_json({"stored": True, "result": result, "stats": runtime.admin.stats()})
 
     def _runtime_info(self) -> Dict[str, Any]:
+        runtime = self._current()
         with _lock:
             device = dict(_device_state)
         return {
@@ -934,6 +1057,13 @@ class _Handler(BaseHTTPRequestHandler):
             "network_state": "online" if device.get("network_online", True) else "offline",
             "owner_id": type(self).owner_id,
             "engine": "agent_memory",
+            "embedding": {
+                "configured": runtime.embedding_configured,
+                "provider": runtime.embedding_provider,
+                "model": runtime.embedding_model,
+                "base_url": runtime.embedding_base_url,
+                "api_key": "***" if runtime.embedding_client_config.get("api_key") else "",
+            },
             "device": device,
         }
 

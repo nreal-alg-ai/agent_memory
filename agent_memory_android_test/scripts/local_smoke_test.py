@@ -66,7 +66,25 @@ def main() -> int:
         "base_url": "https://127.0.0.1:1",
         "api_key": "smoke-test-invalid-key",
         "owner_id": "smoke-user",
+        "embedding_provider": "openai",
+        "embedding_model": "smoke-embedding-model",
+        "embedding_base_url": "https://127.0.0.1:1",
+        "embedding_api_key": "smoke-test-invalid-embedding-key",
     }
+
+    # 0) 部分填充 embedding 配置必须被拒绝
+    partial_config = dict(config)
+    partial_config["embedding_provider"] = "openai"
+    partial_config["embedding_model"] = ""
+    partial_config["embedding_base_url"] = ""
+    partial_config["embedding_api_key"] = ""
+    try:
+        server.start(json.dumps(partial_config, ensure_ascii=False))
+        raise AssertionError("partial embedding config should be rejected")
+    except ValueError as exc:
+        assert "all empty or all filled" in str(exc), exc
+    print("[ok] partial embedding config rejected")
+
     started = json.loads(server.start(json.dumps(config, ensure_ascii=False)))
     base_url = started["base_url"]
     token = started["local_token"]
@@ -81,6 +99,19 @@ def main() -> int:
     health = _http_json(f"{base_url}/health", token)
     assert health.get("ok") is True, health
     print("[ok] static index/app.js + /health")
+
+    # 0.5) Embedding 状态探针：配置了但远程不可达 -> hash 回退；key 必须掩码
+    embedding_status = _http_json(f"{base_url}/api/embedding/status", token)
+    assert embedding_status["configured"] is True, embedding_status
+    assert embedding_status["remote_ok"] is False, embedding_status
+    assert embedding_status["mode"] == "hash_fallback", embedding_status
+    assert isinstance(embedding_status["dimension"], int) and embedding_status["dimension"] > 0, embedding_status
+    runtime_info = _http_json(f"{base_url}/api/runtime", token)
+    embedding_info = runtime_info["embedding"]
+    assert embedding_info["configured"] is True, embedding_info
+    assert embedding_info["api_key"] == "***", embedding_info
+    assert embedding_info["base_url"] == "https://127.0.0.1:1", embedding_info
+    print(f"[ok] /api/embedding/status mode={embedding_status['mode']} + /api/runtime key masked")
 
     # 1) ambient 事件（final、含说话人）应被存储
     ambient = server.ingest_audio_event(
@@ -255,7 +286,31 @@ def main() -> int:
     print(f"[ok] speaker enrolled + classified {classified['state']} sim={classified['similarity']}")
 
     server.stop()
-    print("[ok] stop")
+    print("[ok] stop (configured embedding)")
+
+    # 10) 不配置 embedding 时：回退模式 not_configured，/api/chat 仍正常
+    config_without_embedding = {
+        key: value for key, value in config.items() if not key.startswith("embedding_")
+    }
+    started_fallback = json.loads(
+        server.start(json.dumps(config_without_embedding, ensure_ascii=False))
+    )
+    fallback_base_url = started_fallback["base_url"]
+    fallback_token = started_fallback["local_token"]
+    fallback_status = _http_json(f"{fallback_base_url}/api/embedding/status", fallback_token)
+    assert fallback_status["configured"] is False, fallback_status
+    assert fallback_status["mode"] == "not_configured", fallback_status
+    fallback_chat = _http_json(
+        f"{fallback_base_url}/api/chat",
+        fallback_token,
+        method="POST",
+        payload={"message": "你好", "user_id": "smoke-user"},
+    )
+    assert "reply" in fallback_chat and "debug" in fallback_chat, fallback_chat
+    print("[ok] embedding not configured -> mode=not_configured + /api/chat ok")
+    server.stop()
+    print("[ok] stop (embedding not configured)")
+
     print(f"\nALL SMOKE TESTS PASSED (data_root={data_root})")
     return 0
 

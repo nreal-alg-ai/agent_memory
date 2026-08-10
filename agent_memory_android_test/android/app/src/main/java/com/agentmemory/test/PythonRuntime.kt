@@ -22,6 +22,10 @@ object PythonRuntime {
             .put("base_url", config.baseUrl)
             .put("api_key", config.apiKey)
             .put("owner_id", config.ownerId)
+            .put("embedding_provider", config.embeddingProvider)
+            .put("embedding_model", config.embeddingModel)
+            .put("embedding_base_url", config.embeddingBaseUrl)
+            .put("embedding_api_key", config.embeddingApiKey)
         val result = runtimeModule().callAttr("start", payload.toString())
         val parsed = JSONObject(result.toString())
         return RuntimeEndpoint(
