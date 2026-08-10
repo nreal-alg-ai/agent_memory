@@ -375,24 +375,38 @@ class SessionDB:
             )
 
     def _init_index_fts(self) -> None:
-        """Create the lightweight lexical index used for first-pass recall."""
-        self._conn.execute(
-            """
-            CREATE VIRTUAL TABLE IF NOT EXISTS memory_index_entries_fts USING fts5(
-                title,
-                summary_for_retrieval,
-                keywords,
-                entities,
-                canonical_topics,
-                participants,
-                memory_path
+        """Create the lightweight lexical index used for first-pass recall.
+
+        Some embedded SQLite builds (e.g. Chaquopy on Android) do not compile
+        FTS5. Treat it as optional: search falls back to LIKE queries.
+        """
+        self._fts5_available = False
+        try:
+            self._conn.execute(
+                """
+                CREATE VIRTUAL TABLE IF NOT EXISTS memory_index_entries_fts USING fts5(
+                    title,
+                    summary_for_retrieval,
+                    keywords,
+                    entities,
+                    canonical_topics,
+                    participants,
+                    memory_path
+                )
+                """
             )
-            """
-        )
-        self._backfill_index_fts()
+        except sqlite3.Error:
+            return
+        self._fts5_available = True
+        try:
+            self._backfill_index_fts()
+        except sqlite3.Error:
+            pass
 
     def _backfill_index_fts(self) -> None:
         """Populate FTS rows for existing index cards not yet synchronized."""
+        if not getattr(self, "_fts5_available", False):
+            return
         self._conn.execute(
             """
             INSERT INTO memory_index_entries_fts (
@@ -452,6 +466,8 @@ class SessionDB:
         participants: Sequence[str],
         memory_path: str,
     ) -> None:
+        if not getattr(self, "_fts5_available", False):
+            return
         self._conn.execute(
             "DELETE FROM memory_index_entries_fts WHERE rowid = ?",
             (int(row_id),),
