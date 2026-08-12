@@ -1028,7 +1028,8 @@ class MemoryNodeManager:
                     "summary": fact.get("summary") or "",
                     "fact_type": fact.get("fact_type"),
                     "fact_kind": fact.get("fact_kind"),
-                    "time_key": fact.get("time_key"),
+                    "event_time_key": fact.get("event_time_key") or "",
+                    "dialogue_time_key": fact.get("dialogue_time_key") or "",
                     "keywords": fact.get("keywords") or "",
                     "entities": fact.get("entities") or [],
                     "primary_entity": fact.get("primary_entity"),
@@ -1038,8 +1039,6 @@ class MemoryNodeManager:
                     "actionable_aspects": fact.get("actionable_aspects") or [],
                     "importance": fact.get("importance"),
                     "confidence": fact.get("confidence"),
-                    "occurred_start": metadata.get("occurred_start") or "",
-                    "occurred_end": metadata.get("occurred_end") or "",
                     "time_confidence": metadata.get("time_confidence") or "",
                     "where": metadata.get("where") or "",
                     "metadata": metadata,
@@ -1260,10 +1259,10 @@ class MemoryNodeManager:
             limit=5,
         )
         facts: List[Dict[str, Any]] = []
-        fallback_timestamp = _to_timestamp_text(
+        dialogue_time_key = _to_timestamp_text(
             raw_segments[0].get("started_at") if raw_segments else ""
         ) or _now_text()
-        for index, raw_fact in enumerate(raw_facts, 1):
+        for raw_fact in raw_facts:
             if not isinstance(raw_fact, dict):
                 continue
             text = _compact_whitespace(raw_fact.get("text") or raw_fact.get("summary") or "")
@@ -1309,15 +1308,13 @@ class MemoryNodeManager:
             actionable_aspects = self._normalize_actionable_aspects(
                 raw_fact.get("actionable_aspects"),
             )
-            time_key = f"{fallback_timestamp}#llm:{index:02d}"
-            occurred_start = _compact_whitespace(raw_fact.get("occurred_start") or "")
-            if not occurred_start:
-                occurred_start = time_key
+            event_time_key = _compact_whitespace(raw_fact.get("event_time_key") or "")
             facts.append({
                 "summary": text,
                 "fact_kind": self._normalize_fact_kind(raw_fact.get("fact_kind")),
                 "fact_type": self._normalize_fact_type(raw_fact.get("fact_type")),
-                "time_key": time_key,
+                "event_time_key": event_time_key,
+                "dialogue_time_key": dialogue_time_key,
                 "keywords": " ".join(keywords),
                 "entities": entities,
                 "primary_entity": primary_entity,
@@ -1330,8 +1327,6 @@ class MemoryNodeManager:
                 "metadata": {
                     "extractor": "llm",
                     "priority": priority,
-                    "occurred_start": occurred_start,
-                    "occurred_end": _compact_whitespace(raw_fact.get("occurred_end") or ""),
                     "time_confidence": _compact_whitespace(raw_fact.get("time_confidence") or "unknown"),
                     "where": _compact_whitespace(raw_fact.get("where") or ""),
                 },
@@ -2094,7 +2089,8 @@ class MemoryNodeManager:
                 entity_ids=entity_ids,
                 fact_root_topic=fact_root_topic,
                 fact_aspect_topic=fact_aspect_topic,
-                time_key=fact["time_key"],
+                event_time_key=fact.get("event_time_key") or "",
+                dialogue_time_key=fact.get("dialogue_time_key") or "",
                 confidence=fact["confidence"],
                 importance=fact["importance"],
                 metadata=fact_metadata,
@@ -2167,8 +2163,8 @@ class MemoryNodeManager:
             "fact_count": len(facts),
             "fact_ids": fact_ids,
             "source_counts": dict(source_counts),
-            "time_start": facts[0].get("time_key") if facts else "",
-            "time_end": facts[-1].get("time_key") if facts else "",
+            "time_start": facts[0].get("dialogue_time_key") if facts else "",
+            "time_end": facts[-1].get("dialogue_time_key") if facts else "",
         })
         topic_facts = [fact for fact in facts if self._fact_can_seed_topic_state(fact)]
         entity_facts = [fact for fact in facts if self._fact_can_seed_entity_state(fact)]
@@ -2461,7 +2457,7 @@ class MemoryNodeManager:
             matched_facts = sorted(
                 group["facts"],
                 key=lambda fact: (
-                    str(fact.get("time_key") or ""),
+                    str(fact.get("dialogue_time_key") or ""),
                     int(fact.get("id") or 0),
                 ),
             )
@@ -3048,7 +3044,11 @@ class MemoryNodeManager:
             ]
             latest = aspect_items[-1]
             occurred_at = _compact_whitespace(
-                str(latest.get("fact_time_key") or "").split("#", 1)[0]
+                str(
+                    latest.get("fact_dialogue_time_key")
+                    or latest.get("fact_event_time_key")
+                    or ""
+                ).split("#", 1)[0]
             )
             return [{
                 "occurred_at": occurred_at,
@@ -3071,8 +3071,8 @@ class MemoryNodeManager:
             if str(fact.get("id") or "").strip().isdigit()
         ]
         latest = facts[-1]
-        time_key = _compact_whitespace(latest.get("time_key") or "")
-        occurred_at = time_key.split("#", 1)[0] if time_key else ""
+        dialogue_time_key = _compact_whitespace(latest.get("dialogue_time_key") or "")
+        occurred_at = dialogue_time_key if dialogue_time_key else ""
         return [{
             "occurred_at": occurred_at,
             "change_type": "updated",
@@ -3437,7 +3437,8 @@ class MemoryNodeManager:
             "source_type": fact.get("source_type"),
             "fact_type": fact.get("fact_type"),
             "fact_kind": fact.get("fact_kind"),
-            "time_key": fact.get("time_key"),
+            "event_time_key": fact.get("event_time_key"),
+            "dialogue_time_key": fact.get("dialogue_time_key"),
             "summary": self._log_text(fact.get("summary") or "", limit=1200),
             "keywords": fact.get("keywords"),
             "entities": fact.get("entities") or [],
@@ -3521,7 +3522,8 @@ class MemoryNodeManager:
                             **aspect,
                             "fact_id": fact_id,
                             "fact_summary": fact.get("summary") or "",
-                            "fact_time_key": fact.get("time_key") or "",
+                            "fact_event_time_key": fact.get("event_time_key") or "",
+                            "fact_dialogue_time_key": fact.get("dialogue_time_key") or "",
                         })
         candidates: List[Dict[str, Any]] = []
         for item in grouped.values():
@@ -4416,7 +4418,8 @@ class MemoryNodeManager:
                 "source_type": fact.get("source_type"),
                 "fact_type": fact.get("fact_type"),
                 "fact_kind": fact.get("fact_kind"),
-                "time_key": fact.get("time_key"),
+                "event_time_key": fact.get("event_time_key"),
+                "dialogue_time_key": fact.get("dialogue_time_key"),
                 "summary": fact.get("summary"),
                 "keywords": fact.get("keywords"),
                 "entities": fact.get("entities") or [],
@@ -4436,7 +4439,8 @@ class MemoryNodeManager:
                 "source_type": fact.get("source_type"),
                 "fact_type": fact.get("fact_type"),
                 "fact_kind": fact.get("fact_kind"),
-                "time_key": fact.get("time_key"),
+                "event_time_key": fact.get("event_time_key"),
+                "dialogue_time_key": fact.get("dialogue_time_key"),
                 "summary": fact.get("summary"),
                 "keywords": fact.get("keywords"),
                 "entities": fact.get("entities") or [],
@@ -4463,7 +4467,8 @@ class MemoryNodeManager:
                 "aspect_summary": aspect.get("aspect_summary") or "",
                 "evidence_basis": aspect.get("evidence_basis") or "",
                 "confidence": aspect.get("confidence"),
-                "fact_time_key": aspect.get("fact_time_key") or "",
+                "fact_dialogue_time_key": aspect.get("fact_dialogue_time_key") or "",
+                "fact_event_time_key": aspect.get("fact_event_time_key") or "",
                 "full_fact_summary": aspect.get("fact_summary") or "",
             })
         if aspect_rows:
@@ -4968,6 +4973,7 @@ class MemoryNodeManager:
                 if time_end and not (parsed_time_start or parsed_time_end)
                 else (parsed_time_end or recall_time_end)
             )
+            temporal_mode = self._infer_recall_temporal_mode(query)
             search_query = clean_query or query
             self._log_info("memory_recall", "query_prepared", {
                 "search_query": self._log_text(search_query, limit=500),
@@ -4977,6 +4983,7 @@ class MemoryNodeManager:
                 "effective_time_start": effective_time_start,
                 "effective_time_end": effective_time_end,
                 "recall_time_end": recall_time_end,
+                "temporal_mode": temporal_mode,
             })
 
             memory_text: Optional[str]
@@ -4990,6 +4997,7 @@ class MemoryNodeManager:
                     time_start=effective_time_start,
                     time_end=effective_time_end,
                     memory_source_override=memory_source_override,
+                    temporal_mode=temporal_mode,
                     recent_reference_time=effective_time_end,
                     database=database,
                 )
@@ -5002,6 +5010,7 @@ class MemoryNodeManager:
                     memory_source_override=memory_source_override,
                     parsed_time_start=parsed_time_start,
                     parsed_time_end=parsed_time_end,
+                    temporal_mode=temporal_mode,
                     stage1_report=stage1_report,
                     database=database,
                 )
@@ -5016,6 +5025,7 @@ class MemoryNodeManager:
                     time_start=effective_time_start,
                     time_end=effective_time_end,
                     memory_source_override=memory_source_override,
+                    temporal_mode=temporal_mode,
                     recent_reference_time=(
                         effective_time_end
                         if has_explicit_time_window
@@ -5030,6 +5040,7 @@ class MemoryNodeManager:
                     actual_recall_path = "stage2"
                     memory_text = self._process_recall_stage2(
                         query=search_query,
+                        analysis_query=query,
                         top_k=k,
                         budget=b,
                         time_start=effective_time_start,
@@ -5037,6 +5048,7 @@ class MemoryNodeManager:
                         memory_source_override=memory_source_override,
                         parsed_time_start=parsed_time_start,
                         parsed_time_end=parsed_time_end,
+                        temporal_mode=temporal_mode,
                         stage1_report=stage1_report,
                         database=database,
                     )
@@ -5048,6 +5060,7 @@ class MemoryNodeManager:
                 "memory_context": memory_text or "",
                 "requested_recall_path": normalized_recall_path,
                 "actual_recall_path": actual_recall_path,
+                "temporal_mode": temporal_mode,
                 "status": recall_status,
                 "elapsed_ms": round((time.monotonic() - started_at) * 1000, 2),
                 "recall_context_chars": len(memory_text or ""),
@@ -5056,6 +5069,7 @@ class MemoryNodeManager:
                 "status": recall_status,
                 "recall_path": normalized_recall_path,
                 "actual_recall_path": actual_recall_path,
+                "temporal_mode": temporal_mode,
                 "elapsed_ms": round((time.monotonic() - started_at) * 1000, 2),
                 "recall_context_chars": len(memory_text or ""),
                 "recall_context": memory_text,
@@ -5080,6 +5094,7 @@ class MemoryNodeManager:
         time_start: Optional[str],
         time_end: Optional[str],
         memory_source_override: Optional[Sequence[str]] = None,
+        temporal_mode: str = "dialogue_time",
         recent_reference_time: Optional[str] = None,
         database: Optional[SessionDB] = None,
     ) -> Dict[str, Any]:
@@ -5111,6 +5126,7 @@ class MemoryNodeManager:
             "terms": terms,
             "time_start": time_start,
             "time_end": time_end,
+            "temporal_mode": temporal_mode,
             "recent_reference_time": recent_reference_time,
             "memory_source_override": list(memory_source_override or []),
         })
@@ -5122,6 +5138,7 @@ class MemoryNodeManager:
                 source_types=source_types,
                 time_start=time_start,
                 time_end=time_end,
+                temporal_mode=temporal_mode,
                 candidate_limits=raw_candidate_limits,
                 database=database,
             )
@@ -5133,6 +5150,7 @@ class MemoryNodeManager:
                 source_types=source_types,
                 time_start=time_start,
                 time_end=time_end,
+                temporal_mode=temporal_mode,
                 candidate_limit=candidate_limit,
                 database=database,
             )
@@ -5152,6 +5170,7 @@ class MemoryNodeManager:
                 source_types=source_types,
                 time_start=time_start,
                 time_end=time_end,
+                temporal_mode=temporal_mode,
                 database=database,
             )
         )
@@ -5335,6 +5354,7 @@ class MemoryNodeManager:
         source_types: Optional[Sequence[str]] = None,
         time_start: Optional[str] = None,
         time_end: Optional[str] = None,
+        temporal_mode: str = "dialogue_time",
         database: Optional[SessionDB] = None,
     ) -> Tuple[List[Dict[str, Any]], Dict[str, List[Dict[str, Any]]]]:
         """Merge Stage 1 candidates and expand state/actionable evidence facts."""
@@ -5363,6 +5383,7 @@ class MemoryNodeManager:
             source_types=source_types,
             time_start=time_start,
             time_end=time_end,
+            temporal_mode=temporal_mode,
             limit=max(12, min(48, max(len(raw_candidates), 12))),
             database=database,
         )
@@ -6092,7 +6113,7 @@ class MemoryNodeManager:
     ) -> bool:
         raw = candidate.get("_hydrated") if isinstance(candidate.get("_hydrated"), dict) else {}
         fact_time = self._recall_stage1_parse_datetime(
-            raw.get("time_key") or candidate.get("time_start")
+            raw.get("dialogue_time_key") or candidate.get("time_start")
         )
         reference = self._recall_stage1_parse_datetime(reference_time)
         if fact_time is None or reference is None:
@@ -6189,6 +6210,7 @@ class MemoryNodeManager:
         source_types: Optional[Sequence[str]],
         time_start: Optional[str],
         time_end: Optional[str],
+        temporal_mode: str,
         limit: int,
         database: Optional[SessionDB] = None,
     ) -> List[Dict[str, Any]]:
@@ -6257,13 +6279,16 @@ class MemoryNodeManager:
                 candidate_source=(
                     f"{str(candidate_source_prefix).strip()}_episode_expansion"
                 ),
+                temporal_mode=temporal_mode,
             )
             if not candidate:
                 continue
-            fact_time = candidate.get("time_start") or ""
-            if time_start and fact_time and fact_time < str(time_start):
-                continue
-            if time_end and fact_time and fact_time > str(time_end):
+            if not self._fact_matches_time_bounds(
+                fact,
+                temporal_mode=temporal_mode,
+                time_start=time_start,
+                time_end=time_end,
+            ):
                 continue
             episode_id = fact.get("episode_id")
             candidate["_stage2_episode_seed_targets"] = list(
@@ -6280,6 +6305,7 @@ class MemoryNodeManager:
         source_types: Optional[Sequence[str]],
         time_start: Optional[str],
         time_end: Optional[str],
+        temporal_mode: str,
         limit: int,
         database: Optional[SessionDB] = None,
     ) -> List[Dict[str, Any]]:
@@ -6320,13 +6346,16 @@ class MemoryNodeManager:
                 candidate_source=(
                     f"{str(candidate_source_prefix).strip()}_evidence_expansion"
                 ),
+                temporal_mode=temporal_mode,
             )
             if not candidate:
                 continue
-            fact_time = candidate.get("time_start") or ""
-            if time_start and fact_time and fact_time < str(time_start):
-                continue
-            if time_end and fact_time and fact_time > str(time_end):
+            if not self._fact_matches_time_bounds(
+                fact,
+                temporal_mode=temporal_mode,
+                time_start=time_start,
+                time_end=time_end,
+            ):
                 continue
             expanded.append(candidate)
         return expanded
@@ -6340,6 +6369,7 @@ class MemoryNodeManager:
         source_types: Optional[Sequence[str]],
         time_start: Optional[str],
         time_end: Optional[str],
+        temporal_mode: str,
         top_k: int,
         database: Optional[SessionDB] = None,
     ) -> Dict[str, Any]:
@@ -6355,15 +6385,17 @@ class MemoryNodeManager:
             source_types=source_types,
             time_start=time_start,
             time_end=time_end,
+            temporal_mode=temporal_mode,
             limit=expansion_limit,
             database=database,
         )
         evidence_candidates = self._expand_recall_evidence_facts_from_candidates(
             candidates=seed_candidates,
             candidate_source_prefix="stage2",
-            source_types=source_types, 
+            source_types=source_types,
             time_start=time_start,
             time_end=time_end,
+            temporal_mode=temporal_mode,
             limit=expansion_limit,
             database=database,
         )
@@ -6440,11 +6472,13 @@ class MemoryNodeManager:
         self,
         *,
         query: str,
+        analysis_query: Optional[str] = None,
         top_k: int,
         budget: str,
         time_start: Optional[str],
         time_end: Optional[str],
         memory_source_override: Optional[Sequence[str]] = None,
+        temporal_mode: str = "dialogue_time",
         parsed_time_start: Optional[str] = None,
         parsed_time_end: Optional[str] = None,
         stage1_report: Optional[Dict[str, Any]] = None,
@@ -6463,9 +6497,13 @@ class MemoryNodeManager:
             "budget": budget,
             "time_start": time_start,
             "time_end": time_end,
+            "temporal_mode": temporal_mode,
             "memory_source_override": list(memory_source_override or []),
         })
-        recall_plan = self._analyze_recall_query(query)
+        recall_plan = self._analyze_recall_query(analysis_query or query)
+        temporal_mode = self._normalize_recall_temporal_mode(
+            recall_plan.get("temporal_mode") or temporal_mode
+        )
         forced_source_types = self._normalize_source_override(memory_source_override)
         preferred_source_types = forced_source_types or self._normalize_source_override(
             recall_plan.get("source_types") or []
@@ -6538,6 +6576,7 @@ class MemoryNodeManager:
             "parsed_time_end": parsed_time_end,
             "effective_time_start": time_start,
             "effective_time_end": time_end,
+            "temporal_mode": temporal_mode,
         })
         if supplement_terms:
             lexical_fact_candidates, lexical_state_candidates, lexical_actionable_candidates = (
@@ -6547,6 +6586,7 @@ class MemoryNodeManager:
                     source_types=forced_source_types,
                     time_start=time_start,
                     time_end=time_end,
+                    temporal_mode=temporal_mode,
                     candidate_limits=supplement_candidate_limits,
                     database=database,
                 )
@@ -6575,6 +6615,7 @@ class MemoryNodeManager:
                 source_types=forced_source_types,
                 time_start=time_start,
                 time_end=time_end,
+                temporal_mode=temporal_mode,
                 candidate_limit=max(12, min(48, top_k * 4)),
                 database=database,
             ) if new_llm_entities else ([], [], [])
@@ -6594,6 +6635,7 @@ class MemoryNodeManager:
             source_types=forced_source_types,
             time_start=time_start,
             time_end=time_end,
+            temporal_mode=temporal_mode,
             top_k=top_k,
             database=database,
         )
@@ -6652,6 +6694,7 @@ class MemoryNodeManager:
         supporting_facts: Optional[Sequence[Dict[str, Any]]] = None,
         time_start: Optional[str] = None,
         time_end: Optional[str] = None,
+        temporal_mode: str = "dialogue_time",
     ) -> Optional[Dict[str, Any]]:
         """Convert a memory row into the shared recall candidate shape."""
         try:
@@ -6663,11 +6706,19 @@ class MemoryNodeManager:
         if table == "memory_facts":
             title = _compact_whitespace(row.get("summary") or "")[:120]
             summary = _compact_whitespace(row.get("summary") or "")
-            time_value = self._normalize_event_time_text(row.get("time_key"))
+            fact_times = self._fact_time_values(row, temporal_mode)
+            if not self._fact_matches_time_bounds(
+                row,
+                temporal_mode=temporal_mode,
+                time_start=time_start,
+                time_end=time_end,
+            ):
+                return None
+            time_value = fact_times[0] if fact_times else ""
             entities = row.get("entities") or []
             topics: List[str] = []
             keywords = row.get("keywords") or ""
-            time_end_value = time_value
+            time_end_value = fact_times[-1] if fact_times else ""
         elif table == "memory_states":
             title = _compact_whitespace(row.get("canonical_name") or "")
             summary = _compact_whitespace(row.get("summary") or "")
@@ -6688,7 +6739,10 @@ class MemoryNodeManager:
                 state_metadata.get("keywords"),
                 limit=24,
             ))
-            support_start, support_end = self._event_time_bounds_from_facts(support_facts)
+            support_start, support_end = self._event_time_bounds_from_facts(
+                support_facts,
+                temporal_mode=temporal_mode,
+            )
             if support_start or support_end:
                 time_value = support_start or support_end
                 time_end_value = support_end or support_start
@@ -6703,7 +6757,10 @@ class MemoryNodeManager:
             entities = [row.get("owner")] if row.get("owner") else []
             topics = [row.get("canonical_name")] if row.get("canonical_name") else []
             keywords = ""
-            support_start, support_end = self._event_time_bounds_from_facts(support_facts)
+            support_start, support_end = self._event_time_bounds_from_facts(
+                support_facts,
+                temporal_mode=temporal_mode,
+            )
             if support_start or support_end:
                 time_value = support_start or support_end
                 time_end_value = support_end or support_start
@@ -6712,10 +6769,11 @@ class MemoryNodeManager:
         else:
             return None
 
-        if time_start and time_end_value and time_end_value < str(time_start):
-            return None
-        if time_end and time_value and time_value > str(time_end):
-            return None
+        if table == "memory_facts":
+            if time_start and time_end_value and time_end_value < str(time_start):
+                return None
+            if time_end and time_value and time_value > str(time_end):
+                return None
 
         hydrated = dict(row)
         hydrated.pop("embedding", None)
@@ -6758,6 +6816,7 @@ class MemoryNodeManager:
         source_types: Optional[Sequence[str]],
         time_start: Optional[str],
         time_end: Optional[str],
+        temporal_mode: str,
         candidate_limit: int,
         database: Optional[SessionDB] = None,
     ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
@@ -6828,6 +6887,7 @@ class MemoryNodeManager:
                     ),
                     time_start=time_start,
                     time_end=time_end,
+                    temporal_mode=temporal_mode,
                 )
                 if candidate:
                     candidate["_recall_entity_names"] = matched_entity_names
@@ -6846,6 +6906,7 @@ class MemoryNodeManager:
         source_types: Optional[Sequence[str]],
         time_start: Optional[str],
         time_end: Optional[str],
+        temporal_mode: str,
         candidate_limits: Dict[str, int],
         database: Optional[SessionDB] = None,
     ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
@@ -6868,15 +6929,18 @@ class MemoryNodeManager:
             "memory_actionable_items": "actionable_items",
         }
         for table, _level, loader in table_specs:
-            rows_by_table[table] = loader(
-                terms=terms,
-                source_types=source_types,
+            loader_kwargs = {
+                "terms": terms,
+                "source_types": source_types,
                 # States and actionable items do not have an event-time
                 # column, so their own update/due time is used below.
-                time_start=time_start if table == "memory_facts" else None,
-                time_end=time_end if table == "memory_facts" else None,
-                limit=max(1, int(candidate_limits.get(raw_limit_keys[table], 1) or 1)),
-            )
+                "time_start": time_start if table == "memory_facts" else None,
+                "time_end": time_end if table == "memory_facts" else None,
+                "limit": max(1, int(candidate_limits.get(raw_limit_keys[table], 1) or 1)),
+            }
+            if table == "memory_facts":
+                loader_kwargs["temporal_mode"] = temporal_mode
+            rows_by_table[table] = loader(**loader_kwargs)
 
         candidates_by_level: Dict[str, List[Dict[str, Any]]] = {
             "fact": [],
@@ -6893,7 +6957,9 @@ class MemoryNodeManager:
                 if table == "memory_facts":
                     title = _compact_whitespace(row.get("summary") or "")[:120]
                     summary = _compact_whitespace(row.get("summary") or "")
-                    time_value = self._normalize_event_time_text(row.get("time_key"))
+                    fact_times = self._fact_time_values(row, temporal_mode)
+                    time_value = fact_times[0] if fact_times else ""
+                    time_end_value = fact_times[-1] if fact_times else ""
                     entities = row.get("entities") or []
                     topics = self._normalize_unique_labels([
                         row.get("fact_root_topic"),
@@ -6929,11 +6995,20 @@ class MemoryNodeManager:
                     entities = [row.get("owner")] if row.get("owner") else []
                     topics = [row.get("canonical_name")] if row.get("canonical_name") else []
 
-                time_end_value = time_value
-                if time_start and time_end_value and time_end_value < str(time_start):
+                if table == "memory_facts" and not self._fact_matches_time_bounds(
+                    row,
+                    temporal_mode=temporal_mode,
+                    time_start=time_start,
+                    time_end=time_end,
+                ):
                     continue
-                if time_end and time_value and time_value > str(time_end):
-                    continue
+                if table != "memory_facts":
+                    time_end_value = time_value
+                if table == "memory_facts":
+                    if time_start and time_end_value and time_end_value < str(time_start):
+                        continue
+                    if time_end and time_value and time_value > str(time_end):
+                        continue
 
                 candidate_embedding = row.get("identity_text_embedding")
                 hydrated = dict(row)
@@ -7018,6 +7093,7 @@ class MemoryNodeManager:
         fact: Dict[str, Any],
         *,
         candidate_source: str,
+        temporal_mode: str = "dialogue_time",
     ) -> Optional[Dict[str, Any]]:
         """Convert a raw/supporting fact into the shared display shape."""
         try:
@@ -7026,7 +7102,9 @@ class MemoryNodeManager:
             return None
         source_type = str(fact.get("source_type") or "unified")
         summary = _compact_whitespace(fact.get("summary") or "")
-        time_value = self._normalize_event_time_text(fact.get("time_key"))
+        fact_times = self._fact_time_values(fact, temporal_mode)
+        time_value = fact_times[0] if fact_times else ""
+        time_end_value = fact_times[-1] if fact_times else ""
         hydrated = dict(fact)
         hydrated.pop("identity_text_embedding", None)
         metadata = dict(fact.get("metadata") or {})
@@ -7044,7 +7122,7 @@ class MemoryNodeManager:
             "entities": fact.get("entities") or [],
             "participants": fact.get("participants") or [],
             "time_start": time_value,
-            "time_end": time_value,
+            "time_end": time_end_value,
             "importance": fact.get("importance") or 0.5,
             "confidence": fact.get("confidence") or 0.8,
             "embedding": fact.get("identity_text_embedding"),
@@ -7529,11 +7607,92 @@ class MemoryNodeManager:
             return text[:10]
         return text
 
+    @staticmethod
+    def _normalize_recall_temporal_mode(value: Any) -> str:
+        mode = str(value or "").strip().lower()
+        aliases = {
+            "event": "event_time",
+            "event-time": "event_time",
+            "dialogue": "dialogue_time",
+            "dialogue-time": "dialogue_time",
+            "conversation": "dialogue_time",
+            "all": "both",
+        }
+        mode = aliases.get(mode, mode)
+        return mode if mode in {"event_time", "dialogue_time", "both", "none"} else "none"
+
     @classmethod
-    def _event_time_bounds_from_facts(cls, facts: Sequence[Dict[str, Any]]) -> Tuple[str, str]:
+    def _infer_recall_temporal_mode(cls, query: str) -> str:
+        text = _compact_whitespace(query).lower()
+        dialogue_markers = (
+            "讨论", "聊", "提到", "问过", "说过", "谈过", "对话", "交流",
+            "讨论了", "提及", "discuss", "talk", "mentioned", "asked",
+            "conversation", "chat", "said",
+        )
+        event_markers = (
+            "做了", "做过", "发生", "买了", "买过", "去过", "参加", "完成",
+            "经历", "遇到", "使用过", "发生了什么", "what happened", "did",
+            "bought", "visited", "attended", "completed", "experienced",
+        )
+        has_dialogue = any(marker in text for marker in dialogue_markers)
+        has_event = any(marker in text for marker in event_markers)
+        if has_dialogue and has_event:
+            return "both"
+        if has_event:
+            return "event_time"
+        if has_dialogue:
+            return "dialogue_time"
+        return "none"
+
+    @classmethod
+    def _fact_time_values(
+        cls,
+        fact: Dict[str, Any],
+        temporal_mode: str,
+    ) -> List[str]:
+        mode = cls._normalize_recall_temporal_mode(temporal_mode)
+        event_time = cls._normalize_event_time_text(fact.get("event_time_key"))
+        dialogue_time = cls._normalize_event_time_text(fact.get("dialogue_time_key"))
+        if mode == "event_time":
+            return [event_time] if event_time else []
+        if mode == "dialogue_time":
+            return [dialogue_time] if dialogue_time else []
+        if mode == "both":
+            return sorted({value for value in (event_time, dialogue_time) if value})
+        return []
+
+    @classmethod
+    def _fact_matches_time_bounds(
+        cls,
+        fact: Dict[str, Any],
+        *,
+        temporal_mode: str,
+        time_start: Optional[str],
+        time_end: Optional[str],
+    ) -> bool:
+        mode = cls._normalize_recall_temporal_mode(temporal_mode)
+        if mode == "none" or not (time_start or time_end):
+            return True
+        values = cls._fact_time_values(fact, mode)
+        if not values:
+            return False
+        return any(
+            (not time_start or value >= str(time_start))
+            and (not time_end or value <= str(time_end))
+            for value in values
+        )
+
+    @classmethod
+    def _event_time_bounds_from_facts(
+        cls,
+        facts: Sequence[Dict[str, Any]],
+        *,
+        temporal_mode: str = "event_time",
+    ) -> Tuple[str, str]:
         times = [
-            cls._normalize_event_time_text(fact.get("time_key"))
+            value
             for fact in facts or []
+            for value in cls._fact_time_values(fact, temporal_mode)
         ]
         times = sorted(time for time in times if time)
         if not times:
@@ -7550,7 +7709,7 @@ class MemoryNodeManager:
         target_table = str(entry.get("target_table") or "")
         if target_table == "memory_facts":
             return (
-                self._normalize_event_time_text(raw.get("time_key"))
+                self._normalize_event_time_text(raw.get("event_time_key"))
                 or self._normalize_event_time_text(entry.get("time_start"))
                 or self._normalize_event_time_text(entry.get("time_end"))
                 or "unknown-event-time"
@@ -7571,7 +7730,7 @@ class MemoryNodeManager:
                 return self._format_event_time_range(start, end)
             return "unknown-event-time"
         return (
-            self._normalize_event_time_text(raw.get("time_key"))
+            self._normalize_event_time_text(raw.get("event_time_key"))
             or self._normalize_event_time_text(raw.get("started_at"))
             or self._normalize_event_time_text(entry.get("time_start"))
             or self._normalize_event_time_text(entry.get("time_end"))

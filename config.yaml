@@ -151,6 +151,8 @@ memory_manager:
 
   save_db_name: memory.db
   retrieval_top_k: 8
+  recall_fast_candidate_min_score: 0.35
+  recall_fast_candidate_score_threshold: 0.65
 
   memory_prompt_language_mode: zh
   memory_output_language_mode: zh

@@ -288,7 +288,6 @@ def db_counts(db: SessionDB) -> Dict[str, int]:
         "memory_facts",
         "memory_states",
         "memory_actionable_items",
-        "memory_index_entries",
     ):
         row = db._conn.execute(f"SELECT COUNT(*) AS count FROM {table}").fetchone()
         counts[table] = int(row["count"] if row else 0)

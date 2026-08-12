@@ -751,8 +751,7 @@ def db_counts(db: SessionDB) -> Dict[str, int]:
         "facts": "memory_facts",
         "states": "memory_states",
         "actionable_items": "memory_actionable_items",
-        "index_entries": "memory_index_entries",
-        "entities": "entity_nodes",
+        "entities": "memory_entity_nodes",
     }
     counts: Dict[str, int] = {}
     for key, table in tables.items():
@@ -1352,7 +1351,7 @@ def run_instance_memory_context_worker(
         embedding_config=embedding_config,
     )
     logging.info(
-        "[%s/%s] Finished %s: sessions=%s episodes=%s facts=%s states=%s actionable_items=%s index_entries=%s recall_chars=%s",
+        "[%s/%s] Finished %s: sessions=%s episodes=%s facts=%s states=%s actionable_items=%srecall_chars=%s",
         index,
         total,
         question_id,
@@ -1361,7 +1360,6 @@ def run_instance_memory_context_worker(
         result["db_counts"]["facts"],
         result["db_counts"]["states"],
         result["db_counts"]["actionable_items"],
-        result["db_counts"]["index_entries"],
         result["recall_context_chars"],
     )
     return index, result
@@ -1499,7 +1497,7 @@ def main() -> int:
                 )
                 result = memory_results_by_index[index]
                 logging.info(
-                    "[%s/%s] Memory context ready for %s: sessions=%s episodes=%s facts=%s states=%s actionable_items=%s index_entries=%s recall_chars=%s",
+                    "[%s/%s] Memory context ready for %s: sessions=%s episodes=%s facts=%s states=%s actionable_items=%srecall_chars=%s",
                     index,
                     len(selected),
                     question_id,
@@ -1508,7 +1506,6 @@ def main() -> int:
                     result["db_counts"]["facts"],
                     result["db_counts"]["states"],
                     result["db_counts"]["actionable_items"],
-                    result["db_counts"]["index_entries"],
                     result["recall_context_chars"],
                 )
             except Exception as exc:

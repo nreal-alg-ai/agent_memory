@@ -184,7 +184,8 @@ class SessionDB:
                 entity_ids TEXT NOT NULL DEFAULT '[]',
                 fact_root_topic TEXT NOT NULL DEFAULT '',
                 fact_aspect_topic TEXT NOT NULL DEFAULT '',
-                time_key TEXT NOT NULL DEFAULT '',
+                event_time_key TEXT NOT NULL DEFAULT '',
+                dialogue_time_key TEXT NOT NULL DEFAULT '',
                 confidence REAL NOT NULL DEFAULT 0.85,
                 importance REAL NOT NULL DEFAULT 0.5,
                 processed_for_memory_state INTEGER NOT NULL DEFAULT 0,
@@ -256,7 +257,8 @@ class SessionDB:
                 FOREIGN KEY(entity_id) REFERENCES memory_entity_nodes(id) ON DELETE CASCADE
             );
 
-            CREATE INDEX IF NOT EXISTS idx_memory_facts_time ON memory_facts(time_key);
+            CREATE INDEX IF NOT EXISTS idx_memory_facts_event_time ON memory_facts(event_time_key);
+            CREATE INDEX IF NOT EXISTS idx_memory_facts_dialogue_time ON memory_facts(dialogue_time_key);
             CREATE INDEX IF NOT EXISTS idx_memory_facts_source ON memory_facts(source_type);
             CREATE INDEX IF NOT EXISTS idx_memory_facts_state_processing
             ON memory_facts(processed_for_memory_state, created_at);
@@ -738,14 +740,14 @@ class SessionDB:
         if restrict_to_today:
             local_now = _coerce_reference_datetime(reference_timestamp).astimezone()
             event_date = local_now.date().isoformat()
-            clauses.append("substr(time_key, 1, 10) = ?")
+            clauses.append("substr(dialogue_time_key, 1, 10) = ?")
             params.append(event_date)
         where = "WHERE " + " AND ".join(clauses) if clauses else ""
         rows = self._conn.execute(
             f"""
             SELECT * FROM memory_facts
             {where}
-            ORDER BY replace(substr(time_key, 1, 19), 'T', ' ') ASC, created_at ASC, id ASC
+            ORDER BY replace(substr(dialogue_time_key, 1, 19), 'T', ' ') ASC, created_at ASC, id ASC
             LIMIT ?
             """,
             (*params, max(1, int(limit or 100))),
@@ -830,7 +832,8 @@ class SessionDB:
         entity_ids: Optional[Sequence[int]],
         fact_root_topic: str,
         fact_aspect_topic: str,
-        time_key: str,
+        event_time_key: str,
+        dialogue_time_key: str,
         confidence: float,
         importance: float,
         metadata: Optional[Dict[str, Any]],
@@ -843,10 +846,10 @@ class SessionDB:
             INSERT INTO memory_facts (
                 episode_id, source_type, fact_type, fact_kind,
                 summary, keywords, entities, entity_ids, fact_root_topic,
-                fact_aspect_topic, time_key,
+                fact_aspect_topic, event_time_key, dialogue_time_key,
                 confidence, importance, metadata, identity_text_embedding, identity_text,
                 created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 episode_id,
@@ -859,7 +862,8 @@ class SessionDB:
                 _json_dumps([int(value) for value in entity_ids or []]),
                 str(fact_root_topic or ""),
                 str(fact_aspect_topic or ""),
-                time_key,
+                event_time_key,
+                dialogue_time_key,
                 float(confidence),
                 float(importance),
                 _json_dumps(metadata or {}),
@@ -1077,12 +1081,13 @@ class SessionDB:
         *,
         table: str,
         identity_fts_table: str,
-        time_field: str,
+        time_fields: Optional[Sequence[str]] = None,
         terms: Optional[Sequence[str]],
         source_types: Optional[Sequence[str]],
         time_start: Optional[str],
         time_end: Optional[str],
         limit: int,
+        strict_time_filter: bool = False,
     ) -> List[Dict[str, Any]]:
         """Return raw rows ranked by BM25 over their identity text.
 
@@ -1097,19 +1102,41 @@ class SessionDB:
             placeholders = ",".join("?" for _ in source_types)
             base_clauses.append(f"source_type IN ({placeholders})")
             base_params.extend(source_types)
+        selected_time_fields = [
+            str(field).strip()
+            for field in (time_fields or [])
+            if str(field).strip()
+        ]
+        time_expressions = [
+            f"substr({field}, 1, 19)"
+            if field.endswith("_time_key")
+            else field
+            for field in selected_time_fields
+        ]
         time_expression = (
-            f"substr({time_field}, 1, 19)"
-            if time_field == "time_key"
-            else time_field
+            time_expressions[0]
+            if len(time_expressions) == 1
+            else "updated_at"
+            if not time_expressions
+            else "COALESCE(" + ", ".join(time_expressions) + ")"
         )
         time_clauses: List[str] = []
         time_params: List[Any] = []
-        if time_start:
-            time_clauses.append(f"{time_expression} >= ?")
-            time_params.append(str(time_start))
-        if time_end:
-            time_clauses.append(f"{time_expression} <= ?")
-            time_params.append(str(time_end))
+        for field_expression in time_expressions:
+            field_clauses: List[str] = []
+            field_params: List[str] = []
+            if time_start:
+                field_clauses.append(f"{field_expression} >= ?")
+                field_params.append(str(time_start))
+            if time_end:
+                field_clauses.append(f"{field_expression} <= ?")
+                field_params.append(str(time_end))
+            if field_clauses:
+                time_clauses.append("(" + " AND ".join(field_clauses) + ")")
+                time_params.extend(field_params)
+        if len(time_clauses) > 1:
+            time_filter = "(" + " OR ".join(time_clauses) + ")"
+            time_clauses = [time_filter]
         base_where = " AND ".join(base_clauses) if base_clauses else "1=1"
         timed_where = " AND ".join([base_where, *time_clauses]) if time_clauses else base_where
         row_limit = max(1, int(limit or 80))
@@ -1209,7 +1236,7 @@ class SessionDB:
                 limit_value=row_limit * 2,
             )
         add_recent(where=timed_where, params=timed_params, limit_value=row_limit)
-        if time_clauses and len(row_ids) < row_limit:
+        if time_clauses and len(row_ids) < row_limit and not strict_time_filter:
             # Time range is a strong preference, not a brittle hard stop. Pad
             # with broader keyword/recent candidates so downstream reranking
             # can still recover facts with coarse or slightly shifted times.
@@ -1253,17 +1280,28 @@ class SessionDB:
         source_types: Optional[Sequence[str]] = None,
         time_start: Optional[str] = None,
         time_end: Optional[str] = None,
+        temporal_mode: str = "dialogue_time",
         limit: int = 200,
     ) -> List[Dict[str, Any]]:
+        temporal_mode = str(temporal_mode or "dialogue_time").strip().lower()
+        if temporal_mode == "event_time":
+            time_fields = ["event_time_key"]
+        elif temporal_mode == "both":
+            time_fields = ["event_time_key", "dialogue_time_key"]
+        elif temporal_mode == "none":
+            time_fields = []
+        else:
+            time_fields = ["dialogue_time_key"]
         return self._search_memory_rows(
             table="memory_facts",
             identity_fts_table="memory_facts_identity_fts",
-            time_field="time_key",
+            time_fields=time_fields or ["dialogue_time_key"],
             terms=terms,
             source_types=source_types,
-            time_start=time_start,
-            time_end=time_end,
+            time_start=time_start if temporal_mode != "none" else None,
+            time_end=time_end if temporal_mode != "none" else None,
             limit=limit,
+            strict_time_filter=True,
         )
 
     def search_memory_states(
@@ -1278,11 +1316,11 @@ class SessionDB:
         return self._search_memory_rows(
             table="memory_states",
             identity_fts_table="memory_states_identity_fts",
-            time_field="updated_at",
+            time_fields=[],
             terms=terms,
             source_types=source_types,
-            time_start=time_start,
-            time_end=time_end,
+            time_start=None,
+            time_end=None,
             limit=limit,
         )
 
@@ -1298,11 +1336,11 @@ class SessionDB:
         return self._search_memory_rows(
             table="memory_actionable_items",
             identity_fts_table="memory_actionable_items_identity_fts",
-            time_field="updated_at",
+            time_fields=[],
             terms=terms,
             source_types=source_types,
-            time_start=time_start,
-            time_end=time_end,
+            time_start=None,
+            time_end=None,
             limit=limit,
         )
 
@@ -1349,7 +1387,7 @@ class SessionDB:
             f"""
             SELECT * FROM memory_facts
             WHERE episode_id IN ({placeholders})
-            ORDER BY time_key ASC, id ASC
+            ORDER BY dialogue_time_key ASC, id ASC
             LIMIT ?
             """,
             (*ids, max(1, int(limit or 200))),

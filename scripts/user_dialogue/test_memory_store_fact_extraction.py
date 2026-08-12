@@ -300,7 +300,7 @@ def load_test_turns(
 
 def iter_stored_nodes(db: SessionDB, start_id: int) -> Iterable[Dict[str, Any]]:
     rows = db._conn.execute(
-        """SELECT id, episode_id, source_type, time_key, summary, keywords,
+        """SELECT id, episode_id, source_type, event_time_key, dialogue_time_key, summary, keywords,
                   fact_type, fact_kind, entities,
                   fact_root_topic, fact_aspect_topic,
                   confidence, importance, metadata, created_at, updated_at
@@ -604,9 +604,6 @@ def validate_embedding_runtime(
 
 
 def log_memory_index_state(db: SessionDB, event: str) -> None:
-    index_count = db._conn.execute(
-        "SELECT COUNT(*) AS count FROM memory_index_entries"
-    ).fetchone()["count"]
     fact_count = db._conn.execute(
         "SELECT COUNT(*) AS count FROM memory_facts"
     ).fetchone()["count"]
@@ -617,12 +614,11 @@ def log_memory_index_state(db: SessionDB, event: str) -> None:
         "SELECT COUNT(*) AS count FROM memory_actionable_items"
     ).fetchone()["count"]
     logging.info(
-        "Memory index state event=%s facts=%s states=%s actionable_items=%s index_entries=%s",
+        "Memory index state event=%s facts=%s states=%s actionable_items=%s",
         event,
         fact_count,
         state_count,
         actionable_count,
-        index_count,
     )
 
 
@@ -692,7 +688,7 @@ def main() -> int:
             for local_index, (sample_id, turn_index, user, assistant, hour_offset, is_last_turn) in enumerate(turns):
                 flat_index = args.start + local_index
                 # Keep sample-level spacing at one hour for reflect tests, while
-                # giving each turn a unique timestamp so memory_nodes.time_key
+                # giving each turn a unique timestamp so dialogue-time ordering
                 # does not collide on "#00" across turns in the same sample.
                 turn_timestamp = base_turn_timestamp + timedelta(hours=hour_offset, seconds=turn_index)
                 before_id = db._conn.execute("SELECT COALESCE(MAX(id), 0) AS max_id FROM memory_facts").fetchone()["max_id"]

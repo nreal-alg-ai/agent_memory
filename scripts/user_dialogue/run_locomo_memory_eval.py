@@ -375,8 +375,7 @@ def db_counts(db: SessionDB) -> Dict[str, int]:
         "facts": "memory_facts",
         "states": "memory_states",
         "actionable_items": "memory_actionable_items",
-        "index_entries": "memory_index_entries",
-        "entities": "entity_nodes",
+        "entities": "memory_entity_nodes",
     }
     return {
         name: int((db._conn.execute(f"SELECT COUNT(*) AS count FROM {table}").fetchone() or {"count": 0})["count"])
