@@ -1093,8 +1093,9 @@ class SessionDB:
 
         Table and field names are internal constants supplied by the three
         public wrappers below; user input is only ever bound as SQL values.
-        BM25 hits are merged with recent rows so semantic reranking still has
-        a chance to recover older records without scanning unbounded data.
+        Only identity-text lexical hits are returned. BM25 results are merged
+        with the LIKE fallback when FTS5 is unavailable, while time filtering
+        remains controlled by the caller.
         """
         base_clauses: List[str] = []
         base_params: List[Any] = []
@@ -1213,18 +1214,6 @@ class SessionDB:
             ).fetchall()
             add_ids(rows)
 
-        def add_recent(*, where: str, params: Sequence[Any], limit_value: int) -> None:
-            rows = self._conn.execute(
-                f"""
-                SELECT id FROM {table}
-                WHERE {where}
-                ORDER BY {time_expression} DESC, id DESC
-                LIMIT ?
-                """,
-                (*params, limit_value),
-            ).fetchall()
-            add_ids(rows)
-
         timed_params = [*base_params, *time_params]
         bm25_available = add_bm25_matches(
             where=timed_where,
@@ -1237,11 +1226,10 @@ class SessionDB:
                 params=timed_params,
                 limit_value=row_limit * 2,
             )
-        add_recent(where=timed_where, params=timed_params, limit_value=row_limit)
         if time_clauses and len(row_ids) < row_limit and not strict_time_filter:
             # Time range is a strong preference, not a brittle hard stop. Pad
-            # with broader keyword/recent candidates so downstream reranking
-            # can still recover facts with coarse or slightly shifted times.
+            # with broader lexical candidates so downstream reranking can
+            # still recover facts with coarse or slightly shifted times.
             if bm25_available:
                 add_bm25_matches(
                     where=base_where,
@@ -1254,7 +1242,6 @@ class SessionDB:
                     params=base_params,
                     limit_value=row_limit * 2,
                 )
-            add_recent(where=base_where, params=base_params, limit_value=row_limit)
 
         selected_ids = row_ids[: row_limit * 3]
         if not selected_ids:
