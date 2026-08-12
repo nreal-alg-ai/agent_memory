@@ -6,7 +6,6 @@ benchmark scripts (`memory_facts`, `memory_observations`,
 `memory_interpretations`, `memory_entity_nodes`) while adding the new unified line:
 
     memory_episodes -> memory_facts -> memory_states/actionable_items
-    -> memory_index_entries
 
 `memory_index_entries` is the MemPalace-style directory layer: every retrievable
 memory object writes one index card that points back to its source row.
@@ -26,6 +25,12 @@ import numpy as np
 
 _HAS_FAISS = False
 EMBEDDING_DIM = 384
+
+_IDENTITY_FTS_TABLES = {
+    "memory_facts": "memory_facts_identity_fts",
+    "memory_states": "memory_states_identity_fts",
+    "memory_actionable_items": "memory_actionable_items_identity_fts",
+}
 
 
 def utc_now_text() -> str:
@@ -233,31 +238,6 @@ class SessionDB:
                 UNIQUE(source_type, item_type, canonical_name)
             );
 
-            CREATE TABLE IF NOT EXISTS memory_index_entries (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                source_type TEXT NOT NULL,
-                target_table TEXT NOT NULL,
-                target_id INTEGER NOT NULL,
-                index_level TEXT NOT NULL,
-                memory_path TEXT NOT NULL DEFAULT '',
-                title TEXT NOT NULL DEFAULT '',
-                summary_for_retrieval TEXT NOT NULL,
-                keywords TEXT NOT NULL DEFAULT '',
-                entities TEXT NOT NULL DEFAULT '[]',
-                canonical_topics TEXT NOT NULL DEFAULT '[]',
-                participants TEXT NOT NULL DEFAULT '[]',
-                time_start TEXT,
-                time_end TEXT,
-                importance REAL NOT NULL DEFAULT 0.5,
-                confidence REAL NOT NULL DEFAULT 0.8,
-                embedding BLOB,
-                embedding_text TEXT NOT NULL DEFAULT '',
-                metadata TEXT NOT NULL DEFAULT '{}',
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                UNIQUE(target_table, target_id, index_level)
-            );
-
             CREATE TABLE IF NOT EXISTS memory_entity_nodes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL UNIQUE,
@@ -280,8 +260,6 @@ class SessionDB:
             CREATE INDEX IF NOT EXISTS idx_memory_facts_source ON memory_facts(source_type);
             CREATE INDEX IF NOT EXISTS idx_memory_facts_state_processing
             ON memory_facts(processed_for_memory_state, created_at);
-            CREATE INDEX IF NOT EXISTS idx_memory_index_source ON memory_index_entries(source_type);
-            CREATE INDEX IF NOT EXISTS idx_memory_index_time ON memory_index_entries(time_start);
             CREATE INDEX IF NOT EXISTS idx_memory_states_source ON memory_states(source_type, state_type);
             CREATE INDEX IF NOT EXISTS idx_memory_states_scope
             ON memory_states(source_type, state_scope, state_type);
@@ -294,8 +272,49 @@ class SessionDB:
         self._ensure_memory_states_time_line_schema()
         self._ensure_memory_states_entity_key_schema()
         self._ensure_memory_states_canonical_name_embedding_schema()
-        self._init_index_fts()
+        self._init_identity_fts()
         self._commit_if_needed()
+
+    def _init_identity_fts(self) -> None:
+        """Create and backfill one BM25 index for each memory table."""
+        for source_table, fts_table in _IDENTITY_FTS_TABLES.items():
+            self._conn.execute(
+                f"""
+                CREATE VIRTUAL TABLE IF NOT EXISTS {fts_table} USING fts5(
+                    identity_text
+                )
+                """
+            )
+            self._conn.execute(
+                f"""
+                INSERT INTO {fts_table} (rowid, identity_text)
+                SELECT source.id, source.identity_text
+                FROM {source_table} source
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM {fts_table} fts_row
+                    WHERE fts_row.rowid = source.id
+                )
+                """
+            )
+
+    def _sync_identity_fts(
+        self,
+        *,
+        source_table: str,
+        row_id: int,
+        identity_text: str,
+    ) -> None:
+        """Keep the table-specific BM25 document synchronized with its row."""
+        fts_table = _IDENTITY_FTS_TABLES[source_table]
+        self._conn.execute(
+            f"DELETE FROM {fts_table} WHERE rowid = ?",
+            (int(row_id),),
+        )
+        self._conn.execute(
+            f"INSERT INTO {fts_table} (rowid, identity_text) VALUES (?, ?)",
+            (int(row_id), str(identity_text or "")),
+        )
 
     def _ensure_entity_ids_schema(self) -> None:
         """Ensure all primary memory tables expose direct entity id mappings."""
@@ -439,49 +458,6 @@ class SessionDB:
                 "ALTER TABLE memory_states ADD COLUMN canonical_name_embedding BLOB"
             )
 
-    def _init_index_fts(self) -> None:
-        """Create the lightweight lexical index used for first-pass recall."""
-        self._conn.execute(
-            """
-            CREATE VIRTUAL TABLE IF NOT EXISTS memory_index_entries_fts USING fts5(
-                title,
-                summary_for_retrieval,
-                keywords,
-                entities,
-                canonical_topics,
-                participants,
-                memory_path
-            )
-            """
-        )
-        self._backfill_index_fts()
-
-    def _backfill_index_fts(self) -> None:
-        """Populate FTS rows for existing index cards not yet synchronized."""
-        self._conn.execute(
-            """
-            INSERT INTO memory_index_entries_fts (
-                rowid, title, summary_for_retrieval, keywords, entities,
-                canonical_topics, participants, memory_path
-            )
-            SELECT
-                i.id,
-                i.title,
-                i.summary_for_retrieval,
-                i.keywords,
-                i.entities,
-                i.canonical_topics,
-                i.participants,
-                i.memory_path
-            FROM memory_index_entries i
-            WHERE NOT EXISTS (
-                SELECT 1
-                FROM memory_index_entries_fts f
-                WHERE f.rowid = i.id
-            )
-            """
-        )
-
     @staticmethod
     def _terms_to_fts_query(terms: Sequence[str]) -> str:
         quoted: List[str] = []
@@ -504,41 +480,6 @@ class SessionDB:
             if len(normalized) >= 16:
                 break
         return normalized
-
-    def _sync_index_entry_fts(
-        self,
-        *,
-        row_id: int,
-        title: str,
-        summary_for_retrieval: str,
-        keywords: str,
-        entities: Sequence[str],
-        canonical_topics: Sequence[str],
-        participants: Sequence[str],
-        memory_path: str,
-    ) -> None:
-        self._conn.execute(
-            "DELETE FROM memory_index_entries_fts WHERE rowid = ?",
-            (int(row_id),),
-        )
-        self._conn.execute(
-            """
-            INSERT INTO memory_index_entries_fts (
-                rowid, title, summary_for_retrieval, keywords, entities,
-                canonical_topics, participants, memory_path
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                int(row_id),
-                str(title or ""),
-                str(summary_for_retrieval or ""),
-                str(keywords or ""),
-                " ".join(str(item or "") for item in entities or []),
-                " ".join(str(item or "") for item in canonical_topics or []),
-                " ".join(str(item or "") for item in participants or []),
-                str(memory_path or ""),
-            ),
-        )
 
     def insert_episode(
         self,
@@ -678,6 +619,11 @@ class SessionDB:
         ).fetchone()
         state_id = int(row["id"]) if row else 0
         if state_id:
+            self._sync_identity_fts(
+                source_table="memory_states",
+                row_id=state_id,
+                identity_text=str(identity_text or ""),
+            )
             self.insert_entity_memory_mappings([
                 {
                     "entity_id": int(entity_id),
@@ -760,6 +706,11 @@ class SessionDB:
         ).fetchone()
         actionable_item_id = int(row["id"]) if row else 0
         if actionable_item_id:
+            self._sync_identity_fts(
+                source_table="memory_actionable_items",
+                row_id=actionable_item_id,
+                identity_text=str(identity_text or ""),
+            )
             self.insert_entity_memory_mappings([
                 {
                     "entity_id": int(entity_id),
@@ -919,6 +870,11 @@ class SessionDB:
             ),
         )
         fact_id = int(cur.lastrowid)
+        self._sync_identity_fts(
+            source_table="memory_facts",
+            row_id=fact_id,
+            identity_text=str(identity_text or ""),
+        )
         self.insert_entity_memory_mappings([
             {
                 "entity_id": int(entity_id),
@@ -929,101 +885,6 @@ class SessionDB:
         ])
         self._commit_if_needed()
         return fact_id
-
-    def upsert_index_entry(
-        self,
-        *,
-        source_type: str,
-        target_table: str,
-        target_id: int,
-        index_level: str,
-        memory_path: str,
-        title: str,
-        summary_for_retrieval: str,
-        keywords: str,
-        entities: Sequence[str],
-        canonical_topics: Sequence[str],
-        participants: Sequence[str],
-        time_start: str,
-        time_end: str,
-        importance: float,
-        confidence: float,
-        embedding: Optional[np.ndarray],
-        embedding_text: str,
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> int:
-        now = utc_now_text()
-        self._conn.execute(
-            """
-            INSERT INTO memory_index_entries (
-                source_type, target_table, target_id, index_level, memory_path,
-                title, summary_for_retrieval, keywords, entities, canonical_topics,
-                participants, time_start, time_end, importance, confidence,
-                embedding, embedding_text, metadata, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(target_table, target_id, index_level) DO UPDATE SET
-                source_type = excluded.source_type,
-                memory_path = excluded.memory_path,
-                title = excluded.title,
-                summary_for_retrieval = excluded.summary_for_retrieval,
-                keywords = excluded.keywords,
-                entities = excluded.entities,
-                canonical_topics = excluded.canonical_topics,
-                participants = excluded.participants,
-                time_start = excluded.time_start,
-                time_end = excluded.time_end,
-                importance = excluded.importance,
-                confidence = excluded.confidence,
-                embedding = excluded.embedding,
-                embedding_text = excluded.embedding_text,
-                metadata = excluded.metadata,
-                updated_at = excluded.updated_at
-            """,
-            (
-                source_type,
-                target_table,
-                int(target_id),
-                index_level,
-                memory_path,
-                title,
-                summary_for_retrieval,
-                keywords,
-                _json_dumps(list(entities or [])),
-                _json_dumps(list(canonical_topics or [])),
-                _json_dumps(list(participants or [])),
-                time_start,
-                time_end,
-                float(importance),
-                float(confidence),
-                _embedding_to_blob(embedding),
-                embedding_text,
-                _json_dumps(metadata or {}),
-                now,
-                now,
-            ),
-        )
-        self._commit_if_needed()
-        row = self._conn.execute(
-            """
-            SELECT id FROM memory_index_entries
-            WHERE target_table = ? AND target_id = ? AND index_level = ?
-            """,
-            (target_table, int(target_id), index_level),
-        ).fetchone()
-        row_id = int(row["id"]) if row else 0
-        if row_id:
-            self._sync_index_entry_fts(
-                row_id=row_id,
-                title=title,
-                summary_for_retrieval=summary_for_retrieval,
-                keywords=keywords,
-                entities=entities,
-                canonical_topics=canonical_topics,
-                participants=participants,
-                memory_path=memory_path,
-            )
-        self._commit_if_needed()
-        return row_id
 
     def add_entity_names(self, names: Iterable[str]) -> Dict[str, int]:
         now = utc_now_text()
@@ -1046,6 +907,61 @@ class SessionDB:
             normalized,
         ).fetchall()
         return {str(row["name"]): int(row["id"]) for row in rows}
+
+    def find_entity_nodes_in_text(
+        self,
+        text: str,
+        *,
+        limit: int = 12,
+    ) -> List[Dict[str, Any]]:
+        """Find stored entity names occurring verbatim in a query text."""
+        clean_text = str(text or "").strip()
+        if not clean_text:
+            return []
+        rows = self._conn.execute(
+            """
+            SELECT id, name
+            FROM memory_entity_nodes
+            WHERE length(name) >= 2
+              AND instr(lower(?), lower(name)) > 0
+            ORDER BY length(name) DESC, id ASC
+            LIMIT ?
+            """,
+            (clean_text, max(1, int(limit or 12))),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def memory_entity_mappings_by_entity_ids(
+        self,
+        entity_ids: Sequence[int],
+    ) -> List[Dict[str, Any]]:
+        """Load mapping rows for a bounded set of entity IDs."""
+        ids = list(dict.fromkeys(
+            int(value)
+            for value in entity_ids
+            if value is not None
+        ))
+        if not ids:
+            return []
+        placeholders = ",".join("?" for _ in ids)
+        rows = self._conn.execute(
+            f"""
+            SELECT entity_id, episode_id, fact_id, state_id, actionable_item_id
+            FROM memory_entity_mapping
+            WHERE entity_id IN ({placeholders})
+            """,
+            ids,
+        ).fetchall()
+        return [
+            {
+                "entity_id": int(row["entity_id"]),
+                "episode_id": _json_loads(row["episode_id"], []),
+                "fact_id": _json_loads(row["fact_id"], []),
+                "state_id": _json_loads(row["state_id"], []),
+                "actionable_item_id": _json_loads(row["actionable_item_id"], []),
+            }
+            for row in rows
+        ]
 
     def insert_entity_memory_mappings(
         self,
@@ -1156,142 +1072,11 @@ class SessionDB:
         self._commit_if_needed()
         return changed_count
 
-    def search_index_entries(
-        self,
-        *,
-        source_types: Optional[Sequence[str]] = None,
-        index_levels: Optional[Sequence[str]] = None,
-        time_start: Optional[str] = None,
-        time_end: Optional[str] = None,
-        limit: int = 200,
-        terms: Optional[Sequence[str]] = None,
-    ) -> List[Dict[str, Any]]:
-        clauses: List[str] = []
-        params: List[Any] = []
-        if source_types:
-            placeholders = ",".join("?" for _ in source_types)
-            clauses.append(f"source_type IN ({placeholders})")
-            params.extend(source_types)
-        if index_levels:
-            placeholders = ",".join("?" for _ in index_levels)
-            clauses.append(f"index_level IN ({placeholders})")
-            params.extend(index_levels)
-        if time_start:
-            clauses.append("(time_start IS NULL OR time_start = '' OR time_start >= ?)")
-            params.append(str(time_start))
-        if time_end:
-            clauses.append("(time_start IS NULL OR time_start = '' OR time_start <= ?)")
-            params.append(str(time_end))
-        where = "WHERE " + " AND ".join(clauses) if clauses else ""
-        candidate_limit = max(1, int(limit or 200))
-        normalized_terms = self._normalize_search_terms(terms)
-        candidate_ids: List[int] = []
-        candidate_sources: Dict[int, List[str]] = {}
-
-        def add_ids(rows: Sequence[sqlite3.Row], source: str) -> None:
-            for row in rows:
-                row_id = int(row["id"])
-                if row_id not in candidate_ids:
-                    candidate_ids.append(row_id)
-                candidate_sources.setdefault(row_id, [])
-                if source not in candidate_sources[row_id]:
-                    candidate_sources[row_id].append(source)
-
-        if normalized_terms:
-            match_query = self._terms_to_fts_query(normalized_terms)
-            if match_query:
-                try:
-                    rows = self._conn.execute(
-                        f"""
-                        SELECT i.id
-                        FROM memory_index_entries_fts f
-                        JOIN memory_index_entries i ON i.id = f.rowid
-                        {where}
-                        AND memory_index_entries_fts MATCH ?
-                        ORDER BY bm25(memory_index_entries_fts), i.time_start DESC, i.id DESC
-                        LIMIT ?
-                        """ if where else
-                        """
-                        SELECT i.id
-                        FROM memory_index_entries_fts f
-                        JOIN memory_index_entries i ON i.id = f.rowid
-                        WHERE memory_index_entries_fts MATCH ?
-                        ORDER BY bm25(memory_index_entries_fts), i.time_start DESC, i.id DESC
-                        LIMIT ?
-                        """,
-                        (*params, match_query, candidate_limit * 3) if where else (match_query, candidate_limit * 3),
-                    ).fetchall()
-                    add_ids(rows, "fts")
-                except sqlite3.Error:
-                    pass
-
-            like_clauses: List[str] = []
-            like_params: List[Any] = []
-            searchable_fields = (
-                "title",
-                "summary_for_retrieval",
-                "keywords",
-                "entities",
-                "canonical_topics",
-                "participants",
-                "memory_path",
-            )
-            for term in normalized_terms[:8]:
-                per_term = " OR ".join(f"LOWER({field}) LIKE ?" for field in searchable_fields)
-                like_clauses.append(f"({per_term})")
-                like_params.extend([f"%{term}%"] * len(searchable_fields))
-            structured_where = list(clauses)
-            structured_params = list(params)
-            if like_clauses:
-                structured_where.append("(" + " OR ".join(like_clauses) + ")")
-                structured_params.extend(like_params)
-                rows = self._conn.execute(
-                    f"""
-                    SELECT id FROM memory_index_entries
-                    WHERE {" AND ".join(structured_where)}
-                    ORDER BY time_start DESC, updated_at DESC, id DESC
-                    LIMIT ?
-                    """,
-                    (*structured_params, candidate_limit * 3),
-                ).fetchall()
-                add_ids(rows, "like")
-
-        rows = self._conn.execute(
-            f"""
-            SELECT id FROM memory_index_entries
-            {where}
-            ORDER BY time_start DESC, id DESC
-            LIMIT ?
-            """,
-            (*params, candidate_limit),
-        ).fetchall()
-        add_ids(rows, "recent")
-        if not candidate_ids:
-            return []
-        selected_ids = candidate_ids[: candidate_limit * 4]
-        placeholders = ",".join("?" for _ in selected_ids)
-        rows = self._conn.execute(
-            f"SELECT * FROM memory_index_entries WHERE id IN ({placeholders})",
-            selected_ids,
-        ).fetchall()
-        by_id = {int(row["id"]): self._row_to_dict(row) for row in rows}
-        out: List[Dict[str, Any]] = []
-        for row_id in selected_ids:
-            item = by_id.get(row_id)
-            if not item:
-                continue
-            metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
-            metadata = dict(metadata)
-            metadata["_matched_via"] = candidate_sources.get(row_id, [])
-            item["metadata"] = metadata
-            out.append(item)
-        return out
-
     def _search_memory_rows(
         self,
         *,
         table: str,
-        searchable_fields: Sequence[str],
+        identity_fts_table: str,
         time_field: str,
         terms: Optional[Sequence[str]],
         source_types: Optional[Sequence[str]],
@@ -1299,12 +1084,12 @@ class SessionDB:
         time_end: Optional[str],
         limit: int,
     ) -> List[Dict[str, Any]]:
-        """Return raw rows for direct recall without using index cards.
+        """Return raw rows ranked by BM25 over their identity text.
 
         Table and field names are internal constants supplied by the three
         public wrappers below; user input is only ever bound as SQL values.
-        Keyword hits are merged with recent rows so semantic reranking still
-        has a chance to recover older records without scanning unbounded data.
+        BM25 hits are merged with recent rows so semantic reranking still has
+        a chance to recover older records without scanning unbounded data.
         """
         base_clauses: List[str] = []
         base_params: List[Any] = []
@@ -1330,35 +1115,74 @@ class SessionDB:
         row_limit = max(1, int(limit or 80))
         normalized_terms = self._normalize_search_terms(terms)
         row_ids: List[int] = []
+        bm25_scores: Dict[int, float] = {}
 
         def add_ids(rows: Sequence[sqlite3.Row]) -> None:
             for row in rows:
                 row_id = int(row["id"])
                 if row_id not in row_ids:
                     row_ids.append(row_id)
+                if "bm25_score" in row.keys():
+                    try:
+                        bm25_scores[row_id] = float(row["bm25_score"])
+                    except (TypeError, ValueError):
+                        pass
 
-        def add_keyword_matches(*, where: str, params: Sequence[Any], limit_value: int) -> None:
+        def add_bm25_matches(
+            *,
+            where: str,
+            params: Sequence[Any],
+            limit_value: int,
+        ) -> bool:
             if not normalized_terms:
-                return
-            match_parts: List[str] = []
-            match_params: List[Any] = []
-            for term in normalized_terms[:12]:
-                per_term = " OR ".join(
-                    f"LOWER(COALESCE({field}, '')) LIKE ?" for field in searchable_fields
-                )
-                match_parts.append(f"({per_term})")
-                match_params.extend([f"%{term}%"] * len(searchable_fields))
-            if match_parts:
+                return True
+            match_query = self._terms_to_fts_query(normalized_terms)
+            if not match_query:
+                return True
+            try:
                 rows = self._conn.execute(
                     f"""
-                    SELECT id FROM {table}
-                    WHERE {where} AND ({" OR ".join(match_parts)})
-                    ORDER BY {time_expression} DESC, id DESC
+                    SELECT source.id, bm25({identity_fts_table}) AS bm25_score
+                    FROM {identity_fts_table}
+                    JOIN {table} source ON source.id = {identity_fts_table}.rowid
+                    WHERE {where} AND {identity_fts_table} MATCH ?
+                    ORDER BY bm25({identity_fts_table}) ASC,
+                             {time_expression} DESC, source.id DESC
                     LIMIT ?
                     """,
-                    (*params, *match_params, limit_value),
+                    (*params, match_query, limit_value),
                 ).fetchall()
-                add_ids(rows)
+            except sqlite3.Error:
+                return False
+            add_ids(rows)
+            return True
+
+        def add_identity_like_matches(
+            *,
+            where: str,
+            params: Sequence[Any],
+            limit_value: int,
+        ) -> None:
+            """Fallback for SQLite builds without FTS5 support."""
+            if not normalized_terms:
+                return
+            like_clauses = [
+                "LOWER(COALESCE(source.identity_text, '')) LIKE ?"
+                for _term in normalized_terms[:12]
+            ]
+            if not like_clauses:
+                return
+            rows = self._conn.execute(
+                f"""
+                SELECT source.id
+                FROM {table} source
+                WHERE {where} AND ({" OR ".join(like_clauses)})
+                ORDER BY {time_expression} DESC, source.id DESC
+                LIMIT ?
+                """,
+                (*params, *[f"%{term}%" for term in normalized_terms[:12]], limit_value),
+            ).fetchall()
+            add_ids(rows)
 
         def add_recent(*, where: str, params: Sequence[Any], limit_value: int) -> None:
             rows = self._conn.execute(
@@ -1373,13 +1197,34 @@ class SessionDB:
             add_ids(rows)
 
         timed_params = [*base_params, *time_params]
-        add_keyword_matches(where=timed_where, params=timed_params, limit_value=row_limit * 2)
+        bm25_available = add_bm25_matches(
+            where=timed_where,
+            params=timed_params,
+            limit_value=row_limit * 2,
+        )
+        if not bm25_available:
+            add_identity_like_matches(
+                where=timed_where,
+                params=timed_params,
+                limit_value=row_limit * 2,
+            )
         add_recent(where=timed_where, params=timed_params, limit_value=row_limit)
         if time_clauses and len(row_ids) < row_limit:
             # Time range is a strong preference, not a brittle hard stop. Pad
             # with broader keyword/recent candidates so downstream reranking
             # can still recover facts with coarse or slightly shifted times.
-            add_keyword_matches(where=base_where, params=base_params, limit_value=row_limit * 2)
+            if bm25_available:
+                add_bm25_matches(
+                    where=base_where,
+                    params=base_params,
+                    limit_value=row_limit * 2,
+                )
+            else:
+                add_identity_like_matches(
+                    where=base_where,
+                    params=base_params,
+                    limit_value=row_limit * 2,
+                )
             add_recent(where=base_where, params=base_params, limit_value=row_limit)
 
         selected_ids = row_ids[: row_limit * 3]
@@ -1391,7 +1236,15 @@ class SessionDB:
             selected_ids,
         ).fetchall()
         by_id = {int(row["id"]): self._row_to_dict(row) for row in rows}
-        return [by_id[row_id] for row_id in selected_ids if row_id in by_id]
+        out: List[Dict[str, Any]] = []
+        for row_id in selected_ids:
+            item = by_id.get(row_id)
+            if not item:
+                continue
+            if row_id in bm25_scores:
+                item["_bm25_score"] = bm25_scores[row_id]
+            out.append(item)
+        return out
 
     def search_memory_facts(
         self,
@@ -1404,11 +1257,7 @@ class SessionDB:
     ) -> List[Dict[str, Any]]:
         return self._search_memory_rows(
             table="memory_facts",
-            searchable_fields=(
-                "summary", "keywords", "entities", "entity_ids", "fact_root_topic",
-                "fact_aspect_topic", "fact_kind",
-                "identity_text", "metadata",
-            ),
+            identity_fts_table="memory_facts_identity_fts",
             time_field="time_key",
             terms=terms,
             source_types=source_types,
@@ -1428,10 +1277,7 @@ class SessionDB:
     ) -> List[Dict[str, Any]]:
         return self._search_memory_rows(
             table="memory_states",
-            searchable_fields=(
-                "canonical_name", "summary", "time_line", "entity_ids", "entity_key",
-                "state_scope", "state_type", "identity_text", "metadata",
-            ),
+            identity_fts_table="memory_states_identity_fts",
             time_field="updated_at",
             terms=terms,
             source_types=source_types,
@@ -1451,10 +1297,7 @@ class SessionDB:
     ) -> List[Dict[str, Any]]:
         return self._search_memory_rows(
             table="memory_actionable_items",
-            searchable_fields=(
-                "canonical_name", "summary", "item_type", "owner", "status",
-                "due_at", "entity_ids", "identity_text", "metadata",
-            ),
+            identity_fts_table="memory_actionable_items_identity_fts",
             time_field="updated_at",
             terms=terms,
             source_types=source_types,
@@ -1486,6 +1329,32 @@ class SessionDB:
         ).fetchall()
         by_id = {int(row["id"]): self._row_to_dict(row) for row in rows}
         return [by_id[item] for item in ids if item in by_id]
+
+    def memory_facts_by_episode_ids(
+        self,
+        episode_ids: Sequence[int],
+        *,
+        limit: int = 200,
+    ) -> List[Dict[str, Any]]:
+        """Return facts belonging to a bounded set of episodes."""
+        ids = list(dict.fromkeys(
+            int(value)
+            for value in episode_ids
+            if value is not None
+        ))
+        if not ids:
+            return []
+        placeholders = ",".join("?" for _ in ids)
+        rows = self._conn.execute(
+            f"""
+            SELECT * FROM memory_facts
+            WHERE episode_id IN ({placeholders})
+            ORDER BY time_key ASC, id ASC
+            LIMIT ?
+            """,
+            (*ids, max(1, int(limit or 200))),
+        ).fetchall()
+        return [self._row_to_dict(row) for row in rows]
 
     def memory_states_by_ids(self, state_ids: Sequence[int]) -> List[Dict[str, Any]]:
         ids = [int(value) for value in state_ids if value is not None]
