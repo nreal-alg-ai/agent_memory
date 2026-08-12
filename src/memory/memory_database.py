@@ -1139,7 +1139,9 @@ class SessionDB:
             time_clauses = [time_filter]
         base_where = " AND ".join(base_clauses) if base_clauses else "1=1"
         timed_where = " AND ".join([base_where, *time_clauses]) if time_clauses else base_where
-        row_limit = max(1, int(limit or 80))
+        row_limit = int(limit)
+        if row_limit <= 0:
+            return []
         normalized_terms = self._normalize_search_terms(terms)
         row_ids: List[int] = []
         bm25_scores: Dict[int, float] = {}

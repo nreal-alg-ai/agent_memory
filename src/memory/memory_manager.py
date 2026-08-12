@@ -5113,12 +5113,15 @@ class MemoryNodeManager:
             keywords=[],
             entities=[],
         )
-        candidate_limit = max(12, min(48, max(1, int(top_k or 1)) * 6))
-        raw_candidate_limits = {
-            "facts": candidate_limit,
-            "states": candidate_limit,
-            "actionable_items": candidate_limit,
-        }
+        is_contextual_query = self._recall_stage1_is_contextual_query(query)
+        is_actionable_query = self._recall_stage1_is_actionable_query(query)
+
+        raw_candidate_limits, layer_limits = self._recall_stage1_candidate_limits(
+            top_k=top_k,
+            is_contextual_query=is_contextual_query,
+            is_actionable_query=is_actionable_query,
+        )
+        candidate_limit = max(raw_candidate_limits.values())
         self._log_info("memory_recall_stage1", "start", {
             "query": self._log_text(query, limit=500),
             "top_k": top_k,
@@ -5203,8 +5206,7 @@ class MemoryNodeManager:
                 filtered_candidates.append(candidate)
 
         reference_time = recent_reference_time or datetime.now(timezone.utc).isoformat()
-        is_contextual_query = self._recall_stage1_is_contextual_query(query)
-        is_actionable_query = self._recall_stage1_is_actionable_query(query)
+
         semantic_query = self._recall_stage1_requires_semantic_search(query)
 
         if is_contextual_query:
@@ -5235,11 +5237,6 @@ class MemoryNodeManager:
                 int(item.get("target_id") or 0),
             ),
             reverse=True,
-        )
-        layer_limits = self._recall_stage1_candidate_limits(
-            top_k=top_k,
-            is_contextual_query=is_contextual_query,
-            is_actionable_query=is_actionable_query,
         )
         selected_candidates: List[Dict[str, Any]] = []
         seen_targets: set[Tuple[str, int]] = set()
@@ -5482,16 +5479,23 @@ class MemoryNodeManager:
         top_k: int,
         is_contextual_query: Optional[bool] = None,
         is_actionable_query: Optional[bool] = None,
-    ) -> Dict[str, int]:
-        """Allocate a total Stage 1 budget across memory layers.
+    ) -> Tuple[Dict[str, int], Dict[str, int]]:
+        """Build the raw retrieval and final per-layer Stage 1 budgets.
 
-        These are maximum quotas rather than mandatory counts.  Any unused
-        quota is returned to the global fill pass, so an absent layer cannot
-        reduce the final number of useful candidates.
+        Raw limits control how many candidates each Stage 1 source may return.
+        Layer limits are maximum quotas for the final selection rather than
+        mandatory counts. Any unused layer quota is returned to the global
+        fill pass, so an absent layer cannot reduce the final useful results.
         """
         k = max(1, int(top_k or 1))
         contextual = bool(is_contextual_query)
         actionable = bool(is_actionable_query)
+        raw_candidate_limit = max(12, min(48, k * 6))
+        raw_candidate_limits = {
+            "facts": raw_candidate_limit,
+            "states": raw_candidate_limit,
+            "actionable_items": raw_candidate_limit,
+        }
 
         if actionable:
             state_limit = max(1, int(math.ceil(k * 0.25))) if k >= 3 else 0
@@ -5520,7 +5524,7 @@ class MemoryNodeManager:
             if limits[largest_layer] <= 0:
                 break
             limits[largest_layer] -= 1
-        return limits
+        return raw_candidate_limits, limits
 
     @staticmethod
     def _recall_stage1_candidate_match_type(
@@ -6547,15 +6551,13 @@ class MemoryNodeManager:
             entities=llm_entities,
         )
         query_identity_embedding = self._generate_embedding_vector(query_identity_text)
-        final_candidate_limits = self._final_recall_candidate_limits(
-            query=query,
-            top_k=top_k,
-            budget=budget,
-            preferred_layer_preferences=preferred_layer_preferences,
-        )
-        supplement_candidate_limits = self._cal_stage2_supplement_candidate_limits(
-            top_k=top_k,
-            budget=budget,
+        final_candidate_limits, supplement_candidate_limits = (
+            self._recall_stage2_candidate_limits(
+                query=query,
+                top_k=top_k,
+                budget=budget,
+                preferred_layer_preferences=preferred_layer_preferences,
+            )
         )
         self._log_info("memory_recall_stage2", "query_analyzed", {
             "recall_plan": recall_plan,
@@ -8148,55 +8150,49 @@ class MemoryNodeManager:
             entity_type = "CONCEPT"
         return {"name": name, "type": entity_type}
 
-    @staticmethod
-    def _cal_stage2_supplement_candidate_limits(
-        *,
-        top_k: int,
-        budget: str,
-    ) -> Dict[str, int]:
-        """Return a small lexical pool for Stage 2 concept supplementation."""
-        multipliers = {"low": 1, "mid": 2, "high": 3}
-        multiplier = multipliers.get(str(budget or "mid").lower(), 2)
-        supplement_limit = max(
-            4,
-            min(24, max(1, int(top_k or 1)) * multiplier),
-        )
-        return {
-            "facts": supplement_limit,
-            "states": supplement_limit,
-            "actionable_items": supplement_limit,
-        }
-
-    def _final_recall_candidate_limits(
+    def _recall_stage2_candidate_limits(
         self,
         *,
         query: str,
         top_k: int,
         budget: str,
         preferred_layer_preferences: Optional[Sequence[str]],
-    ) -> Dict[str, int]:
-        """Allocate independent post-ranking limits for each memory type."""
+    ) -> Tuple[Dict[str, int], Dict[str, int]]:
+        """Build Stage 2 final-ranking and lexical-supplement budgets."""
         k = max(1, int(top_k or 1))
+
         lower = str(query or "").lower()
-        limits = {
+        final_limits = {
             "facts": max(4, int(math.ceil(k * 0.60))),
             "states": max(3, int(math.ceil(k * 0.30))),
             "actionable_items": max(3, int(math.ceil(k * 0.25))),
         }
         if self._needs_broad_evidence(query):
-            limits["facts"] = max(limits["facts"], int(math.ceil(k * 0.85)))
+            final_limits["facts"] = max(final_limits["facts"], int(math.ceil(k * 0.85)))
         preferred = set(preferred_layer_preferences or [])
         aliases = {"actionable": "actionable_items", "action": "actionable_items"}
         preferred = {aliases.get(level, level) for level in preferred}
         if preferred:
-            for key in limits:
+            for key in final_limits:
                 if key.rstrip("s") in preferred or key in preferred:
-                    limits[key] += max(1, int(math.ceil(k * 0.15)))
+                    final_limits[key] += max(1, int(math.ceil(k * 0.15)))
         if any(marker in lower for marker in ("todo", "task", "remind", "decision", "commit", "待办", "任务", "提醒", "决定", "承诺")):
-            limits["actionable_items"] = max(limits["actionable_items"], int(math.ceil(k * 0.55)))
+            final_limits["actionable_items"] = max(final_limits["actionable_items"], int(math.ceil(k * 0.55)))
         if any(marker in lower for marker in ("prefer", "usually", "habit", "偏好", "通常", "习惯", "长期", "状态")):
-            limits["states"] = max(limits["states"], int(math.ceil(k * 0.5)))
-        return limits
+            final_limits["states"] = max(final_limits["states"], int(math.ceil(k * 0.5)))
+
+        multipliers = {"low": 1, "mid": 2, "high": 3}
+        multiplier = multipliers.get(str(budget or "mid").lower(), 2)
+        supplement_limit = max(
+            4,
+            min(24, k * multiplier),
+        )
+        supplement_limits = {
+            "facts": supplement_limit,
+            "states": supplement_limit,
+            "actionable_items": supplement_limit,
+        }
+        return final_limits, supplement_limits
 
     def _candidate_limit(self, *, query: str, top_k: int, budget: str) -> int:
         multiplier = {"low": 10, "mid": 18, "high": 28}.get(str(budget).lower(), 18)
