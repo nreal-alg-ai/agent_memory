@@ -149,7 +149,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reader-base-url")
     parser.add_argument("--reader-api-key")
     parser.add_argument("--reader-timeout", type=int)
-    parser.add_argument("--reader-max-tokens", type=int, default=4096)
+    parser.add_argument("--reader-max-tokens", type=int, default=8192)
     parser.add_argument("--reader-temperature", type=float, default=0.0)
     parser.add_argument(
         "--reader-max-context-chars",

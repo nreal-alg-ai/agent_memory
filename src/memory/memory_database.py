@@ -189,6 +189,7 @@ class SessionDB:
                 confidence REAL NOT NULL DEFAULT 0.85,
                 importance REAL NOT NULL DEFAULT 0.5,
                 processed_for_memory_state INTEGER NOT NULL DEFAULT 0,
+                processed_for_memory_actionable_item INTEGER NOT NULL DEFAULT 0,
                 metadata TEXT NOT NULL DEFAULT '{}',
                 identity_text_embedding BLOB,
                 identity_text TEXT NOT NULL DEFAULT '',
@@ -270,6 +271,7 @@ class SessionDB:
             """
         )
         self._ensure_entity_ids_schema()
+        self._ensure_memory_facts_processing_schema()
         self._ensure_memory_states_scope_schema()
         self._ensure_memory_states_time_line_schema()
         self._ensure_memory_states_entity_key_schema()
@@ -334,6 +336,22 @@ class SessionDB:
                 self._conn.execute(
                     f"ALTER TABLE {table} ADD COLUMN entity_ids TEXT NOT NULL DEFAULT '[]'"
                 )
+
+    def _ensure_memory_facts_processing_schema(self) -> None:
+        """Ensure each reflect projection has an independent fact cursor."""
+        columns = {
+            str(row["name"])
+            for row in self._conn.execute("PRAGMA table_info(memory_facts)").fetchall()
+        }
+        if "processed_for_memory_actionable_item" not in columns:
+            self._conn.execute(
+                "ALTER TABLE memory_facts ADD COLUMN "
+                "processed_for_memory_actionable_item INTEGER NOT NULL DEFAULT 0"
+            )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_memory_facts_actionable_processing "
+            "ON memory_facts(processed_for_memory_actionable_item, created_at)"
+        )
 
     def _ensure_memory_states_scope_schema(self) -> None:
         """Normalize the state scope columns for databases created earlier."""
@@ -723,15 +741,28 @@ class SessionDB:
         self._commit_if_needed()
         return actionable_item_id
 
-    def get_unprocessed_facts_for_states(
+    def get_unprocessed_facts(
         self,
         *,
+        processing_target: str = "state",
         reference_timestamp: Any,
         source_types: Optional[Sequence[str]] = None,
         limit: int = 100,
         restrict_to_today: bool = True,
     ) -> List[Dict[str, Any]]:
-        clauses: List[str] = ["processed_for_memory_state = 0"]
+        processing_columns = {
+            "state": "processed_for_memory_state",
+            "actionable_item": "processed_for_memory_actionable_item",
+        }
+        target = str(processing_target or "state").strip().lower()
+        try:
+            processing_column = processing_columns[target]
+        except KeyError as exc:
+            raise ValueError(
+                "processing_target must be 'state' or 'actionable_item'"
+            ) from exc
+
+        clauses: List[str] = [f"{processing_column} = 0"]
         params: List[Any] = []
         if source_types:
             placeholders = ",".join("?" for _ in source_types)
@@ -755,6 +786,37 @@ class SessionDB:
         return [self._row_to_dict(row) for row in rows]
 
     def mark_facts_processed_for_memory_state(self, fact_ids: Sequence[int]) -> int:
+        return self.mark_facts_processed(
+            processing_target="state",
+            fact_ids=fact_ids,
+        )
+
+    def mark_facts_processed_for_memory_actionable_item(
+        self,
+        fact_ids: Sequence[int],
+    ) -> int:
+        return self.mark_facts_processed(
+            processing_target="actionable_item",
+            fact_ids=fact_ids,
+        )
+
+    def mark_facts_processed(
+        self,
+        *,
+        processing_target: str,
+        fact_ids: Sequence[int],
+    ) -> int:
+        processing_columns = {
+            "state": "processed_for_memory_state",
+            "actionable_item": "processed_for_memory_actionable_item",
+        }
+        target = str(processing_target or "").strip().lower()
+        try:
+            processing_column = processing_columns[target]
+        except KeyError as exc:
+            raise ValueError(
+                "processing_target must be 'state' or 'actionable_item'"
+            ) from exc
         ids = [int(value) for value in fact_ids if value is not None]
         if not ids:
             return 0
@@ -762,7 +824,7 @@ class SessionDB:
         cur = self._conn.execute(
             f"""
             UPDATE memory_facts
-            SET processed_for_memory_state = 1,
+            SET {processing_column} = 1,
                 updated_at = ?
             WHERE id IN ({placeholders})
             """,

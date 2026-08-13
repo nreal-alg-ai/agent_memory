@@ -131,6 +131,8 @@ memory_runtime:
 
 memory_manager:
   memory_enabled: true
+  enable_memory_state_update: true
+  enable_memory_actionable_item_update: false
   llm:
     llm_provider: deepseek
     llm_name: deepseek-v4-flash

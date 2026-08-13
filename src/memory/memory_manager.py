@@ -472,6 +472,14 @@ class MemoryNodeManager:
             or "source"
         )
         self._memory_enabled = bool(self._memory_cfg.get("memory_enabled", True))
+        self._enable_memory_state_update = self._config_bool(
+            self._memory_cfg.get("enable_memory_state_update", True),
+            True,
+        )
+        self._enable_memory_actionable_item_update = self._config_bool(
+            self._memory_cfg.get("enable_memory_actionable_item_update", True),
+            True,
+        )
         self._top_k = int(self._memory_cfg.get("retrieval_top_k", 8) or 8)
         self._recall_budget = str(self._memory_cfg.get("recall_budget", "mid") or "mid")
         self._recall_fact_min_embedding_similarity = self._clamp_float(
@@ -2129,85 +2137,38 @@ class MemoryNodeManager:
             "limit": limit,
             "reflect_timestamp": reflect_timestamp,
         })
-        facts = self._db.get_unprocessed_facts_for_states(
-            limit=limit,
-            reference_timestamp=reflect_timestamp,
-        )
-        if not facts:
-            facts_loaded_payload = {
-                "fact_count": 0,
-                "limit": limit,
-                "reflect_timestamp": reflect_timestamp,
-            }
-            self._log_info("memory_reflect", "finish", {
-                **facts_loaded_payload,
-                "status": "fact_empty",
-            })
-            return {
-                "status": "empty",
-                "topic_states_updated": 0,
-                "entity_states_updated": 0,
-                "actionable_items_updated": 0,
-                "total_elapsed_ms": round(
-                    (time.monotonic() - reflect_started_at) * 1000,
-                    2,
-                ),
-            }
-        fact_ids = [
-            int(fact["id"])
-            for fact in facts
-            if str(fact.get("id") or "").strip().isdigit()
-        ]
-        source_counts = Counter(str(fact.get("source_type") or "unified") for fact in facts)
-        self._log_info("memory_reflect", "facts_loaded", {
-            "fact_count": len(facts),
-            "fact_ids": fact_ids,
-            "source_counts": dict(source_counts),
-            "time_start": facts[0].get("dialogue_time_key") if facts else "",
-            "time_end": facts[-1].get("dialogue_time_key") if facts else "",
-        })
-        topic_facts = [fact for fact in facts if self._fact_can_seed_topic_state(fact)]
-        entity_facts = [fact for fact in facts if self._fact_can_seed_entity_state(fact)]
-        self._log_info("memory_reflect", "state_fact_candidates", {
-            "topic_fact_count": len(topic_facts),
-            "topic_fact_ids": [
-                fact.get("id") for fact in topic_facts if fact.get("id") is not None
-            ],
-            "entity_fact_count": len(entity_facts),
-            "entity_fact_ids": [
-                fact.get("id") for fact in entity_facts if fact.get("id") is not None
-            ],
-        })
         # Keep the projection apply atomic. The expensive extraction and
         # embedding work still happens inside the existing worker, while all
         # state/actionable writes and processed markers share one commit point.
         with self._db.transaction():
-            topic_report = self._resolve_and_update_topic_states_from_facts(
-                facts=topic_facts,
+            state_report = self._update_memory_states_using_facts(
+                limit=limit,
+                reference_timestamp=reflect_timestamp,
             )
-            entity_report = self._resolve_and_update_entity_scoped_states_from_facts(
-                facts=entity_facts,
-            )
+            topic_report = state_report["topic_report"]
+            entity_report = state_report["entity_report"]
 
             actionable_report = self._update_memory_actionable_items_using_facts(
-                facts=facts,
-            )
-            facts_marked_processed = self._db.mark_facts_processed_for_memory_state(
-                fact_ids,
+                limit=limit,
+                reference_timestamp=reflect_timestamp,
             )
         report = {
-            "status": "ok",
-            "states_updated": (
-                int(topic_report.get("updated", 0) or 0)
-                + int(entity_report.get("updated", 0) or 0)
+            "status": (
+                "ok"
+                if state_report.get("fact_count", 0)
+                or actionable_report.get("fact_count", 0)
+                else "empty"
             ),
-            "topic_facts_considered": len(topic_facts),
-            "entity_facts_considered": len(entity_facts),
-            "evidence_only_facts": max(0, len(facts) - len(set(
-                int(fact["id"])
-                for fact in [*topic_facts, *entity_facts]
-                if str(fact.get("id") or "").strip().isdigit()
-            ))),
+            "states_updated": int(state_report.get("states_updated", 0) or 0),
+            "topic_facts_considered": int(
+                state_report.get("topic_facts_considered", 0) or 0
+            ),
+            "entity_facts_considered": int(
+                state_report.get("entity_facts_considered", 0) or 0
+            ),
+            "evidence_only_facts": int(
+                state_report.get("evidence_only_facts", 0) or 0
+            ),
             "topic_states_updated": int(topic_report.get("updated", 0) or 0),
             "topic_candidates_unresolved": int(topic_report.get("unresolved", 0) or 0),
             "pending_unresolved_topics": int(topic_report.get("pending_unresolved", 0) or 0),
@@ -2215,7 +2176,12 @@ class MemoryNodeManager:
             "actionable_facts_considered": int(
                 actionable_report.get("candidate_fact_count", 0) or 0
             ),
-            "facts_marked_processed_for_memory_state": facts_marked_processed,
+            "facts_marked_processed_for_memory_state": int(
+                state_report.get("facts_marked_processed", 0) or 0
+            ),
+            "facts_marked_processed_for_memory_actionable_item": int(
+                actionable_report.get("facts_marked_processed", 0) or 0
+            ),
             "actionable_items_updated": int(
                 actionable_report.get("stored_count", 0) or 0
             ),
@@ -2228,13 +2194,134 @@ class MemoryNodeManager:
         self._log_info("memory_reflect", "finish", report)
         return report
 
+    def _update_memory_states_using_facts(
+        self,
+        *,
+        limit: int,
+        reference_timestamp: Any,
+    ) -> Dict[str, Any]:
+        """Update topic and entity state projections from the current facts."""
+
+        started_at = time.monotonic()
+        if not self._enable_memory_state_update:
+            report = {
+                "enabled": 0,
+                "fact_count": 0,
+                "fact_ids": [],
+                "topic_report": {
+                    "enabled": 0,
+                    "updated": 0,
+                    "unresolved": 0,
+                    "pending_unresolved": len(self._pending_unresolved_topics),
+                },
+                "entity_report": {
+                    "enabled": 0,
+                    "updated": 0,
+                },
+                "topic_facts_considered": 0,
+                "entity_facts_considered": 0,
+                "evidence_only_facts": 0,
+                "states_updated": 0,
+                "facts_marked_processed": 0,
+                "total_elapsed_ms": round(
+                    (time.monotonic() - started_at) * 1000,
+                    2,
+                ),
+            }
+            self._log_info("memory_reflect", "state_update_skipped", report)
+            return report
+        facts = self._db.get_unprocessed_facts(
+            processing_target="state",
+            limit=limit,
+            reference_timestamp=reference_timestamp,
+        )
+        self._log_reflect_facts_loaded("state", facts, limit, reference_timestamp)
+        topic_facts = [fact for fact in facts if self._fact_can_seed_topic_state(fact)]
+        entity_facts = [fact for fact in facts if self._fact_can_seed_entity_state(fact)]
+        self._log_info("memory_reflect", "state_fact_candidates", {
+            "topic_fact_count": len(topic_facts),
+            "topic_fact_ids": [
+                fact.get("id") for fact in topic_facts if fact.get("id") is not None
+            ],
+            "entity_fact_count": len(entity_facts),
+            "entity_fact_ids": [
+                fact.get("id") for fact in entity_facts if fact.get("id") is not None
+            ],
+        })
+
+        topic_report = self._resolve_and_update_topic_states_from_facts(
+            facts=topic_facts,
+        )
+        entity_report = self._resolve_and_update_entity_scoped_states_from_facts(
+            facts=entity_facts,
+        )
+        facts_marked_processed = self._db.mark_facts_processed_for_memory_state(
+            [fact.get("id") for fact in facts]
+        )
+        report = {
+            "fact_count": len(facts),
+            "fact_ids": [fact.get("id") for fact in facts],
+            "topic_report": topic_report,
+            "entity_report": entity_report,
+            "topic_facts_considered": len(topic_facts),
+            "entity_facts_considered": len(entity_facts),
+            "evidence_only_facts": max(0, len(facts) - len(set(
+                int(fact["id"])
+                for fact in [*topic_facts, *entity_facts]
+                if str(fact.get("id") or "").strip().isdigit()
+            ))),
+            "states_updated": (
+                int(topic_report.get("updated", 0) or 0)
+                + int(entity_report.get("updated", 0) or 0)
+            ),
+            "facts_marked_processed": facts_marked_processed,
+            "total_elapsed_ms": round(
+                (time.monotonic() - started_at) * 1000,
+                2,
+            ),
+        }
+        self._log_info("memory_reflect", "state_update_finish", report)
+        return report
+
     def _update_memory_actionable_items_using_facts(
         self,
         *,
-        facts: List[Dict[str, Any]],
+        limit: int,
+        reference_timestamp: Any,
     ) -> Dict[str, Any]:
         """Extract and persist actionable items from the current reflect facts."""
         started_at = time.monotonic()
+        if not self._enable_memory_actionable_item_update:
+            report = {
+                "enabled": 0,
+                "fact_count": 0,
+                "fact_ids": [],
+                "candidate_fact_count": 0,
+                "candidate_fact_ids": [],
+                "actionable_update_count": 0,
+                "requested_store_count": 0,
+                "stored_count": 0,
+                "item_ids": [],
+                "facts_marked_processed": 0,
+                "total_elapsed_ms": round(
+                    (time.monotonic() - started_at) * 1000,
+                    2,
+                ),
+            }
+            self._log_info(
+                "memory_reflect",
+                "actionable_item_update_skipped",
+                report,
+            )
+            return report
+        facts = self._db.get_unprocessed_facts(
+            processing_target="actionable_item",
+            limit=limit,
+            reference_timestamp=reference_timestamp,
+        )
+        self._log_reflect_facts_loaded(
+            "actionable_item", facts, limit, reference_timestamp
+        )
         actionable_facts = self._filter_facts_for_actionable_item_extraction(facts)
         self._log_info("memory_reflect", "actionable_item_extraction_start", {
             "candidate_fact_count": len(actionable_facts),
@@ -2267,8 +2354,14 @@ class MemoryNodeManager:
             if item_id:
                 actionable_items_updated += 1
                 actionable_item_ids.append(item_id)
+
+        facts_marked_processed = self._db.mark_facts_processed_for_memory_actionable_item(
+            [fact.get("id") for fact in facts]
+        )
         
         report = {
+            "fact_count": len(facts),
+            "fact_ids": [fact.get("id") for fact in facts],
             "candidate_fact_count": len(actionable_facts),
             "candidate_fact_ids": [
                 fact.get("id") for fact in actionable_facts
@@ -2278,6 +2371,7 @@ class MemoryNodeManager:
             "requested_store_count": len(actionable_updates),
             "stored_count": actionable_items_updated,
             "item_ids": actionable_item_ids,
+            "facts_marked_processed": facts_marked_processed,
             "total_elapsed_ms": round(
                 (time.monotonic() - started_at) * 1000,
                 2,
@@ -2289,6 +2383,28 @@ class MemoryNodeManager:
             report,
         )
         return report
+
+    def _log_reflect_facts_loaded(
+        self,
+        processing_target: str,
+        facts: List[Dict[str, Any]],
+        limit: int,
+        reference_timestamp: Any,
+    ) -> None:
+        """Log the independent fact batch consumed by one reflect projection."""
+        source_counts = Counter(
+            str(fact.get("source_type") or "unified") for fact in facts
+        )
+        self._log_info("memory_reflect", "facts_loaded", {
+            "processing_target": processing_target,
+            "fact_count": len(facts),
+            "fact_ids": [fact.get("id") for fact in facts],
+            "source_counts": dict(source_counts),
+            "limit": limit,
+            "reference_timestamp": reference_timestamp,
+            "time_start": facts[0].get("dialogue_time_key") if facts else "",
+            "time_end": facts[-1].get("dialogue_time_key") if facts else "",
+        })
 
     @classmethod
     def _fact_has_durable_state_signal(cls, fact: Dict[str, Any]) -> bool:
