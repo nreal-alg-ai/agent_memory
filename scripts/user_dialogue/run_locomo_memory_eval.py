@@ -504,7 +504,9 @@ def build_sample_memory_context(
             )
             reflect_runs = int(reflect_operation_report.get("submitted") or 0)
             counts = db_counts(db)
-            recall_time_end = format_memory_time(sessions[-1][1] + timedelta(hours=1)) if sessions else None
+            recall_time_end = format_memory_time(
+                sessions[-1][1] + timedelta(hours=1)
+            ) if sessions else None
             output_qas = json.loads(json.dumps(sample.get("qa") or []))
             detail_rows: List[Dict[str, Any]] = []
             for qa_index, qa in selected_qas(sample, args):

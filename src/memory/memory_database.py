@@ -785,21 +785,6 @@ class SessionDB:
         ).fetchall()
         return [self._row_to_dict(row) for row in rows]
 
-    def mark_facts_processed_for_memory_state(self, fact_ids: Sequence[int]) -> int:
-        return self.mark_facts_processed(
-            processing_target="state",
-            fact_ids=fact_ids,
-        )
-
-    def mark_facts_processed_for_memory_actionable_item(
-        self,
-        fact_ids: Sequence[int],
-    ) -> int:
-        return self.mark_facts_processed(
-            processing_target="actionable_item",
-            fact_ids=fact_ids,
-        )
-
     def mark_facts_processed(
         self,
         *,

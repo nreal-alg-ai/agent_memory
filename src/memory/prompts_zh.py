@@ -68,7 +68,7 @@ UNIFIED_MEMORY_EXTRACTION_PROMPT_ZH = """你是 AI 眼镜长期记忆系统的�
 - state：后续由 facts 更新出的长期主题/偏好/约束/风险等演化状态。
 - index entry：类似 MemPalace 目录卡片的统一召回入口。
 
-你现在需要从下面按时间顺序排列的对话/转写证据批次中提取 episode summary、episode canonical_topics 和 Hindsight 风格的高质量 narrative facts。证据可能来自用户与 assistant 的主动对话，也可能来自多人环境语音转写；请根据 speaker、role 和 time 判断参与者与语义流动。
+你现在需要从下面按时间顺序排列的对话/转写证据批次中提取 episode summary、episode canonical_topics 和 Hindsight 风格的高质量 narrative facts。证据可能来自用户与助手的主动对话，也可能来自多人环境语音转写；请根据 speaker、role 和 time 判断参与者与语义流动。
 
 canonical_topics 生成规则：
 - canonical_topics 是 episode 级别的稳定主题名称，按相关性从高到低排序，输出 1-5 个。
@@ -92,7 +92,7 @@ memory_states 使用规则：
 - `fact_root_topic` 只有在该 fact 的核心对象、讨论目标和语义范围都与 topic_state 的 canonical_name 相近时，才可以原样复用该名称；`fact_aspect_topic` 应保留该 fact 在根主题下的具体讨论方面。
 - 不要仅因为 fact 与某个 topic_state 同属“健康”“产品”“团队”等宽泛领域，或 fact 中出现了该 topic 的相关背景，就复用该名称。若当前证据不能支持这种严格对应，应使用当前证据中的更具体主题，必要时输出新的保守 topic。
 - 不能因为 entity_state 的名称、summary 或历史 timeline 而改变 fact 的 root_topic；entity_state 只能辅助理解，不得作为 topic 候选直接复用。
-- `entities` 保留所有与 fact 直接相关的实体，用于完整召回；`primary_entity` 表示这条 fact 主要描述、影响或归属的单一实体，必须来自 `entities`。对于用户自己的偏好、习惯、约束或风险，优先将 `user` 作为 primary_entity。
+- `entities` 保留所有与 fact 直接相关的实体，用于完整召回；`primary_entity` 表示这条 fact 主要描述、影响或归属的单一实体，必须来自 `entities`。对于用户自己的偏好、习惯、约束或风险，优先将“用户”作为 primary_entity；对于助手自己的动作或建议，优先将“助手”作为 primary_entity。
 
 """ + ENTITY_EXTRACTION_GUIDANCE_ZH + """
 
@@ -104,7 +104,7 @@ Hindsight 风格 narrative fact 的核心要求：
 
 fact_type 判别规则：
 - `semantic` 表示不依赖某一次具体经历也能复用的稳定知识或长期信息，例如项目结构、概念定义、系统约定、常识、用户长期偏好、长期指令或长期约束。它描述“通常是什么/长期怎样”，重点是跨多次对话仍成立的稳定认识。
-- `episodic` 表示某次具体发生过的经历或事件，例如用户在某轮提出请求、assistant 执行修改或测试、一次失败或通过、某个时间点的决定、状态变化或情绪反应。它描述“某次发生了什么”，即使事件涉及一个长期项目，也仍然可以是 episodic。
+- `episodic` 表示某次具体发生过的经历或事件，例如用户在某轮提出请求、助手执行修改或测试、一次失败或通过、某个时间点的决定、状态变化或情绪反应。它描述“某次发生了什么”，即使事件涉及一个长期项目，也仍然可以是 episodic。
 - 判断核心是该 fact 是否依赖一次具体经历才能成立，而不是主题是否长期存在、内容是否重要，或是否可能影响未来。一次性的请求、建议、修改、测试结果、决定或风险事件默认标为 `episodic`；只有证据明确支持跨场景、跨时间可复用的稳定知识或长期模式时才标为 `semantic`。
 - 不要因为 fact 使用了“偏好”“风险”“决定”等 fact_kind 就自动标为 `semantic`：一次具体场景中的偏好表达、临时风险、单次决定仍应标为 `episodic`；反复出现或明确声明长期有效的偏好、约束、指令才可以标为 `semantic`。
 
@@ -128,12 +128,12 @@ fact_type 判别规则：
 4. 不要丢弃 “by the way / I also / I just / last Saturday / two months ago / 顺便 / 我还” 这类附带提到的个人事件；但如果它们属于同一 exchange 的上下文，应合并进同一条 narrative fact，而不是拆成无背景短句。
 5. 只有真正互不相关的事件才拆开；时间推理需要比较先后/间隔的事件可以拆成多条，但每条仍必须保留完整背景和时间锚点。
 6. 只使用输入证据，不要编造完成状态、意图或原因。
-7. 如果 assistant 的推荐中包含未来可能被问到的具体条目，要放入相关 exchange 的 narrative fact，并写清用户是否接受、拒绝、犹豫或提出约束。
+7. 如果助手的推荐中包含未来可能被问到的具体条目，要放入相关 exchange 的 narrative fact，并写清用户是否接受、拒绝、犹豫或提出约束。
 8. priority 为 0-100，只保留至少 60 分的事实。
 9. fact_type 只能是 semantic 或 episodic，并严格按照上面的稳定知识/长期信息与单次事件边界判断。
 10. fact_kind 只能是 preference、decision、request、recommendation、action、commitment、open_question、risk、error、context、instruction、other。
 11. 不要输出只有“用户说了 X”“助手建议 Y”的短 fact；如果删除议题背景、理由、分歧或结论后会变成泛泛短句，必须补回这些信息；若对话没有足够信息支撑，则不要输出该 fact。
-12. 不要把 assistant 的寒暄、礼貌收尾、泛化鼓励或无具体信息的回复单独作为 fact，例如“希望这个方法能帮到您”“有其他问题可以继续沟通”“好的”“不客气”等；除非它明确改变了用户决定、承诺或下一步。
+12. 不要把助手的寒暄、礼貌收尾、泛化鼓励或无具体信息的回复单独作为 fact，例如“希望这个方法能帮到您”“有其他问题可以继续沟通”“好的”“不客气”等；除非它明确改变了用户决定、承诺或下一步。
 13. keywords 只能包含用于检索的短实体、主题、症状、方案、约束、决定和关键时间/顺序锚，通常每个关键词 2-8 个汉字或一个短英文短语；对带时间锚的事件，必须加入原始或补全后的时间词，例如“March 15 2023”“first service”“3/22”“last Saturday”“two months ago”“上周六”“两个月前”。不要把完整句子、寒暄、礼貌话、语气词、泛化表达或“希望这个方法能帮到您”这类文本放入 keywords。
 14. 只返回 JSON，不要 markdown。
 
@@ -188,7 +188,7 @@ actionable_aspects 输出规则：
         {
           "item_type": "task|commitment|decision|follow_up|open_question|risk|reminder|recommendation|constraint",
           "action_summary": "需要后续提醒、跟进、执行、复盘或决策追踪的具体事项",
-          "owner": "user|assistant|other|unknown",
+          "owner": "用户|助手|other|unknown",
           "status": "open|in_progress|done|blocked|decided|noted|unknown",
           "due_at": "",
           "trigger_basis": "当前 fact 中支持该 actionable 线索的具体证据",
@@ -363,9 +363,9 @@ UNIFIED_ACTIONABLE_ITEM_EXTRACTION_PROMPT_ZH = """你是 AI 眼镜长期记忆�
 
 规则：
 1. 提取 0-4 条 actionable items。多数普通对话可以输出空列表，不要为了覆盖 facts 强行生成。
-2. 只提取强 actionable：用户明确要求提醒/跟进/记录/安排/执行，用户或 assistant 明确承诺未来会做，用户做出可追踪的决定，存在必须后续解决的开放问题，或存在会阻塞行动的高价值风险。
+2. 只提取强 actionable：用户明确要求提醒/跟进/记录/安排/执行，用户或助手明确承诺未来会做，用户做出可追踪的决定，存在必须后续解决的开放问题，或存在会阻塞行动的高价值风险。
 3. 不要把“用户愿意试试/可以试一试/听起来不错/可能会考虑”单独提取为 actionable item；这类弱尝试意愿默认只属于 fact 或 state。只有当它同时包含明确提醒需求、截止时间、具体后续检查、强承诺或可验证执行计划时才提取。
-4. 不要把 assistant 的普通建议单独提取为 actionable item。只有当用户明确采纳、要求后续提醒/跟进，或该建议已经变成用户的任务/承诺/决定时才提取。
+4. 不要把助手的普通建议单独提取为 actionable item。只有当用户明确采纳、要求后续提醒/跟进，或该建议已经变成用户的任务/承诺/决定时才提取。
 5. 普通约束、偏好、背景信息应留给 state，不要作为 constraint item；只有当约束正在阻塞一个明确行动或决策时才提取。
 6. 不要复制每条 fact。若多条 facts 指向同一件事，只保留一条最具体、最可追踪的 item。
 7. 每个 item 必须可独立理解：包含执行人/owner、目标对象、上下文、原因、截止时间或时间锚点（如果存在）、当前状态。
@@ -382,7 +382,7 @@ UNIFIED_ACTIONABLE_ITEM_EXTRACTION_PROMPT_ZH = """你是 AI 眼镜长期记忆�
       "item_type": "task|commitment|decision|follow_up|open_question|risk|reminder|recommendation|constraint|other",
       "canonical_name": "稳定短名称",
       "summary": "可独立理解的可执行事项",
-      "owner": "user|assistant|other|unknown",
+      "owner": "用户|助手|other|unknown",
       "status": "open|in_progress|done|blocked|decided|noted|unknown",
       "due_at": "",
       "evidence_fact_ids": [1, 2],

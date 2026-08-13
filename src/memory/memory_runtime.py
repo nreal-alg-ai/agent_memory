@@ -8,8 +8,9 @@ turns or transcript segments into the manager's raw episode segments.
 from __future__ import annotations
 
 import time
+import re
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .memory_manager import (
     MemoryNodeManager,
@@ -31,6 +32,10 @@ class MemoryRuntime:
         """Initialize the runtime buffers and batching thresholds."""
         self._manager = manager
         config = dict(memory_runtime_config or {})
+        self._prompt_language_mode = str(
+            config.get("memory_prompt_language_mode")
+            or "source"
+        ).strip().lower()
         self._max_pending_interaction_turns = max(
             1,
             int(
@@ -184,14 +189,18 @@ class MemoryRuntime:
             return {"queued": False, "reason": "no_pending_segments"}
         segments = list(self._pending_transcript_segments)
         context = dict(self._pending_transcript_context or {})
-        raw_segments = self._normalize_transcript_segments_into_memory_raw_segments(
+        raw_segments, prompt_language = self._normalize_transcript_segments_into_memory_raw_segments(
             segments,
         )
         if not raw_segments:
             self._pending_transcript_segments.clear()
             self._pending_transcript_context = None
             return {"queued": False, "reason": "invalid_pending_segments"}
-        queue_report = self._process_transcript_segments(raw_segments, context)
+        queue_report = self._process_transcript_segments(
+            raw_segments,
+            context,
+            prompt_language=prompt_language,
+        )
         queued = bool(queue_report.get("queued"))
         if queued:
             self._pending_transcript_segments.clear()
@@ -230,18 +239,24 @@ class MemoryRuntime:
 
     def _process_interaction_turns(self, turns: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Convert interaction turns and submit them as an assistant episode."""
-        raw_segments = self._normalize_interaction_turns_to_memory_raw_segments(turns)
+        (
+            raw_segments,
+            prompt_language,
+        ) = self._normalize_interaction_turns_to_memory_raw_segments(turns)
         tags = sorted({tag for turn in turns for tag in turn.get("tags", [])})
         return self._manager.submit_memory_store_task(
             raw_segments=raw_segments,
             source_type="assistant_wakeup",
             tags=tags,
+            prompt_language=prompt_language,
         )
 
     def _process_transcript_segments(
         self,
         raw_segments: Sequence[Dict[str, Any]],
         context: Dict[str, Any],
+        *,
+        prompt_language: str,
     ) -> Dict[str, Any]:
         """Submit normalized transcript segments with their source context."""
         tags = {
@@ -259,7 +274,31 @@ class MemoryRuntime:
             raw_segments=list(raw_segments),
             source_type=str(context.get("source_type") or "allday_recording"),
             tags=sorted(tags),
+            prompt_language=prompt_language,
         )
+
+    def _resolve_prompt_language_from_segments(
+        self,
+        records: Sequence[Dict[str, Any]],
+    ) -> str:
+        """Resolve prompt language for normalized segments or interaction turns."""
+        mode = self._prompt_language_mode
+        if mode in {"en", "english", "force_en"}:
+            return "en"
+        if mode in {"zh", "chinese", "force_zh"}:
+            return "zh"
+        sample = "\n".join(
+            text
+            for record in list(records)[:12]
+            if isinstance(record, dict)
+            for text in (
+                str(record.get("text") or "").strip()
+                or str(record.get("user_message") or "").strip()
+                or str(record.get("assistant_response") or "").strip(),
+            )
+            if text
+        )
+        return "zh" if re.search(r"[\u4e00-\u9fff]", sample) else "en"
 
     def _should_flush_pending_transcript_before(
         self,
@@ -348,8 +387,10 @@ class MemoryRuntime:
     def _normalize_interaction_turns_to_memory_raw_segments(
         self,
         turns: Sequence[Dict[str, Any]],
-    ) -> List[Dict[str, Any]]:
+    ) -> Tuple[List[Dict[str, Any]], str]:
         """Convert frontend interaction turns into manager-compatible segments."""
+
+        prompt_language = self._resolve_prompt_language_from_segments(turns)
         segments: List[Dict[str, Any]] = []
         for turn_index, turn in enumerate(turns, 1):
             timestamp = _to_timestamp_text(turn.get("turn_timestamp")) or _now_text()
@@ -358,8 +399,7 @@ class MemoryRuntime:
             assistant_text = _compact_whitespace(turn.get("assistant_response") or "")
             if user_text:
                 segments.append({
-                    "speaker": "user",
-                    "role": "user",
+                    "speaker": "user" if prompt_language == "en" else "用户",
                     "text": user_text,
                     "started_at": timestamp,
                     "ended_at": timestamp,
@@ -368,20 +408,19 @@ class MemoryRuntime:
                 })
             if assistant_text:
                 segments.append({
-                    "speaker": "assistant",
-                    "role": "assistant",
+                    "speaker": "assistant" if prompt_language == "en" else "助手",
                     "text": assistant_text,
                     "started_at": timestamp,
                     "ended_at": timestamp,
                     "tags": tags,
                     "turn_index": turn_index,
                 })
-        return segments
+        return segments, prompt_language
 
     def _normalize_transcript_segments_into_memory_raw_segments(
         self,
         segments: Sequence[Dict[str, Any]],
-    ) -> List[Dict[str, Any]]:
+    ) -> Tuple[List[Dict[str, Any]], str]:
         """Validate and normalize transcript segments for episode storage."""
         normalized: List[Dict[str, Any]] = []
         for index, segment in enumerate(segments, 1):
@@ -396,12 +435,10 @@ class MemoryRuntime:
                 or segment.get("speaker_id")
                 or "unknown_speaker"
             )
-            role = _compact_whitespace(segment.get("role") or speaker or "speaker")
             started_at = self._transcript_segment_start_time(segment)
             ended_at = self._transcript_segment_end_time(segment)
             normalized.append({
                 "speaker": speaker or "unknown_speaker",
-                "role": role or "speaker",
                 "text": text,
                 "started_at": started_at or _now_text(),
                 "ended_at": ended_at or started_at or _now_text(),
@@ -409,7 +446,7 @@ class MemoryRuntime:
                 "segment_index": int(segment.get("segment_index") or index),
                 "metadata": dict(segment.get("metadata") or {}),
             })
-        return sorted(
+        normalized = sorted(
             normalized,
             key=lambda item: (
                 str(item.get("started_at") or ""),
@@ -417,3 +454,4 @@ class MemoryRuntime:
                 str(item.get("speaker") or ""),
             ),
         )
+        return normalized, self._resolve_prompt_language_from_segments(normalized)
