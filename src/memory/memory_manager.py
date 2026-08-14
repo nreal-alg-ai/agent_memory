@@ -1888,41 +1888,6 @@ class MemoryNodeManager:
             chunks.append(f"{started_at} {speaker}: {text[:600]}")
         return "\n".join(chunks)
 
-    @staticmethod
-    def _truncate_index_text(text: Any, *, max_chars: int = 700) -> str:
-        clean = _compact_whitespace(text or "")
-        if len(clean) <= max_chars:
-            return clean
-        return clean[: max(0, max_chars - 3)].rstrip() + "..."
-
-    def _build_index_embedding_text(
-        self,
-        *,
-        title: str,
-        summary: str,
-        keywords: Any,
-        entities: Sequence[str],
-        canonical_topics: Sequence[str],
-        memory_path: str,
-        max_summary_chars: int = 520,
-    ) -> str:
-        if isinstance(keywords, str):
-            keyword_text = keywords
-        else:
-            keyword_text = " ".join(str(item or "") for item in keywords)
-        return "\n".join(
-            part
-            for part in (
-                f"title: {self._truncate_index_text(title, max_chars=120)}",
-                f"summary: {self._truncate_index_text(summary, max_chars=max_summary_chars)}",
-                f"topics: {', '.join(str(item or '') for item in canonical_topics[:8])}",
-                f"entities: {', '.join(str(item or '') for item in entities[:12])}",
-                f"keywords: {self._truncate_index_text(keyword_text, max_chars=180)}",
-                f"path: {memory_path}",
-            )
-            if part.strip()
-        )
-
     def _is_low_value_assistant_closing(self, text: str) -> bool:
         clean = _compact_whitespace(text)
         if not clean:
@@ -2948,17 +2913,16 @@ class MemoryNodeManager:
         )
         prompt = (
             prompt_template
-            .replace("{canonical_topic}", json.dumps({
-                "canonical_name": candidate.get("topic_name"),
-                "topic_key": candidate.get("topic_key"),
-                "identity_text": candidate.get("identity_text") or "",
-            }, ensure_ascii=False, indent=2))
+            .replace("{candidate_topic_state}", json.dumps(
+                self._format_topic_state_candidate_for_prompt(candidate),
+                ensure_ascii=False,
+                indent=2,
+            ))
             .replace("{existing_topic_state}", json.dumps(
                 self._format_existing_topic_state_for_prompt(existing_state),
                 ensure_ascii=False,
                 indent=2,
             ))
-            .replace("{facts}", self._format_facts_for_state_prompt(facts))
         )
         result = self._call_llm(prompt)
         parsed = self._parse_json_object_from_llm_text(result or "")
@@ -2977,6 +2941,29 @@ class MemoryNodeManager:
             if normalized:
                 return normalized
         return self._fallback_topic_state_update(candidate, existing_state)
+
+    @staticmethod
+    def _format_topic_state_candidate_for_prompt(
+        candidate: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Format the resolved topic candidate without duplicating raw facts."""
+        candidate = candidate or {}
+        return {
+            "root_topic_name": candidate.get("topic_name") or "",
+            "topic_key": candidate.get("topic_key") or "",
+            "identity_text": candidate.get("identity_text") or "",
+            "aspect_topics": list(candidate.get("aspect_topics") or []),
+            "parent_topics": list(candidate.get("parent_topics") or []),
+            "keywords": list(candidate.get("keywords") or []),
+            "context_entities": list(candidate.get("context_entities") or []),
+            "fact_summaries": list(candidate.get("fact_summaries") or []),
+            "fact_ids": [
+                int(fact_id)
+                for fact_id in candidate.get("fact_ids") or []
+                if str(fact_id).strip().isdigit()
+            ],
+            "source_type": candidate.get("source_type") or "",
+        }
 
     @staticmethod
     def _format_existing_topic_state_for_prompt(state: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -4469,26 +4456,6 @@ class MemoryNodeManager:
 
         return item_id
     
-    def _format_facts_for_state_prompt(self, facts: List[Dict[str, Any]]) -> str:
-        rows: List[Dict[str, Any]] = []
-        for fact in facts[:160]:
-            metadata = fact.get("metadata") if isinstance(fact.get("metadata"), dict) else {}
-            rows.append({
-                "id": fact.get("id"),
-                "source_type": fact.get("source_type"),
-                "fact_type": fact.get("fact_type"),
-                "fact_kind": fact.get("fact_kind"),
-                "event_time_key": fact.get("event_time_key"),
-                "dialogue_time_key": fact.get("dialogue_time_key"),
-                "summary": fact.get("summary"),
-                "keywords": fact.get("keywords"),
-                "entities": fact.get("entities") or [],
-                "primary_entity": fact.get("primary_entity"),
-                "fact_root_topic": fact.get("fact_root_topic") or "",
-                "fact_aspect_topic": fact.get("fact_aspect_topic") or "",
-            })
-        return json.dumps(rows, ensure_ascii=False, indent=2)
-
     def _format_facts_for_actionable_prompt(self, facts: List[Dict[str, Any]]) -> str:
         rows: List[Dict[str, Any]] = []
         for fact in facts[:80]:

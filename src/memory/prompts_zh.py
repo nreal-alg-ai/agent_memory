@@ -228,17 +228,21 @@ actionable_aspects 输出规则：
 
 UNIFIED_TOPIC_STATE_UPDATE_PROMPT_ZH = """你是 AI 眼镜长期记忆系统中的 topic_state 更新模块。
 
-输入已经完成主题解析：系统已经判断这批 facts 应归入某个长期 topic，或应创建一个新的长期 topic。你的任务是更新这个 topic_state 的 summary，而不是重新决定主题归属。
+输入已经完成主题解析：系统已经判断当前候选证据应归入某个长期根主题，或应创建一个新的长期根主题。你的任务是基于 candidate_topic_state 和已有 topic_state 更新根 topic_state 的 summary，而不是重新决定主题归属。
 
 规则：
-1. 给定的 canonical_topic 是根主题，只围绕这个根主题更新，不要把无关 facts 合并进来。
-2. summary 需要体现根主题的长期状态：背景、最近变化、关键参与者、已经形成的决定/偏好/约束、仍未解决的问题和下一步。
-3. 如果 existing_topic_state 已有内容，要增量融合，不要简单拼接，不要丢失仍然有效的长期信息。
-4. 不要把单句 fact 改写成另一句 fact；topic_state 必须比 fact 更抽象、更稳定。
-5. summary 必须是简短的当前状态快照，最多 1-2 句话，建议不超过 120 个中文字符；不要把历史 timeline 拼接进 summary。
-6. time_line_updates 只记录本次 facts 带来的状态变化，输出 0-3 条；每条包含发生时间、变化类型、简短变化说明和 fact_ids。不要重复输出已有 timeline，也不要把没有变化的内容写入 timeline。
-7. evidence_fact_ids 必须引用输入 facts 中支撑本次更新的 fact ID。
-8. 只返回 JSON，不要 markdown。
+1. `candidate_topic_state.root_topic_name` 是待更新的根主题，只围绕它更新，不要把其他主题或仅仅共享实体的内容合并进来。
+2. `aspect_topics` 是该根主题下的具体方面，只用于理解局部进展和组织状态，不要为每个 aspect 创建独立 topic_state。
+3. `parent_topics` 是 episode 或上层语境提供的辅助主题，只能作为背景参考；如果与根主题无关，不要写入 summary。
+4. `identity_text`、`keywords`、`context_entities` 和 `fact_summaries` 是候选主题的聚合检索与证据信息。优先使用其中具体、重复或已形成结论的内容，但不要机械复制 identity_text，也不要把所有关键词和实体堆进 summary。
+5. `fact_ids` 是可引用的证据 ID。只能引用 candidate 中确实支撑本次变化的 ID，不要根据 ID 猜测事实内容。
+6. summary 需要体现根主题的长期状态：背景、最近变化、关键参与者、已经形成且仍有效的决定/偏好/约束、仍未解决的问题和下一步。
+7. 如果 existing_topic_state 已有内容，要增量融合，不要简单拼接，不要丢失仍然有效的长期信息。
+8. 不要把单个 fact 改写成另一句 fact；topic_state 必须比单个事实更抽象、更稳定。
+9. summary 必须是简短的当前状态快照，最多 1-2 句话，建议不超过 120 个中文字符；不要把历史 timeline 拼接进 summary。
+10. time_line_updates 只记录 candidate_topic_state 中本次证据带来的状态变化，输出 0-3 条；每条包含发生时间、变化类型、简短变化说明和 fact_ids。不要重复已有 timeline，也不要把没有变化的内容写入 timeline。
+11. evidence_fact_ids 必须来自 candidate_topic_state.fact_ids，并且只能引用真正支撑本次更新的 fact ID。
+12. 只返回 JSON，不要 markdown。
 
 输出格式：
 {
@@ -262,14 +266,23 @@ UNIFIED_TOPIC_STATE_UPDATE_PROMPT_ZH = """你是 AI 眼镜长期记忆系统中�
   "status": "active|stable|resolved|uncertain"
 }
 
-canonical_topic：
-{canonical_topic}
+candidate_topic_state：
+{candidate_topic_state}
+
+candidate_topic_state 字段说明与使用方式：
+- `root_topic_name`：候选的稳定根主题名称，是本次 topic_state 的核心归属。不要把 aspect 或无关 episode 主题改写成新的根主题。
+- `topic_key`：根主题的稳定内部键，只用于确认主题身份，不要写入 summary、canonical_name 或 timeline。
+- `identity_text`：由根主题、方面、关键词、实体和事实摘要构成的候选身份文本，用于整体理解和区分主题；不要原样复制为 state summary。
+- `aspect_topics`：当前候选 facts 涉及的具体方面，例如平台选择、预算限制或方案进展。它们是根主题下的上下文，不是必须单独创建的 state。
+- `parent_topics`：候选 facts 所在 episode 的上层主题，只在能帮助理解根主题时使用，不能覆盖更准确的 root_topic_name。
+- `keywords`：从相关 facts 聚合出的检索关键词，用于识别具体对象、动作、结果和约束；不要把泛化词逐个列入 summary。
+- `context_entities`：相关 facts 中的语义实体，用于确认参与者、产品、项目或对象；只有对根主题状态有意义时才写入 summary。
+- `fact_summaries`：相关 facts 的压缩摘要，是本次候选状态变化的主要证据内容。只提炼其中与根主题直接相关且有长期价值的部分。
+- `fact_ids`：上述摘要对应的 fact 标识，只用于 evidence_fact_ids 和 time_line_updates[].fact_ids 的证据引用。
+- `source_type`：候选来源类型，仅作为来源背景，不要把它当作主题内容。
 
 已有 topic_state：
 {existing_topic_state}
-
-新 facts：
-{facts}
 """
 
 

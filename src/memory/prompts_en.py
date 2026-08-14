@@ -231,19 +231,21 @@ Dialogue/transcript evidence batch:
 
 UNIFIED_TOPIC_STATE_UPDATE_PROMPT_EN = """You are the topic_state update module for a unified AI-glasses long-term memory system inspired by MemPalace.
 
-The input has already passed topic resolution: the system has decided that these facts belong to a long-term topic, or that a new long-term topic should be created. Your task is to update that topic_state summary, not to re-route the topic.
+Topic resolution has already been completed: the system decided that the candidate evidence belongs to one durable root topic, or that a new root topic should be created. Use candidate_topic_state and the existing topic_state to update the root topic_state summary; do not re-route the topic.
 
 Rules:
-1. The given canonical_topic is the root topic. Update only that root topic and do not merge unrelated facts.
-2. Do not create a separate topic_state for each aspect; return concrete aspects as local progress under the root topic.
-3. The summary should describe the durable root state: background, recent changes, key participants, decisions/preferences/constraints that still matter, unresolved questions, and next steps.
-4. If existing_topic_state is present, merge incrementally instead of concatenating. Preserve durable information that is still valid.
-5. Do not rewrite one fact into another fact. A topic_state must be more abstract and stable than individual facts.
-6. summary must be a concise current-state snapshot: at most 1-2 sentences and preferably no more than 80 English words. Do not append the historical timeline or every aspect to summary.
-7. Return only evidence-supported aspects from the input. Each aspect should include a name, current progress summary, and status.
-8. time_line_updates must contain only changes supported by the new facts, with 0-3 events. Each event must include time, change_type, a short change summary, and fact_ids. Do not repeat existing timeline events or record unchanged information.
-9. evidence_fact_ids must cite supporting fact IDs from the input facts.
-10. Return JSON only. No markdown.
+1. `candidate_topic_state.root_topic_name` is the stable root topic. Update only that root topic; do not merge content that merely shares an entity or broad domain.
+2. `aspect_topics` are concrete aspects under the root topic. Use them to understand local progress, but do not create a separate topic_state for every aspect.
+3. `parent_topics` are auxiliary episode-level or higher-level context. Use them only when relevant to the root topic; they must not override a more accurate root_topic_name.
+4. `identity_text`, `keywords`, `context_entities`, and `fact_summaries` are aggregated identity and evidence fields. Use specific, repeated, or concluded information from them, but do not copy identity_text verbatim or dump every keyword and entity into the summary.
+5. `fact_ids` are the available evidence IDs. Cite only IDs that are actually supported by the candidate content; never infer facts from an ID.
+6. The summary should describe the durable root state: background, recent changes, key participants, decisions/preferences/constraints that still matter, unresolved questions, and next steps.
+7. If existing_topic_state is present, merge incrementally instead of concatenating. Preserve durable information that is still valid.
+8. Do not rewrite one fact into another fact. A topic_state must be more abstract and stable than an individual fact.
+9. summary must be a concise current-state snapshot: at most 1-2 sentences and preferably no more than 80 English words. Do not append the historical timeline or every aspect to summary.
+10. time_line_updates must contain only changes supported by candidate_topic_state, with 0-3 events. Each event must include time, change_type, a short change summary, and fact_ids. Do not repeat existing timeline events or record unchanged information.
+11. evidence_fact_ids must come from candidate_topic_state.fact_ids and cite only facts that support this update.
+12. Return JSON only. No markdown.
 
 Output schema:
 {
@@ -274,14 +276,23 @@ Output schema:
   "status": "active|stable|resolved|uncertain"
 }
 
-canonical_topic:
-{canonical_topic}
+candidate_topic_state:
+{candidate_topic_state}
+
+candidate_topic_state field descriptions and usage:
+- `root_topic_name`: the stable root topic this state belongs to. Do not turn an aspect or unrelated episode topic into a new root topic.
+- `topic_key`: the stable internal root-topic key. Use it only to confirm identity; do not write it into summary, canonical_name, or timeline.
+- `identity_text`: an aggregated identity text containing the root topic, aspects, keywords, entities, and fact summaries. Use it for holistic topic understanding; do not copy it verbatim as the state summary.
+- `aspect_topics`: concrete aspects such as platform selection, budget constraints, or plan progress. They are context under the root topic, not necessarily independent states.
+- `parent_topics`: higher-level episode context. Use it only when it helps explain the root topic and never let it override root_topic_name.
+- `keywords`: aggregated retrieval anchors from the related facts. Use them to identify concrete objects, actions, outcomes, and constraints; do not list generic words in the summary.
+- `context_entities`: semantic entities from the related facts. Use them to confirm people, products, projects, or objects only when they matter to the root state.
+- `fact_summaries`: compressed summaries of the related facts and the main evidence for the candidate update. Extract only content directly relevant and durable for the root topic.
+- `fact_ids`: IDs corresponding to the summaries. Use them only for evidence_fact_ids and time_line_updates[].fact_ids.
+- `source_type`: provenance of the candidate; treat it as context, not topic content.
 
 existing_topic_state:
 {existing_topic_state}
-
-new facts:
-{facts}
 """
 
 
