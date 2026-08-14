@@ -347,6 +347,19 @@ entity-scoped state 的目标：
 entity_state_target：
 {entity_state_target}
 
+entity_state_target 字段说明与使用方式：
+- `entity`：本次更新所描述的实体名称。所有 summary、canonical_name 和 time_line_updates 都必须围绕这个实体展开，不要把其他被提及但不是主要对象的实体写成当前状态的归属者。
+- `entity_key`：该实体的稳定内部标识，用于确认实体身份。它不是自然语言内容，不要把它写入 summary、canonical_name 或 timeline；只需用它确认本次 candidate 与已有 entity_state 是否属于同一个实体。
+- `state_type`：本次允许更新的 entity_state 类型，只能围绕这个类型提炼信息。不要因为候选内容同时涉及其他方面，就擅自改成 preference、profile、routine、relationship、constraint 或 risk 中的另一类。
+- `attribute_name`：本次候选状态的具体属性名称，是更新的主要语义边界。summary 应该说明这个属性对该实体的长期含义，而不是泛泛总结整段对话或 topic_state 的进展。
+- `attribute_key`：属性的稳定内部键，用于辅助确认属性身份。它不是需要展示给用户的内容，不要直接复制到 summary 或 canonical_name。
+- `attribute_name_aliases`：该属性可能出现的同义名称或历史名称。判断已有 entity_state 是否描述同一属性时可以参考这些别名，但不要把所有别名机械拼接进输出；如果已有状态表达的是不同属性，应返回 `update_needed=false`。
+- `state_aspect_summaries`：当前候选 facts 已经提炼出的、对这个 entity_state 类型有贡献的 aspect。每一项中的 `aspect_summary` 只描述该属性的状态贡献，`evidence_basis` 说明当前 fact 为什么支持这个贡献。优先依据这些内容生成 summary 和 timeline，不要重新扩展成无关的 topic 总结。
+- `state_aspect_summaries[].fact_id`：支持该 aspect 的 fact 标识。它只用于在输出的 `evidence_fact_ids` 和 `time_line_updates[].fact_ids` 中准确引用证据，不代表可以写入自然语言内容，也不能根据编号推断事实。
+- `state_aspect_summaries[].confidence`：该 aspect 的提炼置信度，用于判断是否应该保守更新；低置信度或证据不足时不要扩展出新的长期结论。
+
+处理原则：先使用 `entity` 和 `entity_key` 确认状态归属，再使用 `state_type`、`attribute_name` 和属性别名确认更新边界，最后综合 `state_aspect_summaries` 中的 aspect_summary 与 evidence_basis 生成当前状态。只有当候选 aspect 对该实体属性确实具有长期价值时才更新；一次性事件、单次建议、临时请求或仅属于 topic_state 的进展都应返回 `update_needed=false`。如果 existing_entity_state 与 candidate 是同一实体和同一属性，则在保留已有长期结论的基础上增量融合；如果属性不同，不要强行合并。
+
 已有 entity_state：
 {existing_entity_state}
 """

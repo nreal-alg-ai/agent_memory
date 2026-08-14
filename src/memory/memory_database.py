@@ -916,6 +916,7 @@ class SessionDB:
         self,
         *,
         source_types: Optional[Sequence[str]] = None,
+        state_type: Optional[Any] = None,
         limit: int = 80,
     ) -> List[Dict[str, Any]]:
         clauses: List[str] = []
@@ -924,6 +925,15 @@ class SessionDB:
             placeholders = ",".join("?" for _ in source_types)
             clauses.append(f"source_type IN ({placeholders})")
             params.extend(source_types)
+        state_type_values = (
+            [state_type]
+            if isinstance(state_type, str)
+            else list(state_type or [])
+        )
+        if state_type_values:
+            placeholders = ",".join("?" for _ in state_type_values)
+            clauses.append(f"state_type IN ({placeholders})")
+            params.extend(state_type_values)
         where = "WHERE " + " AND ".join(clauses) if clauses else ""
         rows = self._conn.execute(
             f"""
@@ -935,6 +945,14 @@ class SessionDB:
             (*params, max(1, int(limit))),
         ).fetchall()
         return [self._row_to_dict(row) for row in rows]
+
+    def get_memory_state_by_id(self, state_id: int) -> Optional[Dict[str, Any]]:
+        """Return one fully hydrated memory state by its primary key."""
+        row = self._conn.execute(
+            "SELECT * FROM memory_states WHERE id = ?",
+            (int(state_id),),
+        ).fetchone()
+        return self._row_to_dict(row) if row else None
 
     def recent_actionable_items(
         self,

@@ -359,6 +359,19 @@ Output schema:
 entity_state_target:
 {entity_state_target}
 
+entity_state_target field descriptions and usage:
+- `entity`: the entity described by this update. All summary, canonical_name, and time_line_updates content must be about this entity. Do not assign the state to another entity that is only mentioned as background or context.
+- `entity_key`: the stable internal identity key for the entity. Use it only to confirm that the candidate and existing_entity_state refer to the same entity. It is not natural-language content and must not be copied into summary, canonical_name, or the timeline.
+- `state_type`: the entity_state type that this update is allowed to modify. Stay within this type; do not switch to preference, profile, routine, relationship, constraint, or risk merely because the candidate also touches another aspect.
+- `attribute_name`: the specific attribute represented by this candidate and the main semantic boundary of the update. The summary must explain what this attribute means long-term for the entity, rather than summarizing the whole dialogue or a topic_state.
+- `attribute_key`: the stable internal key for the attribute. Use it to help confirm attribute identity, but do not copy it into summary or canonical_name.
+- `attribute_name_aliases`: alternative or historical names for the same attribute. Use them when deciding whether existing_entity_state describes the same attribute, but do not mechanically concatenate all aliases into the output. If the existing state describes a different attribute, return `update_needed=false`.
+- `state_aspect_summaries`: aspects already extracted from the candidate facts that contribute to this entity_state type. Each `aspect_summary` describes only the contribution to this attribute, while `evidence_basis` explains why the current fact supports it. Prefer these fields when generating the summary and timeline; do not expand them into an unrelated topic summary.
+- `state_aspect_summaries[].fact_id`: the fact identifier supporting the aspect. Use it only to cite evidence in `evidence_fact_ids` and `time_line_updates[].fact_ids`; it is not semantic content and must not be used to infer facts from the number.
+- `state_aspect_summaries[].confidence`: the extraction confidence for the aspect. Use it to stay conservative; low-confidence or weakly supported aspects must not be expanded into new long-term conclusions.
+
+Processing principle: first use `entity` and `entity_key` to confirm the state owner, then use `state_type`, `attribute_name`, and the attribute aliases to establish the update boundary, and finally use `aspect_summary` and `evidence_basis` from `state_aspect_summaries` to produce the current state. Update only when the candidate aspect has durable value for this entity attribute. For one-off events, single recommendations, temporary requests, or topic-only progress, return `update_needed=false`. When existing_entity_state refers to the same entity and attribute, merge the candidate incrementally while preserving the existing long-term conclusion. If the attribute is different, do not force a merge.
+
 existing_entity_state:
 {existing_entity_state}
 """

@@ -2390,7 +2390,6 @@ class MemoryNodeManager:
         facts: List[Dict[str, Any]],
     ) -> Dict[str, int]:
         update_started_at = time.monotonic()
-        existing_states = self._db.get_recent_memory_states(limit=80)
         if not self._enable_topic_state_resolution:
             report = {
                 "enabled": 0,
@@ -2402,11 +2401,10 @@ class MemoryNodeManager:
                 **report,
             })
             return report
-        existing_topic_states = [
-            state for state in existing_states
-            if str(state.get("state_scope") or "") == "topic_state"
-            and str(state.get("state_type") or "") == "topic"
-        ]
+        existing_topic_states = self._db.get_recent_memory_states(
+            state_type="topic",
+            limit=80,
+        )
         candidates = self._build_topic_state_candidates_from_facts(facts)
         updated = 0
         unresolved = 0
@@ -2451,15 +2449,16 @@ class MemoryNodeManager:
                     ),
                 )
                 updated += 1
-                refreshed = self._db.get_recent_memory_states(
-                    source_types=[state_update["source_type"]],
-                    limit=80,
-                )
-                existing_topic_states = [
-                    state for state in refreshed
-                    if str(state.get("state_scope") or "") == "topic_state"
-                    and str(state.get("state_type") or "") == "topic"
-                ]
+                refreshed_state = self._db.get_memory_state_by_id(state_id)
+                if refreshed_state:
+                    replaced = False
+                    for index, existing in enumerate(existing_topic_states):
+                        if int(existing.get("id") or -1) == int(state_id):
+                            existing_topic_states[index] = refreshed_state
+                            replaced = True
+                            break
+                    if not replaced:
+                        existing_topic_states.append(refreshed_state)
         report = {
             "enabled": 1,
             "candidate_count": len(candidates),
@@ -3403,7 +3402,6 @@ class MemoryNodeManager:
         facts: List[Dict[str, Any]],
     ) -> Dict[str, int]:
         update_started_at = time.monotonic()
-        existing_states = self._db.get_recent_memory_states(limit=80)
         if not self._enable_entity_scoped_state_resolution:
             report = {"enabled": 0, "updated": 0}
             self._log_info("memory_reflect", "entity_state_update_finish", {
@@ -3414,11 +3412,10 @@ class MemoryNodeManager:
                 ),
             })
             return report
-        existing_entity_states = [
-            state for state in existing_states
-            if str(state.get("state_scope") or "") == "entity_state"
-            and str(state.get("state_type") or "") in self._entity_scoped_state_types()
-        ]
+        existing_entity_states = self._db.get_recent_memory_states(
+            state_type=sorted(self._entity_scoped_state_types()),
+            limit=80,
+        )
         candidates = self._build_entity_state_candidates_from_facts(facts)
         updated = 0
         for candidate in candidates:
@@ -3446,15 +3443,16 @@ class MemoryNodeManager:
                     ),
                 )
                 updated += 1
-                refreshed = self._db.get_recent_memory_states(
-                    source_types=[state_update["source_type"]],
-                    limit=200,
-                )
-                existing_entity_states = [
-                    state for state in refreshed
-                    if str(state.get("state_scope") or "") == "entity_state"
-                    and str(state.get("state_type") or "") in self._entity_scoped_state_types()
-                ]
+                refreshed_state = self._db.get_memory_state_by_id(state_id)
+                if refreshed_state:
+                    replaced = False
+                    for index, existing in enumerate(existing_entity_states):
+                        if int(existing.get("id") or -1) == int(state_id):
+                            existing_entity_states[index] = refreshed_state
+                            replaced = True
+                            break
+                    if not replaced:
+                        existing_entity_states.append(refreshed_state)
         report = {"enabled": 1, "candidate_count": len(candidates), "updated": updated}
         self._log_info("memory_reflect", "entity_state_update_finish", {
             **report,
@@ -4081,7 +4079,7 @@ class MemoryNodeManager:
                 identity_text,
                 f"parent_topics: {', '.join(state_metadata.get('parent_topics') or [])}",
                 f"aspects: {', '.join(state_metadata.get('aspect_topic_names') or [])}",
-            ])
+        ])
         identity_text_embedding = self._generate_embedding_vector(identity_text)
         canonical_name_embedding = self._generate_embedding_vector(state["canonical_name"])
         state_id = self._db.upsert_state(
