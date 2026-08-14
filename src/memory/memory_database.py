@@ -584,15 +584,20 @@ class SessionDB:
 
     @staticmethod
     def _normalize_search_terms(terms: Optional[Sequence[str]]) -> List[str]:
+        """Normalize lexical terms that were already tokenized upstream.
+
+        Query tokenization belongs to ``MemoryNodeManager`` so recall and
+        reflect use one consistent lexical policy. The database layer only
+        deduplicates whitespace-normalized terms before building the FTS
+        expression; jieba remains part of index-text construction above.
+        """
         normalized: List[str] = []
         for term in terms or []:
-            lexical_text = _lexical_index_text(term).lower()
-            for token in lexical_text.split():
-                clean = re.sub(r"\s+", " ", token).strip()
-                if clean and clean not in normalized:
-                    normalized.append(clean)
-                if len(normalized) >= 16:
-                    return normalized
+            clean = re.sub(r"\s+", " ", str(term or "").strip()).lower()
+            if clean and clean not in normalized:
+                normalized.append(clean)
+            if len(normalized) >= 32:
+                return normalized
         return normalized
 
     def insert_episode(
@@ -1243,6 +1248,7 @@ class SessionDB:
         time_fields: Optional[Sequence[str]] = None,
         terms: Optional[Sequence[str]],
         source_types: Optional[Sequence[str]],
+        state_type: Optional[Any] = None,
         time_start: Optional[str],
         time_end: Optional[str],
         limit: int,
@@ -1262,6 +1268,15 @@ class SessionDB:
             placeholders = ",".join("?" for _ in source_types)
             base_clauses.append(f"source_type IN ({placeholders})")
             base_params.extend(source_types)
+        state_type_values = (
+            [state_type]
+            if isinstance(state_type, str)
+            else list(state_type or [])
+        )
+        if state_type_values:
+            placeholders = ",".join("?" for _ in state_type_values)
+            base_clauses.append(f"state_type IN ({placeholders})")
+            base_params.extend(state_type_values)
         selected_time_fields = [
             str(field).strip()
             for field in (time_fields or [])
@@ -1457,6 +1472,7 @@ class SessionDB:
         *,
         terms: Optional[Sequence[str]] = None,
         source_types: Optional[Sequence[str]] = None,
+        state_type: Optional[Any] = None,
         time_start: Optional[str] = None,
         time_end: Optional[str] = None,
         limit: int = 200,
@@ -1467,6 +1483,7 @@ class SessionDB:
             time_fields=[],
             terms=terms,
             source_types=source_types,
+            state_type=state_type,
             time_start=None,
             time_end=None,
             limit=limit,

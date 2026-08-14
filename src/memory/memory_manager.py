@@ -29,6 +29,11 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 import numpy as np
 import requests
 
+try:
+    import jieba
+except ImportError:  # pragma: no cover - exercised only in minimal installs
+    jieba = None
+
 from .embedding_client import EmbeddingClient
 from .memory_database import SessionDB
 from .prompts_en import (
@@ -176,10 +181,6 @@ def _to_timestamp_text(value: Any) -> str:
 
 def _compact_whitespace(text: str) -> str:
     return re.sub(r"\s+", " ", str(text or "")).strip()
-
-
-def _json_safe(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True)
 
 
 class MemoryOperationReporter:
@@ -1836,6 +1837,26 @@ class MemoryNodeManager:
     def _topic_similarity_terms(self, text: str) -> List[str]:
         clean = _compact_whitespace(text).lower()
         chinese_chars = "".join(re.findall(r"[\u4e00-\u9fff]", clean))
+        if jieba is not None and chinese_chars:
+            raw_tokens = [
+                *jieba.lcut(clean, HMM=False),
+                *jieba.cut_for_search(clean, HMM=False),
+            ]
+            tokens: List[str] = []
+            seen: set[str] = set()
+            for token in raw_tokens:
+                normalized = _compact_whitespace(token).strip(
+                    "'\".,:;!?，。！？、；：（）()[]{}"
+                )
+                if not normalized or not re.search(r"[0-9a-zA-Z\u4e00-\u9fff]", normalized):
+                    continue
+                key = normalized.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                tokens.append(key)
+            if tokens:
+                return tokens
         if len(chinese_chars) >= 3:
             return [chinese_chars[i : i + 2] for i in range(len(chinese_chars) - 1)]
         return self._keywords(clean, limit=12)
@@ -2366,23 +2387,40 @@ class MemoryNodeManager:
                 **report,
             })
             return report
-        existing_topic_states = self._db.get_recent_memory_states(
-            state_type="topic",
-            limit=80,
-        )
         candidates = self._build_topic_state_candidates_from_facts(facts)
         updated = 0
         unresolved = 0
         for candidate in candidates:
+            candidate_existing_topic_states = (
+                self._retrieve_existing_topic_states_for_candidate(
+                    candidate=candidate,
+                    limit=16,
+                )
+            )
+            self._log_info(
+                "memory_reflect",
+                "topic_state_candidates_retrieved",
+                {
+                    "candidate_root_topic": candidate.get("topic_name"),
+                    "candidate_aspect_topics": candidate.get("aspect_topics") or [],
+                    "candidate_fact_ids": candidate.get("fact_ids") or [],
+                    "existing_state_ids": [
+                        state.get("id")
+                        for state in candidate_existing_topic_states
+                        if state.get("id") is not None
+                    ],
+                    "existing_state_count": len(candidate_existing_topic_states),
+                },
+            )
             matched_state, match_info = self._match_topic_state_candidate_to_existing_state(
                 candidate=candidate,
-                existing_topic_states=existing_topic_states,
+                existing_topic_states=candidate_existing_topic_states,
             )
             grounded, chosen_state, grounding_info = self._ground_topic_state_candidate(
                 candidate=candidate,
                 matched_state=matched_state,
                 match_info=match_info,
-                existing_topic_states=existing_topic_states,
+                existing_topic_states=candidate_existing_topic_states,
             )
             if not grounded:
                 unresolved += 1
@@ -2414,16 +2452,6 @@ class MemoryNodeManager:
                     ),
                 )
                 updated += 1
-                refreshed_state = self._db.get_memory_state_by_id(state_id)
-                if refreshed_state:
-                    replaced = False
-                    for index, existing in enumerate(existing_topic_states):
-                        if int(existing.get("id") or -1) == int(state_id):
-                            existing_topic_states[index] = refreshed_state
-                            replaced = True
-                            break
-                    if not replaced:
-                        existing_topic_states.append(refreshed_state)
         report = {
             "enabled": 1,
             "candidate_count": len(candidates),
@@ -2439,6 +2467,86 @@ class MemoryNodeManager:
             ),
         })
         return report
+
+    def _retrieve_existing_topic_states_for_candidate(
+        self,
+        *,
+        candidate: Dict[str, Any],
+        limit: int = 16,
+    ) -> List[Dict[str, Any]]:
+        """Retrieve only existing topic states relevant to one topic candidate."""
+        candidate_limit = max(1, int(limit or 16))
+        states_by_id: Dict[int, Dict[str, Any]] = {}
+
+        def add_states(rows: Sequence[Dict[str, Any]]) -> None:
+            for row in rows or []:
+                if str(row.get("state_type") or "").strip().lower() != "topic":
+                    continue
+                try:
+                    state_id = int(row.get("id"))
+                except (TypeError, ValueError):
+                    continue
+                states_by_id[state_id] = row
+
+        root_topic = self._normalize_topic_name(candidate.get("topic_name"))
+        if root_topic and self._generate_topic_name_key(root_topic) != "general":
+            add_states(
+                self._db.search_memory_states(
+                    terms=self._build_recall_search_terms(
+                        root_topic,
+                        keywords=[],
+                        entities=[],
+                    ),
+                    state_type="topic",
+                    limit=candidate_limit,
+                )
+            )
+
+        aspect_topics = self._normalize_unique_labels(
+            candidate.get("aspect_topics") or [],
+            limit=16,
+        )
+        if aspect_topics:
+            add_states(
+                self._db.search_memory_states(
+                    terms=self._build_recall_search_terms(
+                        "",
+                        keywords=aspect_topics,
+                        entities=[],
+                    ),
+                    state_type="topic",
+                    limit=candidate_limit,
+                )
+            )
+
+        supplementary_terms = self._normalize_unique_labels(
+            [
+                *(candidate.get("keywords") or []),
+                *(candidate.get("context_entities") or []),
+            ],
+            limit=20,
+        )
+        if supplementary_terms:
+            add_states(
+                self._db.search_memory_states(
+                    terms=self._build_recall_search_terms(
+                        "",
+                        keywords=supplementary_terms,
+                        entities=[],
+                    ),
+                    state_type="topic",
+                    limit=candidate_limit,
+                )
+            )
+
+        # Keep a small recency fallback for underspecified candidates. This is
+        # intentionally candidate-local and is not used as a shared match pool.
+        recent_states = self._db.get_recent_memory_states(
+            state_type="topic",
+            limit=min(8, candidate_limit),
+        )
+        add_states(recent_states)
+        return list(states_by_id.values())
 
     def _build_topic_state_candidates_from_facts(
         self,
@@ -2792,7 +2900,25 @@ class MemoryNodeManager:
                     and (left_key in right_key or right_key in left_key)
                 ):
                     best = max(best, 0.9)
-                best = max(best, self._topic_name_similarity(str(left), str(right)))
+                left_terms = set(self._topic_similarity_terms(str(left)))
+                right_terms = set(self._topic_similarity_terms(str(right)))
+                if not left_terms or not right_terms:
+                    continue
+                shared_terms = left_terms & right_terms
+                if not shared_terms:
+                    continue
+                jaccard = len(shared_terms) / max(1, len(left_terms | right_terms))
+                best = max(best, jaccard)
+
+                # A shorter topic can be a lexical specialization of a
+                # longer topic, e.g. "手机推广策略" and
+                # "新手机产品推广策略". Require at least two shared
+                # tokens so a single generic word cannot create a strong
+                # match by itself.
+                if len(shared_terms) >= 2:
+                    left_coverage = len(shared_terms) / max(1, len(left_terms))
+                    right_coverage = len(shared_terms) / max(1, len(right_terms))
+                    best = max(best, left_coverage, right_coverage)
         return best
 
     @classmethod
@@ -6693,7 +6819,7 @@ class MemoryNodeManager:
             entities=llm_entities,
         )
         ranking_terms = list(dict.fromkeys([
-            *self._query_terms(query),
+            *self._lexical_search_terms_for_text(query, limit=32),
             *supplement_terms,
         ]))
         retrieval_text = (
@@ -7737,20 +7863,94 @@ class MemoryNodeManager:
         keywords: Sequence[str],
         entities: Sequence[str],
     ) -> List[str]:
-        """Combine supplied concepts with optional deterministic query terms."""
+        """Build the shared, already-tokenized lexical query representation."""
         terms: List[str] = []
-        seen = set()
-        for value in [*keywords, *entities, *self._query_terms(query)]:
-            clean = self._normalize_keyword_term(value).lower()
-            if not clean or clean in seen:
-                continue
-            if len(clean) > 80 or re.search(r"[。！？!?；;，,]", clean):
-                continue
-            seen.add(clean)
-            terms.append(clean)
+        seen: set[str] = set()
+
+        def add_terms(values: Sequence[str]) -> None:
+            for value in values:
+                clean = re.sub(r"\s+", " ", str(value or "").strip()).lower()
+                if not clean or clean in seen:
+                    continue
+                if len(clean) > 80 or re.search(r"[。！？!?；;，,]", clean):
+                    continue
+                seen.add(clean)
+                terms.append(clean)
+                if len(terms) >= 32:
+                    return
+
+        for value in [*keywords, *entities]:
+            add_terms(self._lexical_search_terms_for_text(value))
             if len(terms) >= 32:
                 break
+        if len(terms) < 32:
+            add_terms(self._lexical_search_terms_for_text(query, limit=32))
         return terms
+
+    def _lexical_search_terms_for_text(
+        self,
+        text: Any,
+        *,
+        limit: int = 32,
+    ) -> List[str]:
+        """Tokenize one lexical value for the database FTS contract.
+
+        The regular jieba tokens and search-mode sub-tokens mirror the stream
+        used when ``memory_database`` builds ``lexical_index_text``. A
+        whitespace-joined regular-token phrase is retained before individual
+        tokens so short topic phrases remain searchable as a unit.
+        """
+        clean_text = _compact_whitespace(text)
+        if not clean_text:
+            return []
+        values: List[str] = []
+        seen: set[str] = set()
+
+        def add(value: Any) -> None:
+            if len(values) >= max(1, int(limit or 32)):
+                return
+            clean = re.sub(r"\s+", " ", str(value or "").strip()).lower()
+            if not clean or clean in seen:
+                return
+            if len(clean) > 80 or re.search(r"[。！？!?；;，,]", clean):
+                return
+            chinese_count = len(re.findall(r"[\u4e00-\u9fff]", clean))
+            if chinese_count and chinese_count < 2 and len(clean) < 2:
+                return
+            if not chinese_count and len(clean) < 2:
+                return
+            seen.add(clean)
+            values.append(clean)
+
+        chinese_text = "".join(re.findall(r"[\u4e00-\u9fff]", clean_text))
+        if jieba is not None and chinese_text:
+            regular_tokens = [
+                _compact_whitespace(token)
+                for token in jieba.lcut(clean_text, HMM=False)
+            ]
+            regular_tokens = [
+                token for token in regular_tokens
+                if token and re.search(r"[0-9a-zA-Z\u4e00-\u9fff]", token)
+            ]
+            if len(regular_tokens) > 1:
+                add(" ".join(regular_tokens))
+            for token in regular_tokens:
+                add(token)
+            for token in jieba.cut_for_search(clean_text, HMM=False):
+                add(token)
+            return values
+
+        # Minimal-install fallback: keep the complete Chinese run and the
+        # same bigram coverage used by the legacy lexical path.
+        for token in re.findall(
+            r"[A-Za-z][A-Za-z0-9_.$'-]*|\d+(?:/\d+)?|[\u4e00-\u9fff]+",
+            clean_text,
+        ):
+            add(token)
+            if re.fullmatch(r"[\u4e00-\u9fff]+", token):
+                for index in range(len(token) - 1):
+                    add(token[index : index + 2])
+        return values
 
     def _normalize_source_override(self, value: Optional[Sequence[str]]) -> Optional[List[str]]:
         if not value:
@@ -8118,7 +8318,7 @@ class MemoryNodeManager:
     ) -> str:
         terms = list(keywords or [])
         if not terms:
-            terms = self._query_terms(query)
+            terms = self._lexical_search_terms_for_text(query, limit=32)
         parts = [str(query or "").strip()]
         if retrieval_text and str(retrieval_text).strip() != str(query or "").strip():
             parts.append(f"retrieval: {str(retrieval_text).strip()}")
@@ -8127,23 +8327,6 @@ class MemoryNodeManager:
         if entities:
             parts.append(f"entities: {' '.join(str(item) for item in entities)}")
         return "\n".join(parts)
-
-    def _query_terms(self, text: str) -> List[str]:
-        terms = self._keywords(text, limit=32)
-        for phrase in re.findall(r"'([^']+)'|\"([^\"]+)\"", str(text or "")):
-            clean = _compact_whitespace(phrase[0] or phrase[1]).lower()
-            if clean and clean not in terms:
-                terms.insert(0, clean)
-        expanded: List[str] = []
-        for term in terms:
-            expanded.append(term)
-            if re.fullmatch(r"[\u4e00-\u9fff]{3,}", term):
-                for idx in range(0, len(term) - 1):
-                    bigram = term[idx : idx + 2]
-                    if bigram not in expanded:
-                        expanded.append(bigram)
-        terms = expanded
-        return terms
 
     def _keywords(self, text: str, *, limit: int) -> List[str]:
         tokens = re.findall(r"[A-Za-z][A-Za-z0-9_.$'-]*|\d+(?:/\d+)?|[\u4e00-\u9fff]{2,}", str(text or "").lower())
@@ -8174,44 +8357,7 @@ class MemoryNodeManager:
                 topics.append(" ".join(keywords[:size]))
         topics.append(keywords[0])
         return list(dict.fromkeys(topics))[:3]
-
-    def _important_ngrams(self, text: str) -> List[str]:
-        tokens = [term for term in self._keywords(text, limit=12) if len(term) > 2]
-        ngrams: List[str] = []
-        for i in range(len(tokens) - 1):
-            ngrams.append(f"{tokens[i]} {tokens[i + 1]}")
-        return ngrams[:10]
-
-    def _split_high_value_details(self, text: str) -> List[str]:
-        raw = _compact_whitespace(text)
-        if not raw:
-            return []
-        markers = r"\b(?:by the way|also|actually|i just|i still|i need|i have|i attended|i bought|i got|i went|i started|i prefer|i like|i want|i realized)\b"
-        pieces = [raw]
-        for part in re.split(markers, raw, flags=re.IGNORECASE):
-            clean = _compact_whitespace(part)
-            if len(clean) >= 28:
-                pieces.append(clean)
-        for sentence in re.split(r"(?<=[.!?])\s+", raw):
-            clean = _compact_whitespace(sentence)
-            if len(clean) >= 28:
-                pieces.append(clean)
-        return list(dict.fromkeys(pieces))[:8]
-
-    def _assistant_answer_details(self, text: str) -> List[str]:
-        details: List[str] = []
-        for line in str(text or "").splitlines():
-            clean = _compact_whitespace(re.sub(r"^[*\-\d.)\s]+", "", line))
-            if 20 <= len(clean) <= 260:
-                details.append(clean)
-            if len(details) >= 8:
-                break
-        return list(dict.fromkeys(details))
-
-    def _looks_like_recommendation(self, text: str) -> bool:
-        lower = str(text or "").lower()
-        return any(word in lower for word in ("recommend", "suggest", "try", "consider", "tips", "advice"))
-
+    
     def _infer_fact_kind(self, text: str, *, speaker: str) -> str:
         lower = str(text or "").lower()
         if any(word in lower for word in ("prefer", "favorite", "like", "dislike", "would rather")):
@@ -8427,18 +8573,7 @@ class MemoryNodeManager:
             "actionable_items": supplement_limit,
         }
         return final_limits, supplement_limits
-
-    def _candidate_limit(self, *, query: str, top_k: int, budget: str) -> int:
-        multiplier = {"low": 10, "mid": 18, "high": 28}.get(str(budget).lower(), 18)
-        if self._needs_broad_evidence(query):
-            multiplier = max(multiplier, 28)
-        return max(80, int(top_k) * multiplier)
-
-    def _final_limit(self, *, query: str, top_k: int) -> int:
-        if self._needs_broad_evidence(query):
-            return max(int(top_k), 20)
-        return max(int(top_k), 10)
-
+    
     def _needs_broad_evidence(self, query: str) -> bool:
         lower = str(query or "").lower()
         return any(
