@@ -932,7 +932,7 @@ class SessionDB:
             ORDER BY updated_at DESC, id DESC
             LIMIT ?
             """,
-            (*params, max(1, int(limit or 80))),
+            (*params, max(1, int(limit))),
         ).fetchall()
         return [self._row_to_dict(row) for row in rows]
 

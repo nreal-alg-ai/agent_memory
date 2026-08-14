@@ -1160,8 +1160,6 @@ class MemoryNodeManager:
                 ),
             )
         )
-        topic_candidates = self._collect_long_term_topic_candidates(limit=60)
-        
         for attempt in range(2):
             result = self._call_llm(prompt)
             parsed = self._parse_json_object_from_llm_text(result or "")
@@ -1170,7 +1168,6 @@ class MemoryNodeManager:
                     parsed,
                     segments,
                     prompt_language=prompt_language,
-                    topic_candidates=topic_candidates,
                 )
                 if normalized is not None:
                     return normalized
@@ -1265,7 +1262,6 @@ class MemoryNodeManager:
         raw_segments: List[Dict[str, Any]],
         *,
         prompt_language: str,
-        topic_candidates: Optional[List[Dict[str, Any]]] = None,
     ) -> Optional[Dict[str, Any]]:
         raw_facts = data.get("facts")
         if not isinstance(raw_facts, list):
@@ -1285,7 +1281,6 @@ class MemoryNodeManager:
         )
         episode_topics = self._normalize_episode_canonical_topics(
             data.get("canonical_topics") or data.get("episode_canonical_topics"),
-            topic_candidates=topic_candidates or [],
             fallback_text=episode_summary,
             limit=5,
         )
@@ -1696,45 +1691,6 @@ class MemoryNodeManager:
             )
         return "\n\n".join(blocks)
 
-    def _collect_long_term_topic_candidates(self, *, limit: int = 60) -> List[Dict[str, Any]]:
-        """Collect durable topic names that should guide new episode topics."""
-        try:
-            states = self._db.get_recent_memory_states(limit=max(1, int(limit or 60)))
-        except Exception as exc:
-            logger.debug("Failed to load long-term topic candidates: %s", exc)
-            return []
-        rows: List[Dict[str, Any]] = []
-        seen: set[str] = set()
-        for state in states:
-            if str(state.get("state_scope") or "") != "topic_state":
-                continue
-            if str(state.get("state_type") or "") != "topic":
-                continue
-            metadata = state.get("metadata") or {}
-            raw_topics: List[Any] = [
-                state.get("canonical_name"),
-                *(metadata.get("canonical_topics") or []),
-            ]
-            for raw_topic in raw_topics:
-                topic = self._normalize_topic_name(raw_topic)
-                if not topic:
-                    continue
-                key = topic.lower()
-                if key in seen:
-                    continue
-                seen.add(key)
-                rows.append({
-                    "canonical_topic": topic,
-                    "state_id": state.get("id"),
-                    "source_type": state.get("source_type"),
-                    "state_scope": state.get("state_scope"),
-                    "state_type": state.get("state_type"),
-                    "summary": _compact_whitespace(state.get("summary") or "")[:240],
-                })
-                if len(rows) >= limit:
-                    return rows
-        return rows
-
     def _collect_memory_state_context(self, *, limit: int = 12) -> List[Dict[str, Any]]:
         """Collect a small, balanced state reference set for fact extraction."""
         try:
@@ -1800,7 +1756,6 @@ class MemoryNodeManager:
         self,
         value: Any,
         *,
-        topic_candidates: List[Dict[str, Any]],
         fallback_text: str,
         limit: int,
     ) -> List[str]:
@@ -1813,7 +1768,6 @@ class MemoryNodeManager:
             topic = self._normalize_topic_name(raw_topic)
             if not topic:
                 continue
-            topic = self._resolve_existing_topic_name(topic, topic_candidates) or topic
             key = topic.lower()
             if key in seen:
                 continue
@@ -1869,35 +1823,6 @@ class MemoryNodeManager:
         if lower in generic_topics:
             return ""
         return text
-
-    def _resolve_existing_topic_name(
-        self,
-        topic: str,
-        topic_candidates: List[Dict[str, Any]],
-    ) -> Optional[str]:
-        if not topic_candidates:
-            return None
-        topic_key = topic.lower()
-        candidate_names = [
-            self._normalize_topic_name(item.get("canonical_topic"))
-            for item in topic_candidates
-        ]
-        candidate_names = [item for item in candidate_names if item]
-        for candidate in candidate_names:
-            if candidate.lower() == topic_key:
-                return candidate
-        for candidate in candidate_names:
-            candidate_key = candidate.lower()
-            if len(candidate_key) >= 4 and (candidate_key in topic_key or topic_key in candidate_key):
-                return candidate
-        best_name = ""
-        best_score = 0.0
-        for candidate in candidate_names:
-            score = self._topic_name_similarity(topic, candidate)
-            if score > best_score:
-                best_score = score
-                best_name = candidate
-        return best_name if best_score >= 0.62 else None
 
     def _topic_name_similarity(self, left: str, right: str) -> float:
         left_terms = set(self._topic_similarity_terms(left))
@@ -3054,8 +2979,8 @@ class MemoryNodeManager:
     def _format_existing_topic_state_for_prompt(state: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         if not state:
             return {}
+        metadata = state.get("metadata") or {}
         return {
-            "id": state.get("id"),
             "state_scope": state.get("state_scope") or "topic_state",
             "source_type": state.get("source_type"),
             "canonical_name": state.get("canonical_name"),
@@ -3065,9 +2990,31 @@ class MemoryNodeManager:
                 limit=8,
                 max_chars=1000,
             ),
-            "evidence_fact_ids": state.get("evidence_fact_ids") or [],
             "confidence": state.get("confidence"),
-            "metadata": state.get("metadata") or {},
+            "aspect_topic_names": metadata.get("aspect_topic_names") or [],
+        }
+
+    @staticmethod
+    def _format_existing_entity_state_for_prompt(state: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """Format only the semantic context needed to update an entity state."""
+        if not state:
+            return {}
+        metadata = state.get("metadata") or {}
+        return {
+            "state_scope": state.get("state_scope") or "entity_state",
+            "state_type": state.get("state_type"),
+            "entity": metadata.get("entity") or "",
+            "entity_key": metadata.get("entity_key") or "",
+            "canonical_name": state.get("canonical_name"),
+            "attribute_name_aliases": metadata.get("attribute_name_aliases") or [],
+            "summary": state.get("summary"),
+            "time_line": MemoryNodeManager._normalize_time_line(
+                state.get("time_line"),
+                limit=8,
+                max_chars=1000,
+            ),
+            "confidence": state.get("confidence"),
+            "status": state.get("status") or "active",
         }
 
     @staticmethod
@@ -3899,7 +3846,7 @@ class MemoryNodeManager:
                 ],
             }, ensure_ascii=False, indent=2))
             .replace("{existing_entity_state}", json.dumps(
-                self._format_existing_topic_state_for_prompt(existing_state),
+                self._format_existing_entity_state_for_prompt(existing_state),
                 ensure_ascii=False,
                 indent=2,
             ))
