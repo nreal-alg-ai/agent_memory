@@ -12,7 +12,7 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Sequence
+from typing import Any, Dict, List, Sequence, Tuple
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -108,6 +108,11 @@ def main() -> None:
     output_dir = resolve_output_dir(args)
     output_dir.mkdir(parents=True, exist_ok=True)
     configure_logging(output_dir / "run.log", args.log_level)
+    memory_log_path = output_dir / "memory_manager.log"
+    memory_logger, memory_log_handler = configure_memory_logger(
+        memory_log_path,
+        args.log_level,
+    )
     db_path = output_dir / args.db_name
     transcript_path = output_dir / "transcript.txt"
     report_path = output_dir / "report.json"
@@ -136,6 +141,7 @@ def main() -> None:
     runtime = MemoryRuntime(
         manager,
         memory_runtime_config=memory_runtime_config,
+        logger=memory_logger,
     )
 
     queued_episode_count = 0
@@ -190,6 +196,7 @@ def main() -> None:
         "textgrid": str(textgrid_path),
         "db_path": str(db_path),
         "transcript_path": str(transcript_path),
+        "memory_log_path": str(memory_log_path),
         "segment_count": len(memory_segments),
         "queued_episode_count": queued_episode_count,
         "stored_episode_count": store_operation_report["succeeded"],
@@ -201,6 +208,9 @@ def main() -> None:
     }
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     logging.info("Wrote report: %s", report_path)
+    db.close()
+    memory_logger.removeHandler(memory_log_handler)
+    memory_log_handler.close()
     print(json.dumps(report, ensure_ascii=False, indent=2))
 
 
@@ -245,6 +255,24 @@ def configure_logging(log_path: Path, log_level: str) -> None:
             logging.StreamHandler(),
         ],
     )
+
+
+def configure_memory_logger(
+    log_path: Path,
+    log_level: str,
+) -> Tuple[logging.Logger, logging.Handler]:
+    """Create a non-propagating logger for memory pipeline operations."""
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    memory_logger = logging.getLogger("memory.pipeline.ambient_transcript")
+    for existing_handler in list(memory_logger.handlers):
+        memory_logger.removeHandler(existing_handler)
+        existing_handler.close()
+    memory_logger.setLevel(getattr(logging, str(log_level or "INFO").upper(), logging.INFO))
+    memory_logger.propagate = False
+    handler = logging.FileHandler(log_path, encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    memory_logger.addHandler(handler)
+    return memory_logger, handler
 
 
 def parse_session_start(value: str) -> datetime:
