@@ -361,9 +361,6 @@ entity_state_target:
 
 existing_entity_state:
 {existing_entity_state}
-
-new facts:
-{facts}
 """
 
 

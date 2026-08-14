@@ -349,9 +349,6 @@ entity_state_target：
 
 已有 entity_state：
 {existing_entity_state}
-
-新 facts：
-{facts}
 """
 
 

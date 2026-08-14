@@ -3850,7 +3850,6 @@ class MemoryNodeManager:
                 ensure_ascii=False,
                 indent=2,
             ))
-            .replace("{facts}", self._format_entity_state_candidate_facts_for_prompt(candidate))
         )
         result = self._call_llm(prompt)
         parsed = self._parse_json_object_from_llm_text(result or "")
@@ -4509,30 +4508,6 @@ class MemoryNodeManager:
                 "actionable_aspects": actionable_aspects,
             })
         return json.dumps(rows, ensure_ascii=False, indent=2)
-
-    def _format_entity_state_candidate_facts_for_prompt(
-        self,
-        candidate: Dict[str, Any],
-    ) -> str:
-        aspect_rows = []
-        for aspect in candidate.get("state_aspects") or []:
-            if not isinstance(aspect, dict):
-                continue
-            aspect_rows.append({
-                "fact_id": aspect.get("fact_id"),
-                "source_type": candidate.get("source_type"),
-                "state_type": aspect.get("state_type") or candidate.get("state_type"),
-                "attribute_name": aspect.get("attribute_name") or candidate.get("attribute_name"),
-                "aspect_summary": aspect.get("aspect_summary") or "",
-                "evidence_basis": aspect.get("evidence_basis") or "",
-                "confidence": aspect.get("confidence"),
-                "fact_dialogue_time_key": aspect.get("fact_dialogue_time_key") or "",
-                "fact_event_time_key": aspect.get("fact_event_time_key") or "",
-                "full_fact_summary": aspect.get("fact_summary") or "",
-            })
-        if aspect_rows:
-            return json.dumps(aspect_rows[:160], ensure_ascii=False, indent=2)
-        return self._format_facts_for_state_prompt(list(candidate.get("facts") or []))
 
     @staticmethod
     def _normalize_state_scope(value: Any, state_type: Any = None) -> str:
