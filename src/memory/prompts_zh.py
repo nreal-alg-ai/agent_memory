@@ -1,5 +1,28 @@
 """Chinese prompt templates for the unified memory prototype."""
 
+MEMORY_RETRIEVED_FORMAT_PROMPT_ZH = """[统一记忆]
+系统说明：记忆按语义角色分组。state 和 actionable item 提供紧凑摘要；fact 提供可追溯证据。
+时间字段说明：对于 fact，dialogue_time 表示对话/转写讨论该 fact 的时间；event_time 表示 fact 描述的现实事件发生时间。二者含义不同；event_time 未知时，不要用 dialogue_time 推断它。
+{memory_sections}"""
+
+MEMORY_RETRIEVED_SECTION_SPECS_ZH = (
+    (
+        "[长期状态]",
+        "这些是根据 memory facts 反思得到的演化状态，应作为摘要上下文理解，不是用户的直接原话。",
+        "state",
+    ),
+    (
+        "[行动事项]",
+        "这些是可能需要后续跟进的决定、任务、承诺、风险或开放问题。",
+        "actionable_item",
+    ),
+    (
+        "[检索事实]",
+        "这些是直接从 memory_facts 检索出的、按相关性排序的叙事事实。",
+        "fact",
+    ),
+)
+
 ENTITY_EXTRACTION_GUIDANCE_ZH = """实体提取规则:
 
 实体不是只限传统 NER。这里的实体指后续可以跨 facts 聚合、检索、建图的语义锚点。
@@ -202,54 +225,6 @@ actionable_aspects 输出规则：
 对话/转写证据批次：
 {dialogue_batch}
 """
-
-
-UNIFIED_STATE_UPDATE_PROMPT_ZH = """你是 AI 眼镜长期记忆系统中的 state 更新模块。
-
-输入包含新存储的 narrative facts 和当前已有的长期 states。你的任务是更新或新建紧凑的 evolving states，帮助后续召回。state 不是复制某条 fact，而是跨 facts 提炼稳定偏好、反复出现的行为、长期约束、持续风险、重要关系或主题级状态。
-
-边界说明：
-- 主题、项目、议题的演化进展统一归入 topic_state，不再单独创建项目类 state。
-- 具体任务、决定、承诺、提醒、开放问题应归入 actionable_item，不再创建任务类或承诺类 state。
-- state_scope 只能是 topic_state 或 entity_state；topic_state 的 state_type 固定为 topic。
-- 本模块只输出真正需要长期保留的 state；如果事实只表示一次性任务或承诺，不要输出 state。
-
-规则：
-1. 只有当信息在当前 episode 之后仍有价值时，才创建或更新 state。
-2. 不要因为单条琐碎 fact 就创建 state，除非它是稳定偏好、长期约束、持续风险或重要的人生/项目背景。
-3. 同一稳定对象相关的 facts 应合并到同一个 state，避免近重复。
-4. 保留不确定性和最近变化。如果证据冲突，要明确写出冲突。
-5. evidence_fact_ids 必须引用支撑该 state 的 fact ID。
-6. state_type 只能是：topic、preference、profile、routine、relationship、constraint、risk。
-7. importance 和 confidence 都是 0-1。
-8. 只返回 JSON，不要 markdown。
-
-输出格式：
-{
-  "states": [
-    {
-      "state_scope": "topic_state|entity_state",
-      "state_type": "topic|preference|profile|routine|relationship|constraint|risk",
-      "canonical_name": "稳定短名称",
-      "summary": "可独立理解的 evolving state",
-      "evidence_fact_ids": [1, 2],
-      "keywords": ["关键词1", "关键词2"],
-      "entities": ["实体1", "实体2"],
-      "canonical_topics": ["主题1"],
-      "importance": 0.8,
-      "confidence": 0.85,
-      "status": "active|stable|resolved|uncertain"
-    }
-  ]
-}
-
-已有 states：
-{existing_states}
-
-新 facts：
-{facts}
-"""
-
 
 UNIFIED_TOPIC_STATE_UPDATE_PROMPT_ZH = """你是 AI 眼镜长期记忆系统中的 topic_state 更新模块。
 

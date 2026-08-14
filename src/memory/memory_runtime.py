@@ -227,6 +227,13 @@ class MemoryRuntime:
     
     def trigger_memory_recall(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
         """Run recall immediately through the manager without adding buffering."""
+        if not kwargs.get("prompt_language"):
+            query = kwargs.get("query")
+            if query is None and args:
+                query = args[0]
+            kwargs["prompt_language"] = self._resolve_prompt_language_from_segments(
+                [{"text": str(query or "")}]
+            )
         return self._manager.process_memory_recall_immediately(*args, **kwargs)
 
     def flush_task_queue(self, timeout: Optional[float] = None) -> bool:

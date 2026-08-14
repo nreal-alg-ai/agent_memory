@@ -1,5 +1,28 @@
 """English prompt templates for the unified memory prototype."""
 
+MEMORY_RETRIEVED_FORMAT_PROMPT_EN = """[Unified Memory]
+System note: Memories are grouped by semantic role. States and actionable items provide compact summaries; facts provide traceable evidence.
+System note: For facts, dialogue_time is when the conversation/transcript discussed the fact, while event_time is when the real-world event described by the fact occurred. They are different fields; an unknown event_time must not be inferred from dialogue_time.
+{memory_sections}"""
+
+MEMORY_RETRIEVED_SECTION_SPECS_EN = (
+    (
+        "[Long-term States]",
+        "These are evolving state projections derived from memory facts. Treat them as summarized context, not direct user quotations.",
+        "state",
+    ),
+    (
+        "[Actionable Items]",
+        "These are decisions, tasks, commitments, risks, or open questions that may require follow-up.",
+        "actionable_item",
+    ),
+    (
+        "[Retrieved Facts]",
+        "These are ranked narrative facts retrieved directly from memory_facts.",
+        "fact",
+    ),
+)
+
 ENTITY_EXTRACTION_GUIDANCE_EN = """Entity extraction rules:
 
 Entities are not limited to traditional named entities. In this memory system, an entity is a semantic anchor that can be reused across facts for clustering, retrieval, and graph construction.
@@ -205,54 +228,6 @@ Output schema:
 Dialogue/transcript evidence batch:
 {dialogue_batch}
 """
-
-
-UNIFIED_STATE_UPDATE_PROMPT_EN = """You are the state update module for a unified AI-glasses long-term memory system inspired by MemPalace.
-
-The input contains newly stored narrative facts and the current long-term states. Your task is to update or create compact evolving states that help future recall. A state is not a copy of one fact. It should summarize stable preferences, recurring behavior, durable constraints, persistent risks, important relationships, or topic-level situations across multiple facts.
-
-Boundary rules:
-- Topic, project, and issue progress belong in topic_state. Do not create a separate project-style state.
-- Concrete tasks, decisions, commitments, reminders, and open questions belong in actionable_item. Do not create task-style or commitment-style states.
-- state_scope must be topic_state or entity_state; topic_state always uses state_type topic.
-- Output a state only when the information should remain useful as durable memory. Do not output a state for a one-off task or commitment.
-
-Rules:
-1. Create or update only states that are useful beyond the current episode.
-2. Do not create a state from a single trivial fact unless it is a durable preference, long-running constraint, persistent risk, or important life/project context.
-3. Merge facts about the same durable subject into one state instead of creating near-duplicates.
-4. Preserve uncertainty and recent changes. If evidence conflicts, explicitly state the conflict.
-5. Use evidence_fact_ids to cite the fact IDs that support the state.
-6. state_type must be one of: topic, preference, profile, routine, relationship, constraint, risk.
-7. importance is 0-1. confidence is 0-1.
-8. Return JSON only. No markdown.
-
-Output schema:
-{
-  "states": [
-    {
-      "state_scope": "topic_state|entity_state",
-      "state_type": "topic|preference|profile|routine|relationship|constraint|risk",
-      "canonical_name": "stable short name",
-      "summary": "self-contained evolving state",
-      "evidence_fact_ids": [1, 2],
-      "keywords": ["keyword1", "keyword2"],
-      "entities": ["entity1", "entity2"],
-      "canonical_topics": ["topic1"],
-      "importance": 0.8,
-      "confidence": 0.85,
-      "status": "active|stable|resolved|uncertain"
-    }
-  ]
-}
-
-Existing states:
-{existing_states}
-
-New facts:
-{facts}
-"""
-
 
 UNIFIED_TOPIC_STATE_UPDATE_PROMPT_EN = """You are the topic_state update module for a unified AI-glasses long-term memory system inspired by MemPalace.
 

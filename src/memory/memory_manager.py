@@ -41,6 +41,8 @@ from .embedding_client import EmbeddingClient
 from .memory_database import SessionDB
 from .prompts_en import (
     EPISODE_SUMMARY_PROMPT_EN,
+    MEMORY_RETRIEVED_FORMAT_PROMPT_EN,
+    MEMORY_RETRIEVED_SECTION_SPECS_EN,
     RECALL_QUERY_ANALYSIS_PROMPT_EN,
     UNIFIED_ACTIONABLE_ITEM_EXTRACTION_PROMPT_EN,
     UNIFIED_ENTITY_STATE_UPDATE_PROMPT_EN,
@@ -49,6 +51,8 @@ from .prompts_en import (
 )
 from .prompts_zh import (
     EPISODE_SUMMARY_PROMPT_ZH,
+    MEMORY_RETRIEVED_FORMAT_PROMPT_ZH,
+    MEMORY_RETRIEVED_SECTION_SPECS_ZH,
     RECALL_QUERY_ANALYSIS_PROMPT_ZH,
     UNIFIED_ACTIONABLE_ITEM_EXTRACTION_PROMPT_ZH,
     UNIFIED_ENTITY_STATE_UPDATE_PROMPT_ZH,
@@ -5041,6 +5045,7 @@ class MemoryNodeManager:
         recall_gate_mode: Optional[str] = None,
         memory_source_override: Optional[Sequence[str]] = None,
         recall_path: str = "normal",
+        prompt_language: str = "zh",
     ) -> Dict[str, Any]:
         """Run recall immediately against the latest committed memory snapshot."""
         # Recall is read-only and must not wait for the store/reflect worker's
@@ -5056,6 +5061,7 @@ class MemoryNodeManager:
                 recall_gate_mode=recall_gate_mode,
                 memory_source_override=memory_source_override,
                 recall_path=recall_path,
+                prompt_language=prompt_language,
                 database=reader_db,
             )
 
@@ -5069,6 +5075,7 @@ class MemoryNodeManager:
         recall_gate_mode: Optional[str] = None,
         memory_source_override: Optional[Sequence[str]] = None,
         recall_path: str = "normal",
+        prompt_language: str = "zh",
         database: Optional[SessionDB] = None,
     ) -> Dict[str, Any]:
         requested_recall_path = str(recall_path or "normal").strip().lower()
@@ -5105,6 +5112,7 @@ class MemoryNodeManager:
                 "recall_gate_mode": recall_gate_mode,
                 "memory_source_override": list(memory_source_override or []),
                 "recall_path": normalized_recall_path,
+                "prompt_language": prompt_language,
             })
 
             parsed_time_start, parsed_time_end, clean_query = self._parse_time_expression(
@@ -5137,6 +5145,7 @@ class MemoryNodeManager:
                     memory_source_override=memory_source_override,
                     temporal_mode=temporal_mode,
                     recent_reference_time=parsed_time_end,
+                    prompt_language=prompt_language,
                     database=database,
                 )
                 memory_text = self._process_recall_stage2(
@@ -5147,6 +5156,7 @@ class MemoryNodeManager:
                     memory_source_override=memory_source_override,
                     temporal_mode=temporal_mode,
                     stage1_report=stage1_report,
+                    prompt_language=prompt_language,
                     database=database,
                 )
             else:
@@ -5165,6 +5175,7 @@ class MemoryNodeManager:
                         if has_explicit_time_window
                         else datetime.now(timezone.utc).isoformat()
                     ),
+                    prompt_language=prompt_language,
                     database=database,
                 )
                 if normalized_recall_path == "stage1":
@@ -5181,6 +5192,7 @@ class MemoryNodeManager:
                         memory_source_override=memory_source_override,
                         temporal_mode=temporal_mode,
                         stage1_report=stage1_report,
+                        prompt_language=prompt_language,
                         database=database,
                     )
                 else:
@@ -5226,6 +5238,7 @@ class MemoryNodeManager:
         memory_source_override: Optional[Sequence[str]] = None,
         temporal_mode: str = "dialogue_time",
         recent_reference_time: Optional[str] = None,
+        prompt_language: str = "zh",
         database: Optional[SessionDB] = None,
     ) -> Dict[str, Any]:
         """Run a deterministic, no-LLM recall path for high-confidence hits.
@@ -5438,6 +5451,7 @@ class MemoryNodeManager:
         )
         memory_text = self._build_memory_retrieved_format_text(
             entries=selected_candidates,
+            prompt_language=prompt_language,
         )
         stage1_finish_payload = {
             "status": "hit" if trusted and memory_text else "miss",
@@ -6661,6 +6675,7 @@ class MemoryNodeManager:
         memory_source_override: Optional[Sequence[str]] = None,
         temporal_mode: str = "dialogue_time",
         stage1_report: Optional[Dict[str, Any]] = None,
+        prompt_language: str = "zh",
         database: Optional[SessionDB] = None,
     ) -> str:
         """Run the existing LLM and semantic-search recall pipeline.
@@ -6677,9 +6692,13 @@ class MemoryNodeManager:
             "time_start": (temporal_bounds or (None, None))[0],
             "time_end": (temporal_bounds or (None, None))[1],
             "temporal_mode": temporal_mode,
+            "prompt_language": prompt_language,
             "memory_source_override": list(memory_source_override or []),
         })
-        recall_plan = self._analyze_recall_query(analysis_query or query)
+        recall_plan = self._analyze_recall_query(
+            analysis_query or query,
+            prompt_language=prompt_language,
+        )
         temporal_mode = self._normalize_recall_temporal_mode(
             recall_plan.get("temporal_mode") or temporal_mode
         )
@@ -6896,6 +6915,7 @@ class MemoryNodeManager:
         self._log_info("memory_recall_stage2", "ranked", ranked_payload)
         memory_text = self._build_memory_retrieved_format_text(
             entries=ranked,
+            prompt_language=prompt_language,
         )
         self._log_info("memory_recall_stage2", "finish", {
             "status": "ok" if memory_text else "empty",
@@ -7728,8 +7748,17 @@ class MemoryNodeManager:
 
         return selected
     
-    def _analyze_recall_query(self, query: str) -> Dict[str, Any]:
-        prompt_language = self._resolve_prompt_language_from_text(query, fallback="en")
+    def _analyze_recall_query(
+        self,
+        query: str,
+        *,
+        prompt_language: str,
+    ) -> Dict[str, Any]:
+        prompt_language = (
+            "en"
+            if str(prompt_language or "").strip().lower().startswith("en")
+            else "zh"
+        )
         prompt_template = (
             RECALL_QUERY_ANALYSIS_PROMPT_EN
             if prompt_language == "en"
@@ -7960,10 +7989,64 @@ class MemoryNodeManager:
         self,
         *,
         entries: List[Dict[str, Any]],
+        prompt_language: str,
     ) -> str:
         """Format ranked raw memories with source-specific semantic fields."""
         if not entries:
             return ""
+
+        is_en = str(prompt_language or "").strip().lower().startswith("en")
+        format_template = (
+            MEMORY_RETRIEVED_FORMAT_PROMPT_EN
+            if is_en
+            else MEMORY_RETRIEVED_FORMAT_PROMPT_ZH
+        )
+        section_specs = (
+            MEMORY_RETRIEVED_SECTION_SPECS_EN
+            if is_en
+            else MEMORY_RETRIEVED_SECTION_SPECS_ZH
+        )
+        note_prefix = "System note: " if is_en else "系统说明："
+        if is_en:
+            labels = {
+                "fact": "narrative fact",
+                "dialogue_time": "dialogue_time",
+                "event_time": "event_time",
+                "summary": "summary",
+                "fact_root_topic": "fact_root_topic",
+                "fact_aspect_topic": "fact_aspect_topic",
+                "state": "long-term state",
+                "state_scope": "state_scope",
+                "state_type": "state_type",
+                "canonical_name": "canonical_name",
+                "entity": "entity",
+                "timeline": "timeline",
+                "actionable_item": "actionable item",
+                "item_type": "item_type",
+                "status": "status",
+                "owner": "owner",
+                "due_at": "due_at",
+            }
+        else:
+            labels = {
+                "fact": "叙事事实",
+                "dialogue_time": "对话时间",
+                "event_time": "事件时间",
+                "summary": "摘要",
+                "fact_root_topic": "事实根主题",
+                "fact_aspect_topic": "事实方面主题",
+                "state": "长期状态",
+                "state_scope": "状态范围",
+                "state_type": "状态类型",
+                "canonical_name": "规范名称",
+                "entity": "实体",
+                "timeline": "时间线",
+                "actionable_item": "行动事项",
+                "item_type": "事项类型",
+                "status": "状态",
+                "owner": "负责人",
+                "due_at": "截止时间",
+            }
 
         grouped = {
             "state": [entry for entry in entries if entry.get("index_level") == "state"],
@@ -7973,66 +8056,56 @@ class MemoryNodeManager:
             ],
             "fact": [entry for entry in entries if entry.get("index_level") == "fact"],
         }
-        section_specs = (
-            (
-                "[Long-term States]",
-                "These are evolving state projections derived from memory facts. "
-                "Treat them as summarized context, not direct user quotations.",
-                "state",
-            ),
-            (
-                "[Actionable Items]",
-                "These are decisions, tasks, commitments, risks, or open questions "
-                "that may require follow-up.",
-                "actionable_item",
-            ),
-            (
-                "[Retrieved Facts]",
-                "These are ranked narrative facts retrieved directly from memory_facts.",
-                "fact",
-            ),
-        )
-        lines = [
-            "[Unified Memory]",
-            "System note: Memories are grouped by semantic role. States and actionable "
-            "items provide compact summaries; facts provide traceable evidence.",
-        ]
+        sections: List[str] = []
         for title, note, group_key in section_specs:
             group = grouped[group_key]
             if not group:
                 continue
-            section_header = [title, f"System note: {note}"]
-            lines.extend(["", *section_header])
+            section_lines = [title, f"{note_prefix}{note}"]
             for index, entry in enumerate(group, 1):
                 raw = entry.get("_hydrated") if isinstance(entry.get("_hydrated"), dict) else {}
                 time_text = self._recall_event_time_text(entry, raw)
                 if group_key == "fact":
+                    dialogue_time = (
+                        self._normalize_event_time_text(raw.get("dialogue_time_key"))
+                        or "unknown-dialogue-time"
+                    )
+                    event_time = (
+                        self._normalize_event_time_text(raw.get("event_time_key"))
+                        or "unknown-event-time"
+                    )
                     block_lines = [
-                        f"{index}. [{time_text}] narrative fact",
-                        f"   summary: {raw.get('summary') or entry.get('summary_for_retrieval') or ''}",
-                        f"   fact_root_topic: {raw.get('fact_root_topic') or ''}; fact_aspect_topic: {raw.get('fact_aspect_topic') or ''}",
+                        f"{index}. {labels['fact']}",
+                        f"   {labels['dialogue_time']}: {dialogue_time}",
+                        f"   {labels['event_time']}: {event_time}",
+                        f"   {labels['summary']}: {raw.get('summary') or entry.get('summary_for_retrieval') or ''}",
+                        f"   {labels['fact_root_topic']}: {raw.get('fact_root_topic') or ''}; {labels['fact_aspect_topic']}: {raw.get('fact_aspect_topic') or ''}",
                     ]
                 elif group_key == "state":
                     timeline = self._format_state_timeline(raw.get("time_line"))
                     block_lines = [
-                        f"{index}. [{time_text}] long-term state",
-                        f"   state_scope: {raw.get('state_scope') or ''}; state_type: {raw.get('state_type') or ''}",
-                        f"   canonical_name: {raw.get('canonical_name') or ''}",
-                        f"   entity: {raw.get('entity_key') or ''}",
-                        f"   summary: {raw.get('summary') or ''}",
+                        f"{index}. [{time_text}] {labels['state']}",
+                        f"   {labels['state_scope']}: {raw.get('state_scope') or ''}; {labels['state_type']}: {raw.get('state_type') or ''}",
+                        f"   {labels['canonical_name']}: {raw.get('canonical_name') or ''}",
+                        f"   {labels['entity']}: {raw.get('entity_key') or ''}",
+                        f"   {labels['summary']}: {raw.get('summary') or ''}",
                     ]
                     if timeline:
-                        block_lines.append(f"   timeline: {timeline}")
+                        block_lines.append(f"   {labels['timeline']}: {timeline}")
                 else:
                     block_lines = [
-                        f"{index}. [{time_text}] actionable item",
-                        f"   item_type: {raw.get('item_type') or ''}; status: {raw.get('status') or ''}",
-                        f"   canonical_name: {raw.get('canonical_name') or ''}",
-                        f"   owner: {raw.get('owner') or ''}; due_at: {raw.get('due_at') or ''}",
-                        f"   summary: {raw.get('summary') or ''}",
+                        f"{index}. [{time_text}] {labels['actionable_item']}",
+                        f"   {labels['item_type']}: {raw.get('item_type') or ''}; {labels['status']}: {raw.get('status') or ''}",
+                        f"   {labels['canonical_name']}: {raw.get('canonical_name') or ''}",
+                        f"   {labels['owner']}: {raw.get('owner') or ''}; {labels['due_at']}: {raw.get('due_at') or ''}",
+                        f"   {labels['summary']}: {raw.get('summary') or ''}",
                     ]
-                lines.append("\n".join(block_lines))
-        return "\n".join(lines).strip()
+                section_lines.append("\n".join(block_lines))
+            sections.append("\n".join(section_lines))
+        return format_template.replace(
+            "{memory_sections}",
+            "\n\n".join(sections),
+        ).strip()
     
     def _format_state_timeline(
         self,
