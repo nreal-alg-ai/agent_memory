@@ -123,6 +123,8 @@ remote_audio:
   user_reference_audio_dir: assets/user_reference_audio_files
 
 memory_runtime:
+  memory_prompt_language_mode: zh
+  memory_output_language_mode: zh
   max_pending_interaction_turns: 5
   max_pending_interaction_chars: 2000
   transcript_episode_max_gap_seconds: 60.0
@@ -153,11 +155,10 @@ memory_manager:
 
   save_db_name: memory.db
   retrieval_top_k: 8
+  recall_detailed_logging: true
   recall_fast_candidate_min_score: 0.35
   recall_fast_candidate_score_threshold: 0.65
 
-  memory_prompt_language_mode: zh
-  memory_output_language_mode: zh
   store_queue_maxsize: 100
 
   reflect_interval_seconds: 7200

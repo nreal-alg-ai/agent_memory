@@ -483,6 +483,10 @@ class MemoryNodeManager:
             True,
         )
         self._top_k = int(self._memory_cfg.get("retrieval_top_k", 8) or 8)
+        self._recall_detailed_logging = self._config_bool(
+            self._memory_cfg.get("recall_detailed_logging", False),
+            False,
+        )
         self._recall_budget = str(self._memory_cfg.get("recall_budget", "mid") or "mid")
         self._recall_fact_min_embedding_similarity = self._clamp_float(
             self._memory_cfg.get("recall_fact_min_embedding_similarity"),
@@ -675,9 +679,9 @@ class MemoryNodeManager:
             try:
                 with self._memory_operation_lock:
                     if task_kind == "memory_store":
-                        result = self.process_memory_store_task(**task["payload"])
+                        result = self._process_memory_store_task(**task["payload"])
                     elif task_kind == "memory_reflect":
-                        result = self.process_memory_reflect_task(**task["payload"])
+                        result = self._process_memory_reflect_task(**task["payload"])
                     else:
                         raise ValueError(f"Unsupported memory async task: {task_kind}")
                 self._operation_reporter.on_task_finished(
@@ -828,7 +832,7 @@ class MemoryNodeManager:
             },
         )
 
-    def process_memory_store_task(
+    def _process_memory_store_task(
         self,
         *,
         raw_segments: List[Dict[str, Any]],
@@ -965,18 +969,6 @@ class MemoryNodeManager:
                 "entities": episode_entity_names,
             },
         )
-        # self._index_episode(
-        #     episode_id=episode_id,
-        #     source_type=source_type,
-        #     episode_type=episode_type,
-        #     title=episode_title,
-        #     summary=episode_summary,
-        #     started_at=started_at,
-        #     ended_at=ended_at,
-        #     tags=tags,
-        #     canonical_topics=canonical_topics,
-        #     participants=participants,
-        # )
 
         return {
             "episode_id": episode_id,
@@ -2134,7 +2126,7 @@ class MemoryNodeManager:
             payload=dict(kwargs),
         )
 
-    def process_memory_reflect_task(
+    def _process_memory_reflect_task(
         self,
         limit: Optional[int] = None,
         reflect_timestamp: Optional[Any] = None,
@@ -2407,7 +2399,7 @@ class MemoryNodeManager:
     ) -> None:
         """Log the independent fact batch consumed by one reflect projection."""
         source_counts = Counter(
-            str(fact.get("source_type") or "unified") for fact in facts
+            str(fact.get("source_type")) for fact in facts
         )
         self._log_info("memory_reflect", "facts_loaded", {
             "processing_target": processing_target,
@@ -2520,7 +2512,7 @@ class MemoryNodeManager:
             )
             if not state_update or not state_update.get("summary"):
                 continue
-            state_update.setdefault("source_type", candidate.get("source_type") or "unified")
+            state_update.setdefault("source_type", candidate.get("source_type"))
             state_id = self._store_state(state_update)
             if state_id:
                 self._log_info(
@@ -2565,7 +2557,7 @@ class MemoryNodeManager:
     ) -> List[Dict[str, Any]]:
         by_source_and_root: Dict[Tuple[str, str], Dict[str, Any]] = {}
         for fact in facts:
-            source_type = str(fact.get("source_type") or "unified")
+            source_type = str(fact.get("source_type"))
             root_topic_name = (
                 self._normalize_topic_name(fact.get("fact_root_topic"))
                 or "general"
@@ -3336,7 +3328,7 @@ class MemoryNodeManager:
         return {
             "state_scope": "topic_state",
             "state_type": "topic",
-            "source_type": candidate.get("source_type") or (existing_state or {}).get("source_type") or "unified",
+            "source_type": candidate.get("source_type") or (existing_state or {}).get("source_type"),
             "canonical_name": canonical_name,
             "summary": summary,
             "time_line": time_line,
@@ -3424,7 +3416,7 @@ class MemoryNodeManager:
         return {
             "state_scope": "topic_state",
             "state_type": "topic",
-            "source_type": candidate.get("source_type") or (existing_state or {}).get("source_type") or "unified",
+            "source_type": candidate.get("source_type") or (existing_state or {}).get("source_type"),
             "canonical_name": canonical_name,
             "summary": summary,
             "time_line": self._build_state_time_line(
@@ -3613,7 +3605,7 @@ class MemoryNodeManager:
     ) -> List[Dict[str, Any]]:
         grouped: Dict[Tuple[str, str, str, str], Dict[str, Any]] = {}
         for fact in facts:
-            source_type = str(fact.get("source_type") or "unified")
+            source_type = fact.get("source_type")
             state_aspects = self._state_aspects_from_fact(fact)
             if state_aspects:
                 for aspect in state_aspects:
@@ -4010,7 +4002,7 @@ class MemoryNodeManager:
         return {
             "state_scope": "entity_state",
             "state_type": candidate["state_type"],
-            "source_type": candidate.get("source_type") or (existing_state or {}).get("source_type") or "unified",
+            "source_type": candidate.get("source_type") or (existing_state or {}).get("source_type"),
             "canonical_name": canonical_name,
             "summary": summary,
             "time_line": time_line,
@@ -4073,7 +4065,7 @@ class MemoryNodeManager:
         return {
             "state_scope": "entity_state",
             "state_type": candidate["state_type"],
-            "source_type": candidate.get("source_type") or (existing_state or {}).get("source_type") or "unified",
+            "source_type": candidate.get("source_type") or (existing_state or {}).get("source_type"),
             "canonical_name": _compact_whitespace(
                 (existing_state or {}).get("canonical_name")
                 or candidate.get("attribute_name")
@@ -4798,6 +4790,120 @@ class MemoryNodeManager:
             "items": rows,
         }
 
+    def _recall_detailed_candidate_items(
+        self,
+        items: Sequence[Dict[str, Any]],
+        *,
+        decision_by_target: Optional[Dict[Tuple[str, str], Dict[str, Any]]] = None,
+        accepted_targets: Optional[set[Tuple[str, int]]] = None,
+        selected_targets: Optional[set[Tuple[str, int]]] = None,
+        stage: str = "",
+    ) -> List[Dict[str, Any]]:
+        """Serialize detailed recall diagnostics without embeddings or raw rows."""
+        rows: List[Dict[str, Any]] = []
+        decision_by_target = decision_by_target or {}
+        has_accepted_targets = accepted_targets is not None
+        has_selected_targets = selected_targets is not None
+        accepted_targets = accepted_targets or set()
+        selected_targets = selected_targets or set()
+        for item in items or []:
+            table = str(item.get("target_table") or "")
+            target_id = str(item.get("target_id") or "")
+            target_key = (table, target_id)
+            try:
+                target = (table, int(target_id))
+            except (TypeError, ValueError):
+                target = (table, -1)
+            raw = item.get("_hydrated") if isinstance(item.get("_hydrated"), dict) else {}
+            match_details = item.get("_recall_fast_match_details")
+            match_details = dict(match_details) if isinstance(match_details, dict) else {}
+            decision = dict(decision_by_target.get(target_key) or {})
+            source = str(item.get("_recall_candidate_source") or "")
+            provenance = list(item.get("_stage2_provenance") or [])
+            reasons: List[str] = []
+            for value in item.get("_recall_fast_match_evidence") or []:
+                if str(value) and str(value) not in reasons:
+                    reasons.append(str(value))
+            for value in self._recall_candidate_source_channels(source):
+                if value not in reasons:
+                    reasons.append(value)
+            if source.endswith("_evidence_expansion") and "evidence_expansion" not in reasons:
+                reasons.append("evidence_expansion")
+            if source.endswith("_episode_expansion") and "episode_expansion" not in reasons:
+                reasons.append("episode_expansion")
+            for value in provenance:
+                if value not in reasons:
+                    reasons.append(value)
+            filter_reason = (
+                decision.get("decision_reason")
+                or match_details.get("filter_reason")
+                or ""
+            )
+            accepted = decision.get("accepted")
+            if accepted is None:
+                accepted = target in accepted_targets if has_accepted_targets else None
+            selected = target in selected_targets if has_selected_targets else None
+            rows.append({
+                "stage": stage,
+                "target": f"{table}#{target_id}",
+                "level": item.get("index_level") or item.get("_recall_type"),
+                "source_type": item.get("source_type"),
+                "candidate_source": source,
+                "stage2_provenance": provenance,
+                "retrieval_reasons": reasons,
+                "title": self._log_text(
+                    item.get("title") or raw.get("canonical_name") or "",
+                    limit=240,
+                ),
+                "summary": self._log_text(
+                    raw.get("summary")
+                    or item.get("summary_for_retrieval")
+                    or item.get("summary")
+                    or "",
+                    limit=500,
+                ),
+                "identity_text": self._log_text(
+                    item.get("identity_text") or raw.get("identity_text") or "",
+                    limit=500,
+                ),
+                "time_start": item.get("time_start"),
+                "time_end": item.get("time_end"),
+                "match": {
+                    key: value
+                    for key, value in match_details.items()
+                    if key not in {"anchor"} or value
+                },
+                "score": item.get("_recall_score"),
+                "type_score": item.get("_recall_type_score"),
+                "embedding_similarity": item.get("embedding_similarity"),
+                "bm25_raw_score": item.get("_bm25_score"),
+                "bm25_score": item.get("_recall_bm25_score"),
+                "score_components": item.get("_recall_score_components") or {},
+                "provenance_profile": item.get("_recall_provenance") or {},
+                "support_fact_ids": [
+                    fact.get("id")
+                    for fact in item.get("_supporting_facts") or []
+                    if isinstance(fact, dict) and fact.get("id") is not None
+                ],
+                "episode_seed_targets": list(
+                    item.get("_stage2_episode_seed_targets") or []
+                ),
+                "accepted": accepted,
+                "selected": selected,
+                "decision_reason": (
+                    filter_reason
+                    or item.get("_recall_drop_reason")
+                    or (
+                        "selected"
+                        if selected is True
+                        else "not_selected"
+                        if selected is False
+                        else ""
+                    )
+                ),
+            })
+        return rows
+
     @staticmethod
     def _parse_time_expression(
         query: str,
@@ -5283,6 +5389,7 @@ class MemoryNodeManager:
         raw_actionable_candidates = raw_candidates_by_level["actionable_item"]
         filtered_candidates: List[Dict[str, Any]] = []
         candidate_match_results: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        candidate_decisions: Dict[Tuple[str, str], Dict[str, Any]] = {}
         for candidate in raw_candidates:
             match = self._recall_stage1_calculate_candidate_matching_score(candidate, query)
             candidate_key = (
@@ -5303,7 +5410,18 @@ class MemoryNodeManager:
                 match.get("matched_keywords") or []
             )
             candidate["_recall_fast_match_details"] = dict(match)
-            if match.get("matched") and match.get("candidate_score_passed", False):
+            accepted = bool(
+                match.get("matched") and match.get("candidate_score_passed", False)
+            )
+            candidate_decisions[candidate_key] = {
+                "accepted": accepted,
+                "decision_reason": (
+                    "accepted"
+                    if accepted
+                    else str(match.get("filter_reason") or "not_matched")
+                ),
+            }
+            if accepted:
                 filtered_candidates.append(candidate)
 
         reference_time = recent_reference_time or datetime.now(timezone.utc).isoformat()
@@ -5401,7 +5519,7 @@ class MemoryNodeManager:
         memory_text = self._build_memory_retrieved_format_text(
             entries=selected_candidates,
         )
-        self._log_info("memory_recall_stage1", "finish", {
+        stage1_finish_payload = {
             "status": "hit" if trusted and memory_text else "miss",
             "reason": "" if trusted and memory_text else (
                 "empty_formatted_context"
@@ -5430,7 +5548,48 @@ class MemoryNodeManager:
             ],
             "retrieved_chars": len(memory_text),
             "elapsed_ms": round((time.monotonic() - started_at) * 1000, 2),
-        })
+        }
+        if self._recall_detailed_logging:
+            selected_targets = {
+                (
+                    str(candidate.get("target_table") or ""),
+                    int(candidate.get("target_id")),
+                )
+                for candidate in selected_candidates
+                if str(candidate.get("target_id") or "").isdigit()
+            }
+            filtered_targets = {
+                (
+                    str(candidate.get("target_table") or ""),
+                    int(candidate.get("target_id")),
+                )
+                for candidate in filtered_candidates
+                if str(candidate.get("target_id") or "").isdigit()
+            }
+            stage1_finish_payload["candidate_diagnostics"] = {
+                "raw_candidates": self._recall_detailed_candidate_items(
+                    raw_candidates,
+                    decision_by_target=candidate_decisions,
+                    accepted_targets=filtered_targets,
+                    selected_targets=selected_targets,
+                    stage="stage1_raw",
+                ),
+                "filtered_candidates": self._recall_detailed_candidate_items(
+                    filtered_candidates,
+                    decision_by_target=candidate_decisions,
+                    accepted_targets=filtered_targets,
+                    selected_targets=selected_targets,
+                    stage="stage1_filtered",
+                ),
+                "selected_candidates": self._recall_detailed_candidate_items(
+                    selected_candidates,
+                    decision_by_target=candidate_decisions,
+                    accepted_targets=filtered_targets,
+                    selected_targets=selected_targets,
+                    stage="stage1_selected",
+                ),
+            }
+        self._log_info("memory_recall_stage1", "finish", stage1_finish_payload)
         return {
             "memory_context": memory_text or "",
             "raw_candidates": raw_candidates,
@@ -6374,7 +6533,7 @@ class MemoryNodeManager:
         )
         expanded: List[Dict[str, Any]] = []
         for fact in facts:
-            if allowed_sources and str(fact.get("source_type") or "unified") not in allowed_sources:
+            if allowed_sources and fact.get("source_type") not in allowed_sources:
                 continue
             candidate = self._make_recall_fact_candidate(
                 fact,
@@ -6439,7 +6598,7 @@ class MemoryNodeManager:
         facts = db.memory_facts_by_ids(evidence_fact_ids[: max(1, int(limit or 24))])
         expanded: List[Dict[str, Any]] = []
         for fact in facts:
-            if allowed_sources and str(fact.get("source_type") or "unified") not in allowed_sources:
+            if allowed_sources and fact.get("source_type") not in allowed_sources:
                 continue
             candidate = self._make_recall_fact_candidate(
                 fact,
@@ -6558,6 +6717,13 @@ class MemoryNodeManager:
                 merged_by_level[level].append(candidate)
         return {
             "by_level": merged_by_level,
+            "seed_candidates": seed_candidates,
+            "stage1_seed_candidates": list(stage1_raw_candidates or []),
+            "stage2_lexical_candidates": list(stage2_lexical_candidates or []),
+            "stage2_entity_candidates": list(stage2_entity_candidates or []),
+            "episode_candidates": episode_candidates,
+            "evidence_candidates": evidence_candidates,
+            "merged_candidates": list(merged_candidates.values()),
             "merged_count": len(merged_candidates),
             "seed_count": len(seed_candidates),
             "episode_expansion_count": len(episode_candidates),
@@ -6727,7 +6893,7 @@ class MemoryNodeManager:
         fact_candidates = merged_by_level["fact"]
         state_candidates = merged_by_level["state"]
         actionable_candidates = merged_by_level["actionable_item"]
-        self._log_info("memory_recall_stage2", "candidates_found", {
+        stage2_candidates_payload = {
             "facts": self._recall_log_candidate_items(fact_candidates),
             "states": self._recall_log_candidate_items(state_candidates),
             "actionable_items": self._recall_log_candidate_items(actionable_candidates),
@@ -6735,7 +6901,35 @@ class MemoryNodeManager:
             "merged_count": stage2_candidate_report["merged_count"],
             "episode_expansion_count": stage2_candidate_report["episode_expansion_count"],
             "evidence_expansion_count": stage2_candidate_report["evidence_expansion_count"],
-        })
+        }
+        if self._recall_detailed_logging:
+            stage2_candidates_payload["candidate_diagnostics"] = {
+                "stage1_seed_candidates": self._recall_detailed_candidate_items(
+                    stage2_candidate_report.get("stage1_seed_candidates") or [],
+                    stage="stage2_stage1_seed",
+                ),
+                "stage2_lexical_seeds": self._recall_detailed_candidate_items(
+                    stage2_candidate_report.get("stage2_lexical_candidates") or [],
+                    stage="stage2_lexical_seed",
+                ),
+                "stage2_entity_mapping_seeds": self._recall_detailed_candidate_items(
+                    stage2_candidate_report.get("stage2_entity_candidates") or [],
+                    stage="stage2_entity_mapping_seed",
+                ),
+                "evidence_expansions": self._recall_detailed_candidate_items(
+                    stage2_candidate_report.get("evidence_candidates") or [],
+                    stage="stage2_evidence_expansion",
+                ),
+                "episode_expansions": self._recall_detailed_candidate_items(
+                    stage2_candidate_report.get("episode_candidates") or [],
+                    stage="stage2_episode_expansion",
+                ),
+                "merged_candidates": self._recall_detailed_candidate_items(
+                    stage2_candidate_report.get("merged_candidates") or [],
+                    stage="stage2_merged",
+                ),
+            }
+        self._log_info("memory_recall_stage2", "candidates_found", stage2_candidates_payload)
         ranked = self._rank_recall_raw_candidates(
             facts=fact_candidates,
             states=state_candidates,
@@ -6746,7 +6940,7 @@ class MemoryNodeManager:
             final_candidate_limits=final_candidate_limits,
         )
         
-        self._log_info("memory_recall_stage2", "ranked", {
+        ranked_payload = {
             "facts": self._recall_log_candidate_items([
                 item for item in ranked if item.get("index_level") == "fact"
             ]),
@@ -6757,7 +6951,29 @@ class MemoryNodeManager:
                 item for item in ranked if item.get("index_level") == "actionable_item"
             ]),
             "all_ranked": self._recall_log_candidate_items(ranked, limit=20),
-        })
+        }
+        if self._recall_detailed_logging:
+            ranked_targets = {
+                (
+                    str(item.get("target_table") or ""),
+                    int(item.get("target_id")),
+                )
+                for item in ranked
+                if str(item.get("target_id") or "").isdigit()
+            }
+            ranked_payload["candidate_diagnostics"] = {
+                "candidate_pool": self._recall_detailed_candidate_items(
+                    stage2_candidate_report.get("merged_candidates") or [],
+                    selected_targets=ranked_targets,
+                    stage="stage2_rank_pool",
+                ),
+                "ranked_candidates": self._recall_detailed_candidate_items(
+                    ranked,
+                    selected_targets=ranked_targets,
+                    stage="stage2_ranked",
+                ),
+            }
+        self._log_info("memory_recall_stage2", "ranked", ranked_payload)
         memory_text = self._build_memory_retrieved_format_text(
             entries=ranked,
         )
@@ -6784,7 +7000,7 @@ class MemoryNodeManager:
             target_id = int(row.get("id"))
         except (TypeError, ValueError):
             return None
-        source_type = str(row.get("source_type") or "unified")
+        source_type = row.get("source_type")
         support_facts = [dict(fact) for fact in supporting_facts or []]
         if table == "memory_facts":
             title = _compact_whitespace(row.get("summary") or "")[:120]
@@ -6958,7 +7174,7 @@ class MemoryNodeManager:
         }
         for level, rows in rows_by_level.items():
             for row in rows:
-                if allowed_sources and str(row.get("source_type") or "unified") not in allowed_sources:
+                if allowed_sources and row.get("source_type") not in allowed_sources:
                     continue
                 candidate = self._make_recall_memory_candidate(
                     table=table_by_level[level],
@@ -7034,7 +7250,7 @@ class MemoryNodeManager:
                     target_id = int(row.get("id"))
                 except (TypeError, ValueError):
                     continue
-                source_type = str(row.get("source_type") or "unified")
+                source_type = row.get("source_type")
                 if table == "memory_facts":
                     title = _compact_whitespace(row.get("summary") or "")[:120]
                     summary = _compact_whitespace(row.get("summary") or "")
@@ -7180,7 +7396,7 @@ class MemoryNodeManager:
             fact_id = int(fact.get("id"))
         except (TypeError, ValueError):
             return None
-        source_type = str(fact.get("source_type") or "unified")
+        source_type = fact.get("source_type")
         summary = _compact_whitespace(fact.get("summary") or "")
         fact_times = self._fact_time_values(fact, temporal_mode)
         time_value = fact_times[0] if fact_times else ""
@@ -7354,6 +7570,9 @@ class MemoryNodeManager:
                 and query_embedding is not None
                 and similarity < threshold
             ):
+                entry["_recall_drop_reason"] = "embedding_below_threshold"
+                entry["_recall_embedding_threshold"] = threshold
+                entry["_recall_embedding_similarity"] = round(float(similarity), 4)
                 continue
             provenance_profile = self._recall_candidate_provenance_profile(entry)
             bm25_score = self._clamp_float(
@@ -7826,19 +8045,6 @@ class MemoryNodeManager:
         if not entries:
             return ""
 
-        def values_text(value: Any) -> str:
-            if isinstance(value, list):
-                values: List[str] = []
-                for item in value:
-                    if isinstance(item, dict):
-                        text = _compact_whitespace(item.get("name") or item.get("text") or "")
-                    else:
-                        text = _compact_whitespace(item)
-                    if text:
-                        values.append(text)
-                return ", ".join(values)
-            return _compact_whitespace(value)
-
         grouped = {
             "state": [entry for entry in entries if entry.get("index_level") == "state"],
             "actionable_item": [
@@ -7885,11 +8091,9 @@ class MemoryNodeManager:
                         f"{index}. [{time_text}] narrative fact",
                         f"   summary: {raw.get('summary') or entry.get('summary_for_retrieval') or ''}",
                         f"   fact_root_topic: {raw.get('fact_root_topic') or ''}; fact_aspect_topic: {raw.get('fact_aspect_topic') or ''}",
-                        f"   entities: {values_text(raw.get('entities'))}",
                     ]
                 elif group_key == "state":
                     timeline = self._format_state_timeline(raw.get("time_line"))
-                    state_metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
                     block_lines = [
                         f"{index}. [{time_text}] long-term state",
                         f"   state_scope: {raw.get('state_scope') or ''}; state_type: {raw.get('state_type') or ''}",
@@ -7897,9 +8101,6 @@ class MemoryNodeManager:
                         f"   entity: {raw.get('entity_key') or ''}",
                         f"   summary: {raw.get('summary') or ''}",
                     ]
-                    context_entities = values_text(state_metadata.get("context_entities"))
-                    if context_entities:
-                        block_lines.append(f"   context_entities: {context_entities}")
                     if timeline:
                         block_lines.append(f"   timeline: {timeline}")
                 else:

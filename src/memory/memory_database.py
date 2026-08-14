@@ -23,6 +23,11 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 import numpy as np
 
+try:
+    import jieba
+except ImportError:  # pragma: no cover - exercised only in minimal installs
+    jieba = None
+
 _HAS_FAISS = False
 EMBEDDING_DIM = 384
 
@@ -31,6 +36,78 @@ _IDENTITY_FTS_TABLES = {
     "memory_states": "memory_states_identity_fts",
     "memory_actionable_items": "memory_actionable_items_identity_fts",
 }
+
+_LEXICAL_DATE_PATTERNS = (
+    re.compile(r"(?<!\d)\d{4}[-/.年]\d{1,2}[-/.月]\d{1,2}(?:日)?(?!\d)"),
+    re.compile(r"(?<!\d)\d{1,2}月\d{1,2}日?(?!\d)"),
+)
+
+
+def _lexical_index_text(identity_text: Any) -> str:
+    """Convert display identity text into deterministic FTS search tokens.
+
+    The source tables keep the original ``identity_text`` for embeddings and
+    display. FTS receives a separate token stream so Chinese text can be
+    searched by words instead of relying on SQLite's default tokenizer.
+    Dates are excluded here because fact time is filtered through structured
+    time columns rather than lexical coincidence.
+    """
+    text_lines: List[str] = []
+    for line in str(identity_text or "").splitlines():
+        clean_line = line.strip()
+        colon_positions = [
+            position
+            for position in (clean_line.find(":"), clean_line.find("："))
+            if position >= 0
+        ]
+        if colon_positions:
+            # identity_text is formatted as one ``field: value`` per line.
+            # Index only the value so labels such as ``summary`` and
+            # ``entities`` do not become searchable memory content.
+            clean_line = clean_line[min(colon_positions) + 1 :].strip()
+        if clean_line:
+            text_lines.append(clean_line)
+    text = "\n".join(text_lines)
+    for pattern in _LEXICAL_DATE_PATTERNS:
+        text = pattern.sub(" ", text)
+    if not text.strip():
+        return ""
+
+    if jieba is not None:
+        # Search mode keeps useful sub-tokens for Chinese compounds while the
+        # regular cut preserves the complete domain phrase when available.
+        raw_tokens = [
+            *jieba.lcut(text, HMM=False),
+            *jieba.cut_for_search(text, HMM=False),
+        ]
+    else:
+        # Keep the database usable in minimal environments. This fallback is
+        # deliberately simple; production installs should include jieba.
+        raw_tokens = []
+        for match in re.findall(
+            r"[A-Za-z][A-Za-z0-9_.$'-]*|\d+(?:/\d+)?|[\u4e00-\u9fff]+",
+            text,
+        ):
+            if re.fullmatch(r"[\u4e00-\u9fff]+", match):
+                raw_tokens.append(match)
+                raw_tokens.extend(match)
+                raw_tokens.extend(
+                    match[index : index + 2]
+                    for index in range(len(match) - 1)
+                )
+            else:
+                raw_tokens.append(match)
+
+    tokens: List[str] = []
+    seen: set[str] = set()
+    for raw_token in raw_tokens:
+        token = re.sub(r"\s+", "", str(raw_token or "")).strip()
+        if not token or re.fullmatch(r"[^\w\u4e00-\u9fff]+", token):
+            continue
+        if token not in seen:
+            seen.add(token)
+            tokens.append(token)
+    return " ".join(tokens)
 
 
 def utc_now_text() -> str:
@@ -280,27 +357,42 @@ class SessionDB:
         self._commit_if_needed()
 
     def _init_identity_fts(self) -> None:
-        """Create and backfill one BM25 index for each memory table."""
+        """Create and backfill one tokenized BM25 index per memory table."""
         for source_table, fts_table in _IDENTITY_FTS_TABLES.items():
+            existing_columns = {
+                str(row["name"])
+                for row in self._conn.execute(
+                    f"PRAGMA table_info({fts_table})"
+                ).fetchall()
+            }
+            if existing_columns and "lexical_index_text" not in existing_columns:
+                # FTS is a derived index. Rebuilding it is safe and keeps
+                # existing memory rows untouched when the index format changes.
+                self._conn.execute(f"DROP TABLE IF EXISTS {fts_table}")
             self._conn.execute(
                 f"""
                 CREATE VIRTUAL TABLE IF NOT EXISTS {fts_table} USING fts5(
-                    identity_text
+                    lexical_index_text
                 )
                 """
             )
-            self._conn.execute(
-                f"""
-                INSERT INTO {fts_table} (rowid, identity_text)
-                SELECT source.id, source.identity_text
-                FROM {source_table} source
-                WHERE NOT EXISTS (
-                    SELECT 1
-                    FROM {fts_table} fts_row
-                    WHERE fts_row.rowid = source.id
+            existing_ids = {
+                int(row["rowid"])
+                for row in self._conn.execute(
+                    f"SELECT rowid FROM {fts_table}"
+                ).fetchall()
+            }
+            source_rows = self._conn.execute(
+                f"SELECT id, identity_text FROM {source_table}"
+            ).fetchall()
+            for row in source_rows:
+                row_id = int(row["id"])
+                if row_id in existing_ids:
+                    continue
+                self._conn.execute(
+                    f"INSERT INTO {fts_table} (rowid, lexical_index_text) VALUES (?, ?)",
+                    (row_id, _lexical_index_text(row["identity_text"])),
                 )
-                """
-            )
 
     def _sync_identity_fts(
         self,
@@ -309,15 +401,15 @@ class SessionDB:
         row_id: int,
         identity_text: str,
     ) -> None:
-        """Keep the table-specific BM25 document synchronized with its row."""
+        """Keep the tokenized BM25 document synchronized with its source row."""
         fts_table = _IDENTITY_FTS_TABLES[source_table]
         self._conn.execute(
             f"DELETE FROM {fts_table} WHERE rowid = ?",
             (int(row_id),),
         )
         self._conn.execute(
-            f"INSERT INTO {fts_table} (rowid, identity_text) VALUES (?, ?)",
-            (int(row_id), str(identity_text or "")),
+            f"INSERT INTO {fts_table} (rowid, lexical_index_text) VALUES (?, ?)",
+            (int(row_id), _lexical_index_text(identity_text)),
         )
 
     def _ensure_entity_ids_schema(self) -> None:
@@ -494,11 +586,13 @@ class SessionDB:
     def _normalize_search_terms(terms: Optional[Sequence[str]]) -> List[str]:
         normalized: List[str] = []
         for term in terms or []:
-            clean = re.sub(r"\s+", " ", str(term or "").strip().lower())
-            if clean and clean not in normalized:
-                normalized.append(clean)
-            if len(normalized) >= 16:
-                break
+            lexical_text = _lexical_index_text(term).lower()
+            for token in lexical_text.split():
+                clean = re.sub(r"\s+", " ", token).strip()
+                if clean and clean not in normalized:
+                    normalized.append(clean)
+                if len(normalized) >= 16:
+                    return normalized
         return normalized
 
     def insert_episode(

@@ -115,7 +115,7 @@ def parse_args() -> argparse.Namespace:
         help="Do not request provider-enforced JSON output.",
     )
     parser.set_defaults(llm_json_mode=None)
-    parser.add_argument("--max-pending-interaction-interactions", type=int)
+    parser.add_argument("--max-pending-interaction-turns", type=int)
     parser.add_argument("--max-pending-interaction-chars", type=int)
     parser.add_argument("--enable-reflect", action="store_true")
     parser.add_argument(
