@@ -161,28 +161,30 @@ def configure_logging(
         stream_handler = logging.StreamHandler()
         stream_handler.setFormatter(formatter)
         root.addHandler(stream_handler)
-    manager_level = getattr(logging, str(manager_log_level).upper(), logging.INFO)
-    logging.getLogger("memory").setLevel(manager_level)
-    logging.getLogger("memory.memory_manager").setLevel(manager_level)
-
-
 @contextmanager
-def sample_memory_logging(sample_state_dir: Path, manager_log_level: str) -> Iterator[Path]:
-    """Write MemoryNodeManager logs beside one LoCoMo sample database."""
+def sample_memory_logging(
+    sample_state_dir: Path,
+    manager_log_level: str,
+) -> Iterator[Tuple[Path, logging.Logger]]:
+    """Write memory pipeline logs beside one LoCoMo sample database."""
     sample_state_dir.mkdir(parents=True, exist_ok=True)
     log_path = sample_state_dir / "memory_manager.log"
-    manager_logger = logging.getLogger("memory")
-    previous_level = manager_logger.level
+    memory_logger = logging.getLogger(
+        f"memory.pipeline.locomo.{sample_state_dir.name}"
+    )
+    for existing_handler in list(memory_logger.handlers):
+        memory_logger.removeHandler(existing_handler)
+        existing_handler.close()
     handler = logging.FileHandler(log_path, mode="w", encoding="utf-8")
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
-    manager_logger.addHandler(handler)
-    manager_logger.setLevel(getattr(logging, str(manager_log_level).upper(), logging.INFO))
+    memory_logger.addHandler(handler)
+    memory_logger.setLevel(getattr(logging, str(manager_log_level).upper(), logging.INFO))
+    memory_logger.propagate = False
     try:
-        yield log_path
+        yield log_path, memory_logger
     finally:
-        manager_logger.removeHandler(handler)
+        memory_logger.removeHandler(handler)
         handler.close()
-        manager_logger.setLevel(previous_level)
 
 
 def _expand_env_refs(value: Any) -> Any:
@@ -472,7 +474,10 @@ def build_sample_memory_context(
     sample_id = str(sample.get("sample_id") or "unknown_sample")
     sample_state_dir = args.state_dir / sample_id
     db_path = sample_state_dir / "memory.db"
-    with sample_memory_logging(sample_state_dir, args.manager_log_level) as memory_log_path:
+    with sample_memory_logging(
+        sample_state_dir,
+        args.manager_log_level,
+    ) as (memory_log_path, memory_logger):
         db = SessionDB(db_path=db_path)
         try:
             operation_reporter = MemoryOperationReporter()
@@ -486,6 +491,7 @@ def build_sample_memory_context(
             runtime = MemoryRuntime(
                 manager,
                 memory_runtime_config=memory_runtime_config,
+                logger=memory_logger,
             )
             validate_runtime(manager)
             sessions = sorted_locomo_sessions(sample, int(args.max_sessions))

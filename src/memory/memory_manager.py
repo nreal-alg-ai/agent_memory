@@ -9,15 +9,7 @@ internal model is deliberately unified:
 2. Extracted evidence becomes narrative `memory_facts`.
 3. Longer-running preferences/topics/constraints can become `memory_states`.
 4. Concrete decisions/tasks/commitments become `memory_actionable_items`.
-5. Every retrievable object writes a `memory_index_entries` card. The cards are
-   retained as an optional future directory, while the default recall path
-   searches the raw facts/states/actionable-items tables directly.
 
-The current recall path searches the raw memory tables first. The shared
-`memory_index_entries` layer remains available for a future optional retrieval
-mode, but it is not a hard gate for recall.
-
-This file intentionally avoids ASR dependencies.
 """
 
 from __future__ import annotations
@@ -59,8 +51,6 @@ from .prompts_zh import (
     UNIFIED_MEMORY_EXTRACTION_PROMPT_ZH,
     UNIFIED_TOPIC_STATE_UPDATE_PROMPT_ZH,
 )
-
-logger = logging.getLogger(__name__)
 
 RecallTimeBounds = Optional[Tuple[Optional[str], Optional[str]]]
 
@@ -453,8 +443,10 @@ class MemoryNodeManager:
         memory_manager_config: Optional[Dict[str, Any]] = None,
         llm_config: Optional[Dict[str, Any]] = None,
         operation_reporter: Optional[MemoryOperationReporter] = None,
+        logger: Optional[logging.Logger] = None,
     ) -> None:
         self._db = db
+        self._logger = logger or logging.getLogger(__name__)
         self._operation_reporter = operation_reporter or MemoryOperationReporter()
         self._embedding_cfg = dict(embedding_config or {})
         self._memory_cfg = dict(memory_manager_config or {})
@@ -671,6 +663,10 @@ class MemoryNodeManager:
     def enabled(self) -> bool:
         return self._memory_enabled
 
+    def set_logger(self, logger: Optional[logging.Logger]) -> None:
+        """Set the logger used by memory store, reflect, and recall operations."""
+        self._logger = logger or logging.getLogger(__name__)
+
     def _task_worker_loop(self) -> None:
         while not self._task_shutdown_event.is_set() or not self._task_queue.empty():
             try:
@@ -695,7 +691,7 @@ class MemoryNodeManager:
                     result=result,
                 )
             except Exception as exc:
-                logger.exception("Async memory %s failed: %s", task.get("kind"), exc)
+                self._logger.exception("Async memory %s failed: %s", task.get("kind"), exc)
                 self._operation_reporter.on_task_finished(
                     operation_type=task_kind,
                     task_id=task_id,
@@ -724,7 +720,7 @@ class MemoryNodeManager:
         task_id = self._operation_reporter.next_task_id(task_kind)
         with self._task_worker_lock:
             if self._task_shutdown_event.is_set():
-                logger.warning("Memory worker is shut down; dropping %s task", task_kind)
+                self._logger.warning("Memory worker is shut down; dropping %s task", task_kind)
                 return self._reject_memory_task(
                     task_kind=task_kind,
                     task_id=task_id,
@@ -738,7 +734,7 @@ class MemoryNodeManager:
                     "started_at": time.monotonic(),
                 })
             except queue.Full:
-                logger.warning(
+                self._logger.warning(
                     "Memory task queue is full; dropping %s (maxsize=%d)",
                     task_kind,
                     self._task_queue_maxsize,
@@ -1135,7 +1131,7 @@ class MemoryNodeManager:
                     })
                     return {"title": title, "summary": summary}
             if attempt == 0:
-                logger.debug("Episode summary LLM fallback failed, retrying")
+                self._logger.debug("Episode summary LLM fallback failed, retrying")
         return None
 
     def _extract_memory_fact_with_llm(
@@ -1176,7 +1172,7 @@ class MemoryNodeManager:
                 if normalized is not None:
                     return normalized
             if attempt == 0:
-                logger.debug("Unified memory LLM extraction failed, retrying")
+                self._logger.debug("Unified memory LLM extraction failed, retrying")
         return None
 
     def _call_llm(self, prompt: str) -> Optional[str]:
@@ -1185,7 +1181,7 @@ class MemoryNodeManager:
             or not self._llm_base_url
             or str(self._llm_base_url).strip().lower() == "none"
         ):
-            logger.debug(
+            self._logger.debug(
                 "Skipping LLM call because llm_api_key or llm_base_url is not configured"
             )
             return None
@@ -1235,7 +1231,7 @@ class MemoryNodeManager:
                 text = str(exc).lower()
                 if "response_format" in text or "json" in text or "thinking" in text:
                     continue
-                logger.warning("Unified memory LLM call failed: %s", exc)
+                self._logger.warning("Unified memory LLM call failed: %s", exc)
                 return None
         return None
 
@@ -1700,7 +1696,7 @@ class MemoryNodeManager:
         try:
             states = self._db.get_recent_memory_states(limit=max(40, int(limit or 12) * 6))
         except Exception as exc:
-            logger.debug("Failed to load memory state context: %s", exc)
+            self._logger.debug("Failed to load memory state context: %s", exc)
             return []
         rows: List[Dict[str, Any]] = []
         seen: set[Tuple[str, str, str]] = set()
@@ -2928,7 +2924,7 @@ class MemoryNodeManager:
         parsed = self._parse_json_object_from_llm_text(result or "")
         if parsed:
             if not self._config_bool(parsed.get("update_needed", True), True):
-                logger.debug(
+                self._logger.debug(
                     "LLM declined topic-state update for topic=%s",
                     candidate.get("topic_name"),
                 )
@@ -3844,7 +3840,7 @@ class MemoryNodeManager:
         parsed = self._parse_json_object_from_llm_text(result or "")
         if parsed:
             if not self._config_bool(parsed.get("update_needed", True), True):
-                logger.debug(
+                self._logger.debug(
                     "LLM declined entity-state update for entity=%s attribute=%s",
                     candidate.get("entity"),
                     candidate.get("attribute_name"),
@@ -4034,13 +4030,13 @@ class MemoryNodeManager:
         )
         state_type = self._normalize_state_type(state.get("state_type"))
         if not state_scope or not state_type:
-            logger.debug("Skipping state with invalid scope/type: %s", state)
+            self._logger.debug("Skipping state with invalid scope/type: %s", state)
             return 0
         if state_scope == "topic_state" and state_type != "topic":
-            logger.debug("Skipping topic state with non-topic type: %s", state)
+            self._logger.debug("Skipping topic state with non-topic type: %s", state)
             return 0
         if state_scope == "entity_state" and state_type not in self._entity_scoped_state_types():
-            logger.debug("Skipping entity state with invalid type: %s", state)
+            self._logger.debug("Skipping entity state with invalid type: %s", state)
             return 0
         keywords = state.get("keywords") or self._keywords(state["summary"], limit=18)
         entities = state.get("entities") or self._entities(state["summary"])
@@ -4552,8 +4548,7 @@ class MemoryNodeManager:
             return next(iter(sources))
         return "unified"
 
-    @classmethod
-    def _log_info(cls, scope: str, event: str, payload: Dict[str, Any]) -> None:
+    def _log_info(self, scope: str, event: str, payload: Dict[str, Any]) -> None:
         record = {
             "scope": scope,
             "event": event,
@@ -4578,7 +4573,7 @@ class MemoryNodeManager:
                 sort_keys=False,
                 indent=2,
             )
-        logger.info("\n%s", body)
+        self._logger.info("\n%s", body)
 
     @staticmethod
     def _log_text(value: Any, *, limit: int = 500) -> str:
@@ -7278,7 +7273,7 @@ class MemoryNodeManager:
                 )
                 candidate["_recall_bm25_score"] = round(normalized_bm25_score, 4)
                 candidate["_recall_bm25_rank"] = position + 1
-        logger.debug(
+        self._logger.debug(
             "Direct recall candidates: facts=%d states=%d actionable_items=%d total=%d",
             len(rows_by_table["memory_facts"]),
             len(rows_by_table["memory_states"]),

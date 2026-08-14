@@ -484,6 +484,39 @@ def remove_context_log_handler(handler: Optional[logging.Handler]) -> None:
     handler.close()
 
 
+def configure_memory_logger(
+    log_path: Path,
+    log_level: str,
+    logger_name: str,
+) -> Tuple[logging.Logger, logging.Handler]:
+    """Create a non-propagating logger dedicated to memory operations."""
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    memory_logger = logging.getLogger(logger_name)
+    for existing_handler in list(memory_logger.handlers):
+        memory_logger.removeHandler(existing_handler)
+        existing_handler.close()
+    memory_logger.setLevel(getattr(logging, str(log_level).upper(), logging.INFO))
+    memory_logger.propagate = False
+    handler = logging.FileHandler(log_path, mode="w", encoding="utf-8")
+    handler.setLevel(logging.NOTSET)
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    )
+    memory_logger.addHandler(handler)
+    return memory_logger, handler
+
+
+def remove_memory_logger_handler(
+    memory_logger: Optional[logging.Logger],
+    handler: Optional[logging.Handler],
+) -> None:
+    """Close a context-specific memory logger without affecting root logging."""
+    if memory_logger is None or handler is None:
+        return
+    memory_logger.removeHandler(handler)
+    handler.close()
+
+
 def configure_worker_logging(
     log_path: Path,
     log_level: str,
@@ -539,8 +572,15 @@ def process_context_group(
     days = parse_context_days(context)
     db = SessionDB(db_path)
     context_log_handler = add_context_log_handler(context_log_path)
+    memory_logger: Optional[logging.Logger] = None
+    memory_log_handler: Optional[logging.Handler] = None
     results: List[Dict[str, Any]] = []
     try:
+        memory_logger, memory_log_handler = configure_memory_logger(
+            group_dir / "memory.log",
+            args.manager_log_level,
+            f"memory.pipeline.{group_id}",
+        )
         logging.info(
             "Context processing started id=%s records=%s parsed_days=%s",
             group_id,
@@ -562,6 +602,7 @@ def process_context_group(
         runtime = MemoryRuntime(
             manager,
             memory_runtime_config=memory_runtime_config,
+            logger=memory_logger,
         )
         if not args.skip_embedding_validation:
             validate_embedding_runtime(manager, db, embedding_config)
@@ -666,6 +707,7 @@ def process_context_group(
             "context_chars": len(context),
             "db_path": str(db_path),
             "context_log_path": str(context_log_path),
+            "memory_log_path": str(group_dir / "memory.log"),
             "days": len(days),
             "replay": replay_stats,
             "db_counts": counts,
@@ -675,6 +717,7 @@ def process_context_group(
     finally:
         log_memory_index_state(db, f"finished_context:{group_id}")
         db.close()
+        remove_memory_logger_handler(memory_logger, memory_log_handler)
         remove_context_log_handler(context_log_handler)
 
 

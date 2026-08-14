@@ -7,6 +7,7 @@ turns or transcript segments into the manager's raw episode segments.
 
 from __future__ import annotations
 
+import logging
 import time
 import re
 from datetime import datetime
@@ -28,9 +29,13 @@ class MemoryRuntime:
         manager: MemoryNodeManager,
         *,
         memory_runtime_config: Optional[Dict[str, Any]] = None,
+        logger: Optional[logging.Logger] = None,
     ) -> None:
         """Initialize the runtime buffers and batching thresholds."""
         self._manager = manager
+        self._logger = logger or logging.getLogger(__name__)
+        if logger is not None:
+            self._manager.set_logger(logger)
         config = dict(memory_runtime_config or {})
         self._prompt_language_mode = str(
             config.get("memory_prompt_language_mode")
