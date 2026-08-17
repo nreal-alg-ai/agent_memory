@@ -7294,7 +7294,11 @@ class MemoryNodeManager:
     ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
         """Retrieve direct memory candidates through query-matched entities."""
         db = database or self._db
-        entity_rows = db.find_entity_nodes_in_text(query, limit=12)
+        entity_lookup_aliases = self._recall_entity_lookup_aliases(query)
+        entity_lookup_text = " ".join(
+            [str(query or "").strip(), *entity_lookup_aliases]
+        ).strip()
+        entity_rows = db.find_entity_nodes_in_text(entity_lookup_text, limit=12)
         entity_ids = [int(row["id"]) for row in entity_rows if row.get("id") is not None]
         matched_entity_names = [
             str(row.get("name") or "")
@@ -8049,6 +8053,33 @@ class MemoryNodeManager:
                 )
             )
         return terms
+
+    @staticmethod
+    def _recall_entity_lookup_aliases(query: Any) -> List[str]:
+        """Return canonical role entities implied by first/second-person text.
+
+        Memory entities use stable role names (``用户``/``助手`` or
+        ``user``/``assistant``), while recall questions naturally use
+        pronouns such as ``我`` and ``你``. These aliases are only used to
+        query the entity-node index; the original query remains unchanged for
+        time parsing, lexical search, scoring, and LLM analysis.
+        """
+        text = str(query or "")
+        aliases: List[str] = []
+
+        # Do not treat ``我们``/``你们`` as a single speaker role. The
+        # conversational schema models the direct user and assistant roles
+        # separately.
+        is_chinese = bool(re.search(r"[\u4e00-\u9fff]", text))
+        if re.search(r"我(?!们)", text) or re.search(
+            r"\b(?:i|me|my|mine|myself)\b", text, re.IGNORECASE
+        ):
+            aliases.append("用户" if is_chinese else "user")
+        if re.search(r"你(?!们)", text) or re.search(
+            r"\b(?:you|your|yours|yourself)\b", text, re.IGNORECASE
+        ):
+            aliases.append("助手" if is_chinese else "assistant")
+        return list(dict.fromkeys(aliases))
 
     def _lexical_search_terms_for_text(
         self,
