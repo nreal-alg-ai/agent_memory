@@ -6984,6 +6984,9 @@ class MemoryNodeManager:
                 preferred_layer_preferences=preferred_layer_preferences,
             )
         )
+        supplement_entity_mapping_limits, supplement_lexical_limits = (
+            self._split_recall_stage2_source_limits(supplement_candidate_limits)
+        )
         self._log_info("memory_recall_stage2", "query_analyzed", {
             "recall_plan": recall_plan,
             "forced_source_types": forced_source_types or [],
@@ -6998,6 +7001,8 @@ class MemoryNodeManager:
             "query_embedding_available": query_identity_embedding is not None,
             "final_candidate_limits": final_candidate_limits,
             "supplement_candidate_limits": supplement_candidate_limits,
+            "supplement_entity_mapping_limits": supplement_entity_mapping_limits,
+            "supplement_lexical_limits": supplement_lexical_limits,
             "budget": budget,
             "temporal_mode": temporal_mode,
         })
@@ -7009,7 +7014,7 @@ class MemoryNodeManager:
                     source_types=forced_source_types,
                     temporal_bounds=temporal_bounds,
                     temporal_mode=temporal_mode,
-                    candidate_limits=supplement_candidate_limits,
+                    candidate_limits=supplement_lexical_limits,
                     database=database,
                 )
             )
@@ -7037,10 +7042,7 @@ class MemoryNodeManager:
                 source_types=forced_source_types,
                 temporal_bounds=temporal_bounds,
                 temporal_mode=temporal_mode,
-                candidate_limits={
-                    key: max(12, min(48, top_k * 4))
-                    for key in ("facts", "states", "actionable_items")
-                },
+                candidate_limits=supplement_entity_mapping_limits,
                 database=database,
             ) if new_llm_entities else ([], [], [])
         )
@@ -8738,15 +8740,28 @@ class MemoryNodeManager:
         budget: str,
         preferred_layer_preferences: Optional[Sequence[str]],
     ) -> Tuple[Dict[str, int], Dict[str, int]]:
-        """Build Stage 2 final-ranking and lexical-supplement budgets."""
+        """Build Stage 2 final and supplement budgets consistently with Stage 1."""
         k = max(1, int(top_k or 1))
 
-        lower = str(query or "").lower()
-        final_limits = {
-            "facts": max(4, int(math.ceil(k * 0.60))),
-            "states": max(3, int(math.ceil(k * 0.30))),
-            "actionable_items": max(3, int(math.ceil(k * 0.25))),
+        base_raw_limit = max(8, min(32, k * 3))
+        supplement_limits = {
+            "facts": base_raw_limit,
+            "states": base_raw_limit,
+            "actionable_items": base_raw_limit,
         }
+
+        supplement_limits = {
+            key: min(48, value)
+            for key, value in supplement_limits.items()
+        }
+
+        final_limits = {
+            "facts": k,
+            "states": k,
+            "actionable_items": k,
+        }
+
+        lower = str(query or "").lower()
         if self._needs_broad_evidence(query):
             final_limits["facts"] = max(final_limits["facts"], int(math.ceil(k * 0.85)))
         preferred = set(preferred_layer_preferences or [])
@@ -8761,18 +8776,21 @@ class MemoryNodeManager:
         if any(marker in lower for marker in ("prefer", "usually", "habit", "偏好", "通常", "习惯", "长期", "状态")):
             final_limits["states"] = max(final_limits["states"], int(math.ceil(k * 0.5)))
 
-        multipliers = {"low": 1, "mid": 2, "high": 3}
-        multiplier = multipliers.get(str(budget or "mid").lower(), 2)
-        supplement_limit = max(
-            4,
-            min(24, k * multiplier),
-        )
-        supplement_limits = {
-            "facts": supplement_limit,
-            "states": supplement_limit,
-            "actionable_items": supplement_limit,
-        }
         return final_limits, supplement_limits
+
+    @staticmethod
+    def _split_recall_stage2_source_limits(
+        supplement_candidate_limits: Dict[str, int],
+    ) -> Tuple[Dict[str, int], Dict[str, int]]:
+        """Split Stage 2 supplement budgets between mapping and lexical search."""
+        entity_mapping_limits: Dict[str, int] = {}
+        lexical_limits: Dict[str, int] = {}
+        for key, supplement_limit in (supplement_candidate_limits or {}).items():
+            normalized_limit = max(0, int(supplement_limit or 0))
+            entity_limit = normalized_limit // 2
+            entity_mapping_limits[key] = entity_limit
+            lexical_limits[key] = normalized_limit - entity_limit
+        return entity_mapping_limits, lexical_limits
     
     def _needs_broad_evidence(self, query: str) -> bool:
         lower = str(query or "").lower()
