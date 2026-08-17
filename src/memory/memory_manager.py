@@ -5511,7 +5511,7 @@ class MemoryNodeManager:
         semantic_query = self._recall_stage1_requires_semantic_search(query)
 
         selected_candidates, selected_by_layer = (
-            self._recall_stage1_select_candidates_by_layer(
+            self._recall_get_selected_candidates_by_layer(
                 ranked_fact_candidates=ranked_fact_candidates,
                 ranked_state_candidates=ranked_state_candidates,
                 ranked_actionable_items=ranked_actionable_items,
@@ -6087,7 +6087,7 @@ class MemoryNodeManager:
             ranked_by_level["actionable_item"],
         )
 
-    def _recall_stage1_select_candidates_by_layer(
+    def _recall_get_selected_candidates_by_layer(
         self,
         *,
         ranked_fact_candidates: Sequence[Dict[str, Any]],
@@ -7976,26 +7976,23 @@ class MemoryNodeManager:
             ),
         )
 
-        ranked_facts = ranked_facts[: max(0, int(final_limits.get("facts", 0) or 0))]
-        ranked_states = ranked_states[: max(0, int(final_limits.get("states", 0) or 0))]
-        ranked_actionable = ranked_actionable[: max(
-            0,
-            int(final_limits.get("actionable_items", 0) or 0),
-        )]
-        
-        selected: List[Dict[str, Any]] = []
-        seen_targets: set[Tuple[str, int]] = set()
-        for item in [*ranked_states, *ranked_actionable, *ranked_facts]:
-            try:
-                target = (str(item.get("target_table") or ""), int(item.get("target_id")))
-            except (TypeError, ValueError):
-                continue
-            if target in seen_targets:
-                continue
-            seen_targets.add(target)
-            selected.append(item)
-
-        return selected
+        layer_limits = {
+            "fact": max(0, int(final_limits.get("facts", 0) or 0)),
+            "state": max(0, int(final_limits.get("states", 0) or 0)),
+            "actionable_item": max(
+                0,
+                int(final_limits.get("actionable_items", 0) or 0),
+            ),
+        }
+        selected_candidates, _selected_by_layer = (
+            self._recall_get_selected_candidates_by_layer(
+                ranked_fact_candidates=ranked_facts,
+                ranked_state_candidates=ranked_states,
+                ranked_actionable_items=ranked_actionable,
+                layer_limits=layer_limits,
+            )
+        )
+        return selected_candidates
     
     def _analyze_recall_query(
         self,
