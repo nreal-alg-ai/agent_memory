@@ -2493,8 +2493,8 @@ class MemoryNodeManager:
             add_states(
                 self._db.search_memory_states(
                     terms=self._build_recall_search_terms(
-                        root_topic,
-                        keywords=[],
+                        "",
+                        keywords=[root_topic],
                         entities=[],
                     ),
                     state_type="topic",
@@ -3619,7 +3619,7 @@ class MemoryNodeManager:
             "fact_kind": fact.get("fact_kind"),
             "event_time_key": fact.get("event_time_key"),
             "dialogue_time_key": fact.get("dialogue_time_key"),
-            "summary": self._log_text(fact.get("summary") or "", limit=1200),
+            "summary": self._format_log_text(fact.get("summary") or "", limit=1200),
             "keywords": fact.get("keywords"),
             "entities": fact.get("entities") or [],
             "primary_entity": fact.get("primary_entity"),
@@ -3642,7 +3642,7 @@ class MemoryNodeManager:
             "source_type": state.get("source_type"),
             "entity_key": state.get("entity_key") or metadata.get("entity_key") or "",
             "canonical_name": state.get("canonical_name"),
-            "summary": self._log_text(state.get("summary") or "", limit=1200),
+            "summary": self._format_log_text(state.get("summary") or "", limit=1200),
             "time_line": self._normalize_time_line(
                 state.get("time_line"),
                 limit=20,
@@ -4254,7 +4254,7 @@ class MemoryNodeManager:
             self._log_info("memory_reflect", "actionable_llm_parse_failed", {
                 "candidate_fact_count": len(facts),
                 "response_chars": len(result or ""),
-                "response_preview": self._log_text(result or "", limit=600),
+                "response_preview": self._format_log_text(result or "", limit=600),
             })
             return []
         raw_items = parsed.get("actionable_items")
@@ -4702,7 +4702,7 @@ class MemoryNodeManager:
         self._logger.info("\n%s", body)
 
     @staticmethod
-    def _log_text(value: Any, *, limit: int = 500) -> str:
+    def _format_log_text(value: Any, *, limit: int = 500) -> str:
         text = _compact_whitespace(value)
         if limit <= 0 or len(text) <= limit:
             return text
@@ -4794,7 +4794,7 @@ class MemoryNodeManager:
                     }
                 },
                 "time_start": item.get("time_start"),
-                "summary": self._log_text(summary, limit=240),
+                "summary": self._format_log_text(summary, limit=240),
                 "support_fact_ids": support_ids,
             })
         return {
@@ -4830,6 +4830,9 @@ class MemoryNodeManager:
             match_details = item.get("_recall_fast_match_details")
             match_details = dict(match_details) if isinstance(match_details, dict) else {}
             decision = dict(decision_by_target.get(target_key) or {})
+            item_decision = item.get("_recall_decision")
+            if isinstance(item_decision, dict):
+                decision.update(item_decision)
             source = str(item.get("_recall_candidate_source") or "")
             provenance = list(item.get("_stage2_provenance") or [])
             reasons: List[str] = []
@@ -4863,18 +4866,18 @@ class MemoryNodeManager:
                 "candidate_source": source,
                 "stage2_provenance": provenance,
                 "retrieval_reasons": reasons,
-                "title": self._log_text(
+                "title": self._format_log_text(
                     item.get("title") or raw.get("canonical_name") or "",
                     limit=240,
                 ),
-                "summary": self._log_text(
+                "summary": self._format_log_text(
                     raw.get("summary")
                     or item.get("summary_for_retrieval")
                     or item.get("summary")
                     or "",
                     limit=500,
                 ),
-                "identity_text": self._log_text(
+                "identity_text": self._format_log_text(
                     item.get("identity_text") or raw.get("identity_text") or "",
                     limit=500,
                 ),
@@ -5000,6 +5003,48 @@ class MemoryNodeManager:
             clean_query = text[:m.start()] + text[m.end():]
             return fmt(now - timedelta(days=7)), fmt(now), clean_query.strip()
 
+        # Parse a day-level Chinese date range before the single-date branch.
+        # The end bound is exclusive, so a query covering Apr 27 through Apr
+        # 29 searches until the start of Apr 30.
+        m = re.search(
+            r"(?<!\d)"
+            r"(?:(?P<year1>\d{4})\s*年\s*)?"
+            r"(?P<month1>\d{1,2})\s*月\s*(?P<day1>\d{1,2})\s*(?:日|号)?"
+            r"\s*(?:到|至|[-~～])\s*"
+            r"(?:(?P<year2>\d{4})\s*年\s*)?"
+            r"(?P<month2>\d{1,2})\s*月\s*(?P<day2>\d{1,2})\s*(?:日|号)?"
+            r"(?!\d)",
+            text,
+        )
+        if m:
+            year1_text = m.group("year1")
+            year2_text = m.group("year2")
+            month1 = int(m.group("month1"))
+            day1 = int(m.group("day1"))
+            month2 = int(m.group("month2"))
+            day2 = int(m.group("day2"))
+            year1 = int(year1_text) if year1_text else now.year
+            if not year1_text:
+                try:
+                    if datetime(year1, month1, day1).date() > now.date():
+                        year1 -= 1
+                except ValueError:
+                    pass
+            if year2_text:
+                year2 = int(year2_text)
+            elif year1_text:
+                year2 = year1
+            else:
+                year2 = year1 + (1 if (month2, day2) < (month1, day1) else 0)
+            try:
+                start = datetime(year1, month1, day1)
+                end = datetime(year2, month2, day2) + timedelta(days=1)
+                if end > start:
+                    clean_query = text[:m.start()] + text[m.end():]
+                    return fmt(start), fmt(end), clean_query.strip()
+            except ValueError:
+                pass
+
         m = re.search(r"(?:从)?\s*(\d{4})\s*年\s*(\d{1,2})\s*月\s*(?:到|至)\s*(?:(\d{4})\s*年)?\s*(\d{1,2})\s*月", text)
         if m:
             year1 = int(m.group(1))
@@ -5015,6 +5060,41 @@ class MemoryNodeManager:
                 )
                 clean_query = text[:m.start()] + text[m.end():]
                 return fmt(start), fmt(end), clean_query.strip()
+            except ValueError:
+                pass
+
+        m = re.search(
+            r"(?<!\d)(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日?",
+            text,
+        )
+        if m:
+            try:
+                start = datetime(
+                    int(m.group(1)),
+                    int(m.group(2)),
+                    int(m.group(3)),
+                )
+                clean_query = text[:m.start()] + text[m.end():]
+                return None, fmt(start + timedelta(days=1)), clean_query.strip()
+            except ValueError:
+                pass
+
+        # A month/day without a year is interpreted relative to the recall
+        # reference year. For historical-memory queries, a date later than
+        # the reference date most naturally refers to the previous year.
+        m = re.search(
+            r"(?<!\d)(\d{1,2})\s*月\s*(\d{1,2})\s*(?:日|号)?",
+            text,
+        )
+        if m:
+            month = int(m.group(1))
+            day = int(m.group(2))
+            try:
+                start = datetime(now.year, month, day)
+                if start.date() > now.date():
+                    start = datetime(now.year - 1, month, day)
+                clean_query = text[:m.start()] + text[m.end():]
+                return None, fmt(start + timedelta(days=1)), clean_query.strip()
             except ValueError:
                 pass
 
@@ -5034,12 +5114,15 @@ class MemoryNodeManager:
             except ValueError:
                 pass
 
-        m = re.search(r"\b(\d{4})-(\d{1,2})-(\d{1,2})\b", text)
+        m = re.search(
+            r"(?<!\d)(\d{4})-(\d{1,2})-(\d{1,2})(?!\d)",
+            text,
+        )
         if m:
             try:
                 start = datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))
                 clean_query = text[:m.start()] + text[m.end():]
-                return fmt(start), fmt(start + timedelta(days=1)), clean_query.strip()
+                return None, fmt(start + timedelta(days=1)), clean_query.strip()
             except ValueError:
                 pass
 
@@ -5191,7 +5274,7 @@ class MemoryNodeManager:
                 default_to_now=True,
             )
             self._log_info("memory_recall", "start", {
-                "query": self._log_text(query, limit=500),
+                "query": self._format_log_text(query, limit=500),
                 "top_k": k,
                 "budget": b,
                 "tags": tags or [],
@@ -5214,8 +5297,8 @@ class MemoryNodeManager:
             temporal_mode = self._infer_recall_temporal_mode(query)
             search_query = clean_query or query
             self._log_info("memory_recall", "query_prepared", {
-                "search_query": self._log_text(search_query, limit=500),
-                "clean_query": self._log_text(clean_query, limit=500),
+                "search_query": self._format_log_text(search_query, limit=500),
+                "clean_query": self._format_log_text(clean_query, limit=500),
                 "parsed_time_start": parsed_time_start,
                 "parsed_time_end": parsed_time_end,
                 "temporal_mode": temporal_mode,
@@ -5309,7 +5392,7 @@ class MemoryNodeManager:
             return recall_report
         except Exception as exc:
             self._log_info("memory_recall", "error", {
-                "query": self._log_text(query, limit=500),
+                "query": self._format_log_text(query, limit=500),
                 "error_type": type(exc).__name__,
                 "error": str(exc),
                 "elapsed_ms": round((time.monotonic() - started_at) * 1000, 2),
@@ -5332,10 +5415,9 @@ class MemoryNodeManager:
         """Run a deterministic, no-LLM recall path for high-confidence hits.
 
         Stage 1 is deliberately conservative. It returns a formatted context
-        only for exact entity/topic anchors, a recent active topic used by a
-        contextual follow-up, or a relevant high-priority actionable item.
-        Otherwise it returns ``None`` so the caller can fall through to Stage
-        2 semantic retrieval.
+        only when the retrieved candidates provide sufficient direct matching
+        evidence. Otherwise it returns ``None`` so the caller can fall through
+        to Stage 2 semantic retrieval.
         """
         started_at = time.monotonic()
         source_types = self._normalize_source_override(memory_source_override)
@@ -5352,9 +5434,11 @@ class MemoryNodeManager:
             is_contextual_query=is_contextual_query,
             is_actionable_query=is_actionable_query,
         )
-        candidate_limit = max(raw_candidate_limits.values())
+        entity_mapping_candidate_limits, lexical_candidate_limits = (
+            self._split_recall_stage1_source_limits(raw_candidate_limits)
+        )
         self._log_info("memory_recall_stage1", "start", {
-            "query": self._log_text(query, limit=500),
+            "query": self._format_log_text(query, limit=500),
             "top_k": top_k,
             "budget": budget,
             "terms": terms,
@@ -5363,6 +5447,9 @@ class MemoryNodeManager:
             "temporal_mode": temporal_mode,
             "recent_reference_time": recent_reference_time,
             "memory_source_override": list(memory_source_override or []),
+            "raw_candidate_limits": raw_candidate_limits,
+            "entity_mapping_candidate_limits": entity_mapping_candidate_limits,
+            "lexical_candidate_limits": lexical_candidate_limits,
         })
 
         lexical_fact_candidates, lexical_state_candidates, lexical_actionable_candidates = (
@@ -5372,7 +5459,7 @@ class MemoryNodeManager:
                 source_types=source_types,
                 temporal_bounds=temporal_bounds,
                 temporal_mode=temporal_mode,
-                candidate_limits=raw_candidate_limits,
+                candidate_limits=lexical_candidate_limits,
                 database=database,
             )
         )
@@ -5383,7 +5470,7 @@ class MemoryNodeManager:
                 source_types=source_types,
                 temporal_bounds=temporal_bounds,
                 temporal_mode=temporal_mode,
-                candidate_limit=candidate_limit,
+                candidate_limits=entity_mapping_candidate_limits,
                 database=database,
             )
         )
@@ -5405,137 +5492,46 @@ class MemoryNodeManager:
                 database=database,
             )
         )
-        raw_fact_candidates = raw_candidates_by_level["fact"]
-        raw_state_candidates = raw_candidates_by_level["state"]
-        raw_actionable_candidates = raw_candidates_by_level["actionable_item"]
-        filtered_candidates: List[Dict[str, Any]] = []
-        candidate_match_results: Dict[Tuple[str, str], Dict[str, Any]] = {}
-        candidate_decisions: Dict[Tuple[str, str], Dict[str, Any]] = {}
-        for candidate in raw_candidates:
-            match = self._recall_stage1_calculate_candidate_matching_score(candidate, query)
-            candidate_key = (
-                str(candidate.get("target_table") or ""),
-                str(candidate.get("target_id") or ""),
-            )
-            candidate_match_results[candidate_key] = match
-            candidate["_recall_fast_match_anchor"] = match.get("anchor") or ""
-            candidate["_recall_score"] = match.get("rank_score", 0.0)
-            candidate["_recall_type_score"] = match.get("rank_score", 0.0)
-            candidate["_recall_candidate_source"] = (
-                candidate.get("_recall_candidate_source") or "stage1_lexical"
-            )
-            candidate["_recall_fast_match_evidence"] = list(
-                match.get("evidence") or []
-            )
-            candidate["_recall_fast_matched_keywords"] = list(
-                match.get("matched_keywords") or []
-            )
-            candidate["_recall_fast_match_details"] = dict(match)
-            accepted = bool(
-                match.get("matched") and match.get("candidate_score_passed", False)
-            )
-            candidate_decisions[candidate_key] = {
-                "accepted": accepted,
-                "decision_reason": (
-                    "accepted"
-                    if accepted
-                    else str(match.get("filter_reason") or "not_matched")
-                ),
-            }
-            if accepted:
-                filtered_candidates.append(candidate)
-
         reference_time = recent_reference_time or datetime.now(timezone.utc).isoformat()
-
+        (
+            ranked_fact_candidates,
+            ranked_state_candidates,
+            ranked_actionable_items,
+        ) = self._recall_stage1_calculate_candidate_matching_score(
+            candidates=raw_candidates,
+            query=query,
+            is_contextual_query=is_contextual_query,
+            reference_time=reference_time,
+        )
+        filtered_candidates: List[Dict[str, Any]] = [
+            *ranked_fact_candidates,
+            *ranked_state_candidates,
+            *ranked_actionable_items,
+        ]
         semantic_query = self._recall_stage1_requires_semantic_search(query)
 
-        if is_contextual_query:
-            self._recall_stage1_add_contextual_candidates(
-                candidates=filtered_candidates,
-                fact_candidates=raw_fact_candidates,
-                state_candidates=raw_state_candidates,
-                reference_time=reference_time,
+        selected_candidates, selected_by_layer = (
+            self._recall_stage1_select_candidates_by_layer(
+                ranked_fact_candidates=ranked_fact_candidates,
+                ranked_state_candidates=ranked_state_candidates,
+                ranked_actionable_items=ranked_actionable_items,
+                layer_limits=layer_limits,
             )
+        )
 
         evidence_profile = self._recall_stage1_build_evidence_profile(
-            filtered_candidates,
+            selected_candidates,
         )
         evidence_gate = bool(evidence_profile.get("trusted"))
-
-        if is_actionable_query:
-            self._recall_stage1_add_actionable_candidates(
-                candidates=filtered_candidates,
-                actionable_candidates=raw_actionable_candidates,
-                candidate_match_results=candidate_match_results,
-                reference_time=reference_time,
-            )
-
-        filtered_candidates.sort(
-            key=lambda item: (
-                float(item.get("_recall_score") or 0.0),
-                str(item.get("time_start") or ""),
-                int(item.get("target_id") or 0),
-            ),
-            reverse=True,
-        )
-        selected_candidates: List[Dict[str, Any]] = []
-        seen_targets: set[Tuple[str, int]] = set()
-
-        def append_candidate(candidate: Dict[str, Any]) -> bool:
-            try:
-                target = (
-                    str(candidate.get("target_table") or ""),
-                    int(candidate.get("target_id")),
-                )
-            except (TypeError, ValueError):
-                return False
-            if target in seen_targets or len(selected_candidates) >= max(1, int(top_k or 1)):
-                return False
-            seen_targets.add(target)
-            selected_candidates.append(candidate)
-            return True
-
-        selected_by_layer: Dict[str, int] = {
-            layer: 0 for layer in layer_limits
-        }
-        for layer, limit in layer_limits.items():
-            for candidate in filtered_candidates:
-                if str(candidate.get("index_level") or "") != layer:
-                    continue
-                if selected_by_layer[layer] >= limit:
-                    break
-                if append_candidate(candidate):
-                    selected_by_layer[layer] += 1
-
-        # Reuse empty layer quota so a missing source does not reduce the
-        # total number of useful candidates returned to the caller.
-        for candidate in filtered_candidates:
-            if len(selected_candidates) >= max(1, int(top_k or 1)):
-                break
-            append_candidate(candidate)
-        selected_by_layer = {
-            layer: sum(
-                1
-                for candidate in selected_candidates
-                if str(candidate.get("index_level") or "") == layer
-            )
-            for layer in layer_limits
-        }
 
         actionable_hit = any(
             self._recall_stage1_candidate_match_type(item)
             in {"high_priority_actionable", "exact_actionable"}
             for item in selected_candidates
         )
-        contextual_hit = is_contextual_query and any(
-            self._recall_stage1_candidate_match_type(item)
-            in {"recent_fact_context", "recent_active_topic"}
-            for item in selected_candidates
-        )
         trusted = bool(selected_candidates) and (
             evidence_gate
             or actionable_hit
-            or contextual_hit
         )
         memory_text = self._build_memory_retrieved_format_text(
             entries=selected_candidates,
@@ -5550,7 +5546,25 @@ class MemoryNodeManager:
                 if semantic_query
                 else "evidence_profile_below_threshold"
             ),
-            "raw_candidate_count": len(raw_candidates),
+            "raw_candidate_limits": raw_candidate_limits,
+            "entity_mapping_candidate_limits": entity_mapping_candidate_limits,
+            "lexical_candidate_limits": lexical_candidate_limits,
+            "entity_mapping_fact_candidate_count": len(entity_fact_candidates),
+            "entity_mapping_state_candidate_count": len(entity_state_candidates),
+            "entity_mapping_actionable_candidate_count": len(entity_actionable_candidates),
+            "lexical_fact_candidate_count": len(lexical_fact_candidates),
+            "lexical_state_candidate_count": len(lexical_state_candidates),
+            "lexical_actionable_candidate_count": len(lexical_actionable_candidates),
+            "evidence_expansion_candidate_count": sum(
+                1
+                for candidate in raw_candidates
+                if str(candidate.get("_recall_candidate_source") or "")
+                == "stage1_evidence_expansion"
+            ),
+            "raw_candidate_counts_by_level": {
+                level: len(candidates)
+                for level, candidates in raw_candidates_by_level.items()
+            },
             "filtered_candidate_count": len(filtered_candidates),
             "selected_count": len(selected_candidates),
             "trusted": trusted,
@@ -5591,21 +5605,18 @@ class MemoryNodeManager:
             stage1_finish_payload["candidate_diagnostics"] = {
                 "raw_candidates": self._recall_detailed_candidate_items(
                     raw_candidates,
-                    decision_by_target=candidate_decisions,
                     accepted_targets=filtered_targets,
                     selected_targets=selected_targets,
                     stage="stage1_raw",
                 ),
                 "filtered_candidates": self._recall_detailed_candidate_items(
                     filtered_candidates,
-                    decision_by_target=candidate_decisions,
                     accepted_targets=filtered_targets,
                     selected_targets=selected_targets,
                     stage="stage1_filtered",
                 ),
                 "selected_candidates": self._recall_detailed_candidate_items(
                     selected_candidates,
-                    decision_by_target=candidate_decisions,
                     accepted_targets=filtered_targets,
                     selected_targets=selected_targets,
                     stage="stage1_selected",
@@ -5762,49 +5773,72 @@ class MemoryNodeManager:
     ) -> Tuple[Dict[str, int], Dict[str, int]]:
         """Build the raw retrieval and final per-layer Stage 1 budgets.
 
-        Raw limits control how many candidates each Stage 1 source may return.
-        Layer limits are maximum quotas for the final selection rather than
-        mandatory counts. Any unused layer quota is returned to the global
-        fill pass, so an absent layer cannot reduce the final useful results.
+        Raw limits are the combined per-layer budget for the two direct Stage
+        1 sources. The caller splits each raw limit between entity mapping and
+        lexical retrieval. Layer limits are per-layer caps for the final
+        selection. The final
+        candidate count is the sum of these caps rather than ``top_k`` itself;
+        ``top_k`` is used as the base cap for each memory layer.
         """
         k = max(1, int(top_k or 1))
         contextual = bool(is_contextual_query)
         actionable = bool(is_actionable_query)
-        raw_candidate_limit = max(12, min(48, k * 6))
+        base_raw_limit = max(8, min(32, k * 3))
         raw_candidate_limits = {
-            "facts": raw_candidate_limit,
-            "states": raw_candidate_limit,
-            "actionable_items": raw_candidate_limit,
+            "facts": base_raw_limit,
+            "states": base_raw_limit,
+            "actionable_items": base_raw_limit,
         }
 
+        # Contextual recall needs a wider recent-fact and active-topic pool;
+        # actionable recall needs more actionable candidates for the
+        # high-priority pass. These are raw retrieval budgets, not additional
+        # final output slots.
+        contextual_extra = max(4, min(16, k * 2))
+        actionable_extra = max(4, min(16, k * 2))
+        if contextual:
+            raw_candidate_limits["facts"] += contextual_extra
+            raw_candidate_limits["states"] += contextual_extra
         if actionable:
-            state_limit = max(1, int(math.ceil(k * 0.25))) if k >= 3 else 0
-            fact_limit = max(1, int(math.ceil(k * 0.25))) if k >= 3 else 1
-            actionable_limit = max(0, k - state_limit - fact_limit)
-            if k == 2:
-                state_limit, fact_limit, actionable_limit = 0, 1, 1
-        elif contextual:
-            fact_limit = max(1, int(math.ceil(k * 0.35)))
-            state_limit = max(0, int(math.ceil(k * 0.35)))
-            actionable_limit = max(0, k - fact_limit - state_limit)
-        else:
-            fact_limit = max(1, int(math.ceil(k * 0.50)))
-            state_limit = max(0, int(math.ceil(k * 0.35)))
-            actionable_limit = max(0, k - fact_limit - state_limit)
-
-        limits = {
-            "fact": fact_limit,
-            "state": state_limit,
-            "actionable_item": actionable_limit,
+            raw_candidate_limits["actionable_items"] += actionable_extra
+        raw_candidate_limits = {
+            key: min(48, value)
+            for key, value in raw_candidate_limits.items()
         }
-        # Keep the contract explicit even for small k values where a layer
-        # cannot receive a guaranteed slot.
-        while sum(limits.values()) > k:
-            largest_layer = max(limits, key=limits.get)
-            if limits[largest_layer] <= 0:
-                break
-            limits[largest_layer] -= 1
+
+        base_layer_limit = k
+        contextual_layer_extra = int(math.ceil(base_layer_limit * 0.5))
+        actionable_layer_extra = int(math.ceil(base_layer_limit * 0.5))
+        limits = {
+            "fact": base_layer_limit,
+            "state": base_layer_limit,
+            "actionable_item": base_layer_limit,
+        }
+        if contextual:
+            limits["fact"] += contextual_layer_extra
+            limits["state"] += contextual_layer_extra
+        if actionable:
+            limits["actionable_item"] += actionable_layer_extra
         return raw_candidate_limits, limits
+
+    @staticmethod
+    def _split_recall_stage1_source_limits(
+        raw_candidate_limits: Dict[str, int],
+    ) -> Tuple[Dict[str, int], Dict[str, int]]:
+        """Split each Stage 1 raw budget between mapping and lexical search.
+
+        The two direct retrieval sources receive complementary halves. When a
+        budget is odd, lexical search receives the extra candidate so the two
+        limits never exceed the combined raw budget.
+        """
+        entity_mapping_limits: Dict[str, int] = {}
+        lexical_limits: Dict[str, int] = {}
+        for key, raw_limit in (raw_candidate_limits or {}).items():
+            normalized_limit = max(0, int(raw_limit or 0))
+            entity_limit = normalized_limit // 2
+            entity_mapping_limits[key] = entity_limit
+            lexical_limits[key] = normalized_limit - entity_limit
+        return entity_mapping_limits, lexical_limits
 
     @staticmethod
     def _recall_stage1_candidate_match_type(
@@ -5873,132 +5907,6 @@ class MemoryNodeManager:
             })
         return rows
 
-    def _recall_stage1_add_actionable_candidates(
-        self,
-        *,
-        candidates: List[Dict[str, Any]],
-        actionable_candidates: Sequence[Dict[str, Any]],
-        candidate_match_results: Dict[Tuple[str, str], Dict[str, Any]],
-        reference_time: str,
-    ) -> None:
-        """Add high-priority actionable items relevant to the query."""
-        for candidate in actionable_candidates:
-            if not self._recall_stage1_is_high_priority_actionable(
-                candidate,
-                reference_time=reference_time,
-            ):
-                continue
-            candidate_key = (
-                str(candidate.get("target_table") or ""),
-                str(candidate.get("target_id") or ""),
-            )
-            match = candidate_match_results.get(candidate_key) or {
-                "matched": False,
-                "match_type": "",
-                "anchor": "",
-                "rank_score": 0.0,
-                "strong_anchor": False,
-            }
-            if any(
-                str(existing.get("target_table")) == str(candidate.get("target_table"))
-                and int(existing.get("target_id") or -1) == int(candidate.get("target_id") or -2)
-                for existing in candidates
-            ):
-                continue
-            if match.get("strong_anchor"):
-                match_type = match["match_type"]
-                score = max(float(match.get("rank_score") or 0.0), 0.94)
-                anchor = match["anchor"]
-            else:
-                match_type = "high_priority_actionable"
-                score = 0.86
-                anchor = candidate.get("title") or candidate.get("summary_for_retrieval") or ""
-            item = dict(candidate)
-            item["_recall_fast_match_anchor"] = anchor
-            item["_recall_score"] = score
-            item["_recall_type_score"] = score
-            item["_recall_candidate_source"] = (
-                item.get("_recall_candidate_source") or "stage1_lexical"
-            )
-            item["_recall_fast_match_evidence"] = [match_type]
-            item["_recall_fast_matched_keywords"] = list(
-                match.get("matched_keywords") or []
-            )
-            candidates.append(item)
-
-    def _recall_stage1_add_contextual_candidates(
-        self,
-        *,
-        candidates: List[Dict[str, Any]],
-        fact_candidates: Sequence[Dict[str, Any]],
-        state_candidates: Sequence[Dict[str, Any]],
-        reference_time: str,
-    ) -> None:
-        """Add recent facts and active topics for contextual follow-ups.
-
-        Recent facts are the primary freshness signal because reflect may run
-        later than fact extraction. Existing topic states are added only when
-        they are active and tied to a recent fact (or have a recent update when
-        no evidence facts are available).
-        """
-        recent_fact_ids = {
-            int(candidate.get("target_id"))
-            for candidate in fact_candidates
-            if str(candidate.get("target_id") or "").isdigit()
-            and self._recall_stage1_is_recent_fact(
-                candidate,
-                reference_time=reference_time,
-            )
-        }
-
-        def append_if_new(
-            candidate: Dict[str, Any],
-            *,
-            match_type: str,
-            score: float,
-        ) -> None:
-            if any(
-                str(existing.get("target_table")) == str(candidate.get("target_table"))
-                and int(existing.get("target_id") or -1) == int(candidate.get("target_id") or -2)
-                for existing in candidates
-            ):
-                return
-            item = dict(candidate)
-            item["_recall_fast_match_anchor"] = (
-                item.get("title") or item.get("summary_for_retrieval") or ""
-            )
-            item["_recall_score"] = score
-            item["_recall_type_score"] = score
-            item["_recall_candidate_source"] = (
-                item.get("_recall_candidate_source") or "stage1_lexical"
-            )
-            item["_recall_fast_match_evidence"] = [match_type]
-            item["_recall_fast_matched_keywords"] = []
-            candidates.append(item)
-
-        for candidate in fact_candidates:
-            if self._recall_stage1_is_recent_fact(
-                candidate,
-                reference_time=reference_time,
-            ):
-                append_if_new(
-                    candidate,
-                    match_type="recent_fact_context",
-                    score=0.78,
-                )
-
-        for candidate in state_candidates:
-            if self._recall_stage1_is_recent_active_topic(
-                candidate,
-                reference_time=reference_time,
-                recent_fact_ids=recent_fact_ids,
-            ):
-                append_if_new(
-                    candidate,
-                    match_type="recent_active_topic",
-                    score=0.72,
-                )
-
     @staticmethod
     def _recall_candidate_source_channels(value: Any) -> set[str]:
         """Normalize prefixed candidate sources to retrieval channels."""
@@ -6013,6 +5921,237 @@ class MemoryNodeManager:
         return channels
 
     def _recall_stage1_calculate_candidate_matching_score(
+        self,
+        *,
+        candidates: Sequence[Dict[str, Any]],
+        query: str,
+        is_contextual_query: bool = False,
+        reference_time: Optional[str] = None,
+    ) -> Tuple[
+        List[Dict[str, Any]],
+        List[Dict[str, Any]],
+        List[Dict[str, Any]],
+    ]:
+        """Score, filter, and rank Stage 1 candidates by memory layer.
+
+        Contextual recency and actionable priority are score components here;
+        neither category bypasses the normal matching gate.
+        """
+        ranked_by_level: Dict[str, List[Dict[str, Any]]] = {
+            "fact": [],
+            "state": [],
+            "actionable_item": [],
+        }
+        for candidate in candidates or []:
+            match = self._recall_stage1_calculate_single_candidate_matching_score(
+                candidate,
+                query,
+            )
+            score_components = dict(match.get("score_components") or {})
+            index_level = str(candidate.get("index_level") or "")
+            effective_reference_time = (
+                reference_time or datetime.now(timezone.utc).isoformat()
+            )
+
+            if index_level == "actionable_item":
+                high_priority = self._recall_stage1_is_high_priority_actionable(
+                    candidate,
+                    reference_time=effective_reference_time,
+                )
+                high_priority_score = (
+                    self._clamp_float(
+                        self._memory_cfg.get(
+                            "recall_fast_high_priority_actionable_score",
+                            0.20,
+                        ),
+                        0.0,
+                        1.0,
+                        0.20,
+                    )
+                    if high_priority
+                    else 0.0
+                )
+                score_components["high_priority_actionable"] = round(
+                    high_priority_score,
+                    4,
+                )
+                if high_priority and match.get("match_type"):
+                    match.setdefault("evidence", []).append(
+                        "high_priority_actionable"
+                    )
+                    if not match.get("strong_anchor"):
+                        match["match_type"] = "high_priority_actionable"
+
+            if is_contextual_query and index_level in {"fact", "state"}:
+                if index_level == "fact":
+                    is_recent = self._recall_stage1_is_recent_fact(
+                        candidate,
+                        reference_time=effective_reference_time,
+                    )
+                else:
+                    is_recent = self._recall_stage1_is_recent_active_topic(
+                        candidate,
+                        reference_time=effective_reference_time,
+                    )
+                contextual_time_score = (
+                    self._clamp_float(
+                        self._memory_cfg.get(
+                            "recall_fast_contextual_time_score",
+                            0.20,
+                        ),
+                        0.0,
+                        1.0,
+                        0.20,
+                    )
+                    if is_recent
+                    else 0.0
+                )
+                score_components["contextual_recency"] = round(
+                    contextual_time_score,
+                    4,
+                )
+                if contextual_time_score and match.get("match_type"):
+                    match.setdefault("evidence", []).append(
+                        "contextual_recency"
+                    )
+
+            rank_score = min(1.0, sum(score_components.values()))
+            if score_components:
+                match["score_components"] = score_components
+                match["rank_score"] = round(rank_score, 4)
+                candidate_min_score = self._clamp_float(
+                    match.get("candidate_score_threshold"),
+                    0.0,
+                    1.0,
+                    0.35,
+                )
+                match["candidate_score_passed"] = bool(
+                    match.get("strong_anchor")
+                    or (
+                        bool(match.get("match_type"))
+                        and rank_score >= candidate_min_score
+                    )
+                )
+                match["matched"] = bool(
+                    match.get("match_type")
+                    and match.get("candidate_score_passed")
+                )
+                if not match["matched"] and match.get("filter_reason") == "":
+                    match["filter_reason"] = "candidate_score_below_threshold"
+            candidate["_recall_fast_match_anchor"] = match.get("anchor") or ""
+            candidate["_recall_score"] = match.get("rank_score", 0.0)
+            candidate["_recall_type_score"] = match.get("rank_score", 0.0)
+            candidate["_recall_candidate_source"] = (
+                candidate.get("_recall_candidate_source") or "stage1_lexical"
+            )
+            candidate["_recall_fast_match_evidence"] = list(
+                match.get("evidence") or []
+            )
+            candidate["_recall_fast_matched_keywords"] = list(
+                match.get("matched_keywords") or []
+            )
+            candidate["_recall_fast_match_details"] = dict(match)
+            accepted = bool(
+                match.get("matched")
+                and match.get("candidate_score_passed", False)
+            )
+            candidate["_recall_decision"] = {
+                "accepted": accepted,
+                "decision_reason": (
+                    "accepted"
+                    if accepted
+                    else str(match.get("filter_reason") or "not_matched")
+                ),
+            }
+            if not (
+                match.get("matched")
+                and match.get("candidate_score_passed", False)
+            ):
+                continue
+            level = str(candidate.get("index_level") or "")
+            if level in ranked_by_level:
+                ranked_by_level[level].append(candidate)
+
+        def rank_key(item: Dict[str, Any]) -> Tuple[float, str, int]:
+            return (
+                float(item.get("_recall_score") or 0.0),
+                str(item.get("time_start") or ""),
+                int(item.get("target_id") or 0),
+            )
+
+        for candidates_for_level in ranked_by_level.values():
+            candidates_for_level.sort(key=rank_key, reverse=True)
+        return (
+            ranked_by_level["fact"],
+            ranked_by_level["state"],
+            ranked_by_level["actionable_item"],
+        )
+
+    def _recall_stage1_select_candidates_by_layer(
+        self,
+        *,
+        ranked_fact_candidates: Sequence[Dict[str, Any]],
+        ranked_state_candidates: Sequence[Dict[str, Any]],
+        ranked_actionable_items: Sequence[Dict[str, Any]],
+        layer_limits: Dict[str, int],
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+        """Select already-ranked candidates with per-layer preferred limits."""
+        candidates_by_layer: Dict[str, Sequence[Dict[str, Any]]] = {
+            "fact": ranked_fact_candidates,
+            "state": ranked_state_candidates,
+            "actionable_item": ranked_actionable_items,
+        }
+        selected_candidates: List[Dict[str, Any]] = []
+        seen_targets: set[Tuple[str, int]] = set()
+        max_selected_candidates = max(1, sum(layer_limits.values()))
+
+        def append_candidate(candidate: Dict[str, Any]) -> bool:
+            try:
+                target = (
+                    str(candidate.get("target_table") or ""),
+                    int(candidate.get("target_id")),
+                )
+            except (TypeError, ValueError):
+                return False
+            if target in seen_targets or len(selected_candidates) >= max_selected_candidates:
+                return False
+            seen_targets.add(target)
+            selected_candidates.append(candidate)
+            return True
+
+        selected_by_layer: Dict[str, int] = {
+            layer: 0 for layer in layer_limits
+        }
+        for layer, limit in layer_limits.items():
+            for candidate in candidates_by_layer.get(layer, []):
+                if selected_by_layer[layer] >= limit:
+                    break
+                if append_candidate(candidate):
+                    selected_by_layer[layer] += 1
+
+        # Reuse empty layer quota so a missing layer does not reduce the
+        # available output capacity. The first pass enforces each layer's
+        # preferred limit; this pass can use unused capacity from another
+        # layer until the global sum of layer limits is reached.
+        for layer in layer_limits:
+            for candidate in candidates_by_layer.get(layer, []):
+                if len(selected_candidates) >= max_selected_candidates:
+                    break
+                if append_candidate(candidate):
+                    selected_by_layer[layer] += 1
+            if len(selected_candidates) >= max_selected_candidates:
+                break
+        selected_by_layer = {
+            layer: sum(
+                1
+                for candidate in selected_candidates
+                if str(candidate.get("index_level") or "") == layer
+            )
+            for layer in layer_limits
+        }
+        return selected_candidates, selected_by_layer
+
+    def _recall_stage1_calculate_single_candidate_matching_score(
         self,
         candidate: Dict[str, Any],
         query: str,
@@ -6774,7 +6913,7 @@ class MemoryNodeManager:
         """
         stage_started_at = time.monotonic()
         self._log_info("memory_recall_stage2", "start", {
-            "query": self._log_text(query, limit=500),
+            "query": self._format_log_text(query, limit=500),
             "top_k": top_k,
             "budget": budget,
             "time_start": (temporal_bounds or (None, None))[0],
@@ -6819,7 +6958,11 @@ class MemoryNodeManager:
             entities=llm_entities,
         )
         ranking_terms = list(dict.fromkeys([
-            *self._lexical_search_terms_for_text(query, limit=32),
+            *self._lexical_search_terms_for_text(
+                query,
+                limit=32,
+                preserve_phrase=False,
+            ),
             *supplement_terms,
         ]))
         retrieval_text = (
@@ -6850,8 +6993,8 @@ class MemoryNodeManager:
             "entities": llm_entities,
             "supplement_terms": supplement_terms,
             "ranking_terms": ranking_terms,
-            "retrieval_text": self._log_text(retrieval_text, limit=500),
-            "embedding_text": self._log_text(query_identity_text, limit=500),
+            "retrieval_text": self._format_log_text(retrieval_text, limit=500),
+            "identity_text": self._format_log_text(query_identity_text, limit=500),
             "query_embedding_available": query_identity_embedding is not None,
             "final_candidate_limits": final_candidate_limits,
             "supplement_candidate_limits": supplement_candidate_limits,
@@ -6894,7 +7037,10 @@ class MemoryNodeManager:
                 source_types=forced_source_types,
                 temporal_bounds=temporal_bounds,
                 temporal_mode=temporal_mode,
-                candidate_limit=max(12, min(48, top_k * 4)),
+                candidate_limits={
+                    key: max(12, min(48, top_k * 4))
+                    for key in ("facts", "states", "actionable_items")
+                },
                 database=database,
             ) if new_llm_entities else ([], [], [])
         )
@@ -7143,7 +7289,7 @@ class MemoryNodeManager:
         source_types: Optional[Sequence[str]],
         temporal_bounds: RecallTimeBounds,
         temporal_mode: str,
-        candidate_limit: int,
+        candidate_limits: Dict[str, int],
         database: Optional[SessionDB] = None,
     ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
         """Retrieve direct memory candidates through query-matched entities."""
@@ -7166,21 +7312,32 @@ class MemoryNodeManager:
             "state": [],
             "actionable_item": [],
         }
+        raw_limit_keys = {
+            "fact": "facts",
+            "state": "states",
+            "actionable_item": "actionable_items",
+        }
         for mapping in mappings:
             for field, level in (
                 ("fact_id", "fact"),
                 ("state_id", "state"),
                 ("actionable_item_id", "actionable_item"),
             ):
+                level_limit = max(
+                    0,
+                    int(candidate_limits.get(raw_limit_keys[level], 0) or 0),
+                )
+                if len(ids_by_level[level]) >= level_limit:
+                    continue
                 for value in mapping.get(field) or []:
                     try:
                         target_id = int(value)
                     except (TypeError, ValueError):
                         continue
+                    if len(ids_by_level[level]) >= level_limit:
+                        break
                     if target_id not in ids_by_level[level]:
                         ids_by_level[level].append(target_id)
-                    if len(ids_by_level[level]) >= max(1, int(candidate_limit or 1)):
-                        break
 
         facts = db.memory_facts_by_ids(ids_by_level["fact"])
         states = db.memory_states_by_ids(ids_by_level["state"])
@@ -7884,7 +8041,13 @@ class MemoryNodeManager:
             if len(terms) >= 32:
                 break
         if len(terms) < 32:
-            add_terms(self._lexical_search_terms_for_text(query, limit=32))
+            add_terms(
+                self._lexical_search_terms_for_text(
+                    query,
+                    limit=32,
+                    preserve_phrase=False,
+                )
+            )
         return terms
 
     def _lexical_search_terms_for_text(
@@ -7892,6 +8055,7 @@ class MemoryNodeManager:
         text: Any,
         *,
         limit: int = 32,
+        preserve_phrase: bool = True,
     ) -> List[str]:
         """Tokenize one lexical value for the database FTS contract.
 
@@ -7932,7 +8096,7 @@ class MemoryNodeManager:
                 token for token in regular_tokens
                 if token and re.search(r"[0-9a-zA-Z\u4e00-\u9fff]", token)
             ]
-            if len(regular_tokens) > 1:
+            if preserve_phrase and len(regular_tokens) > 1:
                 add(" ".join(regular_tokens))
             for token in regular_tokens:
                 add(token)
@@ -7940,13 +8104,17 @@ class MemoryNodeManager:
                 add(token)
             return values
 
+        if preserve_phrase and not chinese_text:
+            add(clean_text)
+
         # Minimal-install fallback: keep the complete Chinese run and the
         # same bigram coverage used by the legacy lexical path.
         for token in re.findall(
             r"[A-Za-z][A-Za-z0-9_.$'-]*|\d+(?:/\d+)?|[\u4e00-\u9fff]+",
             clean_text,
         ):
-            add(token)
+            if preserve_phrase or not re.fullmatch(r"[\u4e00-\u9fff]+", token):
+                add(token)
             if re.fullmatch(r"[\u4e00-\u9fff]+", token):
                 for index in range(len(token) - 1):
                     add(token[index : index + 2])
@@ -8318,7 +8486,11 @@ class MemoryNodeManager:
     ) -> str:
         terms = list(keywords or [])
         if not terms:
-            terms = self._lexical_search_terms_for_text(query, limit=32)
+            terms = self._lexical_search_terms_for_text(
+                query,
+                limit=32,
+                preserve_phrase=False,
+            )
         parts = [str(query or "").strip()]
         if retrieval_text and str(retrieval_text).strip() != str(query or "").strip():
             parts.append(f"retrieval: {str(retrieval_text).strip()}")
