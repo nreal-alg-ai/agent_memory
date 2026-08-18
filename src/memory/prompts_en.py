@@ -1,5 +1,28 @@
 """English prompt templates for the unified memory prototype."""
 
+MEMORY_RETRIEVED_FORMAT_PROMPT_EN = """[Unified Memory]
+System note: Memories are grouped by semantic role. States and actionable items provide compact summaries; facts provide traceable evidence.
+System note: For facts, dialogue_time is when the conversation/transcript discussed the fact, while event_time is when the real-world event described by the fact occurred. They are different fields; an unknown event_time must not be inferred from dialogue_time.
+{memory_sections}"""
+
+MEMORY_RETRIEVED_SECTION_SPECS_EN = (
+    (
+        "[Long-term States]",
+        "These are evolving state projections derived from memory facts. Treat them as summarized context, not direct user quotations.",
+        "state",
+    ),
+    (
+        "[Actionable Items]",
+        "These are decisions, tasks, commitments, risks, or open questions that may require follow-up.",
+        "actionable_item",
+    ),
+    (
+        "[Retrieved Facts]",
+        "These are ranked narrative facts retrieved directly from memory_facts.",
+        "fact",
+    ),
+)
+
 ENTITY_EXTRACTION_GUIDANCE_EN = """Entity extraction rules:
 
 Entities are not limited to traditional named entities. In this memory system, an entity is a semantic anchor that can be reused across facts for clustering, retrieval, and graph construction.
@@ -105,9 +128,21 @@ Core Hindsight-style narrative fact requirements:
 - Each fact must naturally include the five dimensions in its text: what (complete event/topic/plan/conclusion), when (conversation timestamp or explicit time anchor), where (location/setting/platform/project scope; if absent, say no specific location/setting was mentioned), who (user, assistant, and other key people/organizations with their roles), and why (explicit reason, motivation, concern, disagreement, constraint, implication, conclusion, or follow-up).
 - For a roughly five-turn dialogue batch or a coherent multi-speaker transcript segment, usually produce 1-3 facts. Only split when the batch truly contains multiple unrelated events/topics. In most cases, do not exceed 5 facts.
 
+fact_type classification:
+- `semantic` is reusable stable knowledge or long-term information that does not depend on one particular experience, such as project structure, concept definitions, system conventions, common knowledge, a user's long-term preference, a persistent instruction, or a durable constraint. It describes what is generally true or remains valid across conversations.
+- `episodic` is a concrete experience or event that happened at a particular time, such as the user making a request in one turn, the assistant modifying or testing something, one failure or success, a decision made at a point in time, a state change, or an emotional reaction. It describes what happened on that occasion; it can still be episodic even when it concerns a long-running project.
+- The key test is whether the fact depends on one particular experience to be true, not whether its topic is long-running, important, or potentially useful later. One-off requests, recommendations, modifications, test results, decisions, and risk events are `episodic` by default. Use `semantic` only when the evidence supports knowledge or a pattern that is stable and reusable across contexts and time.
+- Do not label a fact `semantic` merely because its fact_kind is preference, risk, or decision. A preference expressed in one situation, a temporary risk, or a single decision remains `episodic`; a repeatedly observed or explicitly long-term preference, constraint, or instruction may be `semantic`.
+
 Temporal fidelity requirements:
 - Preserve sequence and ordering expressions exactly when they affect meaning: first, first time, second, previous, next, later, earlier, before, after, once, again, subsequent, prior, last, most recent, and similar wording. Do not paraphrase away order. For example, keep "serviced for the first time on March 15" rather than reducing it to "had a good service experience".
-- Preserve relative time expressions in text and keywords: yesterday, last Saturday, previous week, two months ago, about a month ago, mid-February, recently, shortly after, and similar phrases. If the expression is tied to a known Conversation timestamp, also write the resolved date or conservative date range into occurred_start/occurred_end.
+- Preserve relative time expressions in text and keywords: yesterday, last Saturday, previous week, two months ago, about a month ago, mid-February, recently, shortly after, and similar phrases. If the expression can be resolved unambiguously from the Conversation timestamp, write the resolved real-world event time directly into `event_time_key`.
+- The `Time` shown for each segment is the dialogue/transcript timestamp. It is only the reference anchor for resolving relative event times, not the default event time for the fact. Derive `event_time_key` from the specific event described by the fact and the temporal evidence in the text; do not copy the dialogue timestamp merely because the event was discussed at that time.
+- `event_time_key` is the most representative real-world occurrence time or temporal anchor for the event described by the fact. It is not the dialogue time, extraction time, or current system time. It is a single time field; do not output an event end time, interval, or additional start/end time fields.
+- Use this priority when deriving time: explicit absolute date/time in the evidence > a relative expression that can be resolved unambiguously from the segment `Time` > an event explicitly described as happening during the current conversation. For example, with dialogue time 2023-05-30, `last month (around April 2023)` should resolve to a representative time around 2023-04 rather than 2023-05-30; `last weekend (May 27-28)` should use a representative time around 2023-05-27; only an event explicitly described as decided/completed today should use 2023-05-30.
+- If a fact describes both a current conversational act and an earlier background event, use the time of the event the fact primarily describes; split the fact when necessary instead of allowing the dialogue timestamp to overwrite the earlier event time. If only a month, weekend, or relative period is supported, preserve the original expression in text/keywords and use a conservative representative time anchor in `event_time_key`.
+- Prefer explicit dates, times, weekdays, and relative time expressions from the evidence. Resolve a relative expression to an absolute time only when the current segment `Time` makes the resolution unambiguous; otherwise do not guess, leave `event_time_key` empty, and set `time_confidence` to `unknown`. Never fabricate an event time from the dialogue timestamp, current time, or extraction time.
+- If one fact contains multiple events with different times, split them into separate facts instead of using one event time to hide unrelated events.
 - If an event's answerability depends on temporal order, the fact text must include both the event object and the time anchor or order marker. Do not store only the topic name.
 - If multiple events in the batch may later be compared by before/after/first/which happened earlier, either keep them in one narrative fact that explicitly states their relative order, or split them into separate complete facts with their own time anchors. Avoid keeping only one side of a comparison.
 - Personal events mentioned as side context remain important when they include time anchors or ordering words, such as purchases, service/maintenance, repairs, appointments, attendance, travel, meetings, tests, failures, and decisions.
@@ -121,13 +156,12 @@ Rules:
 6. Use only the dialogue evidence. Do not invent completion, intent, or reasons.
 7. Keep assistant recommendations that contain concrete future-answerable items inside the relevant exchange narrative, and include whether the user accepted, rejected, hesitated, or added constraints when supported.
 8. priority is 0-100. Keep only facts worth at least 60.
-9. fact_type must be semantic or episodic.
-10. fact_subject must be user, assistant, world, project, system, or other.
-11. fact_kind must be preference, decision, request, recommendation, action, commitment, open_question, risk, error, context, instruction, or other.
-12. Do not output short facts like "the user said X" or "the assistant suggested Y". If deleting the topic background, reason, disagreement, or conclusion would make the text a vague short note, add those details back; if the dialogue does not support them, omit the fact.
-13. Do not store assistant pleasantries, generic closings, or low-information encouragement as standalone facts, e.g. "hope this helps", "let me know if you have other questions", "okay", or "you're welcome", unless they explicitly change a decision, commitment, or next step.
-14. keywords must be short retrieval terms: entities, topics, symptoms, plans, constraints, decisions, and important time/order anchors. For time-sensitive facts, include the original or resolved time phrase such as "March 15 2023", "first service", "3/22", "last Saturday", or "two months ago". Do not put full sentences, pleasantries, filler, generic encouragement, or phrases like "hope this method helps you" into keywords.
-15. Return JSON only. No markdown.
+9. fact_type must be semantic or episodic, using the stable-knowledge/long-term-information versus one-specific-event boundary above.
+10. fact_kind must be preference, decision, request, recommendation, action, commitment, open_question, risk, error, context, instruction, or other.
+11. Do not output short facts like "the user said X" or "the assistant suggested Y". If deleting the topic background, reason, disagreement, or conclusion would make the text a vague short note, add those details back; if the dialogue does not support them, omit the fact.
+12. Do not store assistant pleasantries, generic closings, or low-information encouragement as standalone facts, e.g. "hope this helps", "let me know if you have other questions", "okay", or "you're welcome", unless they explicitly change a decision, commitment, or next step.
+13. keywords must be short retrieval terms: entities, topics, symptoms, plans, constraints, decisions, and important time/order anchors. For time-sensitive facts, include the original or resolved time phrase such as "March 15 2023", "first service", "3/22", "last Saturday", or "two months ago". Do not put full sentences, pleasantries, filler, generic encouragement, or phrases like "hope this method helps you" into keywords.
+14. Return JSON only. No markdown.
 
 state_aspects rules:
 - `fact_kind` remains the primary semantic type of the fact. `state_aspects` are projection slices showing how this fact can contribute to multiple entity_state types.
@@ -161,13 +195,11 @@ Output schema:
       "primary_entity": {"name": "the single primary entity of this fact", "type": "PERSON|ORGANIZATION|LOCATION|PRODUCT|PROJECT|TECHNOLOGY|CONCEPT|TOPIC|PREFERENCE|OTHER"},
       "fact_root_topic": "stable product/project/long-running issue root topic",
       "fact_aspect_topic": "specific aspect discussed by this fact",
-      "fact_type": "semantic|episodic",
-      "fact_subject": "user|assistant|world|project|system|other",
+      "fact_type": "semantic|episodic; semantic=reusable stable knowledge or long-term information, episodic=an event or state change tied to a specific experience",
       "fact_kind": "preference|decision|request|recommendation|action|commitment|open_question|risk|error|context|instruction|other",
       "priority": 80,
-      "occurred_start": "",
-      "occurred_end": "",
-      "time_confidence": "explicit|inferred_from_turn|unknown",
+      "event_time_key": "real-world event occurrence time or representative temporal anchor derived from the dialogue time anchor and fact content; empty when it cannot be determined",
+      "time_confidence": "explicit|inferred_from_turn|unknown; explicit evidence, resolved from the segment Time and a relative expression, or undetermined",
       "where": "",
       "state_aspects": [
         {
@@ -197,69 +229,23 @@ Dialogue/transcript evidence batch:
 {dialogue_batch}
 """
 
-
-UNIFIED_STATE_UPDATE_PROMPT_EN = """You are the state update module for a unified AI-glasses long-term memory system inspired by MemPalace.
-
-The input contains newly stored narrative facts and the current long-term states. Your task is to update or create compact evolving states that help future recall. A state is not a copy of one fact. It should summarize stable preferences, recurring behavior, durable constraints, persistent risks, important relationships, or topic-level situations across multiple facts.
-
-Boundary rules:
-- Topic, project, and issue progress belong in topic_state. Do not create a separate project-style state.
-- Concrete tasks, decisions, commitments, reminders, and open questions belong in actionable_item. Do not create task-style or commitment-style states.
-- state_scope must be topic_state or entity_state; topic_state always uses state_type topic.
-- Output a state only when the information should remain useful as durable memory. Do not output a state for a one-off task or commitment.
-
-Rules:
-1. Create or update only states that are useful beyond the current episode.
-2. Do not create a state from a single trivial fact unless it is a durable preference, long-running constraint, persistent risk, or important life/project context.
-3. Merge facts about the same durable subject into one state instead of creating near-duplicates.
-4. Preserve uncertainty and recent changes. If evidence conflicts, explicitly state the conflict.
-5. Use evidence_fact_ids to cite the fact IDs that support the state.
-6. state_type must be one of: topic, preference, profile, routine, relationship, constraint, risk.
-7. importance is 0-1. confidence is 0-1.
-8. Return JSON only. No markdown.
-
-Output schema:
-{
-  "states": [
-    {
-      "state_scope": "topic_state|entity_state",
-      "state_type": "topic|preference|profile|routine|relationship|constraint|risk",
-      "canonical_name": "stable short name",
-      "summary": "self-contained evolving state",
-      "evidence_fact_ids": [1, 2],
-      "keywords": ["keyword1", "keyword2"],
-      "entities": ["entity1", "entity2"],
-      "canonical_topics": ["topic1"],
-      "importance": 0.8,
-      "confidence": 0.85,
-      "status": "active|stable|resolved|uncertain"
-    }
-  ]
-}
-
-Existing states:
-{existing_states}
-
-New facts:
-{facts}
-"""
-
-
 UNIFIED_TOPIC_STATE_UPDATE_PROMPT_EN = """You are the topic_state update module for a unified AI-glasses long-term memory system inspired by MemPalace.
 
-The input has already passed topic resolution: the system has decided that these facts belong to a long-term topic, or that a new long-term topic should be created. Your task is to update that topic_state summary, not to re-route the topic.
+Topic resolution has already been completed: the system decided that the candidate evidence belongs to one durable root topic, or that a new root topic should be created. Use candidate_topic_state and the existing topic_state to update the root topic_state summary; do not re-route the topic.
 
 Rules:
-1. The given canonical_topic is the root topic. Update only that root topic and do not merge unrelated facts.
-2. Do not create a separate topic_state for each aspect; return concrete aspects as local progress under the root topic.
-3. The summary should describe the durable root state: background, recent changes, key participants, decisions/preferences/constraints that still matter, unresolved questions, and next steps.
-4. If existing_topic_state is present, merge incrementally instead of concatenating. Preserve durable information that is still valid.
-5. Do not rewrite one fact into another fact. A topic_state must be more abstract and stable than individual facts.
-6. summary must be a concise current-state snapshot: at most 1-2 sentences and preferably no more than 80 English words. Do not append the historical timeline or every aspect to summary.
-7. Return only evidence-supported aspects from the input. Each aspect should include a name, current progress summary, and status.
-8. time_line_updates must contain only changes supported by the new facts, with 0-3 events. Each event must include time, change_type, a short change summary, and fact_ids. Do not repeat existing timeline events or record unchanged information.
-9. evidence_fact_ids must cite supporting fact IDs from the input facts.
-10. Return JSON only. No markdown.
+1. `candidate_topic_state.root_topic_name` is the stable root topic. Update only that root topic; do not merge content that merely shares an entity or broad domain.
+2. `aspect_topics` are concrete aspects under the root topic. Use them to understand local progress, but do not create a separate topic_state for every aspect.
+3. `parent_topics` are auxiliary episode-level or higher-level context. Use them only when relevant to the root topic; they must not override a more accurate root_topic_name.
+4. `identity_text`, `keywords`, `context_entities`, and `fact_summaries` are aggregated identity and evidence fields. Use specific, repeated, or concluded information from them, but do not copy identity_text verbatim or dump every keyword and entity into the summary.
+5. `fact_ids` are the available evidence IDs. Cite only IDs that are actually supported by the candidate content; never infer facts from an ID.
+6. The summary should describe the durable root state: background, recent changes, key participants, decisions/preferences/constraints that still matter, unresolved questions, and next steps.
+7. If existing_topic_state is present, merge incrementally instead of concatenating. Preserve durable information that is still valid.
+8. Do not rewrite one fact into another fact. A topic_state must be more abstract and stable than an individual fact.
+9. summary must be a concise current-state snapshot: at most 1-2 sentences and preferably no more than 80 English words. Do not append the historical timeline or every aspect to summary.
+10. time_line_updates must contain only changes supported by candidate_topic_state, with 0-3 events. Each event must include time, change_type, a short change summary, and fact_ids. Do not repeat existing timeline events or record unchanged information.
+11. evidence_fact_ids must come from candidate_topic_state.fact_ids and cite only facts that support this update.
+12. Return JSON only. No markdown.
 
 Output schema:
 {
@@ -290,14 +276,23 @@ Output schema:
   "status": "active|stable|resolved|uncertain"
 }
 
-canonical_topic:
-{canonical_topic}
+candidate_topic_state:
+{candidate_topic_state}
+
+candidate_topic_state field descriptions and usage:
+- `root_topic_name`: the stable root topic this state belongs to. Do not turn an aspect or unrelated episode topic into a new root topic.
+- `topic_key`: the stable internal root-topic key. Use it only to confirm identity; do not write it into summary, canonical_name, or timeline.
+- `identity_text`: an aggregated identity text containing the root topic, aspects, keywords, entities, and fact summaries. Use it for holistic topic understanding; do not copy it verbatim as the state summary.
+- `aspect_topics`: concrete aspects such as platform selection, budget constraints, or plan progress. They are context under the root topic, not necessarily independent states.
+- `parent_topics`: higher-level episode context. Use it only when it helps explain the root topic and never let it override root_topic_name.
+- `keywords`: aggregated retrieval anchors from the related facts. Use them to identify concrete objects, actions, outcomes, and constraints; do not list generic words in the summary.
+- `context_entities`: semantic entities from the related facts. Use them to confirm people, products, projects, or objects only when they matter to the root state.
+- `fact_summaries`: compressed summaries of the related facts and the main evidence for the candidate update. Extract only content directly relevant and durable for the root topic.
+- `fact_ids`: IDs corresponding to the summaries. Use them only for evidence_fact_ids and time_line_updates[].fact_ids.
+- `source_type`: provenance of the candidate; treat it as context, not topic content.
 
 existing_topic_state:
 {existing_topic_state}
-
-new facts:
-{facts}
 """
 
 
@@ -350,11 +345,21 @@ Output schema:
 entity_state_target:
 {entity_state_target}
 
+entity_state_target field descriptions and usage:
+- `entity`: the entity described by this update. All summary, canonical_name, and time_line_updates content must be about this entity. Do not assign the state to another entity that is only mentioned as background or context.
+- `entity_key`: the stable internal identity key for the entity. Use it only to confirm that the candidate and existing_entity_state refer to the same entity. It is not natural-language content and must not be copied into summary, canonical_name, or the timeline.
+- `state_type`: the entity_state type that this update is allowed to modify. Stay within this type; do not switch to preference, profile, routine, relationship, constraint, or risk merely because the candidate also touches another aspect.
+- `attribute_name`: the specific attribute represented by this candidate and the main semantic boundary of the update. The summary must explain what this attribute means long-term for the entity, rather than summarizing the whole dialogue or a topic_state.
+- `attribute_key`: the stable internal key for the attribute. Use it to help confirm attribute identity, but do not copy it into summary or canonical_name.
+- `attribute_name_aliases`: alternative or historical names for the same attribute. Use them when deciding whether existing_entity_state describes the same attribute, but do not mechanically concatenate all aliases into the output. If the existing state describes a different attribute, return `update_needed=false`.
+- `state_aspect_summaries`: aspects already extracted from the candidate facts that contribute to this entity_state type. Each `aspect_summary` describes only the contribution to this attribute, while `evidence_basis` explains why the current fact supports it. Prefer these fields when generating the summary and timeline; do not expand them into an unrelated topic summary.
+- `state_aspect_summaries[].fact_id`: the fact identifier supporting the aspect. Use it only to cite evidence in `evidence_fact_ids` and `time_line_updates[].fact_ids`; it is not semantic content and must not be used to infer facts from the number.
+- `state_aspect_summaries[].confidence`: the extraction confidence for the aspect. Use it to stay conservative; low-confidence or weakly supported aspects must not be expanded into new long-term conclusions.
+
+Processing principle: first use `entity` and `entity_key` to confirm the state owner, then use `state_type`, `attribute_name`, and the attribute aliases to establish the update boundary, and finally use `aspect_summary` and `evidence_basis` from `state_aspect_summaries` to produce the current state. Update only when the candidate aspect has durable value for this entity attribute. For one-off events, single recommendations, temporary requests, or topic-only progress, return `update_needed=false`. When existing_entity_state refers to the same entity and attribute, merge the candidate incrementally while preserving the existing long-term conclusion. If the attribute is different, do not force a merge.
+
 existing_entity_state:
 {existing_entity_state}
-
-new facts:
-{facts}
 """
 
 
@@ -405,10 +410,10 @@ Candidate facts:
 
 RECALL_QUERY_ANALYSIS_PROMPT_EN = """You are the recall query analyzer for the AI-glasses long-term memory system.
 
-Understand the memory structure before analyzing the query. The default recall path does not use the shared `memory_index_entries` table as its retrieval entry point. It searches the following raw memory tables directly, so do not treat "index" as an additional unified document layer.
+Understand the memory structure before analyzing the query. 
 
 Memory structure:
-1. `memory_facts` / fact: traceable, self-contained narrative facts extracted from one conversation episode or all-day transcript. They preserve what happened, participants, time, place or scene, reasons, viewpoint changes, suggestions, acceptance or rejection, constraints, conclusions, and unresolved questions. A fact may contain an explicitly stated preference, routine, profile detail, risk, or constraint, but it remains current conversational evidence rather than a cross-episode long-term summary. Facts usually include `fact_type`, `fact_kind`, `fact_subject`, `summary`, `keywords`, `entities`, `fact_root_topic`, `fact_aspect_topic`, and `time_key`.
+1. `memory_facts` / fact: traceable, self-contained narrative facts extracted from one conversation episode or all-day transcript. They preserve what happened, participants, time, place or scene, reasons, viewpoint changes, suggestions, acceptance or rejection, constraints, conclusions, and unresolved questions. A fact may contain an explicitly stated preference, routine, profile detail, risk, or constraint, but it remains current conversational evidence rather than a cross-episode long-term summary. Facts usually include `fact_type`, `fact_kind`, `primary_entity`, `summary`, `keywords`, `entities`, `fact_root_topic`, `fact_aspect_topic`, `event_time_key`, and `dialogue_time_key`.
 2. `memory_states` / state: durable evolving projections updated from multiple facts, not raw dialogue quotations. It contains:
    - `topic_state`: the root state for a project, product, topic, or long-running issue, containing overall background, progress, decisions, constraints, risks, and unresolved issues; fine-grained aspects such as "livestream platform selection" or "gift plan" are stored as root-state context and retrieval aliases and do not necessarily become separate states.
    - `entity_state`: durable properties of an entity, including preference, routine, profile, relationship, constraint, and risk.
@@ -427,6 +432,7 @@ Guidance:
 - Output 1-3 values in `layer_preference`, chosen from `fact`, `state`, and `actionable_item`. It identifies layers to prioritize; it is not a new database table.
 - Extract 2-8 short retrieval keywords, prioritizing concrete people, organizations, products, projects, topics, actions, outcomes, constraints, and time anchors. Do not output full sentences, pleasantries, or generic words.
 - Extract useful semantic entities with names and types. Entities may be people, organizations, locations, products, projects, technologies, or concrete concepts; ordinary time expressions such as today, yesterday, or last week are not entities.
+- `temporal_mode` selects which fact timestamp should be used for a time range: `event_time` means the real-world event time described by the fact, `dialogue_time` means when the conversation/transcript occurred, `both` means either timestamp may match, and `none` means no hard time filter. Prefer `event_time` for queries asking what happened, was done, bought, or visited; prefer `dialogue_time` for queries asking what was discussed, mentioned, or asked; use `none` when the temporal intent is unclear.
 
 Return JSON only:
 {
@@ -435,7 +441,8 @@ Return JSON only:
   "needs_broad_evidence": false,
   "query_rewrite": "retrieval-focused rewrite over raw memory tables",
   "keywords": ["keyword1", "keyword2"],
-  "entities": [{"name": "entity name", "type": "PERSON|ORGANIZATION|LOCATION|PRODUCT|PROJECT|TECHNOLOGY|CONCEPT|OTHER"}]
+  "entities": [{"name": "entity name", "type": "PERSON|ORGANIZATION|LOCATION|PRODUCT|PROJECT|TECHNOLOGY|CONCEPT|OTHER"}],
+  "temporal_mode": "event_time|dialogue_time|both|none"
 }
 
 User query:

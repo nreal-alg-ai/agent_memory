@@ -9,15 +9,7 @@ internal model is deliberately unified:
 2. Extracted evidence becomes narrative `memory_facts`.
 3. Longer-running preferences/topics/constraints can become `memory_states`.
 4. Concrete decisions/tasks/commitments become `memory_actionable_items`.
-5. Every retrievable object writes a `memory_index_entries` card. The cards are
-   retained as an optional future directory, while the default recall path
-   searches the raw facts/states/actionable-items tables directly.
 
-The current recall path searches the raw memory tables first. The shared
-`memory_index_entries` layer remains available for a future optional retrieval
-mode, but it is not a hard gate for recall.
-
-This file intentionally avoids ASR dependencies.
 """
 
 from __future__ import annotations
@@ -37,10 +29,17 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 import numpy as np
 import requests
 
+try:
+    import jieba
+except ImportError:  # pragma: no cover - exercised only in minimal installs
+    jieba = None
+
 from .embedding_client import EmbeddingClient
 from .memory_database import SessionDB
 from .prompts_en import (
     EPISODE_SUMMARY_PROMPT_EN,
+    MEMORY_RETRIEVED_FORMAT_PROMPT_EN,
+    MEMORY_RETRIEVED_SECTION_SPECS_EN,
     RECALL_QUERY_ANALYSIS_PROMPT_EN,
     UNIFIED_ACTIONABLE_ITEM_EXTRACTION_PROMPT_EN,
     UNIFIED_ENTITY_STATE_UPDATE_PROMPT_EN,
@@ -49,6 +48,8 @@ from .prompts_en import (
 )
 from .prompts_zh import (
     EPISODE_SUMMARY_PROMPT_ZH,
+    MEMORY_RETRIEVED_FORMAT_PROMPT_ZH,
+    MEMORY_RETRIEVED_SECTION_SPECS_ZH,
     RECALL_QUERY_ANALYSIS_PROMPT_ZH,
     UNIFIED_ACTIONABLE_ITEM_EXTRACTION_PROMPT_ZH,
     UNIFIED_ENTITY_STATE_UPDATE_PROMPT_ZH,
@@ -56,7 +57,7 @@ from .prompts_zh import (
     UNIFIED_TOPIC_STATE_UPDATE_PROMPT_ZH,
 )
 
-logger = logging.getLogger(__name__)
+RecallTimeBounds = Optional[Tuple[Optional[str], Optional[str]]]
 
 DEFAULT_LLM_BASE_URL = "https://api.deepseek.com/v1"
 DEFAULT_LLM_MODEL = "deepseek-v4-flash"
@@ -180,10 +181,6 @@ def _to_timestamp_text(value: Any) -> str:
 
 def _compact_whitespace(text: str) -> str:
     return re.sub(r"\s+", " ", str(text or "")).strip()
-
-
-def _json_safe(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True)
 
 
 class MemoryOperationReporter:
@@ -447,8 +444,10 @@ class MemoryNodeManager:
         memory_manager_config: Optional[Dict[str, Any]] = None,
         llm_config: Optional[Dict[str, Any]] = None,
         operation_reporter: Optional[MemoryOperationReporter] = None,
+        logger: Optional[logging.Logger] = None,
     ) -> None:
         self._db = db
+        self._logger = logger or logging.getLogger(__name__)
         self._operation_reporter = operation_reporter or MemoryOperationReporter()
         self._embedding_cfg = dict(embedding_config or {})
         self._memory_cfg = dict(memory_manager_config or {})
@@ -471,8 +470,20 @@ class MemoryNodeManager:
             or self._memory_cfg.get("prompt_language_mode")
             or "source"
         )
-        self._enabled = bool(self._memory_cfg.get("memory_enabled", True))
+        self._memory_enabled = bool(self._memory_cfg.get("memory_enabled", True))
+        self._enable_memory_state_update = self._config_bool(
+            self._memory_cfg.get("enable_memory_state_update", True),
+            True,
+        )
+        self._enable_memory_actionable_item_update = self._config_bool(
+            self._memory_cfg.get("enable_memory_actionable_item_update", True),
+            True,
+        )
         self._top_k = int(self._memory_cfg.get("retrieval_top_k", 8) or 8)
+        self._recall_detailed_logging = self._config_bool(
+            self._memory_cfg.get("recall_detailed_logging", False),
+            False,
+        )
         self._recall_budget = str(self._memory_cfg.get("recall_budget", "mid") or "mid")
         self._recall_fact_min_embedding_similarity = self._clamp_float(
             self._memory_cfg.get("recall_fact_min_embedding_similarity"),
@@ -488,6 +499,18 @@ class MemoryNodeManager:
         )
         self._recall_actionable_item_min_embedding_similarity = self._clamp_float(
             self._memory_cfg.get("recall_actionable_item_min_embedding_similarity"),
+            0.0,
+            1.0,
+            0.35,
+        )
+        self._recall_fast_candidate_score_threshold = self._clamp_float(
+            self._memory_cfg.get("recall_fast_candidate_score_threshold"),
+            0.0,
+            1.0,
+            0.65,
+        )
+        self._recall_fast_candidate_min_score = self._clamp_float(
+            self._memory_cfg.get("recall_fast_candidate_min_score"),
             0.0,
             1.0,
             0.35,
@@ -639,7 +662,11 @@ class MemoryNodeManager:
 
     @property
     def enabled(self) -> bool:
-        return self._enabled
+        return self._memory_enabled
+
+    def set_logger(self, logger: Optional[logging.Logger]) -> None:
+        """Set the logger used by memory store, reflect, and recall operations."""
+        self._logger = logger or logging.getLogger(__name__)
 
     def _task_worker_loop(self) -> None:
         while not self._task_shutdown_event.is_set() or not self._task_queue.empty():
@@ -653,9 +680,9 @@ class MemoryNodeManager:
             try:
                 with self._memory_operation_lock:
                     if task_kind == "memory_store":
-                        result = self.process_memory_store_task(**task["payload"])
+                        result = self._process_memory_store_task(**task["payload"])
                     elif task_kind == "memory_reflect":
-                        result = self.process_memory_reflect_task(**task["payload"])
+                        result = self._process_memory_reflect_task(**task["payload"])
                     else:
                         raise ValueError(f"Unsupported memory async task: {task_kind}")
                 self._operation_reporter.on_task_finished(
@@ -665,7 +692,7 @@ class MemoryNodeManager:
                     result=result,
                 )
             except Exception as exc:
-                logger.exception("Async memory %s failed: %s", task.get("kind"), exc)
+                self._logger.exception("Async memory %s failed: %s", task.get("kind"), exc)
                 self._operation_reporter.on_task_finished(
                     operation_type=task_kind,
                     task_id=task_id,
@@ -694,7 +721,7 @@ class MemoryNodeManager:
         task_id = self._operation_reporter.next_task_id(task_kind)
         with self._task_worker_lock:
             if self._task_shutdown_event.is_set():
-                logger.warning("Memory worker is shut down; dropping %s task", task_kind)
+                self._logger.warning("Memory worker is shut down; dropping %s task", task_kind)
                 return self._reject_memory_task(
                     task_kind=task_kind,
                     task_id=task_id,
@@ -708,7 +735,7 @@ class MemoryNodeManager:
                     "started_at": time.monotonic(),
                 })
             except queue.Full:
-                logger.warning(
+                self._logger.warning(
                     "Memory task queue is full; dropping %s (maxsize=%d)",
                     task_kind,
                     self._task_queue_maxsize,
@@ -754,7 +781,7 @@ class MemoryNodeManager:
             "task_id": task_id,
             "operation_type": task_kind,
         }
-    
+
     def flush_task_queue(self, timeout: Optional[float] = None) -> bool:
         """Wait until all queued asynchronous memory tasks finish."""
         deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
@@ -785,10 +812,11 @@ class MemoryNodeManager:
         raw_segments: List[Dict[str, Any]],
         source_type: str,
         tags: List[str],
+        prompt_language: str,
     ) -> Dict[str, Any]:
         """Queue one normalized episode for ordered background storage."""
-        if not self._enabled or not raw_segments:
-            reason = "memory_disabled" if not self._enabled else "no_raw_segments"
+        if not self._memory_enabled or not raw_segments:
+            reason = "memory_disabled" if not self._memory_enabled else "no_raw_segments"
             task_id = self._operation_reporter.next_task_id("memory_store")
             return self._reject_memory_task(
                 task_kind="memory_store",
@@ -801,15 +829,17 @@ class MemoryNodeManager:
                 "raw_segments": raw_segments,
                 "source_type": source_type,
                 "tags": tags,
+                "prompt_language": prompt_language,
             },
         )
 
-    def process_memory_store_task(
+    def _process_memory_store_task(
         self,
         *,
         raw_segments: List[Dict[str, Any]],
         source_type: str,
         tags: List[str],
+        prompt_language: str,
     ) -> Dict[str, Any]:
         store_started_at = time.monotonic()
         episode_type = self._episode_type_for_source_type(source_type)
@@ -835,7 +865,10 @@ class MemoryNodeManager:
         episode_participants = self._parse_participants_from_raw_segments(raw_segments)
         episode_started_at = raw_segments[0].get("started_at") or _now_text()
         episode_ended_at = raw_segments[-1].get("ended_at") or episode_started_at
-        extracted_info = self._extract_memory_fact_from_raw_segments(raw_segments)
+        extracted_info = self._extract_memory_fact_from_raw_segments(
+            raw_segments,
+            prompt_language=prompt_language,
+        )
         episode_title = (
             _compact_whitespace(extracted_info.get("episode_title") or "")
             or self._fallback_generate_episode_title_from_raw_segments(raw_segments)
@@ -856,12 +889,19 @@ class MemoryNodeManager:
             facts=facts,
             source_type=source_type,
             episode_type=episode_type,
+            prompt_language=prompt_language,
         )
 
-        save_episode_info = self._store_extracted_memory_episode_into_db(
+        save_entity_info = self._store_extracted_memory_entities_into_db(
             participants=episode_participants,
             raw_segments=raw_segments,
             facts=facts,
+            episode_summary=episode_summary,
+        )
+        save_episode_info = self._store_extracted_memory_episode_into_db(
+            participants=episode_participants,
+            raw_segments=raw_segments,
+            entity_info=save_entity_info,
             source_type=source_type,
             episode_type=episode_type,
             tags=tags,
@@ -877,7 +917,7 @@ class MemoryNodeManager:
             tags=tags,
             source_type=source_type,
             episode_context_topics=episode_canonical_topics,
-            episode_context_entities=save_episode_info["entity_names"],
+            entity_info=save_entity_info,
         )
         report = {
             "status": "ok",
@@ -898,7 +938,7 @@ class MemoryNodeManager:
         *,
         participants: List[str],
         raw_segments: List[Dict[str, Any]],
-        facts: List[Dict[str, Any]],
+        entity_info: Dict[str, int],
         source_type: str,
         episode_type: str,
         tags: List[str],
@@ -908,13 +948,12 @@ class MemoryNodeManager:
         started_at: str,
         ended_at: str,
     ) -> Dict[str, Any]:
-        episode_entity_names = self._episode_entity_names(
-            participants=participants,
-            segments=raw_segments,
-            facts=facts,
-            summary=episode_summary,
-        )
-        episode_entity_ids = self._entity_ids_for_names(episode_entity_names)
+        episode_entity_names = list(entity_info.keys())
+        episode_entity_ids = [
+            int(entity_id)
+            for entity_id in entity_info.values()
+            if str(entity_id).strip().isdigit()
+        ]
         episode_id = self._db.insert_episode(
             source_type=source_type,
             episode_type=episode_type,
@@ -931,27 +970,38 @@ class MemoryNodeManager:
                 "entities": episode_entity_names,
             },
         )
-        # self._index_episode(
-        #     episode_id=episode_id,
-        #     source_type=source_type,
-        #     episode_type=episode_type,
-        #     title=episode_title,
-        #     summary=episode_summary,
-        #     started_at=started_at,
-        #     ended_at=ended_at,
-        #     tags=tags,
-        #     canonical_topics=canonical_topics,
-        #     participants=participants,
-        # )
 
         return {
             "episode_id": episode_id,
             "participants": participants,
             "entity_names": episode_entity_names,
             "entity_ids": episode_entity_ids,
+            "entity_info": entity_info,
             "title": episode_title,
             "summary": episode_summary,
             "canonical_topics": canonical_topics,
+        }
+
+    def _store_extracted_memory_entities_into_db(
+        self,
+        *,
+        participants: List[str],
+        raw_segments: List[Dict[str, Any]],
+        facts: List[Dict[str, Any]],
+        episode_summary: str,
+    ) -> Dict[str, int]:
+        """Persist all episode entities once and return name-to-id mappings."""
+        entity_names = self._episode_entity_names(
+            participants=participants,
+            segments=raw_segments,
+            facts=facts,
+            summary=episode_summary,
+        )
+        mapping = self._db.add_entity_names(entity_names)
+        return {
+            str(entity_name): int(entity_id)
+            for entity_name, entity_id in mapping.items()
+            if str(entity_name).strip() and str(entity_id).strip().isdigit()
         }
 
     def _log_extracted_fact_info(
@@ -961,6 +1011,7 @@ class MemoryNodeManager:
         facts: List[Dict[str, Any]],
         source_type: str,
         episode_type: str,
+        prompt_language: str,
     ) -> None:
         if not facts:
             return
@@ -972,7 +1023,7 @@ class MemoryNodeManager:
                 "episode_type": episode_type,
                 "raw_segments": self._build_memory_segments_for_prompt(
                     raw_segments,
-                    prompt_language=self._resolve_prompt_language_from_segments(raw_segments),
+                    prompt_language=prompt_language,
                 ),
                 "source_segment_count": len(raw_segments),
             },
@@ -986,11 +1037,10 @@ class MemoryNodeManager:
                     "fact_index": index,
                     "fact_count": len(facts),
                     "summary": fact.get("summary") or "",
-                    "source_text": fact.get("source_text") or "",
                     "fact_type": fact.get("fact_type"),
-                    "fact_subject": fact.get("fact_subject"),
                     "fact_kind": fact.get("fact_kind"),
-                    "time_key": fact.get("time_key"),
+                    "event_time_key": fact.get("event_time_key") or "",
+                    "dialogue_time_key": fact.get("dialogue_time_key") or "",
                     "keywords": fact.get("keywords") or "",
                     "entities": fact.get("entities") or [],
                     "primary_entity": fact.get("primary_entity"),
@@ -1000,8 +1050,6 @@ class MemoryNodeManager:
                     "actionable_aspects": fact.get("actionable_aspects") or [],
                     "importance": fact.get("importance"),
                     "confidence": fact.get("confidence"),
-                    "occurred_start": metadata.get("occurred_start") or "",
-                    "occurred_end": metadata.get("occurred_end") or "",
                     "time_confidence": metadata.get("time_confidence") or "",
                     "where": metadata.get("where") or "",
                     "metadata": metadata,
@@ -1010,12 +1058,23 @@ class MemoryNodeManager:
                 },
             )
 
-    def _extract_memory_fact_from_raw_segments(self, raw_segments: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def _extract_memory_fact_from_raw_segments(
+        self,
+        raw_segments: List[Dict[str, Any]],
+        *,
+        prompt_language: str,
+    ) -> Dict[str, Any]:
         """Extract episode metadata and facts with LLM, falling back to heuristics."""
-        data = self._extract_memory_fact_with_llm(raw_segments)
+        data = self._extract_memory_fact_with_llm(
+            raw_segments,
+            prompt_language=prompt_language,
+        )
         if data and data.get("facts"):
             return data
-        llm_episode_summary = self._generate_episode_summary_directly_with_llm(raw_segments) or {}
+        llm_episode_summary = self._generate_episode_summary_directly_with_llm(
+            raw_segments,
+            prompt_language=prompt_language,
+        ) or {}
         summary = (
             llm_episode_summary.get("summary")
             or self._fallback_generate_episode_summary_from_raw_segments(raw_segments)
@@ -1033,10 +1092,11 @@ class MemoryNodeManager:
     def _generate_episode_summary_directly_with_llm(
         self,
         segments: List[Dict[str, Any]],
+        *,
+        prompt_language: str,
     ) -> Optional[Dict[str, str]]:
         if not segments:
             return None
-        prompt_language = self._resolve_prompt_language_from_segments(segments)
         prompt_template = (
             EPISODE_SUMMARY_PROMPT_EN
             if prompt_language == "en"
@@ -1072,17 +1132,20 @@ class MemoryNodeManager:
                     })
                     return {"title": title, "summary": summary}
             if attempt == 0:
-                logger.debug("Episode summary LLM fallback failed, retrying")
+                self._logger.debug("Episode summary LLM fallback failed, retrying")
         return None
 
-    def _extract_memory_fact_with_llm(self, segments: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-        prompt_language = self._resolve_prompt_language_from_segments(segments)
+    def _extract_memory_fact_with_llm(
+        self,
+        segments: List[Dict[str, Any]],
+        *,
+        prompt_language: str,
+    ) -> Optional[Dict[str, Any]]:
         prompt_template = (
             UNIFIED_MEMORY_EXTRACTION_PROMPT_EN
             if prompt_language == "en"
             else UNIFIED_MEMORY_EXTRACTION_PROMPT_ZH
         )
-        topic_candidates = self._collect_long_term_topic_candidates(limit=60)
         memory_state_context = self._collect_memory_state_context(limit=12)
         prompt = (
             prompt_template
@@ -1105,12 +1168,12 @@ class MemoryNodeManager:
                 normalized = self._normalize_memory_fact_extraction_llm_output(
                     parsed,
                     segments,
-                    topic_candidates=topic_candidates,
+                    prompt_language=prompt_language,
                 )
                 if normalized is not None:
                     return normalized
             if attempt == 0:
-                logger.debug("Unified memory LLM extraction failed, retrying")
+                self._logger.debug("Unified memory LLM extraction failed, retrying")
         return None
 
     def _call_llm(self, prompt: str) -> Optional[str]:
@@ -1119,7 +1182,7 @@ class MemoryNodeManager:
             or not self._llm_base_url
             or str(self._llm_base_url).strip().lower() == "none"
         ):
-            logger.debug(
+            self._logger.debug(
                 "Skipping LLM call because llm_api_key or llm_base_url is not configured"
             )
             return None
@@ -1169,7 +1232,7 @@ class MemoryNodeManager:
                 text = str(exc).lower()
                 if "response_format" in text or "json" in text or "thinking" in text:
                     continue
-                logger.warning("Unified memory LLM call failed: %s", exc)
+                self._logger.warning("Unified memory LLM call failed: %s", exc)
                 return None
         return None
 
@@ -1199,7 +1262,7 @@ class MemoryNodeManager:
         data: Dict[str, Any],
         raw_segments: List[Dict[str, Any]],
         *,
-        topic_candidates: Optional[List[Dict[str, Any]]] = None,
+        prompt_language: str,
     ) -> Optional[Dict[str, Any]]:
         raw_facts = data.get("facts")
         if not isinstance(raw_facts, list):
@@ -1208,7 +1271,10 @@ class MemoryNodeManager:
         raw_episode_summary = _compact_whitespace(data.get("episode_summary") or "")
         llm_episode_summary: Dict[str, str] = {}
         if not raw_episode_title or not raw_episode_summary:
-            llm_episode_summary = self._generate_episode_summary_directly_with_llm(raw_segments) or {}
+            llm_episode_summary = self._generate_episode_summary_directly_with_llm(
+                raw_segments,
+                prompt_language=prompt_language,
+            ) or {}
         episode_summary = (
             raw_episode_summary
             or llm_episode_summary.get("summary")
@@ -1216,15 +1282,14 @@ class MemoryNodeManager:
         )
         episode_topics = self._normalize_episode_canonical_topics(
             data.get("canonical_topics") or data.get("episode_canonical_topics"),
-            topic_candidates=topic_candidates or [],
             fallback_text=episode_summary,
             limit=5,
         )
         facts: List[Dict[str, Any]] = []
-        fallback_timestamp = _to_timestamp_text(
+        dialogue_time_key = _to_timestamp_text(
             raw_segments[0].get("started_at") if raw_segments else ""
         ) or _now_text()
-        for index, raw_fact in enumerate(raw_facts, 1):
+        for raw_fact in raw_facts:
             if not isinstance(raw_fact, dict):
                 continue
             text = _compact_whitespace(raw_fact.get("text") or raw_fact.get("summary") or "")
@@ -1232,11 +1297,6 @@ class MemoryNodeManager:
                 continue
             priority = self._normalize_priority(raw_fact.get("priority", 70))
             if priority < 60:
-                continue
-            fact_subject = self._normalize_fact_subject(raw_fact.get("fact_subject"))
-            if fact_subject == "assistant" and self._is_low_value_assistant_closing(text):
-                continue
-            if fact_subject == "user" and self._is_low_value_user_acknowledgement(text):
                 continue
             keywords = self._normalize_string_list(raw_fact.get("keywords"), limit=18)
             if not keywords:
@@ -1247,12 +1307,20 @@ class MemoryNodeManager:
             primary_entity = self._normalize_primary_entity(
                 raw_fact.get("primary_entity"),
                 entities=entities,
-                fact_subject=fact_subject,
             )
             if primary_entity:
                 primary_entity_name = primary_entity["name"]
                 if primary_entity_name not in entities:
                     entities = [primary_entity_name, *entities]
+            primary_entity_name = _compact_whitespace(
+                (primary_entity or {}).get("name") or ""
+            ).lower()
+            if primary_entity_name in {"assistant", "agent", "the assistant", "助手"} \
+                    and self._is_low_value_assistant_closing(text):
+                continue
+            if primary_entity_name in {"user", "the user", "用户"} \
+                    and self._is_low_value_user_acknowledgement(text):
+                continue
             fact_topic_fallback = " ".join(keywords[:3]) if keywords else "general"
             fact_root_topic, fact_aspect_topic = self._normalize_fact_topic_fields(
                 raw_fact.get("fact_root_topic"),
@@ -1267,13 +1335,13 @@ class MemoryNodeManager:
             actionable_aspects = self._normalize_actionable_aspects(
                 raw_fact.get("actionable_aspects"),
             )
+            event_time_key = _compact_whitespace(raw_fact.get("event_time_key") or "")
             facts.append({
                 "summary": text,
-                "source_text": text,
-                "fact_subject": fact_subject,
                 "fact_kind": self._normalize_fact_kind(raw_fact.get("fact_kind")),
                 "fact_type": self._normalize_fact_type(raw_fact.get("fact_type")),
-                "time_key": f"{fallback_timestamp}#llm:{index:02d}",
+                "event_time_key": event_time_key,
+                "dialogue_time_key": dialogue_time_key,
                 "keywords": " ".join(keywords),
                 "entities": entities,
                 "primary_entity": primary_entity,
@@ -1286,11 +1354,8 @@ class MemoryNodeManager:
                 "metadata": {
                     "extractor": "llm",
                     "priority": priority,
-                    "occurred_start": _compact_whitespace(raw_fact.get("occurred_start") or ""),
-                    "occurred_end": _compact_whitespace(raw_fact.get("occurred_end") or ""),
                     "time_confidence": _compact_whitespace(raw_fact.get("time_confidence") or "unknown"),
                     "where": _compact_whitespace(raw_fact.get("where") or ""),
-                    "primary_entity": primary_entity,
                 },
             })
         return {
@@ -1500,7 +1565,7 @@ class MemoryNodeManager:
         participants: List[str] = []
         seen: set[str] = set()
         for segment in raw_segments:
-            speaker = _compact_whitespace(segment.get("speaker") or segment.get("role") or "")
+            speaker = _compact_whitespace(segment.get("speaker") or "")
             if not speaker:
                 continue
             key = speaker.lower()
@@ -1611,7 +1676,6 @@ class MemoryNodeManager:
         is_en = prompt_language == "en"
         time_label = "Time" if is_en else "时间"
         speaker_label = "Speaker" if is_en else "说话人"
-        role_label = "Role" if is_en else "角色"
         text_label = "Text" if is_en else "文本"
         blocks: List[str] = []
         for index, segment in enumerate(segments, 1):
@@ -1623,57 +1687,17 @@ class MemoryNodeManager:
                     f"[Segment {index}]",
                     f"{time_label}: {time_text}",
                     f"{speaker_label}: {segment.get('speaker') or ''}",
-                    f"{role_label}: {segment.get('role') or ''}",
                     f"{text_label}: {segment.get('text') or ''}",
                 ])
             )
         return "\n\n".join(blocks)
-
-    def _collect_long_term_topic_candidates(self, *, limit: int = 60) -> List[Dict[str, Any]]:
-        """Collect durable topic names that should guide new episode topics."""
-        try:
-            states = self._db.get_recent_memory_states(limit=max(1, int(limit or 60)))
-        except Exception as exc:
-            logger.debug("Failed to load long-term topic candidates: %s", exc)
-            return []
-        rows: List[Dict[str, Any]] = []
-        seen: set[str] = set()
-        for state in states:
-            if str(state.get("state_scope") or "") != "topic_state":
-                continue
-            if str(state.get("state_type") or "") != "topic":
-                continue
-            metadata = state.get("metadata") or {}
-            raw_topics: List[Any] = [
-                state.get("canonical_name"),
-                *(metadata.get("canonical_topics") or []),
-            ]
-            for raw_topic in raw_topics:
-                topic = self._normalize_topic_name(raw_topic)
-                if not topic:
-                    continue
-                key = topic.lower()
-                if key in seen:
-                    continue
-                seen.add(key)
-                rows.append({
-                    "canonical_topic": topic,
-                    "state_id": state.get("id"),
-                    "source_type": state.get("source_type"),
-                    "state_scope": state.get("state_scope"),
-                    "state_type": state.get("state_type"),
-                    "summary": _compact_whitespace(state.get("summary") or "")[:240],
-                })
-                if len(rows) >= limit:
-                    return rows
-        return rows
 
     def _collect_memory_state_context(self, *, limit: int = 12) -> List[Dict[str, Any]]:
         """Collect a small, balanced state reference set for fact extraction."""
         try:
             states = self._db.get_recent_memory_states(limit=max(40, int(limit or 12) * 6))
         except Exception as exc:
-            logger.debug("Failed to load memory state context: %s", exc)
+            self._logger.debug("Failed to load memory state context: %s", exc)
             return []
         rows: List[Dict[str, Any]] = []
         seen: set[Tuple[str, str, str]] = set()
@@ -1733,7 +1757,6 @@ class MemoryNodeManager:
         self,
         value: Any,
         *,
-        topic_candidates: List[Dict[str, Any]],
         fallback_text: str,
         limit: int,
     ) -> List[str]:
@@ -1746,7 +1769,6 @@ class MemoryNodeManager:
             topic = self._normalize_topic_name(raw_topic)
             if not topic:
                 continue
-            topic = self._resolve_existing_topic_name(topic, topic_candidates) or topic
             key = topic.lower()
             if key in seen:
                 continue
@@ -1803,35 +1825,6 @@ class MemoryNodeManager:
             return ""
         return text
 
-    def _resolve_existing_topic_name(
-        self,
-        topic: str,
-        topic_candidates: List[Dict[str, Any]],
-    ) -> Optional[str]:
-        if not topic_candidates:
-            return None
-        topic_key = topic.lower()
-        candidate_names = [
-            self._normalize_topic_name(item.get("canonical_topic"))
-            for item in topic_candidates
-        ]
-        candidate_names = [item for item in candidate_names if item]
-        for candidate in candidate_names:
-            if candidate.lower() == topic_key:
-                return candidate
-        for candidate in candidate_names:
-            candidate_key = candidate.lower()
-            if len(candidate_key) >= 4 and (candidate_key in topic_key or topic_key in candidate_key):
-                return candidate
-        best_name = ""
-        best_score = 0.0
-        for candidate in candidate_names:
-            score = self._topic_name_similarity(topic, candidate)
-            if score > best_score:
-                best_score = score
-                best_name = candidate
-        return best_name if best_score >= 0.62 else None
-
     def _topic_name_similarity(self, left: str, right: str) -> float:
         left_terms = set(self._topic_similarity_terms(left))
         right_terms = set(self._topic_similarity_terms(right))
@@ -1844,30 +1837,29 @@ class MemoryNodeManager:
     def _topic_similarity_terms(self, text: str) -> List[str]:
         clean = _compact_whitespace(text).lower()
         chinese_chars = "".join(re.findall(r"[\u4e00-\u9fff]", clean))
+        if jieba is not None and chinese_chars:
+            raw_tokens = [
+                *jieba.lcut(clean, HMM=False),
+                *jieba.cut_for_search(clean, HMM=False),
+            ]
+            tokens: List[str] = []
+            seen: set[str] = set()
+            for token in raw_tokens:
+                normalized = _compact_whitespace(token).strip(
+                    "'\".,:;!?，。！？、；：（）()[]{}"
+                )
+                if not normalized or not re.search(r"[0-9a-zA-Z\u4e00-\u9fff]", normalized):
+                    continue
+                key = normalized.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                tokens.append(key)
+            if tokens:
+                return tokens
         if len(chinese_chars) >= 3:
             return [chinese_chars[i : i + 2] for i in range(len(chinese_chars) - 1)]
         return self._keywords(clean, limit=12)
-
-    def _resolve_prompt_language(self, turns: List[Dict[str, Any]]) -> str:
-        mode = str(self._memory_prompt_language or "source").strip().lower()
-        if mode in {"en", "english", "force_en"}:
-            return "en"
-        if mode in {"zh", "chinese", "force_zh"}:
-            return "zh"
-        sample = "\n".join(
-            f"{turn.get('user_message','')}\n{turn.get('assistant_response','')}"
-            for turn in turns[:3]
-        )
-        return "zh" if re.search(r"[\u4e00-\u9fff]", sample) else "en"
-
-    def _resolve_prompt_language_from_segments(self, segments: List[Dict[str, Any]]) -> str:
-        mode = str(self._memory_prompt_language or "source").strip().lower()
-        if mode in {"en", "english", "force_en"}:
-            return "en"
-        if mode in {"zh", "chinese", "force_zh"}:
-            return "zh"
-        sample = "\n".join(str(segment.get("text") or "") for segment in segments[:12])
-        return "zh" if re.search(r"[\u4e00-\u9fff]", sample) else "en"
 
     def _resolve_prompt_language_from_text(self, text: str, *, fallback: str = "zh") -> str:
         mode = str(self._memory_prompt_language or "source").strip().lower()
@@ -1905,7 +1897,7 @@ class MemoryNodeManager:
     def _fallback_generate_episode_summary_from_raw_segments(self, raw_segments: List[Dict[str, Any]]) -> str:
         chunks: List[str] = []
         for segment in raw_segments[:10]:
-            speaker = segment.get("speaker") or segment.get("role") or "speaker"
+            speaker = segment.get("speaker") or "speaker"
             text = _compact_whitespace(segment.get("text") or "")
             if not text:
                 continue
@@ -1913,88 +1905,6 @@ class MemoryNodeManager:
             chunks.append(f"{started_at} {speaker}: {text[:600]}")
         return "\n".join(chunks)
 
-    @staticmethod
-    def _truncate_index_text(text: Any, *, max_chars: int = 700) -> str:
-        clean = _compact_whitespace(text or "")
-        if len(clean) <= max_chars:
-            return clean
-        return clean[: max(0, max_chars - 3)].rstrip() + "..."
-
-    def _build_index_embedding_text(
-        self,
-        *,
-        title: str,
-        summary: str,
-        keywords: Any,
-        entities: Sequence[str],
-        canonical_topics: Sequence[str],
-        memory_path: str,
-        max_summary_chars: int = 520,
-    ) -> str:
-        if isinstance(keywords, str):
-            keyword_text = keywords
-        else:
-            keyword_text = " ".join(str(item or "") for item in keywords)
-        return "\n".join(
-            part
-            for part in (
-                f"title: {self._truncate_index_text(title, max_chars=120)}",
-                f"summary: {self._truncate_index_text(summary, max_chars=max_summary_chars)}",
-                f"topics: {', '.join(str(item or '') for item in canonical_topics[:8])}",
-                f"entities: {', '.join(str(item or '') for item in entities[:12])}",
-                f"keywords: {self._truncate_index_text(keyword_text, max_chars=180)}",
-                f"path: {memory_path}",
-            )
-            if part.strip()
-        )
-
-    def _index_episode(
-        self,
-        *,
-        episode_id: int,
-        source_type: str,
-        episode_type: str,
-        title: str,
-        summary: str,
-        started_at: str,
-        ended_at: str,
-        tags: List[str],
-        canonical_topics: List[str],
-        participants: List[str],
-    ) -> None:
-        keywords = " ".join(self._keywords(summary, limit=24))
-        memory_path = f"{source_type}/episodes/{episode_type}"
-        summary_card = self._truncate_index_text(summary, max_chars=700)
-        embedding_text = self._build_index_embedding_text(
-            title=title,
-            summary=summary_card,
-            keywords=keywords,
-            entities=participants,
-            canonical_topics=canonical_topics,
-            memory_path=memory_path,
-        )
-        embedding = self._generate_embedding_vector(embedding_text)
-        self._db.upsert_index_entry(
-            source_type=source_type,
-            target_table="memory_episodes",
-            target_id=episode_id,
-            index_level="episode",
-            memory_path=memory_path,
-            title=title,
-            summary_for_retrieval=summary_card,
-            keywords=keywords,
-            entities=participants,
-            canonical_topics=canonical_topics,
-            participants=participants,
-            time_start=started_at,
-            time_end=ended_at,
-            importance=0.55,
-            confidence=0.8,
-            embedding=embedding,
-            embedding_text=embedding_text,
-            metadata={"tags": tags},
-        )
-        
     def _is_low_value_assistant_closing(self, text: str) -> bool:
         clean = _compact_whitespace(text)
         if not clean:
@@ -2035,9 +1945,15 @@ class MemoryNodeManager:
         tags: List[str],
         source_type: str,
         episode_context_topics: Optional[Sequence[str]] = None,
-        episode_context_entities: Optional[Sequence[str]] = None,
+        entity_info: Optional[Dict[str, int]] = None,
     ) -> Dict[str, Any]:
         fact_ids: List[int] = []
+        normalized_entity_info = {
+            str(entity_name): int(entity_id)
+            for entity_name, entity_id in (entity_info or {}).items()
+            if str(entity_name).strip() and str(entity_id).strip().isdigit()
+        }
+        episode_context_entities = list(normalized_entity_info.keys())
         for fact in facts:
             keywords = fact.get("keywords") or ""
             if isinstance(keywords, (list, tuple, set)):
@@ -2047,8 +1963,6 @@ class MemoryNodeManager:
             entities = self._normalize_entity_names(fact.get("entities"))
             raw_metadata = fact.get("metadata")
             metadata = dict(raw_metadata) if isinstance(raw_metadata, dict) else {}
-            metadata.pop("topic_context", None)
-            metadata.pop("topic_hierarchy", None)
             fallback_topics = self._topic_candidates(fact["summary"])
             fact_root_topic = self._normalize_topic_name(
                 fact.get("fact_root_topic")
@@ -2060,21 +1974,24 @@ class MemoryNodeManager:
                 fact.get("fact_aspect_topic")
                 or fact_root_topic
             ) or fact_root_topic
-            embedding_text = "\n".join([
-                fact["summary"],
+            identity_text = "\n".join([
+                f"summary: {_compact_whitespace(fact['summary'])}",
                 f"keywords: {keywords}",
                 f"entities: {', '.join(entities)}",
                 f"primary_entity: {(fact.get('primary_entity') or {}).get('name', '') if isinstance(fact.get('primary_entity'), dict) else ''}",
                 f"fact_root_topic: {fact_root_topic}",
                 f"fact_aspect_topic: {fact_aspect_topic}",
             ])
-            embedding = self._generate_embedding_vector(embedding_text)
+            identity_text_embedding = self._generate_embedding_vector(identity_text)
             fact_entities = self._fact_entity_names(fact, entities=entities)
-            entity_ids = self._entity_ids_for_names(fact_entities)
+            entity_ids = [
+                normalized_entity_info[entity_name]
+                for entity_name in fact_entities
+                if entity_name in normalized_entity_info
+            ]
             fact_metadata = {
                 **metadata,
                 "tags": tags,
-                "source_text": fact["source_text"],
                 "state_aspects": fact.get("state_aspects") or [],
                 "actionable_aspects": fact.get("actionable_aspects") or [],
                 "episode_context_topics": list(episode_context_topics or []),
@@ -2085,50 +2002,20 @@ class MemoryNodeManager:
                 source_type=source_type,
                 fact_type=fact["fact_type"],
                 fact_kind=fact["fact_kind"],
-                fact_subject=fact["fact_subject"],
                 summary=fact["summary"],
                 keywords=keywords,
                 entities=entities,
                 entity_ids=entity_ids,
                 fact_root_topic=fact_root_topic,
                 fact_aspect_topic=fact_aspect_topic,
-                time_key=fact["time_key"],
+                event_time_key=fact.get("event_time_key") or "",
+                dialogue_time_key=fact.get("dialogue_time_key") or "",
                 confidence=fact["confidence"],
                 importance=fact["importance"],
                 metadata=fact_metadata,
-                embedding=embedding,
-                embedding_text=embedding_text,
+                identity_text_embedding=identity_text_embedding,
+                identity_text=identity_text,
             )
-            # memory_path = f"{source_type}/facts/{fact['fact_subject']}/{fact['fact_kind']}"
-            # summary_card = self._truncate_index_text(fact["summary"], max_chars=760)
-            # index_embedding_text = self._build_index_embedding_text(
-            #     title=fact["summary"][:96],
-            #     summary=summary_card,
-            #     keywords=keywords,
-            #     entities=entities,
-            #     memory_path=memory_path,
-            #     max_summary_chars=620,
-            # )
-            # index_embedding = self._generate_embedding_vector(index_embedding_text)
-            # self._db.upsert_index_entry(
-            #     source_type=source_type,
-            #     target_table="memory_facts",
-            #     target_id=fact_id,
-            #     index_level="fact",
-            #     memory_path=memory_path,
-            #     title=fact["summary"][:96],
-            #     summary_for_retrieval=summary_card,
-            #     keywords=keywords,
-            #     entities=entities,
-            #     participants=participants,
-            #     time_start=fact["time_key"].split("#", 1)[0],
-            #     time_end=fact["time_key"].split("#", 1)[0],
-            #     importance=fact["importance"],
-            #     confidence=fact["confidence"],
-            #     embedding=index_embedding,
-            #     embedding_text=index_embedding_text,
-            #     metadata=fact_metadata,
-            # )
             fact_ids.append(fact_id)
         return {
             "fact_ids": fact_ids,
@@ -2138,7 +2025,7 @@ class MemoryNodeManager:
 
     def submit_memory_reflect_task(self, *_, **kwargs: Any) -> Dict[str, Any]:
         """Queue reflection after all previously accepted memory tasks."""
-        if not self._enabled:
+        if not self._memory_enabled:
             task_id = self._operation_reporter.next_task_id("memory_reflect")
             return self._reject_memory_task(
                 task_kind="memory_reflect",
@@ -2150,91 +2037,53 @@ class MemoryNodeManager:
             payload=dict(kwargs),
         )
 
-    def process_memory_reflect_task(self, *_, **kwargs: Any) -> Dict[str, Any]:
+    def _process_memory_reflect_task(
+        self,
+        limit: Optional[int] = None,
+        reflect_timestamp: Optional[Any] = None,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
         """Update topic/entity projections and actionable items from recent facts."""
         reflect_started_at = time.monotonic()
-        limit = max(1, int(kwargs.get("limit") or self._memory_cfg.get("reflect_limit") or 100))
-        reflect_timestamp = kwargs.get("reflect_timestamp")
+        limit = max(1, int(limit or self._memory_cfg.get("reflect_limit") or 100))
         if reflect_timestamp is None:
             reflect_timestamp = kwargs.get("timestamp") or _now_text()
         self._log_info("memory_reflect", "start", {
             "limit": limit,
             "reflect_timestamp": reflect_timestamp,
         })
-        facts = self._db.get_unprocessed_facts_for_states(
-            limit=limit,
-            reference_timestamp=reflect_timestamp,
-        )
-        if not facts:
-            facts_loaded_payload = {
-                "fact_count": 0,
-                "limit": limit,
-                "reflect_timestamp": reflect_timestamp,
-                "total_elapsed_ms": round(
-                    (time.monotonic() - reflect_started_at) * 1000,
-                    2,
-                ),
-            }
-            self._log_info("memory_reflect", "finish", {
-                **facts_loaded_payload,
-                "status": "fact_empty",
-            })
-            return {
-                "status": "empty",
-                "topic_states_updated": 0,
-                "entity_states_updated": 0,
-                "actionable_items_updated": 0,
-                "total_elapsed_ms": facts_loaded_payload["total_elapsed_ms"],
-            }
-        fact_ids = [
-            int(fact["id"])
-            for fact in facts
-            if str(fact.get("id") or "").strip().isdigit()
-        ]
-        source_counts = Counter(str(fact.get("source_type") or "unified") for fact in facts)
-        self._log_info("memory_reflect", "facts_loaded", {
-            "fact_count": len(facts),
-            "fact_ids": fact_ids,
-            "source_counts": dict(source_counts),
-            "time_start": facts[0].get("time_key") if facts else "",
-            "time_end": facts[-1].get("time_key") if facts else "",
-        })
-        topic_facts = [fact for fact in facts if self._fact_can_seed_topic_state(fact)]
-        entity_facts = [fact for fact in facts if self._fact_can_seed_entity_state(fact)]
-        self._log_info("memory_reflect", "state_fact_candidates", {
-            "topic_fact_count": len(topic_facts),
-            "topic_fact_ids": [
-                fact.get("id") for fact in topic_facts if fact.get("id") is not None
-            ],
-            "entity_fact_count": len(entity_facts),
-            "entity_fact_ids": [
-                fact.get("id") for fact in entity_facts if fact.get("id") is not None
-            ],
-        })
-        topic_report = self._resolve_and_update_topic_states_from_facts(
-            facts=topic_facts,
-        )
-        entity_report = self._resolve_and_update_entity_scoped_states_from_facts(
-            facts=entity_facts,
-        )
+        # Keep the projection apply atomic. The expensive extraction and
+        # embedding work still happens inside the existing worker, while all
+        # state/actionable writes and processed markers share one commit point.
+        with self._db.transaction():
+            state_report = self._update_memory_states_using_facts(
+                limit=limit,
+                reference_timestamp=reflect_timestamp,
+            )
+            topic_report = state_report["topic_report"]
+            entity_report = state_report["entity_report"]
 
-        actionable_report = self._update_memory_actionable_items_using_facts(
-            facts=facts,
-        )
-        facts_marked_processed = self._db.mark_facts_processed_for_memory_state(fact_ids)
+            actionable_report = self._update_memory_actionable_items_using_facts(
+                limit=limit,
+                reference_timestamp=reflect_timestamp,
+            )
         report = {
-            "status": "ok",
-            "states_updated": (
-                int(topic_report.get("updated", 0) or 0)
-                + int(entity_report.get("updated", 0) or 0)
+            "status": (
+                "ok"
+                if state_report.get("fact_count", 0)
+                or actionable_report.get("fact_count", 0)
+                else "empty"
             ),
-            "topic_facts_considered": len(topic_facts),
-            "entity_facts_considered": len(entity_facts),
-            "evidence_only_facts": max(0, len(facts) - len(set(
-                int(fact["id"])
-                for fact in [*topic_facts, *entity_facts]
-                if str(fact.get("id") or "").strip().isdigit()
-            ))),
+            "states_updated": int(state_report.get("states_updated", 0) or 0),
+            "topic_facts_considered": int(
+                state_report.get("topic_facts_considered", 0) or 0
+            ),
+            "entity_facts_considered": int(
+                state_report.get("entity_facts_considered", 0) or 0
+            ),
+            "evidence_only_facts": int(
+                state_report.get("evidence_only_facts", 0) or 0
+            ),
             "topic_states_updated": int(topic_report.get("updated", 0) or 0),
             "topic_candidates_unresolved": int(topic_report.get("unresolved", 0) or 0),
             "pending_unresolved_topics": int(topic_report.get("pending_unresolved", 0) or 0),
@@ -2242,7 +2091,12 @@ class MemoryNodeManager:
             "actionable_facts_considered": int(
                 actionable_report.get("candidate_fact_count", 0) or 0
             ),
-            "facts_marked_processed_for_memory_state": facts_marked_processed,
+            "facts_marked_processed_for_memory_state": int(
+                state_report.get("facts_marked_processed", 0) or 0
+            ),
+            "facts_marked_processed_for_memory_actionable_item": int(
+                actionable_report.get("facts_marked_processed", 0) or 0
+            ),
             "actionable_items_updated": int(
                 actionable_report.get("stored_count", 0) or 0
             ),
@@ -2255,13 +2109,135 @@ class MemoryNodeManager:
         self._log_info("memory_reflect", "finish", report)
         return report
 
+    def _update_memory_states_using_facts(
+        self,
+        *,
+        limit: int,
+        reference_timestamp: Any,
+    ) -> Dict[str, Any]:
+        """Update topic and entity state projections from the current facts."""
+
+        started_at = time.monotonic()
+        if not self._enable_memory_state_update:
+            report = {
+                "enabled": 0,
+                "fact_count": 0,
+                "fact_ids": [],
+                "topic_report": {
+                    "enabled": 0,
+                    "updated": 0,
+                    "unresolved": 0,
+                    "pending_unresolved": len(self._pending_unresolved_topics),
+                },
+                "entity_report": {
+                    "enabled": 0,
+                    "updated": 0,
+                },
+                "topic_facts_considered": 0,
+                "entity_facts_considered": 0,
+                "evidence_only_facts": 0,
+                "states_updated": 0,
+                "facts_marked_processed": 0,
+                "total_elapsed_ms": round(
+                    (time.monotonic() - started_at) * 1000,
+                    2,
+                ),
+            }
+            self._log_info("memory_reflect", "state_update_skipped", report)
+            return report
+        facts = self._db.get_unprocessed_facts(
+            processing_target="state",
+            limit=limit,
+            reference_timestamp=reference_timestamp,
+        )
+        self._log_reflect_facts_loaded("state", facts, limit, reference_timestamp)
+        topic_facts = [fact for fact in facts if self._fact_can_seed_topic_state(fact)]
+        entity_facts = [fact for fact in facts if self._fact_can_seed_entity_state(fact)]
+        self._log_info("memory_reflect", "state_fact_candidates", {
+            "topic_fact_count": len(topic_facts),
+            "topic_fact_ids": [
+                fact.get("id") for fact in topic_facts if fact.get("id") is not None
+            ],
+            "entity_fact_count": len(entity_facts),
+            "entity_fact_ids": [
+                fact.get("id") for fact in entity_facts if fact.get("id") is not None
+            ],
+        })
+
+        topic_report = self._resolve_and_update_topic_states_from_facts(
+            facts=topic_facts,
+        )
+        entity_report = self._resolve_and_update_entity_scoped_states_from_facts(
+            facts=entity_facts,
+        )
+        facts_marked_processed = self._db.mark_facts_processed(
+            processing_target="state",
+            fact_ids=[fact.get("id") for fact in facts],
+        )
+        report = {
+            "fact_count": len(facts),
+            "fact_ids": [fact.get("id") for fact in facts],
+            "topic_report": topic_report,
+            "entity_report": entity_report,
+            "topic_facts_considered": len(topic_facts),
+            "entity_facts_considered": len(entity_facts),
+            "evidence_only_facts": max(0, len(facts) - len(set(
+                int(fact["id"])
+                for fact in [*topic_facts, *entity_facts]
+                if str(fact.get("id") or "").strip().isdigit()
+            ))),
+            "states_updated": (
+                int(topic_report.get("updated", 0) or 0)
+                + int(entity_report.get("updated", 0) or 0)
+            ),
+            "facts_marked_processed": facts_marked_processed,
+            "total_elapsed_ms": round(
+                (time.monotonic() - started_at) * 1000,
+                2,
+            ),
+        }
+        self._log_info("memory_reflect", "state_update_finish", report)
+        return report
+
     def _update_memory_actionable_items_using_facts(
         self,
         *,
-        facts: List[Dict[str, Any]],
+        limit: int,
+        reference_timestamp: Any,
     ) -> Dict[str, Any]:
         """Extract and persist actionable items from the current reflect facts."""
         started_at = time.monotonic()
+        if not self._enable_memory_actionable_item_update:
+            report = {
+                "enabled": 0,
+                "fact_count": 0,
+                "fact_ids": [],
+                "candidate_fact_count": 0,
+                "candidate_fact_ids": [],
+                "actionable_update_count": 0,
+                "requested_store_count": 0,
+                "stored_count": 0,
+                "item_ids": [],
+                "facts_marked_processed": 0,
+                "total_elapsed_ms": round(
+                    (time.monotonic() - started_at) * 1000,
+                    2,
+                ),
+            }
+            self._log_info(
+                "memory_reflect",
+                "actionable_item_update_skipped",
+                report,
+            )
+            return report
+        facts = self._db.get_unprocessed_facts(
+            processing_target="actionable_item",
+            limit=limit,
+            reference_timestamp=reference_timestamp,
+        )
+        self._log_reflect_facts_loaded(
+            "actionable_item", facts, limit, reference_timestamp
+        )
         actionable_facts = self._filter_facts_for_actionable_item_extraction(facts)
         self._log_info("memory_reflect", "actionable_item_extraction_start", {
             "candidate_fact_count": len(actionable_facts),
@@ -2294,8 +2270,15 @@ class MemoryNodeManager:
             if item_id:
                 actionable_items_updated += 1
                 actionable_item_ids.append(item_id)
+
+        facts_marked_processed = self._db.mark_facts_processed(
+            processing_target="actionable_item",
+            fact_ids=[fact.get("id") for fact in facts],
+        )
         
         report = {
+            "fact_count": len(facts),
+            "fact_ids": [fact.get("id") for fact in facts],
             "candidate_fact_count": len(actionable_facts),
             "candidate_fact_ids": [
                 fact.get("id") for fact in actionable_facts
@@ -2305,6 +2288,7 @@ class MemoryNodeManager:
             "requested_store_count": len(actionable_updates),
             "stored_count": actionable_items_updated,
             "item_ids": actionable_item_ids,
+            "facts_marked_processed": facts_marked_processed,
             "total_elapsed_ms": round(
                 (time.monotonic() - started_at) * 1000,
                 2,
@@ -2316,6 +2300,28 @@ class MemoryNodeManager:
             report,
         )
         return report
+
+    def _log_reflect_facts_loaded(
+        self,
+        processing_target: str,
+        facts: List[Dict[str, Any]],
+        limit: int,
+        reference_timestamp: Any,
+    ) -> None:
+        """Log the independent fact batch consumed by one reflect projection."""
+        source_counts = Counter(
+            str(fact.get("source_type")) for fact in facts
+        )
+        self._log_info("memory_reflect", "facts_loaded", {
+            "processing_target": processing_target,
+            "fact_count": len(facts),
+            "fact_ids": [fact.get("id") for fact in facts],
+            "source_counts": dict(source_counts),
+            "limit": limit,
+            "reference_timestamp": reference_timestamp,
+            "time_start": facts[0].get("dialogue_time_key") if facts else "",
+            "time_end": facts[-1].get("dialogue_time_key") if facts else "",
+        })
 
     @classmethod
     def _fact_has_durable_state_signal(cls, fact: Dict[str, Any]) -> bool:
@@ -2370,7 +2376,6 @@ class MemoryNodeManager:
         facts: List[Dict[str, Any]],
     ) -> Dict[str, int]:
         update_started_at = time.monotonic()
-        existing_states = self._db.get_recent_memory_states(limit=80)
         if not self._enable_topic_state_resolution:
             report = {
                 "enabled": 0,
@@ -2380,30 +2385,42 @@ class MemoryNodeManager:
             }
             self._log_info("memory_reflect", "topic_state_update_finish", {
                 **report,
-                "elapsed_ms": round(
-                    (time.monotonic() - update_started_at) * 1000,
-                    2,
-                ),
             })
             return report
-        existing_topic_states = [
-            state for state in existing_states
-            if str(state.get("state_scope") or "") == "topic_state"
-            and str(state.get("state_type") or "") == "topic"
-        ]
         candidates = self._build_topic_state_candidates_from_facts(facts)
         updated = 0
         unresolved = 0
         for candidate in candidates:
+            candidate_existing_topic_states = (
+                self._retrieve_existing_topic_states_for_candidate(
+                    candidate=candidate,
+                    limit=16,
+                )
+            )
+            self._log_info(
+                "memory_reflect",
+                "topic_state_candidates_retrieved",
+                {
+                    "candidate_root_topic": candidate.get("topic_name"),
+                    "candidate_aspect_topics": candidate.get("aspect_topics") or [],
+                    "candidate_fact_ids": candidate.get("fact_ids") or [],
+                    "existing_state_ids": [
+                        state.get("id")
+                        for state in candidate_existing_topic_states
+                        if state.get("id") is not None
+                    ],
+                    "existing_state_count": len(candidate_existing_topic_states),
+                },
+            )
             matched_state, match_info = self._match_topic_state_candidate_to_existing_state(
                 candidate=candidate,
-                existing_topic_states=existing_topic_states,
+                existing_topic_states=candidate_existing_topic_states,
             )
             grounded, chosen_state, grounding_info = self._ground_topic_state_candidate(
                 candidate=candidate,
                 matched_state=matched_state,
                 match_info=match_info,
-                existing_topic_states=existing_topic_states,
+                existing_topic_states=candidate_existing_topic_states,
             )
             if not grounded:
                 unresolved += 1
@@ -2421,7 +2438,7 @@ class MemoryNodeManager:
             )
             if not state_update or not state_update.get("summary"):
                 continue
-            state_update.setdefault("source_type", candidate.get("source_type") or "unified")
+            state_update.setdefault("source_type", candidate.get("source_type"))
             state_id = self._store_state(state_update)
             if state_id:
                 self._log_info(
@@ -2435,15 +2452,6 @@ class MemoryNodeManager:
                     ),
                 )
                 updated += 1
-                refreshed = self._db.get_recent_memory_states(
-                    source_types=[state_update["source_type"]],
-                    limit=80,
-                )
-                existing_topic_states = [
-                    state for state in refreshed
-                    if str(state.get("state_scope") or "") == "topic_state"
-                    and str(state.get("state_type") or "") == "topic"
-                ]
         report = {
             "enabled": 1,
             "candidate_count": len(candidates),
@@ -2460,13 +2468,93 @@ class MemoryNodeManager:
         })
         return report
 
+    def _retrieve_existing_topic_states_for_candidate(
+        self,
+        *,
+        candidate: Dict[str, Any],
+        limit: int = 16,
+    ) -> List[Dict[str, Any]]:
+        """Retrieve only existing topic states relevant to one topic candidate."""
+        candidate_limit = max(1, int(limit or 16))
+        states_by_id: Dict[int, Dict[str, Any]] = {}
+
+        def add_states(rows: Sequence[Dict[str, Any]]) -> None:
+            for row in rows or []:
+                if str(row.get("state_type") or "").strip().lower() != "topic":
+                    continue
+                try:
+                    state_id = int(row.get("id"))
+                except (TypeError, ValueError):
+                    continue
+                states_by_id[state_id] = row
+
+        root_topic = self._normalize_topic_name(candidate.get("topic_name"))
+        if root_topic and self._generate_topic_name_key(root_topic) != "general":
+            add_states(
+                self._db.search_memory_states(
+                    terms=self._build_recall_search_terms(
+                        "",
+                        keywords=[root_topic],
+                        entities=[],
+                    ),
+                    state_type="topic",
+                    limit=candidate_limit,
+                )
+            )
+
+        aspect_topics = self._normalize_unique_labels(
+            candidate.get("aspect_topics") or [],
+            limit=16,
+        )
+        if aspect_topics:
+            add_states(
+                self._db.search_memory_states(
+                    terms=self._build_recall_search_terms(
+                        "",
+                        keywords=aspect_topics,
+                        entities=[],
+                    ),
+                    state_type="topic",
+                    limit=candidate_limit,
+                )
+            )
+
+        supplementary_terms = self._normalize_unique_labels(
+            [
+                *(candidate.get("keywords") or []),
+                *(candidate.get("context_entities") or []),
+            ],
+            limit=20,
+        )
+        if supplementary_terms:
+            add_states(
+                self._db.search_memory_states(
+                    terms=self._build_recall_search_terms(
+                        "",
+                        keywords=supplementary_terms,
+                        entities=[],
+                    ),
+                    state_type="topic",
+                    limit=candidate_limit,
+                )
+            )
+
+        # Keep a small recency fallback for underspecified candidates. This is
+        # intentionally candidate-local and is not used as a shared match pool.
+        recent_states = self._db.get_recent_memory_states(
+            state_type="topic",
+            limit=min(8, candidate_limit),
+        )
+        add_states(recent_states)
+        return list(states_by_id.values())
+
     def _build_topic_state_candidates_from_facts(
         self,
         facts: List[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
         by_source_and_root: Dict[Tuple[str, str], Dict[str, Any]] = {}
         for fact in facts:
-            source_type = str(fact.get("source_type") or "unified")
+            source_type = str(fact.get("source_type"))
             root_topic_name = (
                 self._normalize_topic_name(fact.get("fact_root_topic"))
                 or "general"
@@ -2488,7 +2576,7 @@ class MemoryNodeManager:
             matched_facts = sorted(
                 group["facts"],
                 key=lambda fact: (
-                    str(fact.get("time_key") or ""),
+                    str(fact.get("dialogue_time_key") or ""),
                     int(fact.get("id") or 0),
                 ),
             )
@@ -2812,7 +2900,25 @@ class MemoryNodeManager:
                     and (left_key in right_key or right_key in left_key)
                 ):
                     best = max(best, 0.9)
-                best = max(best, self._topic_name_similarity(str(left), str(right)))
+                left_terms = set(self._topic_similarity_terms(str(left)))
+                right_terms = set(self._topic_similarity_terms(str(right)))
+                if not left_terms or not right_terms:
+                    continue
+                shared_terms = left_terms & right_terms
+                if not shared_terms:
+                    continue
+                jaccard = len(shared_terms) / max(1, len(left_terms | right_terms))
+                best = max(best, jaccard)
+
+                # A shorter topic can be a lexical specialization of a
+                # longer topic, e.g. "手机推广策略" and
+                # "新手机产品推广策略". Require at least two shared
+                # tokens so a single generic word cannot create a strong
+                # match by itself.
+                if len(shared_terms) >= 2:
+                    left_coverage = len(shared_terms) / max(1, len(left_terms))
+                    right_coverage = len(shared_terms) / max(1, len(right_terms))
+                    best = max(best, left_coverage, right_coverage)
         return best
 
     @classmethod
@@ -2929,23 +3035,22 @@ class MemoryNodeManager:
         )
         prompt = (
             prompt_template
-            .replace("{canonical_topic}", json.dumps({
-                "canonical_name": candidate.get("topic_name"),
-                "topic_key": candidate.get("topic_key"),
-                "identity_text": candidate.get("identity_text") or "",
-            }, ensure_ascii=False, indent=2))
+            .replace("{candidate_topic_state}", json.dumps(
+                self._format_topic_state_candidate_for_prompt(candidate),
+                ensure_ascii=False,
+                indent=2,
+            ))
             .replace("{existing_topic_state}", json.dumps(
                 self._format_existing_topic_state_for_prompt(existing_state),
                 ensure_ascii=False,
                 indent=2,
             ))
-            .replace("{facts}", self._format_facts_for_state_prompt(facts))
         )
         result = self._call_llm(prompt)
         parsed = self._parse_json_object_from_llm_text(result or "")
         if parsed:
             if not self._config_bool(parsed.get("update_needed", True), True):
-                logger.debug(
+                self._logger.debug(
                     "LLM declined topic-state update for topic=%s",
                     candidate.get("topic_name"),
                 )
@@ -2960,11 +3065,34 @@ class MemoryNodeManager:
         return self._fallback_topic_state_update(candidate, existing_state)
 
     @staticmethod
+    def _format_topic_state_candidate_for_prompt(
+        candidate: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Format the resolved topic candidate without duplicating raw facts."""
+        candidate = candidate or {}
+        return {
+            "root_topic_name": candidate.get("topic_name") or "",
+            "topic_key": candidate.get("topic_key") or "",
+            "identity_text": candidate.get("identity_text") or "",
+            "aspect_topics": list(candidate.get("aspect_topics") or []),
+            "parent_topics": list(candidate.get("parent_topics") or []),
+            "keywords": list(candidate.get("keywords") or []),
+            "context_entities": list(candidate.get("context_entities") or []),
+            "fact_summaries": list(candidate.get("fact_summaries") or []),
+            "fact_ids": [
+                int(fact_id)
+                for fact_id in candidate.get("fact_ids") or []
+                if str(fact_id).strip().isdigit()
+            ],
+            "source_type": candidate.get("source_type") or "",
+        }
+
+    @staticmethod
     def _format_existing_topic_state_for_prompt(state: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         if not state:
             return {}
+        metadata = state.get("metadata") or {}
         return {
-            "id": state.get("id"),
             "state_scope": state.get("state_scope") or "topic_state",
             "source_type": state.get("source_type"),
             "canonical_name": state.get("canonical_name"),
@@ -2974,9 +3102,31 @@ class MemoryNodeManager:
                 limit=8,
                 max_chars=1000,
             ),
-            "evidence_fact_ids": state.get("evidence_fact_ids") or [],
             "confidence": state.get("confidence"),
-            "metadata": state.get("metadata") or {},
+            "aspect_topic_names": metadata.get("aspect_topic_names") or [],
+        }
+
+    @staticmethod
+    def _format_existing_entity_state_for_prompt(state: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """Format only the semantic context needed to update an entity state."""
+        if not state:
+            return {}
+        metadata = state.get("metadata") or {}
+        return {
+            "state_scope": state.get("state_scope") or "entity_state",
+            "state_type": state.get("state_type"),
+            "entity": metadata.get("entity") or "",
+            "entity_key": metadata.get("entity_key") or "",
+            "canonical_name": state.get("canonical_name"),
+            "attribute_name_aliases": metadata.get("attribute_name_aliases") or [],
+            "summary": state.get("summary"),
+            "time_line": MemoryNodeManager._normalize_time_line(
+                state.get("time_line"),
+                limit=8,
+                max_chars=1000,
+            ),
+            "confidence": state.get("confidence"),
+            "status": state.get("status") or "active",
         }
 
     @staticmethod
@@ -3075,7 +3225,11 @@ class MemoryNodeManager:
             ]
             latest = aspect_items[-1]
             occurred_at = _compact_whitespace(
-                str(latest.get("fact_time_key") or "").split("#", 1)[0]
+                str(
+                    latest.get("fact_dialogue_time_key")
+                    or latest.get("fact_event_time_key")
+                    or ""
+                ).split("#", 1)[0]
             )
             return [{
                 "occurred_at": occurred_at,
@@ -3098,8 +3252,8 @@ class MemoryNodeManager:
             if str(fact.get("id") or "").strip().isdigit()
         ]
         latest = facts[-1]
-        time_key = _compact_whitespace(latest.get("time_key") or "")
-        occurred_at = time_key.split("#", 1)[0] if time_key else ""
+        dialogue_time_key = _compact_whitespace(latest.get("dialogue_time_key") or "")
+        occurred_at = dialogue_time_key if dialogue_time_key else ""
         return [{
             "occurred_at": occurred_at,
             "change_type": "updated",
@@ -3233,7 +3387,7 @@ class MemoryNodeManager:
         return {
             "state_scope": "topic_state",
             "state_type": "topic",
-            "source_type": candidate.get("source_type") or (existing_state or {}).get("source_type") or "unified",
+            "source_type": candidate.get("source_type") or (existing_state or {}).get("source_type"),
             "canonical_name": canonical_name,
             "summary": summary,
             "time_line": time_line,
@@ -3321,7 +3475,7 @@ class MemoryNodeManager:
         return {
             "state_scope": "topic_state",
             "state_type": "topic",
-            "source_type": candidate.get("source_type") or (existing_state or {}).get("source_type") or "unified",
+            "source_type": candidate.get("source_type") or (existing_state or {}).get("source_type"),
             "canonical_name": canonical_name,
             "summary": summary,
             "time_line": self._build_state_time_line(
@@ -3361,7 +3515,6 @@ class MemoryNodeManager:
         facts: List[Dict[str, Any]],
     ) -> Dict[str, int]:
         update_started_at = time.monotonic()
-        existing_states = self._db.get_recent_memory_states(limit=80)
         if not self._enable_entity_scoped_state_resolution:
             report = {"enabled": 0, "updated": 0}
             self._log_info("memory_reflect", "entity_state_update_finish", {
@@ -3372,11 +3525,10 @@ class MemoryNodeManager:
                 ),
             })
             return report
-        existing_entity_states = [
-            state for state in existing_states
-            if str(state.get("state_scope") or "") == "entity_state"
-            and str(state.get("state_type") or "") in self._entity_scoped_state_types()
-        ]
+        existing_entity_states = self._db.get_recent_memory_states(
+            state_type=sorted(self._entity_scoped_state_types()),
+            limit=80,
+        )
         candidates = self._build_entity_state_candidates_from_facts(facts)
         updated = 0
         for candidate in candidates:
@@ -3404,15 +3556,16 @@ class MemoryNodeManager:
                     ),
                 )
                 updated += 1
-                refreshed = self._db.get_recent_memory_states(
-                    source_types=[state_update["source_type"]],
-                    limit=200,
-                )
-                existing_entity_states = [
-                    state for state in refreshed
-                    if str(state.get("state_scope") or "") == "entity_state"
-                    and str(state.get("state_type") or "") in self._entity_scoped_state_types()
-                ]
+                refreshed_state = self._db.get_memory_state_by_id(state_id)
+                if refreshed_state:
+                    replaced = False
+                    for index, existing in enumerate(existing_entity_states):
+                        if int(existing.get("id") or -1) == int(state_id):
+                            existing_entity_states[index] = refreshed_state
+                            replaced = True
+                            break
+                    if not replaced:
+                        existing_entity_states.append(refreshed_state)
         report = {"enabled": 1, "candidate_count": len(candidates), "updated": updated}
         self._log_info("memory_reflect", "entity_state_update_finish", {
             **report,
@@ -3464,12 +3617,12 @@ class MemoryNodeManager:
             "source_type": fact.get("source_type"),
             "fact_type": fact.get("fact_type"),
             "fact_kind": fact.get("fact_kind"),
-            "fact_subject": fact.get("fact_subject"),
-            "time_key": fact.get("time_key"),
-            "summary": self._log_text(fact.get("summary") or "", limit=1200),
+            "event_time_key": fact.get("event_time_key"),
+            "dialogue_time_key": fact.get("dialogue_time_key"),
+            "summary": self._format_log_text(fact.get("summary") or "", limit=1200),
             "keywords": fact.get("keywords"),
             "entities": fact.get("entities") or [],
-            "primary_entity": fact.get("primary_entity") or metadata.get("primary_entity"),
+            "primary_entity": fact.get("primary_entity"),
             "fact_root_topic": fact.get("fact_root_topic") or "",
             "fact_aspect_topic": fact.get("fact_aspect_topic") or "",
             "state_aspects": fact.get("state_aspects") or metadata.get("state_aspects") or [],
@@ -3489,7 +3642,7 @@ class MemoryNodeManager:
             "source_type": state.get("source_type"),
             "entity_key": state.get("entity_key") or metadata.get("entity_key") or "",
             "canonical_name": state.get("canonical_name"),
-            "summary": self._log_text(state.get("summary") or "", limit=1200),
+            "summary": self._format_log_text(state.get("summary") or "", limit=1200),
             "time_line": self._normalize_time_line(
                 state.get("time_line"),
                 limit=20,
@@ -3510,7 +3663,7 @@ class MemoryNodeManager:
     ) -> List[Dict[str, Any]]:
         grouped: Dict[Tuple[str, str, str, str], Dict[str, Any]] = {}
         for fact in facts:
-            source_type = str(fact.get("source_type") or "unified")
+            source_type = fact.get("source_type")
             state_aspects = self._state_aspects_from_fact(fact)
             if state_aspects:
                 for aspect in state_aspects:
@@ -3549,7 +3702,8 @@ class MemoryNodeManager:
                             **aspect,
                             "fact_id": fact_id,
                             "fact_summary": fact.get("summary") or "",
-                            "fact_time_key": fact.get("time_key") or "",
+                            "fact_event_time_key": fact.get("event_time_key") or "",
+                            "fact_dialogue_time_key": fact.get("dialogue_time_key") or "",
                         })
         candidates: List[Dict[str, Any]] = []
         for item in grouped.values():
@@ -3582,7 +3736,7 @@ class MemoryNodeManager:
     def _state_aspects_from_fact(self, fact: Dict[str, Any]) -> List[Dict[str, Any]]:
         metadata = fact.get("metadata") if isinstance(fact.get("metadata"), dict) else {}
         raw = fact.get("state_aspects") or metadata.get("state_aspects")
-        fallback_entity = fact.get("primary_entity") or metadata.get("primary_entity")
+        fallback_entity = fact.get("primary_entity")
         return self._normalize_state_aspects(raw, fallback_entity=fallback_entity)
 
     def _entities_for_state_aspect(
@@ -3596,11 +3750,6 @@ class MemoryNodeManager:
         else:
             name = _compact_whitespace(entity)
         if name:
-            lower = name.lower()
-            if lower in {"用户", "user", "the user"}:
-                return ["user"]
-            if lower in {"助手", "assistant", "agent", "the assistant"}:
-                return ["assistant"]
             return [name]
         return self._entities_for_entity_state_fact(fact)
 
@@ -3609,7 +3758,7 @@ class MemoryNodeManager:
         fact: Dict[str, Any],
     ) -> List[str]:
         metadata = fact.get("metadata") if isinstance(fact.get("metadata"), dict) else {}
-        primary_entity = fact.get("primary_entity") or metadata.get("primary_entity")
+        primary_entity = fact.get("primary_entity")
         if isinstance(primary_entity, dict):
             primary_name = _compact_whitespace(
                 primary_entity.get("name") or primary_entity.get("text") or ""
@@ -3617,11 +3766,6 @@ class MemoryNodeManager:
         else:
             primary_name = _compact_whitespace(primary_entity)
         if primary_name:
-            normalized_primary = primary_name.lower()
-            if normalized_primary in {"用户", "user", "the user"}:
-                return ["user"]
-            if normalized_primary in {"助手", "assistant", "agent", "the assistant"}:
-                return ["assistant"]
             return [primary_name]
 
         entities = [
@@ -3629,12 +3773,7 @@ class MemoryNodeManager:
             for value in (fact.get("entities") or [])
             if _compact_whitespace(value)
         ]
-        subject = str(fact.get("fact_subject") or "").strip().lower()
-        if subject in {"user", "assistant"}:
-            # A fact without an explicit primary_entity still belongs to one
-            # speaker; never fan it out to every mentioned entity.
-            return [subject]
-        if not entities and subject in {"project", "world", "other"}:
+        if not entities:
             entities.extend(self._fact_topic_names(fact))
         out: List[str] = []
         seen: set[str] = set()
@@ -3818,17 +3957,16 @@ class MemoryNodeManager:
                 ],
             }, ensure_ascii=False, indent=2))
             .replace("{existing_entity_state}", json.dumps(
-                self._format_existing_topic_state_for_prompt(existing_state),
+                self._format_existing_entity_state_for_prompt(existing_state),
                 ensure_ascii=False,
                 indent=2,
             ))
-            .replace("{facts}", self._format_entity_state_candidate_facts_for_prompt(candidate))
         )
         result = self._call_llm(prompt)
         parsed = self._parse_json_object_from_llm_text(result or "")
         if parsed:
             if not self._config_bool(parsed.get("update_needed", True), True):
-                logger.debug(
+                self._logger.debug(
                     "LLM declined entity-state update for entity=%s attribute=%s",
                     candidate.get("entity"),
                     candidate.get("attribute_name"),
@@ -3913,19 +4051,21 @@ class MemoryNodeManager:
             candidate=candidate,
             existing_state=existing_state,
         )
+        entity_name = self._normalize_entity_names([
+            candidate.get("entity")
+            or existing_metadata.get("entity")
+            or candidate.get("entity_key")
+        ], limit=1)
         return {
             "state_scope": "entity_state",
             "state_type": candidate["state_type"],
-            "source_type": candidate.get("source_type") or (existing_state or {}).get("source_type") or "unified",
+            "source_type": candidate.get("source_type") or (existing_state or {}).get("source_type"),
             "canonical_name": canonical_name,
             "summary": summary,
             "time_line": time_line,
             "evidence_fact_ids": evidence_ids,
             "keywords": self._normalize_string_list(raw.get("keywords"), limit=18),
-            "entities": self._normalize_entity_names([
-                candidate.get("entity"),
-                *(raw.get("entities") or []),
-            ], limit=18),
+            "entities": entity_name,
             "canonical_topics": canonical_topics,
             "importance": self._clamp_float(raw.get("importance"), 0.0, 1.0, 0.68),
             "confidence": self._clamp_float(raw.get("confidence"), 0.0, 1.0, 0.74),
@@ -3982,7 +4122,7 @@ class MemoryNodeManager:
         return {
             "state_scope": "entity_state",
             "state_type": candidate["state_type"],
-            "source_type": candidate.get("source_type") or (existing_state or {}).get("source_type") or "unified",
+            "source_type": candidate.get("source_type") or (existing_state or {}).get("source_type"),
             "canonical_name": _compact_whitespace(
                 (existing_state or {}).get("canonical_name")
                 or candidate.get("attribute_name")
@@ -4016,13 +4156,13 @@ class MemoryNodeManager:
         )
         state_type = self._normalize_state_type(state.get("state_type"))
         if not state_scope or not state_type:
-            logger.debug("Skipping state with invalid scope/type: %s", state)
+            self._logger.debug("Skipping state with invalid scope/type: %s", state)
             return 0
         if state_scope == "topic_state" and state_type != "topic":
-            logger.debug("Skipping topic state with non-topic type: %s", state)
+            self._logger.debug("Skipping topic state with non-topic type: %s", state)
             return 0
         if state_scope == "entity_state" and state_type not in self._entity_scoped_state_types():
-            logger.debug("Skipping entity state with invalid type: %s", state)
+            self._logger.debug("Skipping entity state with invalid type: %s", state)
             return 0
         keywords = state.get("keywords") or self._keywords(state["summary"], limit=18)
         entities = state.get("entities") or self._entities(state["summary"])
@@ -4037,14 +4177,10 @@ class MemoryNodeManager:
                 or state_metadata.get("entity")
                 or ""
             )
-        evidence_facts = self._db.memory_facts_by_ids(evidence_fact_ids)
         entity_names = list(entities or [])
         if entity_key:
             entity_names.append(entity_key)
-        entity_ids = self._entity_ids_from_names_and_facts(
-            names=entity_names,
-            facts=evidence_facts,
-        )
+        entity_ids = self._entity_ids_for_names(entity_names, limit=64)
         identity_text = "\n".join([
             state["canonical_name"],
             state["summary"],
@@ -4056,8 +4192,7 @@ class MemoryNodeManager:
                 identity_text,
                 f"parent_topics: {', '.join(state_metadata.get('parent_topics') or [])}",
                 f"aspects: {', '.join(state_metadata.get('aspect_topic_names') or [])}",
-                f"context_entities: {', '.join(state_metadata.get('context_entities') or [])}",
-            ])
+        ])
         identity_text_embedding = self._generate_embedding_vector(identity_text)
         canonical_name_embedding = self._generate_embedding_vector(state["canonical_name"])
         state_id = self._db.upsert_state(
@@ -4084,48 +4219,6 @@ class MemoryNodeManager:
             canonical_name_embedding=canonical_name_embedding,
             identity_text=identity_text,
         )
-        # if state_id:
-        #     memory_path = f"{state['source_type']}/states/{state_scope}/{state_type}"
-        #     # State summaries are maintained as concise current snapshots. Reuse
-        #     # the same text in the index so retrieval sees exactly that snapshot.
-        #     summary_card = _compact_whitespace(state["summary"])
-        #     evidence_time_start, evidence_time_end = self._event_time_bounds_from_facts(
-        #         evidence_facts,
-        #     )
-        #     index_embedding_text = self._build_index_embedding_text(
-        #         title=state["canonical_name"],
-        #         summary=summary_card,
-        #         keywords=keywords,
-        #         entities=entities,
-        #         canonical_topics=canonical_topics,
-        #         memory_path=memory_path,
-        #     )
-        #     index_embedding = self._generate_embedding_vector(index_embedding_text)
-        #     self._db.upsert_index_entry(
-        #         source_type=state["source_type"],
-        #         target_table="memory_states",
-        #         target_id=state_id,
-        #         index_level="state",
-        #         memory_path=memory_path,
-        #         title=state["canonical_name"],
-        #         summary_for_retrieval=summary_card,
-        #         keywords=" ".join(keywords),
-        #         entities=entities,
-        #         canonical_topics=canonical_topics,
-        #         participants=["user", "assistant"],
-        #         time_start=evidence_time_start,
-        #         time_end=evidence_time_end,
-        #         importance=state["importance"],
-        #         confidence=state["confidence"],
-        #         embedding=index_embedding,
-        #         embedding_text=index_embedding_text,
-        #         metadata={
-        #             "state_scope": state_scope,
-        #             "state_type": state_type,
-        #             "status": state["status"],
-        #             "evidence_fact_ids": evidence_fact_ids,
-        #         },
-        #     )
         return state_id
 
     def _extract_actionable_items_with_llm(
@@ -4161,7 +4254,7 @@ class MemoryNodeManager:
             self._log_info("memory_reflect", "actionable_llm_parse_failed", {
                 "candidate_fact_count": len(facts),
                 "response_chars": len(result or ""),
-                "response_preview": self._log_text(result or "", limit=600),
+                "response_preview": self._format_log_text(result or "", limit=600),
             })
             return []
         raw_items = parsed.get("actionable_items")
@@ -4272,11 +4365,8 @@ class MemoryNodeManager:
     def _fact_can_seed_actionable_item(self, fact: Dict[str, Any]) -> bool:
         kind = str(fact.get("fact_kind") or "").strip().lower()
         fact_type = str(fact.get("fact_type") or "").strip().lower()
-        subject = str(fact.get("fact_subject") or "").strip().lower()
         summary = str(fact.get("summary") or "")
-        metadata = fact.get("metadata") if isinstance(fact.get("metadata"), dict) else {}
-        source_text = str(metadata.get("source_text") or fact.get("source_text") or "")
-        all_text = f"{summary}\n{source_text}".lower()
+        all_text = f"{summary}".lower()
         if not summary:
             return False
         if any(pattern in all_text for pattern in _WEAK_TRY_PATTERNS):
@@ -4290,7 +4380,15 @@ class MemoryNodeManager:
             return self._has_strong_decision_marker(all_text)
         if kind == "risk":
             return self._has_blocking_marker(all_text)
-        if kind == "instruction" and subject in {"user", "assistant", "system"}:
+        primary_entity = fact.get("primary_entity")
+        primary_entity_name = (
+            primary_entity.get("name")
+            if isinstance(primary_entity, dict)
+            else primary_entity
+        )
+        if kind == "instruction" and str(primary_entity_name or "").strip().lower() in {
+            "user", "the user", "用户", "assistant", "the assistant", "助手", "system", "系统",
+        }:
             return True
         if kind == "action" and fact_type == "episodic":
             return self._has_explicit_followup_or_commitment(all_text, item_type="task")
@@ -4446,7 +4544,7 @@ class MemoryNodeManager:
             names=[*entities, item.get("owner") or ""],
             facts=evidence_facts,
         )
-        embedding_text = "\n".join([
+        identity_text = "\n".join([
             item["canonical_name"],
             item["summary"],
             f"item_type: {item['item_type']}",
@@ -4456,7 +4554,7 @@ class MemoryNodeManager:
             f"keywords: {' '.join(keywords)}",
             f"entities: {', '.join(entities)}",
         ])
-        embedding = self._generate_embedding_vector(embedding_text)
+        identity_text_embedding = self._generate_embedding_vector(identity_text)
         item_id = self._db.upsert_actionable_item(
             item_type=item["item_type"],
             source_type=item["source_type"],
@@ -4474,72 +4572,12 @@ class MemoryNodeManager:
                 "entities": entities,
                 "canonical_topics": canonical_topics,
             },
-            embedding=embedding,
-            embedding_text=embedding_text,
+            identity_text_embedding=identity_text_embedding,
+            identity_text=identity_text,
         )
-        # if item_id:
-        #     memory_path = f"{item['source_type']}/actionable_items/{item['item_type']}"
-        #     summary_card = self._truncate_index_text(item["summary"], max_chars=700)
-        #     evidence_time_start, evidence_time_end = self._event_time_bounds_from_facts(
-        #         evidence_facts,
-        #     )
-        #     index_embedding_text = self._build_index_embedding_text(
-        #         title=item["canonical_name"],
-        #         summary=summary_card,
-        #         keywords=keywords,
-        #         entities=entities,
-        #         canonical_topics=canonical_topics,
-        #         memory_path=memory_path,
-        #     )
-        #     index_embedding = self._generate_embedding_vector(index_embedding_text)
-        #     self._db.upsert_index_entry(
-        #         source_type=item["source_type"],
-        #         target_table="memory_actionable_items",
-        #         target_id=item_id,
-        #         index_level="actionable_item",
-        #         memory_path=memory_path,
-        #         title=item["canonical_name"],
-        #         summary_for_retrieval=summary_card,
-        #         keywords=" ".join(keywords),
-        #         entities=entities,
-        #         canonical_topics=canonical_topics,
-        #         participants=["user", "assistant"],
-        #         time_start=evidence_time_start,
-        #         time_end=evidence_time_end,
-        #         importance=item["importance"],
-        #         confidence=item["confidence"],
-        #         embedding=index_embedding,
-        #         embedding_text=index_embedding_text,
-        #         metadata={
-        #             "item_type": item["item_type"],
-        #             "owner": item["owner"],
-        #             "status": item["status"],
-        #             "due_at": item["due_at"],
-        #             "evidence_fact_ids": evidence_fact_ids,
-        #         },
-        #     )
+
         return item_id
     
-    def _format_facts_for_state_prompt(self, facts: List[Dict[str, Any]]) -> str:
-        rows: List[Dict[str, Any]] = []
-        for fact in facts[:160]:
-            metadata = fact.get("metadata") if isinstance(fact.get("metadata"), dict) else {}
-            rows.append({
-                "id": fact.get("id"),
-                "source_type": fact.get("source_type"),
-                "fact_type": fact.get("fact_type"),
-                "fact_kind": fact.get("fact_kind"),
-                "fact_subject": fact.get("fact_subject"),
-                "time_key": fact.get("time_key"),
-                "summary": fact.get("summary"),
-                "keywords": fact.get("keywords"),
-                "entities": fact.get("entities") or [],
-                "primary_entity": fact.get("primary_entity") or metadata.get("primary_entity"),
-                "fact_root_topic": fact.get("fact_root_topic") or "",
-                "fact_aspect_topic": fact.get("fact_aspect_topic") or "",
-            })
-        return json.dumps(rows, ensure_ascii=False, indent=2)
-
     def _format_facts_for_actionable_prompt(self, facts: List[Dict[str, Any]]) -> str:
         rows: List[Dict[str, Any]] = []
         for fact in facts[:80]:
@@ -4550,40 +4588,17 @@ class MemoryNodeManager:
                 "source_type": fact.get("source_type"),
                 "fact_type": fact.get("fact_type"),
                 "fact_kind": fact.get("fact_kind"),
-                "fact_subject": fact.get("fact_subject"),
-                "time_key": fact.get("time_key"),
+                "event_time_key": fact.get("event_time_key"),
+                "dialogue_time_key": fact.get("dialogue_time_key"),
                 "summary": fact.get("summary"),
                 "keywords": fact.get("keywords"),
                 "entities": fact.get("entities") or [],
-                "primary_entity": fact.get("primary_entity") or metadata.get("primary_entity"),
+                "primary_entity": fact.get("primary_entity"),
                 "fact_root_topic": fact.get("fact_root_topic") or "",
                 "fact_aspect_topic": fact.get("fact_aspect_topic") or "",
                 "actionable_aspects": actionable_aspects,
             })
         return json.dumps(rows, ensure_ascii=False, indent=2)
-
-    def _format_entity_state_candidate_facts_for_prompt(
-        self,
-        candidate: Dict[str, Any],
-    ) -> str:
-        aspect_rows = []
-        for aspect in candidate.get("state_aspects") or []:
-            if not isinstance(aspect, dict):
-                continue
-            aspect_rows.append({
-                "fact_id": aspect.get("fact_id"),
-                "source_type": candidate.get("source_type"),
-                "state_type": aspect.get("state_type") or candidate.get("state_type"),
-                "attribute_name": aspect.get("attribute_name") or candidate.get("attribute_name"),
-                "aspect_summary": aspect.get("aspect_summary") or "",
-                "evidence_basis": aspect.get("evidence_basis") or "",
-                "confidence": aspect.get("confidence"),
-                "fact_time_key": aspect.get("fact_time_key") or "",
-                "full_fact_summary": aspect.get("fact_summary") or "",
-            })
-        if aspect_rows:
-            return json.dumps(aspect_rows[:160], ensure_ascii=False, indent=2)
-        return self._format_facts_for_state_prompt(list(candidate.get("facts") or []))
 
     @staticmethod
     def _normalize_state_scope(value: Any, state_type: Any = None) -> str:
@@ -4631,6 +4646,10 @@ class MemoryNodeManager:
     @staticmethod
     def _normalize_actionable_owner(value: Any) -> str:
         text = str(value or "unknown").strip().lower()
+        if text in {"用户", "user", "the user"}:
+            return "user"
+        if text in {"助手", "assistant", "agent", "the assistant"}:
+            return "assistant"
         allowed = {"user", "assistant", "other", "unknown"}
         return text if text in allowed else "unknown"
 
@@ -4655,8 +4674,7 @@ class MemoryNodeManager:
             return next(iter(sources))
         return "unified"
 
-    @classmethod
-    def _log_info(cls, scope: str, event: str, payload: Dict[str, Any]) -> None:
+    def _log_info(self, scope: str, event: str, payload: Dict[str, Any]) -> None:
         record = {
             "scope": scope,
             "event": event,
@@ -4681,10 +4699,10 @@ class MemoryNodeManager:
                 sort_keys=False,
                 indent=2,
             )
-        logger.info("\n%s", body)
+        self._logger.info("\n%s", body)
 
     @staticmethod
-    def _log_text(value: Any, *, limit: int = 500) -> str:
+    def _format_log_text(value: Any, *, limit: int = 500) -> str:
         text = _compact_whitespace(value)
         if limit <= 0 or len(text) <= limit:
             return text
@@ -4751,12 +4769,32 @@ class MemoryNodeManager:
                 "target": f"{item.get('target_table')}#{item.get('target_id')}",
                 "level": item.get("index_level") or item.get("_recall_type"),
                 "source_type": item.get("source_type"),
-                "score": item.get("_recall_score"),
+                "score": item.get(
+                    "_recall_score",
+                    item.get("_recall_type_score"),
+                ),
                 "type_score": item.get("_recall_type_score"),
                 "rank": item.get("_recall_rank"),
                 "embedding_similarity": item.get("embedding_similarity"),
+                "bm25_score": (
+                    item.get("_recall_score_components") or {}
+                ).get("bm25_identity_text"),
+                "score_components": item.get("_recall_score_components") or {},
+                "provenance": {
+                    key: value
+                    for key, value in (item.get("_recall_provenance") or {}).items()
+                    if key in {
+                        "candidate_source",
+                        "stage2_provenance",
+                        "direct_index",
+                        "evidence_expansion",
+                        "episode_expansion",
+                        "provenance_bonus",
+                        "expansion_penalty",
+                    }
+                },
                 "time_start": item.get("time_start"),
-                "summary": self._log_text(summary, limit=240),
+                "summary": self._format_log_text(summary, limit=240),
                 "support_fact_ids": support_ids,
             })
         return {
@@ -4764,12 +4802,129 @@ class MemoryNodeManager:
             "items": rows,
         }
 
+    def _recall_detailed_candidate_items(
+        self,
+        items: Sequence[Dict[str, Any]],
+        *,
+        decision_by_target: Optional[Dict[Tuple[str, str], Dict[str, Any]]] = None,
+        accepted_targets: Optional[set[Tuple[str, int]]] = None,
+        selected_targets: Optional[set[Tuple[str, int]]] = None,
+        stage: str = "",
+    ) -> List[Dict[str, Any]]:
+        """Serialize detailed recall diagnostics without embeddings or raw rows."""
+        rows: List[Dict[str, Any]] = []
+        decision_by_target = decision_by_target or {}
+        has_accepted_targets = accepted_targets is not None
+        has_selected_targets = selected_targets is not None
+        accepted_targets = accepted_targets or set()
+        selected_targets = selected_targets or set()
+        for item in items or []:
+            table = str(item.get("target_table") or "")
+            target_id = str(item.get("target_id") or "")
+            target_key = (table, target_id)
+            try:
+                target = (table, int(target_id))
+            except (TypeError, ValueError):
+                target = (table, -1)
+            raw = item.get("_hydrated") if isinstance(item.get("_hydrated"), dict) else {}
+            match_details = item.get("_recall_fast_match_details")
+            match_details = dict(match_details) if isinstance(match_details, dict) else {}
+            decision = dict(decision_by_target.get(target_key) or {})
+            item_decision = item.get("_recall_decision")
+            if isinstance(item_decision, dict):
+                decision.update(item_decision)
+            source = str(item.get("_recall_candidate_source") or "")
+            provenance = list(item.get("_stage2_provenance") or [])
+            reasons: List[str] = []
+            for value in item.get("_recall_fast_match_evidence") or []:
+                if str(value) and str(value) not in reasons:
+                    reasons.append(str(value))
+            for value in self._recall_candidate_source_channels(source):
+                if value not in reasons:
+                    reasons.append(value)
+            if source.endswith("_evidence_expansion") and "evidence_expansion" not in reasons:
+                reasons.append("evidence_expansion")
+            if source.endswith("_episode_expansion") and "episode_expansion" not in reasons:
+                reasons.append("episode_expansion")
+            for value in provenance:
+                if value not in reasons:
+                    reasons.append(value)
+            filter_reason = (
+                decision.get("decision_reason")
+                or match_details.get("filter_reason")
+                or ""
+            )
+            accepted = decision.get("accepted")
+            if accepted is None:
+                accepted = target in accepted_targets if has_accepted_targets else None
+            selected = target in selected_targets if has_selected_targets else None
+            rows.append({
+                "stage": stage,
+                "target": f"{table}#{target_id}",
+                "level": item.get("index_level") or item.get("_recall_type"),
+                "source_type": item.get("source_type"),
+                "candidate_source": source,
+                "stage2_provenance": provenance,
+                "retrieval_reasons": reasons,
+                "title": self._format_log_text(
+                    item.get("title") or raw.get("canonical_name") or "",
+                    limit=240,
+                ),
+                "summary": self._format_log_text(
+                    raw.get("summary")
+                    or item.get("summary_for_retrieval")
+                    or item.get("summary")
+                    or "",
+                    limit=500,
+                ),
+                "identity_text": self._format_log_text(
+                    item.get("identity_text") or raw.get("identity_text") or "",
+                    limit=500,
+                ),
+                "time_start": item.get("time_start"),
+                "time_end": item.get("time_end"),
+                "match": {
+                    key: value
+                    for key, value in match_details.items()
+                    if key not in {"anchor"} or value
+                },
+                "score": item.get("_recall_score"),
+                "type_score": item.get("_recall_type_score"),
+                "embedding_similarity": item.get("embedding_similarity"),
+                "bm25_raw_score": item.get("_bm25_score"),
+                "bm25_score": item.get("_recall_bm25_score"),
+                "score_components": item.get("_recall_score_components") or {},
+                "provenance_profile": item.get("_recall_provenance") or {},
+                "support_fact_ids": [
+                    fact.get("id")
+                    for fact in item.get("_supporting_facts") or []
+                    if isinstance(fact, dict) and fact.get("id") is not None
+                ],
+                "episode_seed_targets": list(
+                    item.get("_stage2_episode_seed_targets") or []
+                ),
+                "accepted": accepted,
+                "selected": selected,
+                "decision_reason": (
+                    filter_reason
+                    or item.get("_recall_drop_reason")
+                    or (
+                        "selected"
+                        if selected is True
+                        else "not_selected"
+                        if selected is False
+                        else ""
+                    )
+                ),
+            })
+        return rows
+
     @staticmethod
     def _parse_time_expression(
         query: str,
         *,
         reference_time: Optional[str] = None,
-    ) -> Tuple[Optional[str], Optional[str], str]:
+    ) -> Tuple[Optional[str], str, str]:
         """Parse lightweight time expressions from a recall query.
 
         This mirrors the voice_recording recall path but uses the recall
@@ -4848,6 +5003,48 @@ class MemoryNodeManager:
             clean_query = text[:m.start()] + text[m.end():]
             return fmt(now - timedelta(days=7)), fmt(now), clean_query.strip()
 
+        # Parse a day-level Chinese date range before the single-date branch.
+        # The end bound is exclusive, so a query covering Apr 27 through Apr
+        # 29 searches until the start of Apr 30.
+        m = re.search(
+            r"(?<!\d)"
+            r"(?:(?P<year1>\d{4})\s*年\s*)?"
+            r"(?P<month1>\d{1,2})\s*月\s*(?P<day1>\d{1,2})\s*(?:日|号)?"
+            r"\s*(?:到|至|[-~～])\s*"
+            r"(?:(?P<year2>\d{4})\s*年\s*)?"
+            r"(?P<month2>\d{1,2})\s*月\s*(?P<day2>\d{1,2})\s*(?:日|号)?"
+            r"(?!\d)",
+            text,
+        )
+        if m:
+            year1_text = m.group("year1")
+            year2_text = m.group("year2")
+            month1 = int(m.group("month1"))
+            day1 = int(m.group("day1"))
+            month2 = int(m.group("month2"))
+            day2 = int(m.group("day2"))
+            year1 = int(year1_text) if year1_text else now.year
+            if not year1_text:
+                try:
+                    if datetime(year1, month1, day1).date() > now.date():
+                        year1 -= 1
+                except ValueError:
+                    pass
+            if year2_text:
+                year2 = int(year2_text)
+            elif year1_text:
+                year2 = year1
+            else:
+                year2 = year1 + (1 if (month2, day2) < (month1, day1) else 0)
+            try:
+                start = datetime(year1, month1, day1)
+                end = datetime(year2, month2, day2) + timedelta(days=1)
+                if end > start:
+                    clean_query = text[:m.start()] + text[m.end():]
+                    return fmt(start), fmt(end), clean_query.strip()
+            except ValueError:
+                pass
+
         m = re.search(r"(?:从)?\s*(\d{4})\s*年\s*(\d{1,2})\s*月\s*(?:到|至)\s*(?:(\d{4})\s*年)?\s*(\d{1,2})\s*月", text)
         if m:
             year1 = int(m.group(1))
@@ -4863,6 +5060,41 @@ class MemoryNodeManager:
                 )
                 clean_query = text[:m.start()] + text[m.end():]
                 return fmt(start), fmt(end), clean_query.strip()
+            except ValueError:
+                pass
+
+        m = re.search(
+            r"(?<!\d)(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日?",
+            text,
+        )
+        if m:
+            try:
+                start = datetime(
+                    int(m.group(1)),
+                    int(m.group(2)),
+                    int(m.group(3)),
+                )
+                clean_query = text[:m.start()] + text[m.end():]
+                return None, fmt(start + timedelta(days=1)), clean_query.strip()
+            except ValueError:
+                pass
+
+        # A month/day without a year is interpreted relative to the recall
+        # reference year. For historical-memory queries, a date later than
+        # the reference date most naturally refers to the previous year.
+        m = re.search(
+            r"(?<!\d)(\d{1,2})\s*月\s*(\d{1,2})\s*(?:日|号)?",
+            text,
+        )
+        if m:
+            month = int(m.group(1))
+            day = int(m.group(2))
+            try:
+                start = datetime(now.year, month, day)
+                if start.date() > now.date():
+                    start = datetime(now.year - 1, month, day)
+                clean_query = text[:m.start()] + text[m.end():]
+                return None, fmt(start + timedelta(days=1)), clean_query.strip()
             except ValueError:
                 pass
 
@@ -4882,12 +5114,15 @@ class MemoryNodeManager:
             except ValueError:
                 pass
 
-        m = re.search(r"\b(\d{4})-(\d{1,2})-(\d{1,2})\b", text)
+        m = re.search(
+            r"(?<!\d)(\d{4})-(\d{1,2})-(\d{1,2})(?!\d)",
+            text,
+        )
         if m:
             try:
                 start = datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))
                 clean_query = text[:m.start()] + text[m.end():]
-                return fmt(start), fmt(start + timedelta(days=1)), clean_query.strip()
+                return None, fmt(start + timedelta(days=1)), clean_query.strip()
             except ValueError:
                 pass
 
@@ -4967,7 +5202,7 @@ class MemoryNodeManager:
             clean_query = text[:m.start()] + text[m.end():]
             return fmt(today_start), fmt(now), clean_query.strip()
 
-        return None, None, text
+        return None, fmt(now), text
 
     # ── Recall path: raw candidates -> unified rerank -> formatted evidence ─
 
@@ -4977,24 +5212,28 @@ class MemoryNodeManager:
         top_k: int = None,
         budget: str = None,
         tags: Optional[List[str]] = None,
-        time_start: Optional[str] = None,
         time_end: Optional[str] = None,
         recall_gate_mode: Optional[str] = None,
         memory_source_override: Optional[Sequence[str]] = None,
         recall_path: str = "normal",
+        prompt_language: str = "zh",
     ) -> Dict[str, Any]:
-        """Run recall immediately against the current stored memory."""
-        with self._memory_operation_lock:
+        """Run recall immediately against the latest committed memory snapshot."""
+        # Recall is read-only and must not wait for the store/reflect worker's
+        # long-running LLM or embedding work. A separate WAL reader gives it
+        # a consistent committed snapshot without sharing the writer connection.
+        with self._db.reader_transaction() as reader_db:
             return self._recall_sync(
                 query=query,
                 top_k=top_k,
                 budget=budget,
                 tags=tags,
-                time_start=time_start,
                 time_end=time_end,
                 recall_gate_mode=recall_gate_mode,
                 memory_source_override=memory_source_override,
                 recall_path=recall_path,
+                prompt_language=prompt_language,
+                database=reader_db,
             )
 
     def _recall_sync(
@@ -5003,15 +5242,16 @@ class MemoryNodeManager:
         top_k: int = None,
         budget: str = None,
         tags: Optional[List[str]] = None,
-        time_start: Optional[str] = None,
         time_end: Optional[str] = None,
         recall_gate_mode: Optional[str] = None,
         memory_source_override: Optional[Sequence[str]] = None,
         recall_path: str = "normal",
+        prompt_language: str = "zh",
+        database: Optional[SessionDB] = None,
     ) -> Dict[str, Any]:
         requested_recall_path = str(recall_path or "normal").strip().lower()
         started_at = time.monotonic()
-        if not self._enabled or not str(query or "").strip():
+        if not self._memory_enabled or not str(query or "").strip():
             recall_report = {
                 "memory_context": "",
                 "requested_recall_path": requested_recall_path,
@@ -5029,100 +5269,112 @@ class MemoryNodeManager:
                 )
             k = max(1, int(top_k or self._top_k or 8))
             b = str(budget or self._recall_budget or "mid")
-            recall_time_end = self._normalize_recall_time_bound(
+            reference_time = self._normalize_recall_time_bound(
                 time_end,
                 default_to_now=True,
             )
             self._log_info("memory_recall", "start", {
-                "query": self._log_text(query, limit=500),
+                "query": self._format_log_text(query, limit=500),
                 "top_k": k,
                 "budget": b,
                 "tags": tags or [],
-                "time_start": time_start,
-                "time_end": recall_time_end,
+                "requested_time_end": time_end,
+                "time_end": reference_time,
                 "recall_gate_mode": recall_gate_mode,
                 "memory_source_override": list(memory_source_override or []),
                 "recall_path": normalized_recall_path,
+                "prompt_language": prompt_language,
             })
 
             parsed_time_start, parsed_time_end, clean_query = self._parse_time_expression(
                 query,
-                reference_time=recall_time_end,
+                reference_time=reference_time,
             )
-            effective_time_start = (
-                self._normalize_recall_time_bound(time_start)
-                or parsed_time_start
+            temporal_bounds: RecallTimeBounds = (
+                parsed_time_start,
+                parsed_time_end,
             )
-            effective_time_end = (
-                self._normalize_recall_time_bound(time_end)
-                if time_end and not (parsed_time_start or parsed_time_end)
-                else (parsed_time_end or recall_time_end)
-            )
+            temporal_mode = self._infer_recall_temporal_mode(query)
             search_query = clean_query or query
             self._log_info("memory_recall", "query_prepared", {
-                "search_query": self._log_text(search_query, limit=500),
-                "clean_query": self._log_text(clean_query, limit=500),
+                "search_query": self._format_log_text(search_query, limit=500),
+                "clean_query": self._format_log_text(clean_query, limit=500),
                 "parsed_time_start": parsed_time_start,
                 "parsed_time_end": parsed_time_end,
-                "effective_time_start": effective_time_start,
-                "effective_time_end": effective_time_end,
-                "recall_time_end": recall_time_end,
+                "temporal_mode": temporal_mode,
             })
 
             memory_text: Optional[str]
             actual_recall_path: str
             if normalized_recall_path == "stage2":
                 actual_recall_path = "stage2"
-                memory_text = self._recall_stage2_semantic_search(
+                stage1_report = self._process_recall_stage1(
                     query=search_query,
                     top_k=k,
                     budget=b,
-                    time_start=effective_time_start,
-                    time_end=effective_time_end,
+                    temporal_bounds=temporal_bounds,
                     memory_source_override=memory_source_override,
-                    parsed_time_start=parsed_time_start,
-                    parsed_time_end=parsed_time_end,
+                    temporal_mode=temporal_mode,
+                    recent_reference_time=parsed_time_end,
+                    prompt_language=prompt_language,
+                    database=database,
+                )
+                memory_text = self._process_recall_stage2(
+                    query=search_query,
+                    top_k=k,
+                    budget=b,
+                    temporal_bounds=temporal_bounds,
+                    memory_source_override=memory_source_override,
+                    temporal_mode=temporal_mode,
+                    stage1_report=stage1_report,
+                    prompt_language=prompt_language,
+                    database=database,
                 )
             else:
                 has_explicit_time_window = bool(
-                    time_start or time_end or parsed_time_start or parsed_time_end
+                    parsed_time_start
                 )
-                stage1_text = self._recall_stage1_fast_path(
+                stage1_report = self._process_recall_stage1(
                     query=search_query,
                     top_k=k,
                     budget=b,
-                    time_start=effective_time_start,
-                    time_end=effective_time_end,
+                    temporal_bounds=temporal_bounds,
                     memory_source_override=memory_source_override,
+                    temporal_mode=temporal_mode,
                     recent_reference_time=(
-                        effective_time_end
+                        parsed_time_end
                         if has_explicit_time_window
                         else datetime.now(timezone.utc).isoformat()
                     ),
+                    prompt_language=prompt_language,
+                    database=database,
                 )
                 if normalized_recall_path == "stage1":
                     actual_recall_path = "stage1"
-                    memory_text = stage1_text or ""
-                elif stage1_text is None:
+                    memory_text = str(stage1_report.get("memory_context") or "")
+                elif not stage1_report.get("trusted"):
                     actual_recall_path = "stage2"
-                    memory_text = self._recall_stage2_semantic_search(
+                    memory_text = self._process_recall_stage2(
                         query=search_query,
+                        analysis_query=query,
                         top_k=k,
                         budget=b,
-                        time_start=effective_time_start,
-                        time_end=effective_time_end,
+                        temporal_bounds=temporal_bounds,
                         memory_source_override=memory_source_override,
-                        parsed_time_start=parsed_time_start,
-                        parsed_time_end=parsed_time_end,
+                        temporal_mode=temporal_mode,
+                        stage1_report=stage1_report,
+                        prompt_language=prompt_language,
+                        database=database,
                     )
                 else:
-                    memory_text = stage1_text
+                    memory_text = str(stage1_report.get("memory_context") or "")
                     actual_recall_path = "stage1"
             recall_status = "ok" if memory_text else "empty"
             recall_report = {
                 "memory_context": memory_text or "",
                 "requested_recall_path": normalized_recall_path,
                 "actual_recall_path": actual_recall_path,
+                "temporal_mode": temporal_mode,
                 "status": recall_status,
                 "elapsed_ms": round((time.monotonic() - started_at) * 1000, 2),
                 "recall_context_chars": len(memory_text or ""),
@@ -5131,6 +5383,7 @@ class MemoryNodeManager:
                 "status": recall_status,
                 "recall_path": normalized_recall_path,
                 "actual_recall_path": actual_recall_path,
+                "temporal_mode": temporal_mode,
                 "elapsed_ms": round((time.monotonic() - started_at) * 1000, 2),
                 "recall_context_chars": len(memory_text or ""),
                 "recall_context": memory_text,
@@ -5139,31 +5392,32 @@ class MemoryNodeManager:
             return recall_report
         except Exception as exc:
             self._log_info("memory_recall", "error", {
-                "query": self._log_text(query, limit=500),
+                "query": self._format_log_text(query, limit=500),
                 "error_type": type(exc).__name__,
                 "error": str(exc),
                 "elapsed_ms": round((time.monotonic() - started_at) * 1000, 2),
             })
             raise
 
-    def _recall_stage1_fast_path(
+    def _process_recall_stage1(
         self,
         *,
         query: str,
         top_k: int,
         budget: str,
-        time_start: Optional[str],
-        time_end: Optional[str],
+        temporal_bounds: RecallTimeBounds,
         memory_source_override: Optional[Sequence[str]] = None,
+        temporal_mode: str = "dialogue_time",
         recent_reference_time: Optional[str] = None,
-    ) -> Optional[str]:
+        prompt_language: str = "zh",
+        database: Optional[SessionDB] = None,
+    ) -> Dict[str, Any]:
         """Run a deterministic, no-LLM recall path for high-confidence hits.
 
         Stage 1 is deliberately conservative. It returns a formatted context
-        only for exact entity/topic anchors, a recent active topic used by a
-        contextual follow-up, or a relevant high-priority actionable item.
-        Otherwise it returns ``None`` so the caller can fall through to Stage
-        2 semantic retrieval.
+        only when the retrieved candidates provide sufficient direct matching
+        evidence. Otherwise it returns ``None`` so the caller can fall through
+        to Stage 2 semantic retrieval.
         """
         started_at = time.monotonic()
         source_types = self._normalize_source_override(memory_source_override)
@@ -5172,358 +5426,1102 @@ class MemoryNodeManager:
             keywords=[],
             entities=[],
         )
-        candidate_limit = max(12, min(48, max(1, int(top_k or 1)) * 6))
-        raw_candidate_limits = {
-            "facts": candidate_limit,
-            "states": candidate_limit,
-            "actionable_items": candidate_limit,
-        }
+        is_contextual_query = self._recall_stage1_is_contextual_query(query)
+        is_actionable_query = self._recall_stage1_is_actionable_query(query)
+
+        raw_candidate_limits, layer_limits = self._recall_stage1_candidate_limits(
+            top_k=top_k,
+            is_contextual_query=is_contextual_query,
+            is_actionable_query=is_actionable_query,
+        )
+        entity_mapping_candidate_limits, lexical_candidate_limits = (
+            self._split_recall_stage1_source_limits(raw_candidate_limits)
+        )
         self._log_info("memory_recall_stage1", "start", {
-            "query": self._log_text(query, limit=500),
+            "query": self._format_log_text(query, limit=500),
             "top_k": top_k,
             "budget": budget,
             "terms": terms,
-            "time_start": time_start,
-            "time_end": time_end,
+            "time_start": (temporal_bounds or (None, None))[0],
+            "time_end": (temporal_bounds or (None, None))[1],
+            "temporal_mode": temporal_mode,
             "recent_reference_time": recent_reference_time,
             "memory_source_override": list(memory_source_override or []),
+            "raw_candidate_limits": raw_candidate_limits,
+            "entity_mapping_candidate_limits": entity_mapping_candidate_limits,
+            "lexical_candidate_limits": lexical_candidate_limits,
         })
 
-        raw_fact_candidates, raw_state_candidates, raw_actionable_candidates = (
-            self._retrieve_recall_raw_candidates(
+        lexical_fact_candidates, lexical_state_candidates, lexical_actionable_candidates = (
+            self._retrieve_recall_raw_candidates_lexical_search(
                 terms=terms,
+                candidate_source_prefix="stage1",
                 source_types=source_types,
-                time_start=time_start,
-                time_end=time_end,
-                raw_candidate_limits=raw_candidate_limits,
+                temporal_bounds=temporal_bounds,
+                temporal_mode=temporal_mode,
+                candidate_limits=lexical_candidate_limits,
+                database=database,
             )
         )
-        filtered_candidates: List[Dict[str, Any]] = []
-        candidate_match_results: Dict[Tuple[str, str], Dict[str, Any]] = {}
-        for candidate in [
-            *raw_fact_candidates,
-            *raw_state_candidates,
-            *raw_actionable_candidates,
-        ]:
-            match = self._recall_stage1_candidate_match(candidate, query)
-            candidate_key = (
-                str(candidate.get("target_table") or ""),
-                str(candidate.get("target_id") or ""),
+        entity_fact_candidates, entity_state_candidates, entity_actionable_candidates = (
+            self._retrieve_recall_entity_mapping_candidates(
+                query=query,
+                candidate_source_prefix="stage1",
+                source_types=source_types,
+                temporal_bounds=temporal_bounds,
+                temporal_mode=temporal_mode,
+                candidate_limits=entity_mapping_candidate_limits,
+                database=database,
             )
-            candidate_match_results[candidate_key] = match
-            if match["matched"]:
-                item = dict(candidate)
-                item["_recall_fast_match_type"] = match["match_type"]
-                item["_recall_fast_match_anchor"] = match["anchor"]
-                item["_recall_score"] = match["score"]
-                item["_recall_type_score"] = match["score"]
-                item["_recall_candidate_source"] = match["match_type"]
-                filtered_candidates.append(item)
-
+        )
+        raw_candidates, raw_candidates_by_level = (
+            self._expand_and_merge_recall_stage1_raw_candidates(
+                entity_candidates=[
+                    *entity_fact_candidates,
+                    *entity_state_candidates,
+                    *entity_actionable_candidates,
+                ],
+                lexical_candidates=[
+                    *lexical_fact_candidates,
+                    *lexical_state_candidates,
+                    *lexical_actionable_candidates,
+                ],
+                source_types=source_types,
+                temporal_bounds=temporal_bounds,
+                temporal_mode=temporal_mode,
+                database=database,
+            )
+        )
         reference_time = recent_reference_time or datetime.now(timezone.utc).isoformat()
-        is_contextual_query = self._recall_stage1_is_contextual_query(query)
-        if is_contextual_query:
-            self._recall_stage1_add_contextual_candidates(
-                candidates=filtered_candidates,
-                fact_candidates=raw_fact_candidates,
-                state_candidates=raw_state_candidates,
-                reference_time=reference_time,
-            )
-
-        is_actionable_query = self._recall_stage1_is_actionable_query(query)
-        if is_actionable_query:
-            self._recall_stage1_add_actionable_candidates(
-                candidates=filtered_candidates,
-                actionable_candidates=raw_actionable_candidates,
-                candidate_match_results=candidate_match_results,
-                reference_time=reference_time,
-            )
-
-        filtered_candidates.sort(
-            key=lambda item: (
-                float(item.get("_recall_score") or 0.0),
-                str(item.get("time_start") or ""),
-                int(item.get("target_id") or 0),
-            ),
-            reverse=True,
+        (
+            ranked_fact_candidates,
+            ranked_state_candidates,
+            ranked_actionable_items,
+        ) = self._recall_stage1_calculate_candidate_matching_score(
+            candidates=raw_candidates,
+            query=query,
+            search_terms=terms,
+            is_contextual_query=is_contextual_query,
+            reference_time=reference_time,
         )
-        selected_candidates: List[Dict[str, Any]] = []
-        seen_targets: set[Tuple[str, int]] = set()
-        for candidate in filtered_candidates:
-            try:
-                target = (
-                    str(candidate.get("target_table") or ""),
-                    int(candidate.get("target_id")),
-                )
-            except (TypeError, ValueError):
-                continue
-            if target in seen_targets:
-                continue
-            seen_targets.add(target)
-            selected_candidates.append(candidate)
-            if len(selected_candidates) >= max(1, int(top_k or 1)):
-                break
+        filtered_candidates: List[Dict[str, Any]] = [
+            *ranked_fact_candidates,
+            *ranked_state_candidates,
+            *ranked_actionable_items,
+        ]
+        semantic_query = self._recall_stage1_requires_semantic_search(query)
 
-        exact_hit = any(
-            str(item.get("_recall_fast_match_type") or "").startswith("exact_")
-            for item in selected_candidates
+        selected_candidates, selected_by_layer = (
+            self._recall_get_selected_candidates_by_layer(
+                ranked_fact_candidates=ranked_fact_candidates,
+                ranked_state_candidates=ranked_state_candidates,
+                ranked_actionable_items=ranked_actionable_items,
+                layer_limits=layer_limits,
+            )
         )
+
+        evidence_profile = self._recall_stage1_build_evidence_profile(
+            selected_candidates,
+        )
+        evidence_gate = bool(evidence_profile.get("trusted"))
+
         actionable_hit = any(
-            str(item.get("_recall_fast_match_type") or "")
+            self._recall_stage1_candidate_match_type(item)
             in {"high_priority_actionable", "exact_actionable"}
             for item in selected_candidates
         )
-        semantic_query = self._recall_stage1_requires_semantic_search(query)
-        can_return_fast = bool(selected_candidates) and not semantic_query and (
-            exact_hit
+        trusted = bool(selected_candidates) and (
+            evidence_gate
             or actionable_hit
-            or is_contextual_query
         )
-        if not can_return_fast:
-            self._log_info("memory_recall_stage1", "finish", {
-                "status": "miss",
-                "reason": (
-                    "no_high_confidence_candidate"
-                    if not selected_candidates
-                    else "semantic_query_requires_stage2"
-                ),
-                "candidate_count": len(filtered_candidates),
-                "selected_count": len(selected_candidates),
-                "exact_hit": exact_hit,
-                "actionable_hit": actionable_hit,
-                "is_contextual_query": is_contextual_query,
-                "semantic_query": semantic_query,
-                "elapsed_ms": round((time.monotonic() - started_at) * 1000, 2),
-            })
-            return None
-
         memory_text = self._build_memory_retrieved_format_text(
             entries=selected_candidates,
-            query=query,
-            budget=budget,
+            prompt_language=prompt_language,
         )
-        if not memory_text:
-            self._log_info("memory_recall_stage1", "finish", {
-                "status": "miss",
-                "reason": "empty_formatted_context",
-                "candidate_count": len(filtered_candidates),
-                "selected_count": len(selected_candidates),
-                "elapsed_ms": round((time.monotonic() - started_at) * 1000, 2),
-            })
-            return None
-        self._log_info("memory_recall_stage1", "finish", {
-            "status": "hit",
-            "candidate_count": len(filtered_candidates),
+        stage1_finish_payload = {
+            "status": "hit" if trusted and memory_text else "miss",
+            "reason": "" if trusted and memory_text else (
+                "empty_formatted_context"
+                if not memory_text
+                else "semantic_query_requires_stage2"
+                if semantic_query
+                else "evidence_profile_below_threshold"
+            ),
+            "raw_candidate_limits": raw_candidate_limits,
+            "entity_mapping_candidate_limits": entity_mapping_candidate_limits,
+            "lexical_candidate_limits": lexical_candidate_limits,
+            "entity_mapping_fact_candidate_count": len(entity_fact_candidates),
+            "entity_mapping_state_candidate_count": len(entity_state_candidates),
+            "entity_mapping_actionable_candidate_count": len(entity_actionable_candidates),
+            "lexical_fact_candidate_count": len(lexical_fact_candidates),
+            "lexical_state_candidate_count": len(lexical_state_candidates),
+            "lexical_actionable_candidate_count": len(lexical_actionable_candidates),
+            "evidence_expansion_candidate_count": sum(
+                1
+                for candidate in raw_candidates
+                if str(candidate.get("_recall_candidate_source") or "")
+                == "stage1_evidence_expansion"
+            ),
+            "raw_candidate_counts_by_level": {
+                level: len(candidates)
+                for level, candidates in raw_candidates_by_level.items()
+            },
+            "filtered_candidate_count": len(filtered_candidates),
             "selected_count": len(selected_candidates),
+            "trusted": trusted,
             "match_types": [
-                item.get("_recall_fast_match_type") for item in selected_candidates
+                self._recall_stage1_candidate_match_type(item)
+                for item in selected_candidates
             ],
+            "evidence_profile": evidence_profile,
+            "layer_limits": layer_limits,
+            "selected_by_layer": selected_by_layer,
+            "selected_scores": self._recall_stage1_score_log(
+                selected_candidates
+            ),
             "targets": [
                 f"{item.get('target_table')}#{item.get('target_id')}"
                 for item in selected_candidates
             ],
             "retrieved_chars": len(memory_text),
             "elapsed_ms": round((time.monotonic() - started_at) * 1000, 2),
-        })
-        return memory_text
-
-    def _recall_stage1_add_actionable_candidates(
-        self,
-        *,
-        candidates: List[Dict[str, Any]],
-        actionable_candidates: Sequence[Dict[str, Any]],
-        candidate_match_results: Dict[Tuple[str, str], Dict[str, Any]],
-        reference_time: str,
-    ) -> None:
-        """Add high-priority actionable items relevant to the query."""
-        for candidate in actionable_candidates:
-            if not self._recall_stage1_is_high_priority_actionable(
-                candidate,
-                reference_time=reference_time,
-            ):
-                continue
-            candidate_key = (
-                str(candidate.get("target_table") or ""),
-                str(candidate.get("target_id") or ""),
-            )
-            match = candidate_match_results.get(candidate_key) or {
-                "matched": False,
-                "match_type": "",
-                "anchor": "",
-                "score": 0.0,
+        }
+        if self._recall_detailed_logging:
+            selected_targets = {
+                (
+                    str(candidate.get("target_table") or ""),
+                    int(candidate.get("target_id")),
+                )
+                for candidate in selected_candidates
+                if str(candidate.get("target_id") or "").isdigit()
             }
-            if any(
-                str(existing.get("target_table")) == str(candidate.get("target_table"))
-                and int(existing.get("target_id") or -1) == int(candidate.get("target_id") or -2)
-                for existing in candidates
-            ):
-                continue
-            if match["matched"]:
-                match_type = match["match_type"]
-                score = max(float(match["score"]), 0.94)
-                anchor = match["anchor"]
-            else:
-                match_type = "high_priority_actionable"
-                score = 0.86
-                anchor = candidate.get("title") or candidate.get("summary_for_retrieval") or ""
-            item = dict(candidate)
-            item["_recall_fast_match_type"] = match_type
-            item["_recall_fast_match_anchor"] = anchor
-            item["_recall_score"] = score
-            item["_recall_type_score"] = score
-            item["_recall_candidate_source"] = match_type
-            candidates.append(item)
-
-    def _recall_stage1_add_contextual_candidates(
-        self,
-        *,
-        candidates: List[Dict[str, Any]],
-        fact_candidates: Sequence[Dict[str, Any]],
-        state_candidates: Sequence[Dict[str, Any]],
-        reference_time: str,
-    ) -> None:
-        """Add recent facts and active topics for contextual follow-ups.
-
-        Recent facts are the primary freshness signal because reflect may run
-        later than fact extraction. Existing topic states are added only when
-        they are active and tied to a recent fact (or have a recent update when
-        no evidence facts are available).
-        """
-        recent_fact_ids = {
-            int(candidate.get("target_id"))
-            for candidate in fact_candidates
-            if str(candidate.get("target_id") or "").isdigit()
-            and self._recall_stage1_is_recent_fact(
-                candidate,
-                reference_time=reference_time,
-            )
+            filtered_targets = {
+                (
+                    str(candidate.get("target_table") or ""),
+                    int(candidate.get("target_id")),
+                )
+                for candidate in filtered_candidates
+                if str(candidate.get("target_id") or "").isdigit()
+            }
+            stage1_finish_payload["candidate_diagnostics"] = {
+                "raw_candidates": self._recall_detailed_candidate_items(
+                    raw_candidates,
+                    accepted_targets=filtered_targets,
+                    selected_targets=selected_targets,
+                    stage="stage1_raw",
+                ),
+                "filtered_candidates": self._recall_detailed_candidate_items(
+                    filtered_candidates,
+                    accepted_targets=filtered_targets,
+                    selected_targets=selected_targets,
+                    stage="stage1_filtered",
+                ),
+                "selected_candidates": self._recall_detailed_candidate_items(
+                    selected_candidates,
+                    accepted_targets=filtered_targets,
+                    selected_targets=selected_targets,
+                    stage="stage1_selected",
+                ),
+            }
+        self._log_info("memory_recall_stage1", "finish", stage1_finish_payload)
+        return {
+            "memory_context": memory_text or "",
+            "raw_candidates": raw_candidates,
+            "filtered_candidates": filtered_candidates,
+            "selected_candidates": selected_candidates,
+            "evidence_profile": evidence_profile,
+            "trusted": bool(trusted and memory_text),
+            "raw_candidate_count": len(raw_candidates),
+            "filtered_candidate_count": len(filtered_candidates),
+            "selected_count": len(selected_candidates),
+            "elapsed_ms": round((time.monotonic() - started_at) * 1000, 2),
         }
 
-        def append_if_new(
-            candidate: Dict[str, Any],
-            *,
-            match_type: str,
-            score: float,
-        ) -> None:
-            if any(
-                str(existing.get("target_table")) == str(candidate.get("target_table"))
-                and int(existing.get("target_id") or -1) == int(candidate.get("target_id") or -2)
-                for existing in candidates
-            ):
-                return
-            item = dict(candidate)
-            item["_recall_fast_match_type"] = match_type
-            item["_recall_fast_match_anchor"] = (
-                item.get("title") or item.get("summary_for_retrieval") or ""
+    def _expand_and_merge_recall_stage1_raw_candidates(
+        self,
+        *,
+        entity_candidates: Sequence[Dict[str, Any]],
+        lexical_candidates: Sequence[Dict[str, Any]],
+        source_types: Optional[Sequence[str]] = None,
+        temporal_bounds: RecallTimeBounds = None,
+        temporal_mode: str = "dialogue_time",
+        database: Optional[SessionDB] = None,
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, List[Dict[str, Any]]]]:
+        """Merge Stage 1 candidates and expand state/actionable evidence facts."""
+        raw_candidates: List[Dict[str, Any]] = []
+        candidates_by_target: Dict[Tuple[str, int], Dict[str, Any]] = {}
+        for source_name, source_candidates in (
+            ("stage1_entity_mapping", entity_candidates),
+            ("stage1_lexical", lexical_candidates),
+        ):
+            for candidate in source_candidates:
+                candidate["_recall_candidate_source"] = source_name
+                self._merge_recall_stage1_candidate(
+                    candidate=candidate,
+                    source_name=source_name,
+                    candidates_by_target=candidates_by_target,
+                    raw_candidates=raw_candidates,
+                )
+        
+        seed_candidates = [
+            *list(entity_candidates or []),
+            *list(lexical_candidates or []),
+        ]
+        evidence_candidates = self._expand_recall_evidence_facts_from_candidates(
+            candidates=seed_candidates,
+            candidate_source_prefix="stage1",
+            source_types=source_types,
+            temporal_bounds=temporal_bounds,
+            temporal_mode=temporal_mode,
+            limit=max(12, min(48, max(len(raw_candidates), 12))),
+            database=database,
+        )
+        for evidence_candidate in evidence_candidates:
+            self._merge_recall_stage1_candidate(
+                candidate=evidence_candidate,
+                source_name="stage1_evidence_expansion",
+                candidates_by_target=candidates_by_target,
+                raw_candidates=raw_candidates,
             )
-            item["_recall_score"] = score
-            item["_recall_type_score"] = score
-            item["_recall_candidate_source"] = match_type
-            candidates.append(item)
 
-        for candidate in fact_candidates:
-            if self._recall_stage1_is_recent_fact(
+        candidates_by_level: Dict[str, List[Dict[str, Any]]] = {
+            "fact": [],
+            "state": [],
+            "actionable_item": [],
+        }
+        for candidate in raw_candidates:
+            level = str(candidate.get("index_level") or "")
+            if level in candidates_by_level:
+                candidates_by_level[level].append(candidate)
+        return raw_candidates, candidates_by_level
+
+    def _merge_recall_stage1_candidate(
+        self,
+        *,
+        candidate: Dict[str, Any],
+        source_name: str,
+        candidates_by_target: Dict[Tuple[str, int], Dict[str, Any]],
+        raw_candidates: List[Dict[str, Any]],
+    ) -> None:
+        """Merge one Stage 1 candidate while preserving source provenance."""
+        try:
+            target = (
+                str(candidate.get("target_table") or ""),
+                int(candidate.get("target_id")),
+            )
+        except (TypeError, ValueError):
+            return
+        existing_candidate = candidates_by_target.get(target)
+        if existing_candidate is None:
+            candidates_by_target[target] = candidate
+            raw_candidates.append(candidate)
+            return
+
+        existing_source = str(
+            existing_candidate.get("_recall_candidate_source") or source_name
+        )
+        direct_source_names: set[str] = set()
+        if existing_source == "stage1_both":
+            direct_source_names.update({"stage1_entity_mapping", "stage1_lexical"})
+        elif existing_source in {"stage1_entity_mapping", "stage1_lexical"}:
+            direct_source_names.add(existing_source)
+        if source_name == "stage1_both":
+            direct_source_names.update({"stage1_entity_mapping", "stage1_lexical"})
+        elif source_name in {"stage1_entity_mapping", "stage1_lexical"}:
+            direct_source_names.add(source_name)
+        if direct_source_names == {"stage1_entity_mapping", "stage1_lexical"}:
+            existing_candidate["_recall_candidate_source"] = "stage1_both"
+        elif direct_source_names:
+            # A direct index hit remains the primary source when the same fact
+            # is also returned through Stage 1 evidence expansion.
+            existing_candidate["_recall_candidate_source"] = next(
+                iter(direct_source_names)
+            )
+        elif existing_source == source_name:
+            existing_candidate["_recall_candidate_source"] = existing_source
+        else:
+            existing_candidate["_recall_candidate_source"] = source_name
+
+        try:
+            existing_bm25 = float(existing_candidate.get("_bm25_score"))
+        except (TypeError, ValueError):
+            existing_bm25 = None
+        try:
+            candidate_bm25 = float(candidate.get("_bm25_score"))
+        except (TypeError, ValueError):
+            candidate_bm25 = None
+        # SQLite FTS5 BM25 ranks lower values as more relevant.
+        if candidate_bm25 is not None and (
+            existing_bm25 is None or candidate_bm25 < existing_bm25
+        ):
+            existing_candidate["_bm25_score"] = candidate_bm25
+            existing_candidate["_recall_bm25_score"] = self._clamp_float(
+                candidate.get("_recall_bm25_score"),
+                0.0,
+                1.0,
+                0.0,
+            )
+            existing_candidate["_recall_bm25_rank"] = candidate.get(
+                "_recall_bm25_rank"
+            )
+
+    @staticmethod
+    def _recall_stage1_candidate_limits(
+        *,
+        top_k: int,
+        is_contextual_query: Optional[bool] = None,
+        is_actionable_query: Optional[bool] = None,
+    ) -> Tuple[Dict[str, int], Dict[str, int]]:
+        """Build the raw retrieval and final per-layer Stage 1 budgets.
+
+        Raw limits are the combined per-layer budget for the two direct Stage
+        1 sources. The caller splits each raw limit between entity mapping and
+        lexical retrieval. Layer limits are per-layer caps for the final
+        selection. The final
+        candidate count is the sum of these caps rather than ``top_k`` itself;
+        ``top_k`` is used as the base cap for each memory layer.
+        """
+        k = max(1, int(top_k or 1))
+        contextual = bool(is_contextual_query)
+        actionable = bool(is_actionable_query)
+        base_raw_limit = max(8, min(32, k * 3))
+        raw_candidate_limits = {
+            "facts": base_raw_limit,
+            "states": base_raw_limit,
+            "actionable_items": base_raw_limit,
+        }
+
+        # Contextual recall needs a wider recent-fact and active-topic pool;
+        # actionable recall needs more actionable candidates for the
+        # high-priority pass. These are raw retrieval budgets, not additional
+        # final output slots.
+        contextual_extra = max(4, min(16, k * 2))
+        actionable_extra = max(4, min(16, k * 2))
+        if contextual:
+            raw_candidate_limits["facts"] += contextual_extra
+            raw_candidate_limits["states"] += contextual_extra
+        if actionable:
+            raw_candidate_limits["actionable_items"] += actionable_extra
+        raw_candidate_limits = {
+            key: min(48, value)
+            for key, value in raw_candidate_limits.items()
+        }
+
+        base_layer_limit = k
+        contextual_layer_extra = int(math.ceil(base_layer_limit * 0.5))
+        actionable_layer_extra = int(math.ceil(base_layer_limit * 0.5))
+        limits = {
+            "fact": base_layer_limit,
+            "state": base_layer_limit,
+            "actionable_item": base_layer_limit,
+        }
+        if contextual:
+            limits["fact"] += contextual_layer_extra
+            limits["state"] += contextual_layer_extra
+        if actionable:
+            limits["actionable_item"] += actionable_layer_extra
+        return raw_candidate_limits, limits
+
+    @staticmethod
+    def _split_recall_stage1_source_limits(
+        raw_candidate_limits: Dict[str, int],
+    ) -> Tuple[Dict[str, int], Dict[str, int]]:
+        """Split each Stage 1 raw budget between mapping and lexical search.
+
+        The two direct retrieval sources receive complementary halves. When a
+        budget is odd, lexical search receives the extra candidate so the two
+        limits never exceed the combined raw budget.
+        """
+        entity_mapping_limits: Dict[str, int] = {}
+        lexical_limits: Dict[str, int] = {}
+        for key, raw_limit in (raw_candidate_limits or {}).items():
+            normalized_limit = max(0, int(raw_limit or 0))
+            entity_limit = normalized_limit // 2
+            entity_mapping_limits[key] = entity_limit
+            lexical_limits[key] = normalized_limit - entity_limit
+        return entity_mapping_limits, lexical_limits
+
+    @staticmethod
+    def _recall_stage1_candidate_match_type(
+        candidate: Dict[str, Any],
+    ) -> str:
+        """Read a candidate match type from details or fallback evidence."""
+        details = candidate.get("_recall_fast_match_details")
+        if isinstance(details, dict) and details.get("match_type"):
+            return str(details.get("match_type"))
+        known_types = {
+            "exact_actionable",
+            "exact_topic",
+            "exact_name",
+            "topic_overlap",
+            "name_overlap",
+            "entity_mapping",
+            "bm25_lexical",
+            "high_priority_actionable",
+            "recent_fact_context",
+            "recent_active_topic",
+        }
+        for value in candidate.get("_recall_fast_match_evidence") or []:
+            if str(value) in known_types:
+                return str(value)
+        return ""
+
+    @staticmethod
+    def _recall_stage1_score_log(
+        candidates: Sequence[Dict[str, Any]],
+        *,
+        limit: int = 8,
+    ) -> List[Dict[str, Any]]:
+        """Return compact score evidence for Stage 1 diagnostics."""
+        rows: List[Dict[str, Any]] = []
+        for candidate in list(candidates)[: max(1, int(limit or 1))]:
+            rows.append({
+                "target": (
+                    f"{candidate.get('target_table')}#"
+                    f"{candidate.get('target_id')}"
+                ),
+                "match_type": MemoryNodeManager._recall_stage1_candidate_match_type(
+                    candidate
+                ),
+                "candidate_source": candidate.get("_recall_candidate_source") or "",
+                "evidence": list(
+                    candidate.get("_recall_fast_match_evidence") or []
+                ),
+                "matched_keywords": list(
+                    candidate.get("_recall_fast_matched_keywords") or []
+                ),
+                "rank_score": round(
+                    float(candidate.get("_recall_score") or 0.0),
+                    4,
+                ),
+                "candidate_score_passed": bool(
+                    (candidate.get("_recall_fast_match_details") or {}).get(
+                        "candidate_score_passed"
+                    )
+                ),
+                "candidate_score_threshold": (
+                    candidate.get("_recall_fast_match_details") or {}
+                ).get("candidate_score_threshold"),
+                "bm25_score": round(
+                    float(candidate.get("_recall_bm25_score") or 0.0),
+                    4,
+                ),
+                "bm25_raw_score": candidate.get("_bm25_score"),
+            })
+        return rows
+
+    @staticmethod
+    def _recall_candidate_source_channels(value: Any) -> set[str]:
+        """Normalize prefixed candidate sources to retrieval channels."""
+        source = str(value or "").strip().lower()
+        if source == "both" or source.endswith("_both"):
+            return {"entity_mapping", "lexical"}
+        channels: set[str] = set()
+        if source == "entity_mapping" or source.endswith("_entity_mapping"):
+            channels.add("entity_mapping")
+        if source == "lexical" or source.endswith("_lexical"):
+            channels.add("lexical")
+        return channels
+
+    def _recall_stage1_calculate_candidate_matching_score(
+        self,
+        *,
+        candidates: Sequence[Dict[str, Any]],
+        query: str,
+        search_terms: Sequence[str] = (),
+        is_contextual_query: bool = False,
+        reference_time: Optional[str] = None,
+    ) -> Tuple[
+        List[Dict[str, Any]],
+        List[Dict[str, Any]],
+        List[Dict[str, Any]],
+    ]:
+        """Score, filter, and rank Stage 1 candidates by memory layer.
+
+        Contextual recency and actionable priority are score components here;
+        neither category bypasses the normal matching gate.
+        """
+        ranked_by_level: Dict[str, List[Dict[str, Any]]] = {
+            "fact": [],
+            "state": [],
+            "actionable_item": [],
+        }
+        for candidate in candidates or []:
+            match = self._recall_stage1_calculate_single_candidate_matching_score(
                 candidate,
-                reference_time=reference_time,
-            ):
-                append_if_new(
-                    candidate,
-                    match_type="recent_fact_context",
-                    score=0.78,
-                )
+                query,
+                search_terms=search_terms,
+            )
+            score_components = dict(match.get("score_components") or {})
+            index_level = str(candidate.get("index_level") or "")
+            effective_reference_time = (
+                reference_time or datetime.now(timezone.utc).isoformat()
+            )
 
-        for candidate in state_candidates:
-            if self._recall_stage1_is_recent_active_topic(
-                candidate,
-                reference_time=reference_time,
-                recent_fact_ids=recent_fact_ids,
-            ):
-                append_if_new(
+            if index_level == "actionable_item":
+                high_priority = self._recall_stage1_is_high_priority_actionable(
                     candidate,
-                    match_type="recent_active_topic",
-                    score=0.72,
+                    reference_time=effective_reference_time,
                 )
+                high_priority_score = (
+                    self._clamp_float(
+                        self._memory_cfg.get(
+                            "recall_fast_high_priority_actionable_score",
+                            0.20,
+                        ),
+                        0.0,
+                        1.0,
+                        0.20,
+                    )
+                    if high_priority
+                    else 0.0
+                )
+                score_components["high_priority_actionable"] = round(
+                    high_priority_score,
+                    4,
+                )
+                if high_priority and match.get("match_type"):
+                    match.setdefault("evidence", []).append(
+                        "high_priority_actionable"
+                    )
+                    if not match.get("strong_anchor"):
+                        match["match_type"] = "high_priority_actionable"
 
-    def _recall_stage1_candidate_match(
+            if is_contextual_query and index_level in {"fact", "state"}:
+                if index_level == "fact":
+                    is_recent = self._recall_stage1_is_recent_fact(
+                        candidate,
+                        reference_time=effective_reference_time,
+                    )
+                else:
+                    is_recent = self._recall_stage1_is_recent_active_topic(
+                        candidate,
+                        reference_time=effective_reference_time,
+                    )
+                contextual_time_score = (
+                    self._clamp_float(
+                        self._memory_cfg.get(
+                            "recall_fast_contextual_time_score",
+                            0.20,
+                        ),
+                        0.0,
+                        1.0,
+                        0.20,
+                    )
+                    if is_recent
+                    else 0.0
+                )
+                score_components["contextual_recency"] = round(
+                    contextual_time_score,
+                    4,
+                )
+                if contextual_time_score and match.get("match_type"):
+                    match.setdefault("evidence", []).append(
+                        "contextual_recency"
+                    )
+
+            rank_score = min(1.0, sum(score_components.values()))
+            if score_components:
+                match["score_components"] = score_components
+                match["rank_score"] = round(rank_score, 4)
+                candidate_min_score = self._clamp_float(
+                    match.get("candidate_score_threshold"),
+                    0.0,
+                    1.0,
+                    0.35,
+                )
+                match["candidate_score_passed"] = bool(
+                    match.get("strong_anchor")
+                    or (
+                        bool(match.get("match_type"))
+                        and rank_score >= candidate_min_score
+                    )
+                )
+                match["matched"] = bool(
+                    match.get("match_type")
+                    and match.get("candidate_score_passed")
+                )
+                if not match["matched"] and match.get("filter_reason") == "":
+                    match["filter_reason"] = "candidate_score_below_threshold"
+            candidate["_recall_score"] = match.get("rank_score", 0.0)
+            candidate["_recall_type_score"] = match.get("rank_score", 0.0)
+            candidate["_recall_candidate_source"] = (
+                candidate.get("_recall_candidate_source") or "stage1_lexical"
+            )
+            candidate["_recall_fast_match_evidence"] = list(
+                match.get("evidence") or []
+            )
+            candidate["_recall_fast_matched_keywords"] = list(
+                match.get("matched_keywords") or []
+            )
+            candidate["_recall_fast_match_details"] = dict(match)
+            accepted = bool(
+                match.get("matched")
+                and match.get("candidate_score_passed", False)
+            )
+            candidate["_recall_decision"] = {
+                "accepted": accepted,
+                "decision_reason": (
+                    "accepted"
+                    if accepted
+                    else str(match.get("filter_reason") or "not_matched")
+                ),
+            }
+            if not (
+                match.get("matched")
+                and match.get("candidate_score_passed", False)
+            ):
+                continue
+            level = str(candidate.get("index_level") or "")
+            if level in ranked_by_level:
+                ranked_by_level[level].append(candidate)
+
+        def rank_key(item: Dict[str, Any]) -> Tuple[float, str, int]:
+            return (
+                float(item.get("_recall_score") or 0.0),
+                str(item.get("time_start") or ""),
+                int(item.get("target_id") or 0),
+            )
+
+        for candidates_for_level in ranked_by_level.values():
+            candidates_for_level.sort(key=rank_key, reverse=True)
+        return (
+            ranked_by_level["fact"],
+            ranked_by_level["state"],
+            ranked_by_level["actionable_item"],
+        )
+
+    def _recall_get_selected_candidates_by_layer(
+        self,
+        *,
+        ranked_fact_candidates: Sequence[Dict[str, Any]],
+        ranked_state_candidates: Sequence[Dict[str, Any]],
+        ranked_actionable_items: Sequence[Dict[str, Any]],
+        layer_limits: Dict[str, int],
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+        """Select already-ranked candidates with per-layer preferred limits."""
+        candidates_by_layer: Dict[str, Sequence[Dict[str, Any]]] = {
+            "facts": ranked_fact_candidates,
+            "states": ranked_state_candidates,
+            "actionable_items": ranked_actionable_items,
+        }
+        selected_candidates: List[Dict[str, Any]] = []
+        seen_targets: set[Tuple[str, int]] = set()
+        max_selected_candidates = max(1, sum(layer_limits.values()))
+
+        def append_candidate(candidate: Dict[str, Any]) -> bool:
+            try:
+                target = (
+                    str(candidate.get("target_table") or ""),
+                    int(candidate.get("target_id")),
+                )
+            except (TypeError, ValueError):
+                return False
+            if target in seen_targets or len(selected_candidates) >= max_selected_candidates:
+                return False
+            seen_targets.add(target)
+            selected_candidates.append(candidate)
+            return True
+
+        selected_by_layer: Dict[str, int] = {
+            layer: 0 for layer in layer_limits
+        }
+        for layer, limit in layer_limits.items():
+            for candidate in candidates_by_layer.get(layer, []):
+                if selected_by_layer[layer] >= limit:
+                    break
+                if append_candidate(candidate):
+                    selected_by_layer[layer] += 1
+
+        # Reuse empty layer quota so a missing layer does not reduce the
+        # available output capacity. The first pass enforces each layer's
+        # preferred limit; this pass can use unused capacity from another
+        # layer until the global sum of layer limits is reached.
+        for layer in layer_limits:
+            for candidate in candidates_by_layer.get(layer, []):
+                if len(selected_candidates) >= max_selected_candidates:
+                    break
+                if append_candidate(candidate):
+                    selected_by_layer[layer] += 1
+            if len(selected_candidates) >= max_selected_candidates:
+                break
+        selected_by_layer = {
+            layer: sum(
+                1
+                for candidate in selected_candidates
+                if str(candidate.get("index_level") or "") == layer
+            )
+            for layer in layer_limits
+        }
+        return selected_candidates, selected_by_layer
+
+    def _recall_stage1_calculate_single_candidate_matching_score(
         self,
         candidate: Dict[str, Any],
         query: str,
+        *,
+        search_terms: Sequence[str] = (),
     ) -> Dict[str, Any]:
+        """Collect exact and lexical-overlap evidence for one candidate.
+
+        This method deliberately does not decide whether the whole recall is
+        trustworthy.  That decision is made from all filtered candidates by
+        ``_recall_stage1_build_evidence_profile``.
+        """
         raw = candidate.get("_hydrated") if isinstance(candidate.get("_hydrated"), dict) else {}
         metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
         topic_values: List[str] = []
-        entity_values: List[str] = []
         name_values: List[str] = []
+
+        def extend_values(target: List[str], value: Any) -> None:
+            if isinstance(value, (list, tuple, set)):
+                for item in value:
+                    extend_values(target, item)
+                return
+            anchor = self._recall_stage1_clean_anchor(value)
+            if anchor and anchor not in target:
+                target.append(anchor)
+
         index_level = str(candidate.get("index_level") or "")
         if index_level == "state":
             state_scope = str(raw.get("state_scope") or "")
             if state_scope == "topic_state":
-                topic_values.extend([
+                extend_values(topic_values, [
                     raw.get("canonical_name"),
-                    *(metadata.get("canonical_topics") or []),
-                    *(metadata.get("parent_topics") or []),
-                    *(metadata.get("aspect_topic_names") or []),
+                    metadata.get("canonical_topics"),
+                    metadata.get("parent_topics"),
+                    metadata.get("aspect_topic_names"),
                 ])
             else:
-                name_values.extend([
+                extend_values(name_values, [
                     raw.get("canonical_name"),
-                    *(metadata.get("attribute_name_aliases") or []),
+                    metadata.get("attribute_name_aliases"),
                 ])
-            entity_values.extend([
-                raw.get("entity_key"),
-                metadata.get("entity"),
-                *(metadata.get("context_entities") or []),
-                *(metadata.get("entities") or []),
-            ])
         elif index_level == "fact":
-            topic_values.extend([
+            extend_values(topic_values, [
                 raw.get("fact_root_topic"),
                 raw.get("fact_aspect_topic"),
             ])
-            entity_values.extend([
-                *(raw.get("entities") or []),
-                metadata.get("primary_entity"),
-                *(metadata.get("episode_context_entities") or []),
-            ])
         elif index_level == "actionable_item":
-            name_values.append(raw.get("canonical_name"))
-            topic_values.extend([
-                *(metadata.get("canonical_topics") or []),
-                *(raw.get("canonical_topics") or []),
-            ])
-            entity_values.extend([
-                raw.get("owner"),
-                *(metadata.get("entities") or []),
+            extend_values(name_values, raw.get("canonical_name"))
+            extend_values(topic_values, [
+                metadata.get("canonical_topics"),
+                raw.get("canonical_topics"),
             ])
 
-        for value, match_type in [
-            *((topic, "exact_topic") for topic in topic_values),
-            *((entity, "exact_entity") for entity in entity_values),
-            *((name, "exact_name") for name in name_values),
-        ]:
-            anchor = self._recall_stage1_clean_anchor(value)
-            if not anchor or not self._recall_stage1_contains_anchor(query, anchor):
-                continue
-            if index_level == "actionable_item" and match_type in {"exact_topic", "exact_name"}:
-                match_type = "exact_actionable"
-            score = {
-                "exact_topic": 1.0,
-                "exact_entity": 0.98,
-                "exact_name": 0.96,
-                "exact_actionable": 0.99,
-            }.get(match_type, 0.9)
+        exact_topics = [
+            anchor for anchor in topic_values
+            if self._recall_stage1_contains_anchor(query, anchor)
+        ]
+        exact_names = [
+            anchor for anchor in name_values
+            if self._recall_stage1_contains_anchor(query, anchor)
+        ]
+
+        normalized_search_terms = [
+            cleaned
+            for value in search_terms or ()
+            if (cleaned := self._recall_stage1_clean_anchor(value))
+        ]
+
+        topic_overlap = self._topic_name_overlap(
+            normalized_search_terms,
+            topic_values,
+            allow_substring=False,
+        ) if normalized_search_terms and topic_values else 0.0
+        name_overlap = self._topic_name_overlap(
+            normalized_search_terms,
+            name_values,
+            allow_substring=False,
+        ) if normalized_search_terms and name_values else 0.0
+        
+        strong_overlap_threshold = 0.90
+        strong_topic_overlap = topic_overlap >= strong_overlap_threshold
+        strong_name_overlap = name_overlap >= strong_overlap_threshold
+
+        evidence: List[str] = []
+        if exact_topics:
+            evidence.append("exact_topic")
+        if exact_names:
+            evidence.append("exact_name")
+        if topic_overlap > 0.0:
+            evidence.append("topic_overlap")
+        if name_overlap > 0.0:
+            evidence.append("name_overlap")
+        bm25_score = self._clamp_float(
+            candidate.get("_recall_bm25_score"),
+            0.0,
+            1.0,
+            0.0,
+        )
+        candidate_source = str(candidate.get("_recall_candidate_source") or "")
+        candidate_sources = self._recall_candidate_source_channels(candidate_source)
+        entity_mapping_hit = "entity_mapping" in candidate_sources
+        lexical_source_hit = "lexical" in candidate_sources
+        if entity_mapping_hit:
+            evidence.append("entity_mapping")
+
+        if exact_topics:
+            exact_topic_score = min(
+                0.54,
+                0.48 + 0.03 * (len(exact_topics) - 1),
+            )
+        else:
+            exact_topic_score = 0.0
+        # A lexical overlap is weaker than an exact query anchor, but it must
+        # still affect ranking when no exact topic was found.
+        topic_overlap_score = (
+            min(0.36, 0.36 * topic_overlap)
+            if not exact_topics
+            else 0.0
+        )
+        if exact_names:
+            exact_name_score = min(
+                0.48,
+                0.42 + 0.03 * (len(exact_names) - 1),
+            )
+        else:
+            exact_name_score = 0.0
+        name_overlap_score = (
+            min(0.30, 0.30 * name_overlap)
+            if not exact_names
+            else 0.0
+        )
+        bm25_component = 0.45 * bm25_score if lexical_source_hit else 0.0
+        mapping_score = 0.30 if entity_mapping_hit else 0.0
+        score_components = {
+            "exact_topic": round(exact_topic_score, 4),
+            "exact_name": round(exact_name_score, 4),
+            "topic_overlap": round(topic_overlap_score, 4),
+            "name_overlap": round(name_overlap_score, 4),
+            "entity_mapping": round(mapping_score, 4),
+            "bm25_identity_text": round(bm25_component, 4),
+        }
+        rank_score = min(1.0, sum(score_components.values()))
+        lexical_bm25_match = bool(
+            lexical_source_hit
+            and bm25_score >= 0.55
+        )
+        strong_anchor = bool(
+            exact_topics
+            or exact_names
+            or strong_topic_overlap
+            or strong_name_overlap
+        )
+        candidate_min_score = self._clamp_float(
+            getattr(self, "_recall_fast_candidate_min_score", None),
+            0.0,
+            1.0,
+            0.35,
+        )
+        candidate_score_passed = bool(
+            strong_anchor or rank_score >= candidate_min_score
+        )
+
+        if index_level == "actionable_item" and (exact_topics or exact_names):
+            match_type = "exact_actionable"
+            anchor = max(
+                [*exact_topics, *exact_names],
+                key=len,
+            )
+        elif exact_topics:
+            match_type = "exact_topic"
+            anchor = max(exact_topics, key=len)
+        elif exact_names:
+            match_type = "exact_name"
+            anchor = max(exact_names, key=len)
+        elif entity_mapping_hit:
+            match_type = "entity_mapping"
+            anchor = ", ".join(candidate.get("_recall_entity_names") or []) or (
+                candidate.get("title") or candidate.get("summary_for_retrieval") or ""
+            )
+        elif lexical_bm25_match:
+            match_type = "bm25_lexical"
+            anchor = (
+                candidate.get("identity_text")
+                or raw.get("identity_text")
+                or candidate.get("summary_for_retrieval")
+                or candidate.get("title")
+                or ""
+            )
+        elif topic_overlap > 0.0:
+            match_type = "topic_overlap"
+            anchor = ", ".join(topic_values)
+        elif name_overlap > 0.0:
+            match_type = "name_overlap"
+            anchor = ", ".join(name_values)
+        else:
             return {
-                "matched": True,
+                "matched": False,
+                "match_type": "",
+                "anchor": "",
+                "rank_score": 0.0,
+                "evidence": [],
+                "matched_keywords": [],
+                "exact_topics": [],
+                "exact_names": [],
+                "candidate_source": candidate_source,
+                "candidate_sources": sorted(candidate_sources - {""}),
+                "entity_mapping_hit": entity_mapping_hit,
+                "strong_anchor": False,
+                "candidate_score_passed": False,
+                "candidate_score_threshold": candidate_min_score,
+                "filter_reason": "no_matching_evidence",
+                "bm25_score": round(bm25_score, 4),
+                "bm25_raw_score": candidate.get("_bm25_score"),
+                "topic_overlap": round(topic_overlap, 4),
+                "name_overlap": round(name_overlap, 4),
+                "score_components": score_components,
+            }
+
+        if lexical_source_hit and bm25_score:
+            evidence.append("bm25_identity_text")
+        if not candidate_score_passed:
+            return {
+                "matched": False,
                 "match_type": match_type,
                 "anchor": anchor,
-                "score": score,
+                "rank_score": round(rank_score, 4),
+                "evidence": evidence,
+                "matched_keywords": [],
+                "exact_topics": exact_topics,
+                "exact_names": exact_names,
+                "candidate_source": candidate_source,
+                "candidate_sources": sorted(candidate_sources - {""}),
+                "entity_mapping_hit": entity_mapping_hit,
+                "strong_anchor": strong_anchor,
+                "candidate_score_passed": False,
+                "candidate_score_threshold": candidate_min_score,
+                "filter_reason": "candidate_score_below_threshold",
+                "bm25_score": round(bm25_score, 4),
+                "bm25_raw_score": candidate.get("_bm25_score"),
+                "topic_overlap": round(topic_overlap, 4),
+                "name_overlap": round(name_overlap, 4),
+                "score_components": score_components,
             }
         return {
-            "matched": False,
-            "match_type": "",
-            "anchor": "",
-            "score": 0.0,
+            "matched": True,
+            "match_type": match_type,
+            "anchor": anchor,
+            "rank_score": round(rank_score, 4),
+            "evidence": evidence,
+            "matched_keywords": [],
+            "exact_topics": exact_topics,
+            "exact_names": exact_names,
+            "candidate_source": candidate_source,
+            "candidate_sources": sorted(candidate_sources - {""}),
+            "entity_mapping_hit": entity_mapping_hit,
+            "candidate_score_passed": True,
+            "candidate_score_threshold": candidate_min_score,
+            "filter_reason": "",
+            "bm25_score": round(bm25_score, 4),
+            "bm25_raw_score": candidate.get("_bm25_score"),
+            "topic_overlap": round(topic_overlap, 4),
+            "name_overlap": round(name_overlap, 4),
+            "score_components": score_components,
+            "strong_anchor": strong_anchor,
         }
+
+    def _recall_stage1_build_evidence_profile(
+        self,
+        candidates: Sequence[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Aggregate evidence already computed for the filtered candidates."""
+        exact_topic_anchors: set[str] = set()
+        exact_name_anchors: set[str] = set()
+        exact_topic_count = 0
+        exact_name_count = 0
+        entity_mapping_candidate_count = 0
+        max_bm25_score = 0.0
+        bm25_support_candidate_count = 0
+        max_candidate_score = 0.0
+        strong_anchor_candidate_count = 0
+
+        for candidate in candidates:
+            details = candidate.get("_recall_fast_match_details")
+            if not isinstance(details, dict):
+                continue
+            candidate_score = self._clamp_float(
+                details.get("rank_score"),
+                0.0,
+                1.0,
+                0.0,
+            )
+            max_candidate_score = max(max_candidate_score, candidate_score)
+            if details.get("strong_anchor"):
+                strong_anchor_candidate_count += 1
+            topics = [str(value) for value in details.get("exact_topics") or []]
+            names = [str(value) for value in details.get("exact_names") or []]
+            exact_topic_count += len(topics)
+            exact_name_count += len(names)
+            if details.get("entity_mapping_hit"):
+                entity_mapping_candidate_count += 1
+            exact_topic_anchors.update(
+                self._recall_stage1_normalize_match_text(value)
+                for value in topics
+            )
+            exact_name_anchors.update(
+                self._recall_stage1_normalize_match_text(value)
+                for value in names
+            )
+            bm25_score = self._clamp_float(
+                details.get("bm25_score"),
+                0.0,
+                1.0,
+                0.0,
+            )
+            candidate_sources = {
+                str(value)
+                for value in details.get("candidate_sources") or []
+            }
+            if bm25_score and "lexical" in candidate_sources:
+                max_bm25_score = max(max_bm25_score, bm25_score)
+                bm25_support_candidate_count += 1
+
+        # Candidate-level evidence already includes exact topic/name, entity
+        # mapping, and BM25 components. Reuse the strongest candidate score
+        # and BM25 score instead of rescanning identity_text here.
+        lexical_support_score = max_bm25_score
+        score = max(max_candidate_score, lexical_support_score)
+        score = round(min(1.0, score), 4)
+
+        strong_anchor = bool(
+            exact_topic_anchors
+            or exact_name_anchors
+        )
+        bm25_lexical_support = bool(
+            bm25_support_candidate_count
+            and max_bm25_score >= 0.75
+        )
+        trusted = bool(candidates) and (
+            strong_anchor
+            or (
+                score >= self._recall_fast_candidate_score_threshold
+                and bm25_lexical_support
+            )
+        )
+        return {
+            "score": score,
+            "best_candidate_score": round(max_candidate_score, 4),
+            "lexical_support_score": round(lexical_support_score, 4),
+            "trusted": trusted,
+            "threshold": self._recall_fast_candidate_score_threshold,
+            "candidate_count": len(candidates),
+            "exact_topic_count": exact_topic_count,
+            "unique_exact_topic_count": len(exact_topic_anchors),
+            "exact_name_count": exact_name_count,
+            "unique_exact_name_count": len(exact_name_anchors),
+            "entity_mapping_candidate_count": entity_mapping_candidate_count,
+            "strong_anchor_candidate_count": strong_anchor_candidate_count,
+            "max_bm25_score": round(max_bm25_score, 4),
+            "bm25_support_candidate_count": bm25_support_candidate_count,
+            "bm25_lexical_support": bm25_lexical_support,
+            "strong_anchor": strong_anchor,
+        }
+
+    @staticmethod
+    def _recall_stage1_normalize_match_text(value: Any) -> str:
+        return _compact_whitespace(value).lower().strip("'\".,:;!?，。！？、；：（）()[]{}")
 
     @staticmethod
     def _recall_stage1_clean_anchor(value: Any) -> str:
@@ -5606,7 +6604,7 @@ class MemoryNodeManager:
     ) -> bool:
         raw = candidate.get("_hydrated") if isinstance(candidate.get("_hydrated"), dict) else {}
         fact_time = self._recall_stage1_parse_datetime(
-            raw.get("time_key") or candidate.get("time_start")
+            raw.get("dialogue_time_key") or candidate.get("time_start")
         )
         reference = self._recall_stage1_parse_datetime(reference_time)
         if fact_time is None or reference is None:
@@ -5695,17 +6693,285 @@ class MemoryNodeManager:
         )
         return any(marker in lower for marker in markers)
 
-    def _recall_stage2_semantic_search(
+    def _expand_recall_episode_facts_from_candidates(
+        self,
+        *,
+        candidates: Sequence[Dict[str, Any]],
+        candidate_source_prefix: str,
+        source_types: Optional[Sequence[str]],
+        temporal_bounds: RecallTimeBounds,
+        temporal_mode: str,
+        limit: int,
+        database: Optional[SessionDB] = None,
+    ) -> List[Dict[str, Any]]:
+        """Add bounded facts from episodes represented by Stage 1 candidates."""
+        db = database or self._db
+        episode_ids: List[int] = []
+        seed_targets: Dict[int, List[str]] = {}
+        evidence_fact_ids: List[int] = []
+        for candidate in candidates or []:
+            raw = candidate.get("_hydrated") if isinstance(candidate.get("_hydrated"), dict) else {}
+            raw_episode_ids = [raw.get("episode_id")]
+            raw_episode_ids.extend(
+                fact.get("episode_id")
+                for fact in candidate.get("_supporting_facts") or []
+                if isinstance(fact, dict)
+            )
+            for value in raw.get("evidence_fact_ids") or []:
+                try:
+                    fact_id = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if fact_id not in evidence_fact_ids:
+                    evidence_fact_ids.append(fact_id)
+            for value in raw_episode_ids:
+                if not str(value or "").strip().isdigit():
+                    continue
+                episode_id = int(value)
+                if episode_id not in episode_ids:
+                    episode_ids.append(episode_id)
+                seed_targets.setdefault(episode_id, []).append(
+                    f"{candidate.get('target_table')}#{candidate.get('target_id')}"
+                )
+                if len(episode_ids) >= 8:
+                    break
+            if len(episode_ids) >= 8:
+                break
+        if evidence_fact_ids:
+            for fact in db.memory_facts_by_ids(evidence_fact_ids):
+                episode_id = fact.get("episode_id")
+                if not str(episode_id or "").strip().isdigit():
+                    continue
+                episode_id = int(episode_id)
+                if episode_id not in episode_ids:
+                    episode_ids.append(episode_id)
+                seed_targets.setdefault(episode_id, [])
+                for candidate in candidates or []:
+                    target = f"{candidate.get('target_table')}#{candidate.get('target_id')}"
+                    if target not in seed_targets[episode_id]:
+                        seed_targets[episode_id].append(target)
+                if len(episode_ids) >= 8:
+                    break
+        if not episode_ids:
+            return []
+
+        allowed_sources = set(source_types or [])
+        facts = db.memory_facts_by_episode_ids(
+            episode_ids,
+            limit=max(1, int(limit or 24)),
+        )
+        expanded: List[Dict[str, Any]] = []
+        for fact in facts:
+            if allowed_sources and fact.get("source_type") not in allowed_sources:
+                continue
+            candidate = self._make_recall_fact_candidate(
+                fact,
+                candidate_source=(
+                    f"{str(candidate_source_prefix).strip()}_episode_expansion"
+                ),
+                temporal_mode=temporal_mode,
+            )
+            if not candidate:
+                continue
+            if not self._fact_matches_time_bounds(
+                fact,
+                temporal_mode=temporal_mode,
+                temporal_bounds=temporal_bounds,
+            ):
+                continue
+            episode_id = fact.get("episode_id")
+            candidate["_stage2_episode_seed_targets"] = list(
+                dict.fromkeys(seed_targets.get(int(episode_id), []))
+            ) if str(episode_id or "").strip().isdigit() else []
+            expanded.append(candidate)
+        return expanded
+
+    def _expand_recall_evidence_facts_from_candidates(
+        self,
+        *,
+        candidates: Sequence[Dict[str, Any]],
+        candidate_source_prefix: str,
+        source_types: Optional[Sequence[str]],
+        temporal_bounds: RecallTimeBounds,
+        temporal_mode: str,
+        limit: int,
+        database: Optional[SessionDB] = None,
+    ) -> List[Dict[str, Any]]:
+        """Add facts directly cited by state and actionable-item candidates."""
+        db = database or self._db
+        evidence_fact_ids: List[int] = []
+        for candidate in candidates or []:
+            if str(candidate.get("index_level") or "") not in {
+                "state",
+                "actionable_item",
+            }:
+                continue
+            raw = candidate.get("_hydrated")
+            raw = raw if isinstance(raw, dict) else {}
+            raw_fact_ids = list(raw.get("evidence_fact_ids") or [])
+            raw_fact_ids.extend(
+                fact.get("id")
+                for fact in candidate.get("_supporting_facts") or []
+                if isinstance(fact, dict)
+            )
+            for value in raw_fact_ids:
+                try:
+                    fact_id = int(value)
+                except (TypeError, ValueError):
+                    continue
+                evidence_fact_ids.append(fact_id)
+
+        if not evidence_fact_ids:
+            return []
+        allowed_sources = set(source_types or [])
+        facts = db.memory_facts_by_ids(evidence_fact_ids[: max(1, int(limit or 24))])
+        expanded: List[Dict[str, Any]] = []
+        for fact in facts:
+            if allowed_sources and fact.get("source_type") not in allowed_sources:
+                continue
+            candidate = self._make_recall_fact_candidate(
+                fact,
+                candidate_source=(
+                    f"{str(candidate_source_prefix).strip()}_evidence_expansion"
+                ),
+                temporal_mode=temporal_mode,
+            )
+            if not candidate:
+                continue
+            if not self._fact_matches_time_bounds(
+                fact,
+                temporal_mode=temporal_mode,
+                temporal_bounds=temporal_bounds,
+            ):
+                continue
+            expanded.append(candidate)
+        return expanded
+
+    def _merge_and_expand_recall_stage2_candidates(
+        self,
+        *,
+        stage1_raw_candidates: Sequence[Dict[str, Any]],
+        stage2_lexical_candidates: Sequence[Dict[str, Any]],
+        stage2_entity_candidates: Sequence[Dict[str, Any]],
+        source_types: Optional[Sequence[str]],
+        temporal_bounds: RecallTimeBounds,
+        temporal_mode: str,
+        top_k: int,
+        database: Optional[SessionDB] = None,
+    ) -> Dict[str, Any]:
+        """Merge Stage 1/2 seeds and expand episode and evidence relations."""
+        seed_candidates = [
+            *list(stage2_lexical_candidates or []),
+            *list(stage2_entity_candidates or []),
+        ]
+        expansion_limit = max(12, min(64, max(1, int(top_k or 1)) * 6))
+        episode_candidates = self._expand_recall_episode_facts_from_candidates(
+            candidates=seed_candidates,
+            candidate_source_prefix="stage2",
+            source_types=source_types,
+            temporal_bounds=temporal_bounds,
+            temporal_mode=temporal_mode,
+            limit=expansion_limit,
+            database=database,
+        )
+        evidence_candidates = self._expand_recall_evidence_facts_from_candidates(
+            candidates=seed_candidates,
+            candidate_source_prefix="stage2",
+            source_types=source_types,
+            temporal_bounds=temporal_bounds,
+            temporal_mode=temporal_mode,
+            limit=expansion_limit,
+            database=database,
+        )
+
+        merged_candidates: Dict[Tuple[str, int], Dict[str, Any]] = {}
+
+        def merge_candidate_group(
+            candidates: Sequence[Dict[str, Any]],
+            provenance: str,
+            *,
+            seed: bool = False,
+        ) -> None:
+            for raw_candidate in candidates or []:
+                try:
+                    target = (
+                        str(raw_candidate.get("target_table") or ""),
+                        int(raw_candidate.get("target_id")),
+                    )
+                except (TypeError, ValueError):
+                    continue
+                candidate = dict(raw_candidate)
+                provenance_values = list(candidate.get("_stage2_provenance") or [])
+                if provenance not in provenance_values:
+                    provenance_values.append(provenance)
+                candidate["_stage2_provenance"] = provenance_values
+                if seed:
+                    candidate["_stage1_seed_score"] = float(
+                        candidate.get("_recall_score") or 0.0
+                    )
+                existing = merged_candidates.get(target)
+                if existing is None:
+                    merged_candidates[target] = candidate
+                    continue
+                existing_provenance = list(existing.get("_stage2_provenance") or [])
+                for value in provenance_values:
+                    if value not in existing_provenance:
+                        existing_provenance.append(value)
+                existing["_stage2_provenance"] = existing_provenance
+                if seed and not existing.get("_stage1_seed_score"):
+                    existing["_stage1_seed_score"] = float(
+                        candidate.get("_stage1_seed_score") or 0.0
+                    )
+
+        merge_candidate_group(stage1_raw_candidates, "stage1_seed", seed=True)
+        merge_candidate_group(stage2_lexical_candidates, "stage2_lexical_supplement")
+        merge_candidate_group(stage2_entity_candidates, "stage2_entity_mapping_supplement")
+        merge_candidate_group(
+            evidence_candidates,
+            "evidence_expansion",
+        )
+        merge_candidate_group(
+            episode_candidates,
+            "episode_expansion",
+        )
+
+        merged_by_level: Dict[str, List[Dict[str, Any]]] = {
+            "fact": [],
+            "state": [],
+            "actionable_item": [],
+        }
+        for candidate in merged_candidates.values():
+            level = str(candidate.get("index_level") or "")
+            if level in merged_by_level:
+                merged_by_level[level].append(candidate)
+        return {
+            "by_level": merged_by_level,
+            "seed_candidates": seed_candidates,
+            "stage1_seed_candidates": list(stage1_raw_candidates or []),
+            "stage2_lexical_candidates": list(stage2_lexical_candidates or []),
+            "stage2_entity_candidates": list(stage2_entity_candidates or []),
+            "episode_candidates": episode_candidates,
+            "evidence_candidates": evidence_candidates,
+            "merged_candidates": list(merged_candidates.values()),
+            "merged_count": len(merged_candidates),
+            "seed_count": len(seed_candidates),
+            "episode_expansion_count": len(episode_candidates),
+            "evidence_expansion_count": len(evidence_candidates),
+        }
+
+    def _process_recall_stage2(
         self,
         *,
         query: str,
+        analysis_query: Optional[str] = None,
         top_k: int,
         budget: str,
-        time_start: Optional[str],
-        time_end: Optional[str],
+        temporal_bounds: RecallTimeBounds,
         memory_source_override: Optional[Sequence[str]] = None,
-        parsed_time_start: Optional[str] = None,
-        parsed_time_end: Optional[str] = None,
+        temporal_mode: str = "dialogue_time",
+        stage1_report: Optional[Dict[str, Any]] = None,
+        prompt_language: str = "zh",
+        database: Optional[SessionDB] = None,
     ) -> str:
         """Run the existing LLM and semantic-search recall pipeline.
 
@@ -5715,14 +6981,22 @@ class MemoryNodeManager:
         """
         stage_started_at = time.monotonic()
         self._log_info("memory_recall_stage2", "start", {
-            "query": self._log_text(query, limit=500),
+            "query": self._format_log_text(query, limit=500),
             "top_k": top_k,
             "budget": budget,
-            "time_start": time_start,
-            "time_end": time_end,
+            "time_start": (temporal_bounds or (None, None))[0],
+            "time_end": (temporal_bounds or (None, None))[1],
+            "temporal_mode": temporal_mode,
+            "prompt_language": prompt_language,
             "memory_source_override": list(memory_source_override or []),
         })
-        recall_plan = self._analyze_recall_query(query)
+        recall_plan = self._analyze_recall_query(
+            analysis_query or query,
+            prompt_language=prompt_language,
+        )
+        temporal_mode = self._normalize_recall_temporal_mode(
+            recall_plan.get("temporal_mode") or temporal_mode
+        )
         forced_source_types = self._normalize_source_override(memory_source_override)
         preferred_source_types = forced_source_types or self._normalize_source_override(
             recall_plan.get("source_types") or []
@@ -5743,32 +7017,43 @@ class MemoryNodeManager:
             recall_plan.get("entities"),
             limit=12,
         )
-        terms = self._build_recall_search_terms(
-            query,
+        # Stage 1 already performed lexical retrieval with the raw user query.
+        # Stage 2 lexical retrieval is only for LLM-derived concepts; the raw
+        # query is added back later only for ranking the merged candidates.
+        supplement_terms = self._build_recall_search_terms(
+            "",
             keywords=llm_keywords,
             entities=llm_entities,
         )
+        ranking_terms = list(dict.fromkeys([
+            *self._lexical_search_terms_for_text(
+                query,
+                limit=32,
+                preserve_phrase=False,
+            ),
+            *supplement_terms,
+        ]))
         retrieval_text = (
-            recall_plan.get("search_text")
-            or recall_plan.get("query_rewrite")
+            recall_plan.get("query_rewrite")
             or ""
         )
-        query_embedding_text = self._format_recall_query_embedding_text(
+        query_identity_text = self._format_recall_query_identity_text(
             query,
             retrieval_text=retrieval_text,
             keywords=llm_keywords,
             entities=llm_entities,
         )
-        query_embedding = self._generate_embedding_vector(query_embedding_text)
-        final_candidate_limits = self._final_recall_candidate_limits(
-            query=query,
-            top_k=top_k,
-            budget=budget,
-            preferred_layer_preferences=preferred_layer_preferences,
+        query_identity_embedding = self._generate_embedding_vector(query_identity_text)
+        final_candidate_limits, supplement_candidate_limits = (
+            self._recall_stage2_candidate_limits(
+                query=query,
+                top_k=top_k,
+                budget=budget,
+                preferred_layer_preferences=preferred_layer_preferences,
+            )
         )
-        raw_candidate_limits = self._cal_raw_candidate_limits_from_recall_limits(
-            final_candidate_limits,
-            budget=budget,
+        supplement_entity_mapping_limits, supplement_lexical_limits = (
+            self._split_recall_stage2_source_limits(supplement_candidate_limits)
         )
         self._log_info("memory_recall_stage2", "query_analyzed", {
             "recall_plan": recall_plan,
@@ -5777,45 +7062,128 @@ class MemoryNodeManager:
             "preferred_layer_preferences": preferred_layer_preferences or [],
             "keywords": llm_keywords,
             "entities": llm_entities,
-            "terms": terms,
-            "retrieval_text": self._log_text(retrieval_text, limit=500),
-            "embedding_text": self._log_text(query_embedding_text, limit=500),
-            "query_embedding_available": query_embedding is not None,
+            "supplement_terms": supplement_terms,
+            "ranking_terms": ranking_terms,
+            "retrieval_text": self._format_log_text(retrieval_text, limit=500),
+            "identity_text": self._format_log_text(query_identity_text, limit=500),
+            "query_embedding_available": query_identity_embedding is not None,
             "final_candidate_limits": final_candidate_limits,
-            "raw_candidate_limits": raw_candidate_limits,
+            "supplement_candidate_limits": supplement_candidate_limits,
+            "supplement_entity_mapping_limits": supplement_entity_mapping_limits,
+            "supplement_lexical_limits": supplement_lexical_limits,
             "budget": budget,
-            "parsed_time_start": parsed_time_start,
-            "parsed_time_end": parsed_time_end,
-            "effective_time_start": time_start,
-            "effective_time_end": time_end,
+            "temporal_mode": temporal_mode,
         })
-        fact_candidates, state_candidates, actionable_candidates = self._retrieve_recall_raw_candidates(
-            terms=terms,
-            source_types=forced_source_types,
-            time_start=time_start,
-            time_end=time_end,
-            raw_candidate_limits=raw_candidate_limits,
+        if supplement_terms:
+            lexical_fact_candidates, lexical_state_candidates, lexical_actionable_candidates = (
+                self._retrieve_recall_raw_candidates_lexical_search(
+                    terms=supplement_terms,
+                    candidate_source_prefix="stage2",
+                    source_types=forced_source_types,
+                    temporal_bounds=temporal_bounds,
+                    temporal_mode=temporal_mode,
+                    candidate_limits=supplement_lexical_limits,
+                    database=database,
+                )
+            )
+        else:
+            lexical_fact_candidates, lexical_state_candidates, lexical_actionable_candidates = (
+                [], [], []
+            )
+        stage1_raw_candidates = list(
+            (stage1_report or {}).get("raw_candidates") or []
         )
-        self._log_info("memory_recall_stage2", "candidates_found", {
+        stage1_entity_names = {
+            self._recall_stage1_normalize_match_text(value)
+            for candidate in stage1_raw_candidates
+            for value in candidate.get("_recall_entity_names") or []
+            if self._recall_stage1_normalize_match_text(value)
+        }
+        new_llm_entities = [
+            entity for entity in llm_entities
+            if self._recall_stage1_normalize_match_text(entity) not in stage1_entity_names
+        ]
+        stage2_entity_fact_candidates, stage2_entity_state_candidates, stage2_entity_actionable_candidates = (
+            self._retrieve_recall_entity_mapping_candidates(
+                query=" ".join(new_llm_entities),
+                candidate_source_prefix="stage2",
+                source_types=forced_source_types,
+                temporal_bounds=temporal_bounds,
+                temporal_mode=temporal_mode,
+                candidate_limits=supplement_entity_mapping_limits,
+                database=database,
+            ) if new_llm_entities else ([], [], [])
+        )
+        stage2_candidate_report = self._merge_and_expand_recall_stage2_candidates(
+            stage1_raw_candidates=stage1_raw_candidates,
+            stage2_lexical_candidates=[
+                *lexical_fact_candidates,
+                *lexical_state_candidates,
+                *lexical_actionable_candidates,
+            ],
+            stage2_entity_candidates=[
+                *stage2_entity_fact_candidates,
+                *stage2_entity_state_candidates,
+                *stage2_entity_actionable_candidates,
+            ],
+            source_types=forced_source_types,
+            temporal_bounds=temporal_bounds,
+            temporal_mode=temporal_mode,
+            top_k=top_k,
+            database=database,
+        )
+        merged_by_level = stage2_candidate_report["by_level"]
+        fact_candidates = merged_by_level["fact"]
+        state_candidates = merged_by_level["state"]
+        actionable_candidates = merged_by_level["actionable_item"]
+        stage2_candidates_payload = {
             "facts": self._recall_log_candidate_items(fact_candidates),
             "states": self._recall_log_candidate_items(state_candidates),
             "actionable_items": self._recall_log_candidate_items(actionable_candidates),
-        })
+            "stage1_seed_count": len(stage1_raw_candidates),
+            "merged_count": stage2_candidate_report["merged_count"],
+            "episode_expansion_count": stage2_candidate_report["episode_expansion_count"],
+            "evidence_expansion_count": stage2_candidate_report["evidence_expansion_count"],
+        }
+        if self._recall_detailed_logging:
+            stage2_candidates_payload["candidate_diagnostics"] = {
+                "stage1_seed_candidates": self._recall_detailed_candidate_items(
+                    stage2_candidate_report.get("stage1_seed_candidates") or [],
+                    stage="stage2_stage1_seed",
+                ),
+                "stage2_lexical_seeds": self._recall_detailed_candidate_items(
+                    stage2_candidate_report.get("stage2_lexical_candidates") or [],
+                    stage="stage2_lexical_seed",
+                ),
+                "stage2_entity_mapping_seeds": self._recall_detailed_candidate_items(
+                    stage2_candidate_report.get("stage2_entity_candidates") or [],
+                    stage="stage2_entity_mapping_seed",
+                ),
+                "evidence_expansions": self._recall_detailed_candidate_items(
+                    stage2_candidate_report.get("evidence_candidates") or [],
+                    stage="stage2_evidence_expansion",
+                ),
+                "episode_expansions": self._recall_detailed_candidate_items(
+                    stage2_candidate_report.get("episode_candidates") or [],
+                    stage="stage2_episode_expansion",
+                ),
+                "merged_candidates": self._recall_detailed_candidate_items(
+                    stage2_candidate_report.get("merged_candidates") or [],
+                    stage="stage2_merged",
+                ),
+            }
+        self._log_info("memory_recall_stage2", "candidates_found", stage2_candidates_payload)
         ranked = self._rank_recall_raw_candidates(
             facts=fact_candidates,
             states=state_candidates,
             actionable_items=actionable_candidates,
             query=query,
-            terms=terms,
-            query_embedding=query_embedding,
-            preferred_source_types=preferred_source_types,
-            preferred_layer_preferences=preferred_layer_preferences,
+            terms=ranking_terms,
+            query_embedding=query_identity_embedding,
             final_candidate_limits=final_candidate_limits,
-            fact_type_preference=str(
-                recall_plan.get("fact_type_preference") or "both"
-            ).strip().lower(),
         )
-        self._log_info("memory_recall_stage2", "ranked", {
+        
+        ranked_payload = {
             "facts": self._recall_log_candidate_items([
                 item for item in ranked if item.get("index_level") == "fact"
             ]),
@@ -5826,11 +7194,32 @@ class MemoryNodeManager:
                 item for item in ranked if item.get("index_level") == "actionable_item"
             ]),
             "all_ranked": self._recall_log_candidate_items(ranked, limit=20),
-        })
+        }
+        if self._recall_detailed_logging:
+            ranked_targets = {
+                (
+                    str(item.get("target_table") or ""),
+                    int(item.get("target_id")),
+                )
+                for item in ranked
+                if str(item.get("target_id") or "").isdigit()
+            }
+            ranked_payload["candidate_diagnostics"] = {
+                "candidate_pool": self._recall_detailed_candidate_items(
+                    stage2_candidate_report.get("merged_candidates") or [],
+                    selected_targets=ranked_targets,
+                    stage="stage2_rank_pool",
+                ),
+                "ranked_candidates": self._recall_detailed_candidate_items(
+                    ranked,
+                    selected_targets=ranked_targets,
+                    stage="stage2_ranked",
+                ),
+            }
+        self._log_info("memory_recall_stage2", "ranked", ranked_payload)
         memory_text = self._build_memory_retrieved_format_text(
             entries=ranked,
-            query=query,
-            budget=budget,
+            prompt_language=prompt_language,
         )
         self._log_info("memory_recall_stage2", "finish", {
             "status": "ok" if memory_text else "empty",
@@ -5839,25 +7228,255 @@ class MemoryNodeManager:
         })
         return memory_text
 
-    def _retrieve_recall_raw_candidates(
+    def _make_recall_memory_candidate(
+        self,
+        *,
+        table: str,
+        level: str,
+        row: Dict[str, Any],
+        candidate_source: str,
+        supporting_facts: Optional[Sequence[Dict[str, Any]]] = None,
+        temporal_bounds: RecallTimeBounds = None,
+        temporal_mode: str = "dialogue_time",
+    ) -> Optional[Dict[str, Any]]:
+        """Convert a memory row into the shared recall candidate shape."""
+        try:
+            target_id = int(row.get("id"))
+        except (TypeError, ValueError):
+            return None
+        source_type = row.get("source_type")
+        support_facts = [dict(fact) for fact in supporting_facts or []]
+        if table == "memory_facts":
+            title = _compact_whitespace(row.get("summary") or "")[:120]
+            summary = _compact_whitespace(row.get("summary") or "")
+            fact_times = self._fact_time_values(row, temporal_mode)
+            if not self._fact_matches_time_bounds(
+                row,
+                temporal_mode=temporal_mode,
+                temporal_bounds=temporal_bounds,
+            ):
+                return None
+            time_value = fact_times[0] if fact_times else ""
+            entities = row.get("entities") or []
+            topics: List[str] = []
+            keywords = row.get("keywords") or ""
+            time_end_value = fact_times[-1] if fact_times else ""
+        elif table == "memory_states":
+            title = _compact_whitespace(row.get("canonical_name") or "")
+            summary = _compact_whitespace(row.get("summary") or "")
+            time_value = self._normalize_event_time_text(row.get("updated_at"))
+            state_metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+            entities = self._normalize_entity_names([
+                row.get("entity_key"),
+                *(state_metadata.get("context_entities") or []),
+                *(state_metadata.get("entities") or []),
+            ], limit=18)
+            topics = self._normalize_unique_labels([
+                row.get("canonical_name"),
+                *(state_metadata.get("canonical_topics") or []),
+                *(state_metadata.get("parent_topics") or []),
+                *(state_metadata.get("aspect_topic_names") or []),
+            ], limit=24)
+            keywords = " ".join(self._normalize_string_list(
+                state_metadata.get("keywords"),
+                limit=24,
+            ))
+            support_start, support_end = self._event_time_bounds_from_facts(
+                support_facts,
+                temporal_mode=temporal_mode,
+            )
+            if support_start or support_end:
+                time_value = support_start or support_end
+                time_end_value = support_end or support_start
+            else:
+                time_end_value = time_value
+        elif table == "memory_actionable_items":
+            title = _compact_whitespace(row.get("canonical_name") or "")
+            summary = _compact_whitespace(row.get("summary") or "")
+            time_value = self._normalize_event_time_text(
+                row.get("due_at") or row.get("updated_at") or row.get("created_at")
+            )
+            entities = [row.get("owner")] if row.get("owner") else []
+            topics = [row.get("canonical_name")] if row.get("canonical_name") else []
+            keywords = ""
+            support_start, support_end = self._event_time_bounds_from_facts(
+                support_facts,
+                temporal_mode=temporal_mode,
+            )
+            if support_start or support_end:
+                time_value = support_start or support_end
+                time_end_value = support_end or support_start
+            else:
+                time_end_value = time_value
+        else:
+            return None
+
+        if table == "memory_facts":
+            time_start, time_end = temporal_bounds or (None, None)
+            if time_start and time_end_value and time_end_value < str(time_start):
+                return None
+            if time_end and time_value and time_value > str(time_end):
+                return None
+
+        hydrated = dict(row)
+        hydrated.pop("embedding", None)
+        hydrated.pop("identity_text_embedding", None)
+        hydrated.pop("canonical_name_embedding", None)
+        metadata = dict(row.get("metadata") or {})
+        metadata["_matched_via"] = [candidate_source]
+        candidate = {
+            "source_type": source_type,
+            "target_table": table,
+            "target_id": target_id,
+            "index_level": level,
+            "memory_path": f"{source_type}/{level}",
+            "title": title,
+            "summary_for_retrieval": summary,
+            "identity_text": _compact_whitespace(row.get("identity_text") or ""),
+            "keywords": keywords,
+            "entities": entities,
+            "participants": row.get("participants") or [],
+            "time_start": time_value,
+            "time_end": time_end_value,
+            "importance": row.get("importance") or 0.5,
+            "confidence": row.get("confidence") or 0.8,
+            "embedding": row.get("identity_text_embedding"),
+            "metadata": metadata,
+            "_hydrated": hydrated,
+            "_supporting_facts": support_facts,
+            "_bm25_score": row.get("_bm25_score"),
+            "_recall_candidate_source": candidate_source,
+        }
+        if table != "memory_facts":
+            candidate["canonical_topics"] = topics
+        return candidate
+
+    def _retrieve_recall_entity_mapping_candidates(
+        self,
+        *,
+        query: str,
+        candidate_source_prefix: str,
+        source_types: Optional[Sequence[str]],
+        temporal_bounds: RecallTimeBounds,
+        temporal_mode: str,
+        candidate_limits: Dict[str, int],
+        database: Optional[SessionDB] = None,
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """Retrieve direct memory candidates through query-matched entities."""
+        db = database or self._db
+        entity_lookup_aliases = self._recall_entity_lookup_aliases(query)
+        entity_lookup_text = " ".join(
+            [str(query or "").strip(), *entity_lookup_aliases]
+        ).strip()
+        entity_rows = db.find_entity_nodes_in_text(entity_lookup_text, limit=12)
+        entity_ids = [int(row["id"]) for row in entity_rows if row.get("id") is not None]
+        matched_entity_names = [
+            str(row.get("name") or "")
+            for row in entity_rows
+            if str(row.get("name") or "").strip()
+        ]
+        if not entity_ids:
+            return [], [], []
+        mappings = db.memory_entity_mappings_by_entity_ids(entity_ids)
+        if not mappings:
+            return [], [], []
+        allowed_sources = set(source_types or [])
+        ids_by_level: Dict[str, List[int]] = {
+            "fact": [],
+            "state": [],
+            "actionable_item": [],
+        }
+        raw_limit_keys = {
+            "fact": "facts",
+            "state": "states",
+            "actionable_item": "actionable_items",
+        }
+        for mapping in mappings:
+            for field, level in (
+                ("fact_id", "fact"),
+                ("state_id", "state"),
+                ("actionable_item_id", "actionable_item"),
+            ):
+                level_limit = max(
+                    0,
+                    int(candidate_limits.get(raw_limit_keys[level], 0) or 0),
+                )
+                if len(ids_by_level[level]) >= level_limit:
+                    continue
+                for value in mapping.get(field) or []:
+                    try:
+                        target_id = int(value)
+                    except (TypeError, ValueError):
+                        continue
+                    if len(ids_by_level[level]) >= level_limit:
+                        break
+                    if target_id not in ids_by_level[level]:
+                        ids_by_level[level].append(target_id)
+
+        facts = db.memory_facts_by_ids(ids_by_level["fact"])
+        states = db.memory_states_by_ids(ids_by_level["state"])
+        actionable_items = db.memory_actionable_items_by_ids(ids_by_level["actionable_item"])
+        candidates_by_level: Dict[str, List[Dict[str, Any]]] = {
+            "fact": [],
+            "state": [],
+            "actionable_item": [],
+        }
+        rows_by_level = {
+            "fact": facts,
+            "state": states,
+            "actionable_item": actionable_items,
+        }
+        table_by_level = {
+            "fact": "memory_facts",
+            "state": "memory_states",
+            "actionable_item": "memory_actionable_items",
+        }
+        for level, rows in rows_by_level.items():
+            for row in rows:
+                if allowed_sources and row.get("source_type") not in allowed_sources:
+                    continue
+                candidate = self._make_recall_memory_candidate(
+                    table=table_by_level[level],
+                    level=level,
+                    row=row,
+                    candidate_source=(
+                        f"{str(candidate_source_prefix).strip()}_entity_mapping"
+                    ),
+                    temporal_bounds=temporal_bounds,
+                    temporal_mode=temporal_mode,
+                )
+                if candidate:
+                    candidate["_recall_entity_names"] = matched_entity_names
+                    candidates_by_level[level].append(candidate)
+        return (
+            candidates_by_level["fact"],
+            candidates_by_level["state"],
+            candidates_by_level["actionable_item"],
+        )
+
+    def _retrieve_recall_raw_candidates_lexical_search(
         self,
         *,
         terms: List[str],
+        candidate_source_prefix: str,
         source_types: Optional[Sequence[str]],
-        time_start: Optional[str],
-        time_end: Optional[str],
-        raw_candidate_limits: Dict[str, int],
+        temporal_bounds: RecallTimeBounds,
+        temporal_mode: str,
+        candidate_limits: Dict[str, int],
+        database: Optional[SessionDB] = None,
     ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
         """Build separate raw candidate groups before type-specific ranking.
 
         This intentionally bypasses `memory_index_entries` for the default
-        path. Each candidate still points to its source row, so formatting and
-        evidence hydration remain shared with the index-based implementation.
+        path. Each candidate still points to its source row; relationship
+        expansion is handled by the Stage 1/Stage 2 merge layer.
         """
+        db = database or self._db
+        time_start, time_end = temporal_bounds or (None, None)
         table_specs = (
-            ("memory_facts", "fact", self._db.search_memory_facts),
-            ("memory_states", "state", self._db.search_memory_states),
-            ("memory_actionable_items", "actionable_item", self._db.search_memory_actionable_items),
+            ("memory_facts", "fact", db.search_memory_facts),
+            ("memory_states", "state", db.search_memory_states),
+            ("memory_actionable_items", "actionable_item", db.search_memory_actionable_items),
         )
         rows_by_table: Dict[str, List[Dict[str, Any]]] = {}
         raw_limit_keys = {
@@ -5866,31 +7485,18 @@ class MemoryNodeManager:
             "memory_actionable_items": "actionable_items",
         }
         for table, _level, loader in table_specs:
-            rows_by_table[table] = loader(
-                terms=terms,
-                source_types=source_types,
+            loader_kwargs = {
+                "terms": terms,
+                "source_types": source_types,
                 # States and actionable items do not have an event-time
-                # column. Their evidence facts provide the temporal filter.
-                time_start=time_start if table == "memory_facts" else None,
-                time_end=time_end if table == "memory_facts" else None,
-                limit=max(1, int(raw_candidate_limits.get(raw_limit_keys[table], 1) or 1)),
-            )
-
-        evidence_ids: List[int] = []
-        for table in ("memory_states", "memory_actionable_items"):
-            for row in rows_by_table[table]:
-                for value in row.get("evidence_fact_ids") or []:
-                    try:
-                        fact_id = int(value)
-                    except (TypeError, ValueError):
-                        continue
-                    if fact_id not in evidence_ids:
-                        evidence_ids.append(fact_id)
-        evidence_by_id = {
-            int(fact["id"]): fact
-            for fact in self._db.memory_facts_by_ids(evidence_ids)
-            if fact.get("id") is not None
-        }
+                # column, so their own update/due time is used below.
+                "time_start": time_start if table == "memory_facts" else None,
+                "time_end": time_end if table == "memory_facts" else None,
+                "limit": max(1, int(candidate_limits.get(raw_limit_keys[table], 1) or 1)),
+            }
+            if table == "memory_facts":
+                loader_kwargs["temporal_mode"] = temporal_mode
+            rows_by_table[table] = loader(**loader_kwargs)
 
         candidates_by_level: Dict[str, List[Dict[str, Any]]] = {
             "fact": [],
@@ -5903,11 +7509,13 @@ class MemoryNodeManager:
                     target_id = int(row.get("id"))
                 except (TypeError, ValueError):
                     continue
-                source_type = str(row.get("source_type") or "unified")
+                source_type = row.get("source_type")
                 if table == "memory_facts":
                     title = _compact_whitespace(row.get("summary") or "")[:120]
                     summary = _compact_whitespace(row.get("summary") or "")
-                    time_value = self._normalize_event_time_text(row.get("time_key"))
+                    fact_times = self._fact_time_values(row, temporal_mode)
+                    time_value = fact_times[0] if fact_times else ""
+                    time_end_value = fact_times[-1] if fact_times else ""
                     entities = row.get("entities") or []
                     topics = self._normalize_unique_labels([
                         row.get("fact_root_topic"),
@@ -5943,36 +7551,21 @@ class MemoryNodeManager:
                     entities = [row.get("owner")] if row.get("owner") else []
                     topics = [row.get("canonical_name")] if row.get("canonical_name") else []
 
-                support_facts = []
-                if table in {"memory_states", "memory_actionable_items"}:
-                    for value in row.get("evidence_fact_ids") or []:
-                        try:
-                            fact_id = int(value)
-                        except (TypeError, ValueError):
-                            continue
-                        fact = evidence_by_id.get(fact_id)
-                        if fact:
-                            support_facts.append(dict(fact))
-                        if len(support_facts) >= 4:
-                            break
-                    support_start, support_end = self._event_time_bounds_from_facts(support_facts)
-                    if support_start or support_end:
-                        time_value = support_start or support_end
-                        time_end_value = support_end or support_start
-                    else:
-                        time_end_value = time_value
+                if table == "memory_facts" and not self._fact_matches_time_bounds(
+                    row,
+                    temporal_mode=temporal_mode,
+                    temporal_bounds=temporal_bounds,
+                ):
+                    continue
+                if table != "memory_facts":
+                    time_end_value = time_value
+                if table == "memory_facts":
                     if time_start and time_end_value and time_end_value < str(time_start):
                         continue
                     if time_end and time_value and time_value > str(time_end):
                         continue
-                else:
-                    time_end_value = time_value
 
-                candidate_embedding = (
-                    row.get("identity_text_embedding")
-                    if table == "memory_states"
-                    else row.get("embedding")
-                )
+                candidate_embedding = row.get("identity_text_embedding")
                 hydrated = dict(row)
                 hydrated.pop("embedding", None)
                 hydrated.pop("identity_text_embedding", None)
@@ -5987,6 +7580,7 @@ class MemoryNodeManager:
                     "memory_path": f"{source_type}/{level}",
                     "title": title,
                     "summary_for_retrieval": summary,
+                    "identity_text": _compact_whitespace(row.get("identity_text") or ""),
                     "keywords": (
                         " ".join(state_keywords)
                         if table == "memory_states"
@@ -6001,13 +7595,42 @@ class MemoryNodeManager:
                     "embedding": candidate_embedding,
                     "metadata": metadata,
                     "_hydrated": hydrated,
-                    "_supporting_facts": support_facts,
-                    "_recall_candidate_source": "direct",
+                    "_supporting_facts": [],
+                    "_bm25_score": row.get("_bm25_score"),
+                    "_recall_candidate_source": (
+                        f"{str(candidate_source_prefix).strip()}_lexical"
+                    ),
                 }
                 if table != "memory_facts":
                     candidate["canonical_topics"] = topics
                 candidates_by_level[level].append(candidate)
-        logger.debug(
+
+        # SQLite FTS5 BM25 returns lower (normally negative) values for more
+        # relevant documents. Its magnitude is table-dependent, so normalize
+        # only among the BM25 hits in each returned memory layer.
+        for level_candidates in candidates_by_level.values():
+            scored_candidates: List[Tuple[float, Dict[str, Any]]] = []
+            for candidate in level_candidates:
+                try:
+                    raw_bm25_score = float(candidate.get("_bm25_score"))
+                except (TypeError, ValueError):
+                    candidate["_recall_bm25_score"] = 0.0
+                    continue
+                if not math.isfinite(raw_bm25_score):
+                    candidate["_recall_bm25_score"] = 0.0
+                    continue
+                scored_candidates.append((raw_bm25_score, candidate))
+            scored_candidates.sort(key=lambda item: item[0])
+            count = len(scored_candidates)
+            for position, (_raw_bm25_score, candidate) in enumerate(scored_candidates):
+                normalized_bm25_score = (
+                    0.80
+                    if count == 1
+                    else 0.42 + 0.50 * (1.0 - position / (count - 1))
+                )
+                candidate["_recall_bm25_score"] = round(normalized_bm25_score, 4)
+                candidate["_recall_bm25_rank"] = position + 1
+        self._logger.debug(
             "Direct recall candidates: facts=%d states=%d actionable_items=%d total=%d",
             len(rows_by_table["memory_facts"]),
             len(rows_by_table["memory_states"]),
@@ -6020,55 +7643,25 @@ class MemoryNodeManager:
             candidates_by_level["actionable_item"],
         )
 
-    def _recall_type_weights(
-        self,
-        query: str,
-        preferred_layer_preferences: Optional[Sequence[str]],
-    ) -> Dict[str, float]:
-        """Build query-intent weights for the three raw memory layers."""
-        weights = {"fact": 1.0, "state": 1.0, "actionable_item": 1.0}
-        preferred = set(preferred_layer_preferences or [])
-        if preferred:
-            for level in weights:
-                weights[level] = 1.3 if level in preferred else 0.82
-
-        lower = str(query or "").lower()
-        fact_markers = (
-            "when", "where", "who", "which", "what happened", "before", "after",
-            "什么时候", "哪里", "谁", "哪一个", "发生了什么", "之前", "之后", "具体说过",
-        )
-        state_markers = (
-            "prefer", "usually", "habit", "profile", "relationship", "trend", "state",
-            "偏好", "通常", "习惯", "画像", "关系", "趋势", "长期", "状态", "一般怎么",
-        )
-        actionable_markers = (
-            "todo", "task", "remind", "decision", "commit", "deadline", "follow up",
-            "待办", "任务", "提醒", "决定", "承诺", "截止", "跟进", "下一步", "风险",
-        )
-        if any(marker in lower for marker in fact_markers):
-            weights["fact"] *= 1.28
-        if any(marker in lower for marker in state_markers):
-            weights["state"] *= 1.28
-        if any(marker in lower for marker in actionable_markers):
-            weights["actionable_item"] *= 1.35
-        return weights
-
     def _make_recall_fact_candidate(
         self,
         fact: Dict[str, Any],
         *,
         candidate_source: str,
+        temporal_mode: str = "dialogue_time",
     ) -> Optional[Dict[str, Any]]:
         """Convert a raw/supporting fact into the shared display shape."""
         try:
             fact_id = int(fact.get("id"))
         except (TypeError, ValueError):
             return None
-        source_type = str(fact.get("source_type") or "unified")
+        source_type = fact.get("source_type")
         summary = _compact_whitespace(fact.get("summary") or "")
-        time_value = self._normalize_event_time_text(fact.get("time_key"))
+        fact_times = self._fact_time_values(fact, temporal_mode)
+        time_value = fact_times[0] if fact_times else ""
+        time_end_value = fact_times[-1] if fact_times else ""
         hydrated = dict(fact)
-        hydrated.pop("embedding", None)
+        hydrated.pop("identity_text_embedding", None)
         metadata = dict(fact.get("metadata") or {})
         metadata["_matched_via"] = [candidate_source]
         return {
@@ -6079,18 +7672,124 @@ class MemoryNodeManager:
             "memory_path": f"{source_type}/fact",
             "title": summary[:120],
             "summary_for_retrieval": summary,
+            "identity_text": _compact_whitespace(fact.get("identity_text") or ""),
             "keywords": fact.get("keywords") or "",
             "entities": fact.get("entities") or [],
             "participants": fact.get("participants") or [],
             "time_start": time_value,
-            "time_end": time_value,
+            "time_end": time_end_value,
             "importance": fact.get("importance") or 0.5,
             "confidence": fact.get("confidence") or 0.8,
-            "embedding": fact.get("embedding"),
+            "embedding": fact.get("identity_text_embedding"),
             "metadata": metadata,
             "_hydrated": hydrated,
             "_supporting_facts": [],
             "_recall_candidate_source": candidate_source,
+        }
+
+    @staticmethod
+    def _recall_candidate_provenance_profile(
+        candidate: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Summarize retrieval provenance without changing candidate content."""
+        provenance = {
+            str(value)
+            for value in candidate.get("_stage2_provenance") or []
+            if str(value).strip()
+        }
+        candidate_source = str(
+            candidate.get("_recall_candidate_source") or ""
+        ).strip()
+        source_names = MemoryNodeManager._recall_candidate_source_channels(
+            candidate_source
+        )
+        stage1_seed = "stage1_seed" in provenance
+        stage1_entity_mapping = bool(
+            stage1_seed and "entity_mapping" in source_names
+        )
+        stage1_lexical = bool(stage1_seed and "lexical" in source_names)
+        stage1_direct_index = bool(
+            stage1_seed
+            and candidate_source in {
+                "stage1_entity_mapping",
+                "stage1_lexical",
+                "stage1_both",
+            }
+        )
+        stage2_entity_mapping = "stage2_entity_mapping_supplement" in provenance
+        stage2_lexical = "stage2_lexical_supplement" in provenance
+        direct_index = bool(
+            stage1_direct_index
+            or stage2_entity_mapping
+            or stage2_lexical
+        )
+        evidence_expansion = bool(
+            "evidence_expansion" in provenance
+            or candidate_source.endswith("_evidence_expansion")
+        )
+        episode_expansion = bool(
+            "episode_expansion" in provenance
+            or candidate_source.endswith("_episode_expansion")
+        )
+        fast_match = candidate.get("_recall_fast_match_details")
+        fast_match = fast_match if isinstance(fast_match, dict) else {}
+        strong_anchor = bool(fast_match.get("strong_anchor"))
+
+        # These bonuses are deliberately small. Retrieval provenance should
+        # break ties between semantically relevant candidates, not rescue a
+        # candidate whose identity_text is unrelated to the query.
+        provenance_bonus = 0.0
+        if stage1_entity_mapping:
+            provenance_bonus += 0.08
+        if stage1_lexical:
+            provenance_bonus += 0.04
+        if stage2_entity_mapping:
+            provenance_bonus += 0.05
+        if stage2_lexical:
+            provenance_bonus += 0.025
+        if (stage1_entity_mapping or stage2_entity_mapping) and (
+            stage1_lexical or stage2_lexical
+        ):
+            provenance_bonus += 0.04
+        if not provenance and "entity_mapping" in source_names:
+            provenance_bonus += 0.04
+        elif not provenance and "lexical" in source_names:
+            provenance_bonus += 0.02
+        if strong_anchor:
+            provenance_bonus += 0.04
+
+        hop = 0 if direct_index else 1 if (
+            evidence_expansion or episode_expansion
+        ) else 0
+        if direct_index:
+            expansion_penalty = 0.0
+        elif evidence_expansion:
+            # Evidence facts are explicitly cited by a state/actionable item,
+            # so they are weaker than direct hits but stronger than same-episode
+            # expansion facts.
+            expansion_penalty = min(0.08, 0.03 * max(1, hop))
+        elif episode_expansion:
+            expansion_penalty = min(0.18, 0.08 * max(1, hop))
+        else:
+            expansion_penalty = 0.0
+
+        return {
+            "candidate_source": candidate_source,
+            "source_names": sorted(source_names),
+            "stage2_provenance": sorted(provenance),
+            "stage1_seed": stage1_seed,
+            "stage1_direct_index": stage1_direct_index,
+            "stage1_entity_mapping": stage1_entity_mapping,
+            "stage1_lexical": stage1_lexical,
+            "stage2_entity_mapping": stage2_entity_mapping,
+            "stage2_lexical": stage2_lexical,
+            "direct_index": direct_index,
+            "evidence_expansion": evidence_expansion,
+            "episode_expansion": episode_expansion,
+            "hop": hop,
+            "strong_anchor": strong_anchor,
+            "provenance_bonus": round(min(0.22, provenance_bonus), 4),
+            "expansion_penalty": round(expansion_penalty, 4),
         }
 
     def _rank_recall_candidates_by_type(
@@ -6102,9 +7801,8 @@ class MemoryNodeManager:
         query: str,
         query_embedding: Optional[np.ndarray],
         min_embedding_similarity: Optional[float],
-        fact_type_preference: str = "both",
     ) -> List[Dict[str, Any]]:
-        """Score one memory type with fields appropriate to its semantics."""
+        """Score one memory type with calibrated relevance and provenance."""
         query_lower = str(query or "").lower()
         threshold = (
             None
@@ -6114,49 +7812,68 @@ class MemoryNodeManager:
         scored: List[Tuple[float, str, int, Dict[str, Any]]] = []
         for position, entry in enumerate(candidates):
             raw = entry.get("_hydrated") if isinstance(entry.get("_hydrated"), dict) else {}
-            retrieval_summary = (
-                entry.get("summary_for_retrieval")
-                or entry.get("summary")
-                or raw.get("summary")
-            )
+            metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
+
+            def extend_values(target: List[str], value: Any) -> None:
+                if isinstance(value, (list, tuple, set)):
+                    for item in value:
+                        extend_values(target, item)
+                    return
+                clean = _compact_whitespace(value)
+                if clean and clean not in target:
+                    target.append(clean)
+
+            topic_values: List[str] = []
+            name_values: List[str] = []
+            state_scope = str(raw.get("state_scope") or "")
             if memory_type == "fact":
-                fields = (
-                    entry.get("title"), retrieval_summary,
-                    entry.get("keywords"), entry.get("entities"),
-                    raw.get("fact_root_topic"), raw.get("fact_aspect_topic"),
-                    raw.get("fact_kind"),
-                    raw.get("fact_subject"), raw.get("fact_type"), raw.get("time_key"),
-                )
+                extend_values(topic_values, raw.get("fact_root_topic"))
+                extend_values(topic_values, raw.get("fact_aspect_topic"))
             elif memory_type == "state":
-                fields = (
-                    entry.get("title"), retrieval_summary,
-                    entry.get("keywords"),
-                    entry.get("canonical_topics"), entry.get("entities"),
-                    raw.get("state_scope"), raw.get("state_type"),
-                    raw.get("entity_key"), raw.get("time_line"),
-                    (raw.get("metadata") or {}).get("parent_topics"),
-                    (raw.get("metadata") or {}).get("aspect_topic_names"),
-                    (raw.get("metadata") or {}).get("context_entities"),
-                )
+                extend_values(name_values, raw.get("canonical_name"))
+                if state_scope == "topic_state":
+                    extend_values(topic_values, raw.get("canonical_name"))
+                    extend_values(
+                        topic_values,
+                        metadata.get("aspect_topic_names"),
+                    )
+                    extend_values(
+                        topic_values,
+                        metadata.get("canonical_topics"),
+                    )
+                else:
+                    extend_values(
+                        name_values,
+                        metadata.get("attribute_name_aliases"),
+                    )
+                    extend_values(
+                        topic_values,
+                        metadata.get("canonical_topics"),
+                    )
             else:
-                fields = (
-                    entry.get("title"), retrieval_summary,
-                    entry.get("keywords"), entry.get("entities"),
-                    entry.get("canonical_topics"), raw.get("item_type"),
-                    raw.get("owner"), raw.get("status"), raw.get("due_at"),
+                extend_values(name_values, raw.get("canonical_name"))
+                extend_values(topic_values, metadata.get("canonical_topics"))
+                extend_values(topic_values, raw.get("canonical_topics"))
+
+            topic_overlap = (
+                self._topic_name_overlap(
+                    terms,
+                    topic_values,
+                    allow_substring=False,
                 )
-            text = " ".join(
-                _compact_whitespace(_json_safe(value) if isinstance(value, (list, dict)) else value)
-                for value in fields
-                if value
-            ).lower()
-            term_hits = sum(1 for term in terms if term and term.lower() in text)
-            term_coverage = term_hits / max(1, min(len(terms), 8))
-            phrase_bonus = 0.0
-            for quoted in re.findall(r"'([^']+)'|\"([^\"]+)\"", query):
-                phrase = (quoted[0] or quoted[1]).lower()
-                if phrase and phrase in text:
-                    phrase_bonus += 1.5
+                if terms and topic_values
+                else 0.0
+            )
+            name_overlap = (
+                self._topic_name_overlap(
+                    terms,
+                    name_values,
+                    allow_substring=False,
+                )
+                if terms and name_values
+                else 0.0
+            )
+            structured_overlap = max(topic_overlap, name_overlap)
             similarity = max(0.0, self._cal_embedding_similarity(
                 query_embedding,
                 entry.get("embedding"),
@@ -6166,68 +7883,92 @@ class MemoryNodeManager:
                 and query_embedding is not None
                 and similarity < threshold
             ):
+                entry["_recall_drop_reason"] = "embedding_below_threshold"
+                entry["_recall_embedding_threshold"] = threshold
+                entry["_recall_embedding_similarity"] = round(float(similarity), 4)
                 continue
-            importance = self._clamp_float(entry.get("importance"), 0.0, 1.0, 0.5)
-            confidence = self._clamp_float(entry.get("confidence"), 0.0, 1.0, 0.8)
-            support_score = self._clamp_float(
-                entry.get("_recall_support_score"),
+            provenance_profile = self._recall_candidate_provenance_profile(entry)
+            bm25_score = self._clamp_float(
+                entry.get("_recall_bm25_score"),
                 0.0,
                 1.0,
                 0.0,
             )
-            score = (
-                term_coverage * 2.4
-                + term_hits * 0.28
-                + phrase_bonus
-                + similarity * 2.0
-                + importance * 0.4
-                + confidence * 0.25
-                + support_score * 0.55
+            has_bm25_signal = bool(
+                entry.get("_recall_bm25_score") is not None
+                or entry.get("_bm25_score") is not None
             )
+
+            # Use a weighted average over available signals. Entity-mapping
+            # candidates often have no BM25 result, and candidates from an
+            # embedding-only path may have no lexical terms; neither should be
+            # penalized merely because a signal is unavailable.
+            relevance_parts: List[Tuple[float, float]] = []
+            if query_embedding is not None and entry.get("embedding") is not None:
+                relevance_parts.append((0.42, similarity))
+            if has_bm25_signal:
+                relevance_parts.append((0.28, bm25_score))
+            if terms and (topic_values or name_values):
+                relevance_parts.append((0.25, structured_overlap))
+            relevance_weight = sum(weight for weight, _value in relevance_parts)
+            relevance_score = (
+                sum(weight * value for weight, value in relevance_parts)
+                / relevance_weight
+                if relevance_weight > 1e-6
+                else 0.0
+            )
+            type_bonus = 0.0
             if memory_type == "fact":
-                if fact_type_preference in {"semantic", "episodic"} and str(
-                    raw.get("fact_type") or ""
-                ).lower() == fact_type_preference:
-                    score += 0.35
                 if any(marker in query_lower for marker in ("when", "before", "after", "什么时候", "之前", "之后")):
-                    score += 0.2
+                    type_bonus += 0.03
             elif memory_type == "state":
-                if raw.get("canonical_name") and any(
-                    str(term).lower() in str(raw.get("canonical_name")).lower()
-                    for term in terms
-                ):
-                    score += 0.35
+                if structured_overlap >= 0.90:
+                    type_bonus += 0.05
             else:
                 if any(marker in query_lower for marker in (
                     "todo", "task", "remind", "decision", "commit", "待办", "任务", "提醒", "决定", "承诺",
                 )):
-                    score += 0.35
+                    type_bonus += 0.05
                 if str(raw.get("status") or "").lower() in {"open", "in_progress", "blocked"}:
-                    score += 0.1
+                    type_bonus += 0.02
+            score = self._clamp_float(
+                relevance_score
+                + type_bonus
+                + float(provenance_profile["provenance_bonus"])
+                - float(provenance_profile["expansion_penalty"]),
+                0.0,
+                1.0,
+                0.0,
+            )
             item = dict(entry)
             item.pop("embedding", None)
             if query_embedding is not None:
                 item["embedding_similarity"] = round(float(similarity), 4)
+            item["_recall_score_components"] = {
+                "embedding_similarity": round(float(similarity), 4),
+                "bm25_identity_text": round(float(bm25_score), 4),
+                "topic_overlap": round(float(topic_overlap), 4),
+                "name_overlap": round(float(name_overlap), 4),
+                "structured_overlap": round(float(structured_overlap), 4),
+                "relevance_score": round(float(relevance_score), 4),
+                "type_bonus": round(float(type_bonus), 4),
+                "provenance_bonus": provenance_profile["provenance_bonus"],
+                "expansion_penalty": provenance_profile["expansion_penalty"],
+                "final_type_score": round(float(score), 4),
+            }
+            item["_recall_provenance"] = provenance_profile
+            item["_stage2_hop_penalty"] = provenance_profile["expansion_penalty"]
             scored.append((score, str(entry.get("time_start") or ""), -position, item))
 
         if not scored:
             return []
-        raw_scores = [row[0] for row in scored]
-        min_score = min(raw_scores)
-        max_score = max(raw_scores)
-        score_span = max_score - min_score
         ranked: List[Dict[str, Any]] = []
         for rank, (score, time_value, position, item) in enumerate(
             sorted(scored, key=lambda row: (row[0], row[1], row[2]), reverse=True),
             1,
         ):
-            normalized = (
-                (score - min_score) / score_span
-                if score_span > 1e-6
-                else min(1.0, max(0.0, score / 4.0))
-            )
             item["_recall_type"] = memory_type
-            item["_recall_type_score"] = round(float(normalized), 4)
+            item["_recall_type_score"] = round(float(score), 4)
             item["_recall_rank"] = rank
             ranked.append(item)
         return ranked
@@ -6240,7 +7981,6 @@ class MemoryNodeManager:
         query: str,
         query_embedding: Optional[np.ndarray],
         min_embedding_similarity: Optional[float],
-        fact_type_preference: str = "both",
     ) -> List[Dict[str, Any]]:
         return self._rank_recall_candidates_by_type(
             candidates,
@@ -6249,7 +7989,6 @@ class MemoryNodeManager:
             query=query,
             query_embedding=query_embedding,
             min_embedding_similarity=min_embedding_similarity,
-            fact_type_preference=fact_type_preference,
         )
 
     def _rank_recall_state_candidates(
@@ -6297,16 +8036,29 @@ class MemoryNodeManager:
         query: str,
         terms: Sequence[str],
         query_embedding: Optional[np.ndarray],
-        preferred_source_types: Optional[Sequence[str]] = None,
-        preferred_layer_preferences: Optional[Sequence[str]] = None,
         final_candidate_limits: Optional[Dict[str, int]] = None,
-        fact_type_preference: str = "both",
         fact_min_embedding_similarity: Optional[float] = None,
         state_min_embedding_similarity: Optional[float] = None,
         actionable_item_min_embedding_similarity: Optional[float] = None,
     ) -> List[Dict[str, Any]]:
-        """Rank each raw layer independently, then merge normalized scores."""
-        weights = self._recall_type_weights(query, preferred_layer_preferences)
+        """Rank each raw layer independently, then merge the ranked candidates."""
+
+        final_limits = final_candidate_limits or {
+            "facts": len(facts),
+            "states": len(states),
+            "actionable_items": len(actionable_items),
+        }
+        ranked_facts = self._rank_recall_fact_candidates(
+            facts,
+            terms=terms,
+            query=query,
+            query_embedding=query_embedding,
+            min_embedding_similarity=(
+                self._recall_fact_min_embedding_similarity
+                if fact_min_embedding_similarity is None
+                else fact_min_embedding_similarity
+            ),
+        )
         ranked_states = self._rank_recall_state_candidates(
             states,
             terms=terms,
@@ -6329,91 +8081,28 @@ class MemoryNodeManager:
                 else actionable_item_min_embedding_similarity
             ),
         )
-        final_limits = final_candidate_limits or {
-            "facts": len(facts),
-            "states": len(states),
-            "actionable_items": len(actionable_items),
-        }
-        ranked_states = ranked_states[: max(0, int(final_limits.get("states", 0) or 0))]
-        ranked_actionable = ranked_actionable[: max(
-            0,
-            int(final_limits.get("actionable_items", 0) or 0),
-        )]
 
-        all_fact_candidates = [dict(item) for item in facts]
-        fact_ids = {
-            int(item.get("target_id"))
-            for item in all_fact_candidates
-            if str(item.get("target_id") or "").isdigit()
-        }
-        for parent in [*ranked_states, *ranked_actionable]:
-            parent_score = float(parent.get("_recall_type_score") or 0.0)
-            for support_fact in parent.get("_supporting_facts") or []:
-                try:
-                    fact_id = int(support_fact.get("id"))
-                except (TypeError, ValueError):
-                    continue
-                if fact_id in fact_ids:
-                    continue
-                candidate = self._make_recall_fact_candidate(
-                    support_fact,
-                    candidate_source=f"support_{parent.get('_recall_type', 'memory')}",
-                )
-                if candidate:
-                    candidate["_recall_support_score"] = round(parent_score * 0.85, 4)
-                    all_fact_candidates.append(candidate)
-                    fact_ids.add(fact_id)
-        ranked_facts = self._rank_recall_fact_candidates(
-            all_fact_candidates,
-            terms=terms,
-            query=query,
-            query_embedding=query_embedding,
-            min_embedding_similarity=(
-                self._recall_fact_min_embedding_similarity
-                if fact_min_embedding_similarity is None
-                else fact_min_embedding_similarity
-            ),
-            fact_type_preference=fact_type_preference,
-        )
-        ranked_facts = ranked_facts[: max(0, int(final_limits.get("facts", 0) or 0))]
-
-        merged: List[Dict[str, Any]] = []
-        for item in [*ranked_states, *ranked_actionable, *ranked_facts]:
-            candidate = dict(item)
-            level = str(candidate.get("index_level") or candidate.get("_recall_type") or "")
-            type_score = float(candidate.get("_recall_type_score") or 0.0)
-            source_bonus = 0.0
-            if preferred_source_types and candidate.get("source_type") in set(preferred_source_types):
-                source_bonus = 0.08
-            candidate["_recall_score"] = round(
-                type_score * weights.get(level, 1.0) + source_bonus,
-                4,
+        selected_candidates, _selected_by_layer = (
+            self._recall_get_selected_candidates_by_layer(
+                ranked_fact_candidates=ranked_facts,
+                ranked_state_candidates=ranked_states,
+                ranked_actionable_items=ranked_actionable,
+                layer_limits=final_limits,
             )
-            merged.append(candidate)
-        merged.sort(
-            key=lambda item: (
-                float(item.get("_recall_score") or 0.0),
-                str(item.get("time_start") or ""),
-            ),
-            reverse=True,
         )
-
-        selected: List[Dict[str, Any]] = []
-        seen_targets: set[Tuple[str, int]] = set()
-        for item in merged:
-            try:
-                target = (str(item.get("target_table") or ""), int(item.get("target_id")))
-            except (TypeError, ValueError):
-                continue
-            if target in seen_targets:
-                continue
-            seen_targets.add(target)
-            selected.append(item)
-
-        return selected
+        return selected_candidates
     
-    def _analyze_recall_query(self, query: str) -> Dict[str, Any]:
-        prompt_language = self._resolve_prompt_language_from_text(query, fallback="en")
+    def _analyze_recall_query(
+        self,
+        query: str,
+        *,
+        prompt_language: str,
+    ) -> Dict[str, Any]:
+        prompt_language = (
+            "en"
+            if str(prompt_language or "").strip().lower().startswith("en")
+            else "zh"
+        )
         prompt_template = (
             RECALL_QUERY_ANALYSIS_PROMPT_EN
             if prompt_language == "en"
@@ -6430,20 +8119,132 @@ class MemoryNodeManager:
         keywords: Sequence[str],
         entities: Sequence[str],
     ) -> List[str]:
-        """Combine LLM query concepts with deterministic fallback terms."""
+        """Build the shared, already-tokenized lexical query representation."""
         terms: List[str] = []
-        seen = set()
-        for value in [*keywords, *entities, *self._query_terms(query)]:
-            clean = self._normalize_keyword_term(value).lower()
-            if not clean or clean in seen:
-                continue
-            if len(clean) > 80 or re.search(r"[。！？!?；;，,]", clean):
-                continue
-            seen.add(clean)
-            terms.append(clean)
+        seen: set[str] = set()
+
+        def add_terms(values: Sequence[str]) -> None:
+            for value in values:
+                clean = re.sub(r"\s+", " ", str(value or "").strip()).lower()
+                if not clean or clean in seen:
+                    continue
+                if len(clean) > 80 or re.search(r"[。！？!?；;，,]", clean):
+                    continue
+                seen.add(clean)
+                terms.append(clean)
+                if len(terms) >= 32:
+                    return
+
+        for value in [*keywords, *entities]:
+            add_terms(self._lexical_search_terms_for_text(value))
             if len(terms) >= 32:
                 break
+        if len(terms) < 32:
+            add_terms(
+                self._lexical_search_terms_for_text(
+                    query,
+                    limit=32,
+                    preserve_phrase=False,
+                )
+            )
         return terms
+
+    @staticmethod
+    def _recall_entity_lookup_aliases(query: Any) -> List[str]:
+        """Return canonical role entities implied by first/second-person text.
+
+        Memory entities use stable role names (``用户``/``助手`` or
+        ``user``/``assistant``), while recall questions naturally use
+        pronouns such as ``我`` and ``你``. These aliases are only used to
+        query the entity-node index; the original query remains unchanged for
+        time parsing, lexical search, scoring, and LLM analysis.
+        """
+        text = str(query or "")
+        aliases: List[str] = []
+
+        # Do not treat ``我们``/``你们`` as a single speaker role. The
+        # conversational schema models the direct user and assistant roles
+        # separately.
+        is_chinese = bool(re.search(r"[\u4e00-\u9fff]", text))
+        if re.search(r"我(?!们)", text) or re.search(
+            r"\b(?:i|me|my|mine|myself)\b", text, re.IGNORECASE
+        ):
+            aliases.append("用户" if is_chinese else "user")
+        if re.search(r"你(?!们)", text) or re.search(
+            r"\b(?:you|your|yours|yourself)\b", text, re.IGNORECASE
+        ):
+            aliases.append("助手" if is_chinese else "assistant")
+        return list(dict.fromkeys(aliases))
+
+    def _lexical_search_terms_for_text(
+        self,
+        text: Any,
+        *,
+        limit: int = 32,
+        preserve_phrase: bool = True,
+    ) -> List[str]:
+        """Tokenize one lexical value for the database FTS contract.
+
+        The regular jieba tokens and search-mode sub-tokens mirror the stream
+        used when ``memory_database`` builds ``lexical_index_text``. A
+        whitespace-joined regular-token phrase is retained before individual
+        tokens so short topic phrases remain searchable as a unit.
+        """
+        clean_text = _compact_whitespace(text)
+        if not clean_text:
+            return []
+        values: List[str] = []
+        seen: set[str] = set()
+
+        def add(value: Any) -> None:
+            if len(values) >= max(1, int(limit or 32)):
+                return
+            clean = re.sub(r"\s+", " ", str(value or "").strip()).lower()
+            if not clean or clean in seen:
+                return
+            if len(clean) > 80 or re.search(r"[。！？!?；;，,]", clean):
+                return
+            chinese_count = len(re.findall(r"[\u4e00-\u9fff]", clean))
+            if chinese_count and chinese_count < 2 and len(clean) < 2:
+                return
+            if not chinese_count and len(clean) < 2:
+                return
+            seen.add(clean)
+            values.append(clean)
+
+        chinese_text = "".join(re.findall(r"[\u4e00-\u9fff]", clean_text))
+        if jieba is not None and chinese_text:
+            regular_tokens = [
+                _compact_whitespace(token)
+                for token in jieba.lcut(clean_text, HMM=False)
+            ]
+            regular_tokens = [
+                token for token in regular_tokens
+                if token and re.search(r"[0-9a-zA-Z\u4e00-\u9fff]", token)
+            ]
+            if preserve_phrase and len(regular_tokens) > 1:
+                add(" ".join(regular_tokens))
+            for token in regular_tokens:
+                add(token)
+            for token in jieba.cut_for_search(clean_text, HMM=False):
+                add(token)
+            return values
+
+        if preserve_phrase and not chinese_text:
+            add(clean_text)
+
+        # Minimal-install fallback: keep the complete Chinese run and the
+        # same bigram coverage used by the legacy lexical path.
+        for token in re.findall(
+            r"[A-Za-z][A-Za-z0-9_.$'-]*|\d+(?:/\d+)?|[\u4e00-\u9fff]+",
+            clean_text,
+        ):
+            if preserve_phrase or not re.fullmatch(r"[\u4e00-\u9fff]+", token):
+                add(token)
+            if re.fullmatch(r"[\u4e00-\u9fff]+", token):
+                for index in range(len(token) - 1):
+                    add(token[index : index + 2])
+        return values
 
     def _normalize_source_override(self, value: Optional[Sequence[str]]) -> Optional[List[str]]:
         if not value:
@@ -6510,11 +8311,92 @@ class MemoryNodeManager:
             return text[:10]
         return text
 
+    @staticmethod
+    def _normalize_recall_temporal_mode(value: Any) -> str:
+        mode = str(value or "").strip().lower()
+        aliases = {
+            "event": "event_time",
+            "event-time": "event_time",
+            "dialogue": "dialogue_time",
+            "dialogue-time": "dialogue_time",
+            "conversation": "dialogue_time",
+            "all": "both",
+        }
+        mode = aliases.get(mode, mode)
+        return mode if mode in {"event_time", "dialogue_time", "both", "none"} else "none"
+
     @classmethod
-    def _event_time_bounds_from_facts(cls, facts: Sequence[Dict[str, Any]]) -> Tuple[str, str]:
+    def _infer_recall_temporal_mode(cls, query: str) -> str:
+        text = _compact_whitespace(query).lower()
+        dialogue_markers = (
+            "讨论", "聊", "提到", "问过", "说过", "谈过", "对话", "交流",
+            "讨论了", "提及", "discuss", "talk", "mentioned", "asked",
+            "conversation", "chat", "said",
+        )
+        event_markers = (
+            "做了", "做过", "发生", "买了", "买过", "去过", "参加", "完成",
+            "经历", "遇到", "使用过", "发生了什么", "what happened", "did",
+            "bought", "visited", "attended", "completed", "experienced",
+        )
+        has_dialogue = any(marker in text for marker in dialogue_markers)
+        has_event = any(marker in text for marker in event_markers)
+        if has_dialogue and has_event:
+            return "both"
+        if has_event:
+            return "event_time"
+        if has_dialogue:
+            return "dialogue_time"
+        return "none"
+
+    @classmethod
+    def _fact_time_values(
+        cls,
+        fact: Dict[str, Any],
+        temporal_mode: str,
+    ) -> List[str]:
+        mode = cls._normalize_recall_temporal_mode(temporal_mode)
+        event_time = cls._normalize_event_time_text(fact.get("event_time_key"))
+        dialogue_time = cls._normalize_event_time_text(fact.get("dialogue_time_key"))
+        if mode == "event_time":
+            return [event_time] if event_time else []
+        if mode == "dialogue_time":
+            return [dialogue_time] if dialogue_time else []
+        if mode == "both":
+            return sorted({value for value in (event_time, dialogue_time) if value})
+        return []
+
+    @classmethod
+    def _fact_matches_time_bounds(
+        cls,
+        fact: Dict[str, Any],
+        *,
+        temporal_mode: str,
+        temporal_bounds: RecallTimeBounds,
+    ) -> bool:
+        time_start, time_end = temporal_bounds or (None, None)
+        mode = cls._normalize_recall_temporal_mode(temporal_mode)
+        if mode == "none" or not (time_start or time_end):
+            return True
+        values = cls._fact_time_values(fact, mode)
+        if not values:
+            return False
+        return any(
+            (not time_start or value >= str(time_start))
+            and (not time_end or value <= str(time_end))
+            for value in values
+        )
+
+    @classmethod
+    def _event_time_bounds_from_facts(
+        cls,
+        facts: Sequence[Dict[str, Any]],
+        *,
+        temporal_mode: str = "event_time",
+    ) -> Tuple[str, str]:
         times = [
-            cls._normalize_event_time_text(fact.get("time_key"))
+            value
             for fact in facts or []
+            for value in cls._fact_time_values(fact, temporal_mode)
         ]
         times = sorted(time for time in times if time)
         if not times:
@@ -6531,7 +8413,7 @@ class MemoryNodeManager:
         target_table = str(entry.get("target_table") or "")
         if target_table == "memory_facts":
             return (
-                self._normalize_event_time_text(raw.get("time_key"))
+                self._normalize_event_time_text(raw.get("event_time_key"))
                 or self._normalize_event_time_text(entry.get("time_start"))
                 or self._normalize_event_time_text(entry.get("time_end"))
                 or "unknown-event-time"
@@ -6552,7 +8434,7 @@ class MemoryNodeManager:
                 return self._format_event_time_range(start, end)
             return "unknown-event-time"
         return (
-            self._normalize_event_time_text(raw.get("time_key"))
+            self._normalize_event_time_text(raw.get("event_time_key"))
             or self._normalize_event_time_text(raw.get("started_at"))
             or self._normalize_event_time_text(entry.get("time_start"))
             or self._normalize_event_time_text(entry.get("time_end"))
@@ -6563,26 +8445,64 @@ class MemoryNodeManager:
         self,
         *,
         entries: List[Dict[str, Any]],
-        query: str = "",
-        budget: str = "mid",
+        prompt_language: str,
     ) -> str:
         """Format ranked raw memories with source-specific semantic fields."""
-        del query, budget
         if not entries:
             return ""
 
-        def values_text(value: Any) -> str:
-            if isinstance(value, list):
-                values: List[str] = []
-                for item in value:
-                    if isinstance(item, dict):
-                        text = _compact_whitespace(item.get("name") or item.get("text") or "")
-                    else:
-                        text = _compact_whitespace(item)
-                    if text:
-                        values.append(text)
-                return ", ".join(values)
-            return _compact_whitespace(value)
+        is_en = str(prompt_language or "").strip().lower().startswith("en")
+        format_template = (
+            MEMORY_RETRIEVED_FORMAT_PROMPT_EN
+            if is_en
+            else MEMORY_RETRIEVED_FORMAT_PROMPT_ZH
+        )
+        section_specs = (
+            MEMORY_RETRIEVED_SECTION_SPECS_EN
+            if is_en
+            else MEMORY_RETRIEVED_SECTION_SPECS_ZH
+        )
+        note_prefix = "System note: " if is_en else "系统说明："
+        if is_en:
+            labels = {
+                "fact": "narrative fact",
+                "dialogue_time": "dialogue_time",
+                "event_time": "event_time",
+                "summary": "summary",
+                "fact_root_topic": "fact_root_topic",
+                "fact_aspect_topic": "fact_aspect_topic",
+                "state": "long-term state",
+                "state_scope": "state_scope",
+                "state_type": "state_type",
+                "canonical_name": "canonical_name",
+                "entity": "entity",
+                "timeline": "timeline",
+                "actionable_item": "actionable item",
+                "item_type": "item_type",
+                "status": "status",
+                "owner": "owner",
+                "due_at": "due_at",
+            }
+        else:
+            labels = {
+                "fact": "叙事事实",
+                "dialogue_time": "对话时间",
+                "event_time": "事件时间",
+                "summary": "摘要",
+                "fact_root_topic": "事实根主题",
+                "fact_aspect_topic": "事实方面主题",
+                "state": "长期状态",
+                "state_scope": "状态范围",
+                "state_type": "状态类型",
+                "canonical_name": "规范名称",
+                "entity": "实体",
+                "timeline": "时间线",
+                "actionable_item": "行动事项",
+                "item_type": "事项类型",
+                "status": "状态",
+                "owner": "负责人",
+                "due_at": "截止时间",
+            }
 
         grouped = {
             "state": [entry for entry in entries if entry.get("index_level") == "state"],
@@ -6592,71 +8512,56 @@ class MemoryNodeManager:
             ],
             "fact": [entry for entry in entries if entry.get("index_level") == "fact"],
         }
-        section_specs = (
-            (
-                "[Long-term States]",
-                "These are evolving state projections derived from memory facts. "
-                "Treat them as summarized context, not direct user quotations.",
-                "state",
-            ),
-            (
-                "[Actionable Items]",
-                "These are decisions, tasks, commitments, risks, or open questions "
-                "that may require follow-up.",
-                "actionable_item",
-            ),
-            (
-                "[Retrieved Facts]",
-                "These are ranked narrative facts retrieved directly from memory_facts.",
-                "fact",
-            ),
-        )
-        lines = [
-            "[Unified Memory]",
-            "System note: Memories are grouped by semantic role. States and actionable "
-            "items provide compact summaries; facts provide traceable evidence.",
-        ]
+        sections: List[str] = []
         for title, note, group_key in section_specs:
             group = grouped[group_key]
             if not group:
                 continue
-            section_header = [title, f"System note: {note}"]
-            lines.extend(["", *section_header])
+            section_lines = [title, f"{note_prefix}{note}"]
             for index, entry in enumerate(group, 1):
                 raw = entry.get("_hydrated") if isinstance(entry.get("_hydrated"), dict) else {}
                 time_text = self._recall_event_time_text(entry, raw)
                 if group_key == "fact":
+                    dialogue_time = (
+                        self._normalize_event_time_text(raw.get("dialogue_time_key"))
+                        or "unknown-dialogue-time"
+                    )
+                    event_time = (
+                        self._normalize_event_time_text(raw.get("event_time_key"))
+                        or "unknown-event-time"
+                    )
                     block_lines = [
-                        f"{index}. [{time_text}] narrative fact",
-                        f"   summary: {raw.get('summary') or entry.get('summary_for_retrieval') or ''}",
-                        f"   fact_root_topic: {raw.get('fact_root_topic') or ''}; fact_aspect_topic: {raw.get('fact_aspect_topic') or ''}",
-                        f"   entities: {values_text(raw.get('entities'))}",
+                        f"{index}. {labels['fact']}",
+                        f"   {labels['dialogue_time']}: {dialogue_time}",
+                        f"   {labels['event_time']}: {event_time}",
+                        f"   {labels['summary']}: {raw.get('summary') or entry.get('summary_for_retrieval') or ''}",
+                        f"   {labels['fact_root_topic']}: {raw.get('fact_root_topic') or ''}; {labels['fact_aspect_topic']}: {raw.get('fact_aspect_topic') or ''}",
                     ]
                 elif group_key == "state":
                     timeline = self._format_state_timeline(raw.get("time_line"))
-                    state_metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
                     block_lines = [
-                        f"{index}. [{time_text}] long-term state",
-                        f"   state_scope: {raw.get('state_scope') or ''}; state_type: {raw.get('state_type') or ''}",
-                        f"   canonical_name: {raw.get('canonical_name') or ''}",
-                        f"   entity: {raw.get('entity_key') or ''}",
-                        f"   summary: {raw.get('summary') or ''}",
+                        f"{index}. [{time_text}] {labels['state']}",
+                        f"   {labels['state_scope']}: {raw.get('state_scope') or ''}; {labels['state_type']}: {raw.get('state_type') or ''}",
+                        f"   {labels['canonical_name']}: {raw.get('canonical_name') or ''}",
+                        f"   {labels['entity']}: {raw.get('entity_key') or ''}",
+                        f"   {labels['summary']}: {raw.get('summary') or ''}",
                     ]
-                    context_entities = values_text(state_metadata.get("context_entities"))
-                    if context_entities:
-                        block_lines.append(f"   context_entities: {context_entities}")
                     if timeline:
-                        block_lines.append(f"   timeline: {timeline}")
+                        block_lines.append(f"   {labels['timeline']}: {timeline}")
                 else:
                     block_lines = [
-                        f"{index}. [{time_text}] actionable item",
-                        f"   item_type: {raw.get('item_type') or ''}; status: {raw.get('status') or ''}",
-                        f"   canonical_name: {raw.get('canonical_name') or ''}",
-                        f"   owner: {raw.get('owner') or ''}; due_at: {raw.get('due_at') or ''}",
-                        f"   summary: {raw.get('summary') or ''}",
+                        f"{index}. [{time_text}] {labels['actionable_item']}",
+                        f"   {labels['item_type']}: {raw.get('item_type') or ''}; {labels['status']}: {raw.get('status') or ''}",
+                        f"   {labels['canonical_name']}: {raw.get('canonical_name') or ''}",
+                        f"   {labels['owner']}: {raw.get('owner') or ''}; {labels['due_at']}: {raw.get('due_at') or ''}",
+                        f"   {labels['summary']}: {raw.get('summary') or ''}",
                     ]
-                lines.append("\n".join(block_lines))
-        return "\n".join(lines).strip()
+                section_lines.append("\n".join(block_lines))
+            sections.append("\n".join(section_lines))
+        return format_template.replace(
+            "{memory_sections}",
+            "\n\n".join(sections),
+        ).strip()
     
     def _format_state_timeline(
         self,
@@ -6697,7 +8602,7 @@ class MemoryNodeManager:
         self._ensure_embedding_client()
         return self._embedding_client.embed_text(text) if self._embedding_client else None
 
-    def _format_recall_query_embedding_text(
+    def _format_recall_query_identity_text(
         self,
         query: str,
         *,
@@ -6707,7 +8612,11 @@ class MemoryNodeManager:
     ) -> str:
         terms = list(keywords or [])
         if not terms:
-            terms = self._query_terms(query)
+            terms = self._lexical_search_terms_for_text(
+                query,
+                limit=32,
+                preserve_phrase=False,
+            )
         parts = [str(query or "").strip()]
         if retrieval_text and str(retrieval_text).strip() != str(query or "").strip():
             parts.append(f"retrieval: {str(retrieval_text).strip()}")
@@ -6716,23 +8625,6 @@ class MemoryNodeManager:
         if entities:
             parts.append(f"entities: {' '.join(str(item) for item in entities)}")
         return "\n".join(parts)
-
-    def _query_terms(self, text: str) -> List[str]:
-        terms = self._keywords(text, limit=32)
-        for phrase in re.findall(r"'([^']+)'|\"([^\"]+)\"", str(text or "")):
-            clean = _compact_whitespace(phrase[0] or phrase[1]).lower()
-            if clean and clean not in terms:
-                terms.insert(0, clean)
-        expanded: List[str] = []
-        for term in terms:
-            expanded.append(term)
-            if re.fullmatch(r"[\u4e00-\u9fff]{3,}", term):
-                for idx in range(0, len(term) - 1):
-                    bigram = term[idx : idx + 2]
-                    if bigram not in expanded:
-                        expanded.append(bigram)
-        terms = expanded
-        return terms
 
     def _keywords(self, text: str, *, limit: int) -> List[str]:
         tokens = re.findall(r"[A-Za-z][A-Za-z0-9_.$'-]*|\d+(?:/\d+)?|[\u4e00-\u9fff]{2,}", str(text or "").lower())
@@ -6763,44 +8655,7 @@ class MemoryNodeManager:
                 topics.append(" ".join(keywords[:size]))
         topics.append(keywords[0])
         return list(dict.fromkeys(topics))[:3]
-
-    def _important_ngrams(self, text: str) -> List[str]:
-        tokens = [term for term in self._keywords(text, limit=12) if len(term) > 2]
-        ngrams: List[str] = []
-        for i in range(len(tokens) - 1):
-            ngrams.append(f"{tokens[i]} {tokens[i + 1]}")
-        return ngrams[:10]
-
-    def _split_high_value_details(self, text: str) -> List[str]:
-        raw = _compact_whitespace(text)
-        if not raw:
-            return []
-        markers = r"\b(?:by the way|also|actually|i just|i still|i need|i have|i attended|i bought|i got|i went|i started|i prefer|i like|i want|i realized)\b"
-        pieces = [raw]
-        for part in re.split(markers, raw, flags=re.IGNORECASE):
-            clean = _compact_whitespace(part)
-            if len(clean) >= 28:
-                pieces.append(clean)
-        for sentence in re.split(r"(?<=[.!?])\s+", raw):
-            clean = _compact_whitespace(sentence)
-            if len(clean) >= 28:
-                pieces.append(clean)
-        return list(dict.fromkeys(pieces))[:8]
-
-    def _assistant_answer_details(self, text: str) -> List[str]:
-        details: List[str] = []
-        for line in str(text or "").splitlines():
-            clean = _compact_whitespace(re.sub(r"^[*\-\d.)\s]+", "", line))
-            if 20 <= len(clean) <= 260:
-                details.append(clean)
-            if len(details) >= 8:
-                break
-        return list(dict.fromkeys(details))
-
-    def _looks_like_recommendation(self, text: str) -> bool:
-        lower = str(text or "").lower()
-        return any(word in lower for word in ("recommend", "suggest", "try", "consider", "tips", "advice"))
-
+    
     def _infer_fact_kind(self, text: str, *, speaker: str) -> str:
         lower = str(text or "").lower()
         if any(word in lower for word in ("prefer", "favorite", "like", "dislike", "would rather")):
@@ -6826,12 +8681,6 @@ class MemoryNodeManager:
     def _normalize_fact_type(value: Any) -> str:
         text = str(value or "episodic").strip().lower()
         return text if text in {"semantic", "episodic"} else "episodic"
-
-    @staticmethod
-    def _normalize_fact_subject(value: Any) -> str:
-        text = str(value or "other").strip().lower()
-        allowed = {"user", "assistant", "world", "project", "system", "other"}
-        return text if text in allowed else "other"
 
     @staticmethod
     def _normalize_fact_kind(value: Any) -> str:
@@ -6957,7 +8806,6 @@ class MemoryNodeManager:
         value: Any,
         *,
         entities: Sequence[str],
-        fact_subject: str,
     ) -> Optional[Dict[str, str]]:
         """Normalize the single entity used for entity-state assignment."""
         name = ""
@@ -6968,11 +8816,7 @@ class MemoryNodeManager:
         else:
             name = _compact_whitespace(value)
         if not name:
-            subject = str(fact_subject or "").strip().lower()
-            if subject in {"user", "assistant"}:
-                name = subject
-                entity_type = "PERSON"
-            elif entities:
+            if entities:
                 name = _compact_whitespace(entities[0])
         if not name:
             return None
@@ -6984,76 +8828,66 @@ class MemoryNodeManager:
             entity_type = "CONCEPT"
         return {"name": name, "type": entity_type}
 
-    @staticmethod
-    def _cal_raw_candidate_limits_from_recall_limits(
-        final_candidate_limits: Dict[str, int],
-        *,
-        budget: str,
-    ) -> Dict[str, int]:
-        """Expand per-type final limits into broad raw candidate pools.
-
-        The raw pool is intentionally independent for facts, states, and
-        actionable items. This mirrors the voice_recording recall path: final
-        output size must not determine how many records another memory type is
-        allowed to contribute during first-pass retrieval.
-        """
-        multipliers = {"low": 8, "mid": 12, "high": 18}
-        multiplier = multipliers.get(str(budget or "mid").lower(), 12)
-        floors = {"facts": 40, "states": 28, "actionable_items": 24}
-        ceilings = {"facts": 180, "states": 120, "actionable_items": 100}
-        return {
-            key: max(
-                floors[key],
-                min(
-                    ceilings[key],
-                    max(1, int(final_candidate_limits.get(key, 0) or 0)) * multiplier,
-                ),
-            )
-            for key in ("facts", "states", "actionable_items")
-        }
-
-    def _final_recall_candidate_limits(
+    def _recall_stage2_candidate_limits(
         self,
         *,
         query: str,
         top_k: int,
         budget: str,
         preferred_layer_preferences: Optional[Sequence[str]],
-    ) -> Dict[str, int]:
-        """Allocate independent post-ranking limits for each memory type."""
+    ) -> Tuple[Dict[str, int], Dict[str, int]]:
+        """Build Stage 2 final and supplement budgets consistently with Stage 1."""
         k = max(1, int(top_k or 1))
-        lower = str(query or "").lower()
-        limits = {
-            "facts": max(4, int(math.ceil(k * 0.60))),
-            "states": max(3, int(math.ceil(k * 0.30))),
-            "actionable_items": max(3, int(math.ceil(k * 0.25))),
+
+        base_raw_limit = max(8, min(32, k * 3))
+        supplement_limits = {
+            "facts": base_raw_limit,
+            "states": base_raw_limit,
+            "actionable_items": base_raw_limit,
         }
+
+        supplement_limits = {
+            key: min(48, value)
+            for key, value in supplement_limits.items()
+        }
+
+        final_limits = {
+            "facts": k,
+            "states": k,
+            "actionable_items": k,
+        }
+
+        lower = str(query or "").lower()
         if self._needs_broad_evidence(query):
-            limits["facts"] = max(limits["facts"], int(math.ceil(k * 0.85)))
+            final_limits["facts"] = max(final_limits["facts"], int(math.ceil(k * 0.85)))
         preferred = set(preferred_layer_preferences or [])
         aliases = {"actionable": "actionable_items", "action": "actionable_items"}
         preferred = {aliases.get(level, level) for level in preferred}
         if preferred:
-            for key in limits:
+            for key in final_limits:
                 if key.rstrip("s") in preferred or key in preferred:
-                    limits[key] += max(1, int(math.ceil(k * 0.15)))
+                    final_limits[key] += max(1, int(math.ceil(k * 0.15)))
         if any(marker in lower for marker in ("todo", "task", "remind", "decision", "commit", "待办", "任务", "提醒", "决定", "承诺")):
-            limits["actionable_items"] = max(limits["actionable_items"], int(math.ceil(k * 0.55)))
+            final_limits["actionable_items"] = max(final_limits["actionable_items"], int(math.ceil(k * 0.55)))
         if any(marker in lower for marker in ("prefer", "usually", "habit", "偏好", "通常", "习惯", "长期", "状态")):
-            limits["states"] = max(limits["states"], int(math.ceil(k * 0.5)))
-        return limits
+            final_limits["states"] = max(final_limits["states"], int(math.ceil(k * 0.5)))
 
-    def _candidate_limit(self, *, query: str, top_k: int, budget: str) -> int:
-        multiplier = {"low": 10, "mid": 18, "high": 28}.get(str(budget).lower(), 18)
-        if self._needs_broad_evidence(query):
-            multiplier = max(multiplier, 28)
-        return max(80, int(top_k) * multiplier)
+        return final_limits, supplement_limits
 
-    def _final_limit(self, *, query: str, top_k: int) -> int:
-        if self._needs_broad_evidence(query):
-            return max(int(top_k), 20)
-        return max(int(top_k), 10)
-
+    @staticmethod
+    def _split_recall_stage2_source_limits(
+        supplement_candidate_limits: Dict[str, int],
+    ) -> Tuple[Dict[str, int], Dict[str, int]]:
+        """Split Stage 2 supplement budgets between mapping and lexical search."""
+        entity_mapping_limits: Dict[str, int] = {}
+        lexical_limits: Dict[str, int] = {}
+        for key, supplement_limit in (supplement_candidate_limits or {}).items():
+            normalized_limit = max(0, int(supplement_limit or 0))
+            entity_limit = normalized_limit // 2
+            entity_mapping_limits[key] = entity_limit
+            lexical_limits[key] = normalized_limit - entity_limit
+        return entity_mapping_limits, lexical_limits
+    
     def _needs_broad_evidence(self, query: str) -> bool:
         lower = str(query or "").lower()
         return any(

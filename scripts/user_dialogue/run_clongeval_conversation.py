@@ -78,6 +78,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
     parser.add_argument("--output-root-dir", type=Path, default=DEFAULT_OUTPUT_ROOT_DIR)
     parser.add_argument("--output-dir", type=Path)
+    parser.add_argument(
+        "--existing-state-dir",
+        type=Path,
+        help=(
+            "Reuse existing per-context DBs from "
+            "<dir>/<context_group_id>/memory.db. When set, skip replay, "
+            "store, and reflect; only rerun recall and reader answering."
+        ),
+    )
     parser.add_argument("--start", type=int, default=0)
     parser.add_argument("--limit", type=int, default=0, help="0 means all records.")
     parser.add_argument(
@@ -115,7 +124,7 @@ def parse_args() -> argparse.Namespace:
         help="Do not request provider-enforced JSON output.",
     )
     parser.set_defaults(llm_json_mode=None)
-    parser.add_argument("--max-pending-interaction-interactions", type=int)
+    parser.add_argument("--max-pending-interaction-turns", type=int)
     parser.add_argument("--max-pending-interaction-chars", type=int)
     parser.add_argument("--enable-reflect", action="store_true")
     parser.add_argument(
@@ -272,6 +281,33 @@ def context_group_id(context: str, group_index: int) -> str:
     return f"context_{group_index:04d}_{digest}"
 
 
+def resolve_existing_context_db(
+    existing_state_dir: Path,
+    *,
+    context: str,
+    group_id: str,
+) -> Path:
+    """Resolve a prior context DB, tolerating a changed filtered group index."""
+    existing_root = Path(existing_state_dir).expanduser().resolve()
+    direct_path = existing_root / group_id / "memory.db"
+    if direct_path.is_file():
+        return direct_path
+
+    digest = hashlib.sha1(context.encode("utf-8")).hexdigest()[:12]
+    matches = sorted(existing_root.glob(f"context_*_{digest}/memory.db"))
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        raise FileNotFoundError(
+            "Existing memory DB not found for context "
+            f"{group_id} under {existing_root}"
+        )
+    raise RuntimeError(
+        "Multiple existing memory DBs matched context "
+        f"{group_id} under {existing_root}"
+    )
+
+
 def group_records_by_context(
     records: Sequence[Dict[str, Any]],
 ) -> List[Tuple[str, List[Dict[str, Any]]]]:
@@ -288,7 +324,6 @@ def db_counts(db: SessionDB) -> Dict[str, int]:
         "memory_facts",
         "memory_states",
         "memory_actionable_items",
-        "memory_index_entries",
     ):
         row = db._conn.execute(f"SELECT COUNT(*) AS count FROM {table}").fetchone()
         counts[table] = int(row["count"] if row else 0)
@@ -485,6 +520,39 @@ def remove_context_log_handler(handler: Optional[logging.Handler]) -> None:
     handler.close()
 
 
+def configure_memory_logger(
+    log_path: Path,
+    log_level: str,
+    logger_name: str,
+) -> Tuple[logging.Logger, logging.Handler]:
+    """Create a non-propagating logger dedicated to memory operations."""
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    memory_logger = logging.getLogger(logger_name)
+    for existing_handler in list(memory_logger.handlers):
+        memory_logger.removeHandler(existing_handler)
+        existing_handler.close()
+    memory_logger.setLevel(getattr(logging, str(log_level).upper(), logging.INFO))
+    memory_logger.propagate = False
+    handler = logging.FileHandler(log_path, mode="w", encoding="utf-8")
+    handler.setLevel(logging.NOTSET)
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    )
+    memory_logger.addHandler(handler)
+    return memory_logger, handler
+
+
+def remove_memory_logger_handler(
+    memory_logger: Optional[logging.Logger],
+    handler: Optional[logging.Handler],
+) -> None:
+    """Close a context-specific memory logger without affecting root logging."""
+    if memory_logger is None or handler is None:
+        return
+    memory_logger.removeHandler(handler)
+    handler.close()
+
+
 def configure_worker_logging(
     log_path: Path,
     log_level: str,
@@ -527,7 +595,16 @@ def process_context_group(
     group_id = context_group_id(context, group_index)
     group_dir = args.output_dir / group_id
     group_dir.mkdir(parents=True, exist_ok=True)
-    db_path = group_dir / "memory.db"
+    reused_existing_db = args.existing_state_dir is not None
+    db_path = (
+        resolve_existing_context_db(
+            args.existing_state_dir,
+            context=context,
+            group_id=group_id,
+        )
+        if reused_existing_db
+        else group_dir / "memory.db"
+    )
     context_log_path = group_dir / "context.log"
     logging.info(
         "Processing context group %s/%s id=%s records=%s context_chars=%s",
@@ -537,16 +614,26 @@ def process_context_group(
         len(group_records),
         len(context),
     )
-    days = parse_context_days(context)
+    days = [] if reused_existing_db else parse_context_days(context)
     db = SessionDB(db_path)
     context_log_handler = add_context_log_handler(context_log_path)
+    memory_logger: Optional[logging.Logger] = None
+    memory_log_handler: Optional[logging.Handler] = None
     results: List[Dict[str, Any]] = []
     try:
+        memory_logger, memory_log_handler = configure_memory_logger(
+            group_dir / "memory.log",
+            args.manager_log_level,
+            f"memory.pipeline.{group_id}",
+        )
         logging.info(
-            "Context processing started id=%s records=%s parsed_days=%s",
+            "Context processing started id=%s records=%s parsed_days=%s "
+            "reused_existing_db=%s db_path=%s",
             group_id,
             len(group_records),
             len(days),
+            reused_existing_db,
+            db_path,
         )
         operation_reporter = MemoryOperationReporter()
         manager = StoreFactExtractionManager(
@@ -563,21 +650,33 @@ def process_context_group(
         runtime = MemoryRuntime(
             manager,
             memory_runtime_config=memory_runtime_config,
+            logger=memory_logger,
         )
         if not args.skip_embedding_validation:
             validate_embedding_runtime(manager, db, embedding_config)
         log_memory_index_state(db, f"before_context:{group_id}")
-        replay_stats = replay_context_into_memory(
-            runtime=runtime,
-            db=db,
-            days=days,
-            group_id=group_id,
-            enable_reflect=args.enable_reflect,
-            reflect_every_days=args.reflect_every_days,
-            reflect_limit=args.reflect_limit,
-        )
-        if not runtime.flush_task_queue():
-            raise RuntimeError("Timed out while draining queued memory stores")
+        if reused_existing_db:
+            replay_stats = {
+                "parsed_days": 0,
+                "turn_pairs": 0,
+                "store_batches": 0,
+                "reflect_runs": 0,
+                "last_reflected_day": 0,
+                "reflect_reports": [],
+                "db_counts": db_counts(db),
+            }
+        else:
+            replay_stats = replay_context_into_memory(
+                runtime=runtime,
+                db=db,
+                days=days,
+                group_id=group_id,
+                enable_reflect=args.enable_reflect,
+                reflect_every_days=args.reflect_every_days,
+                reflect_limit=args.reflect_limit,
+            )
+            if not runtime.flush_task_queue():
+                raise RuntimeError("Timed out while draining queued memory stores")
         log_memory_index_state(db, f"after_context:{group_id}")
         counts = db_counts(db)
         memory_operation_report = operation_reporter.snapshot()
@@ -644,6 +743,7 @@ def process_context_group(
                 "recall_context_chars": len(recall_context or ""),
                 "recall_context": recall_context,
                 "db_path": str(db_path),
+                "reused_existing_db": reused_existing_db,
                 "db_counts": counts,
             }
             results.append(result)
@@ -666,7 +766,9 @@ def process_context_group(
             "record_count": len(group_records),
             "context_chars": len(context),
             "db_path": str(db_path),
+            "reused_existing_db": reused_existing_db,
             "context_log_path": str(context_log_path),
+            "memory_log_path": str(group_dir / "memory.log"),
             "days": len(days),
             "replay": replay_stats,
             "db_counts": counts,
@@ -676,6 +778,7 @@ def process_context_group(
     finally:
         log_memory_index_state(db, f"finished_context:{group_id}")
         db.close()
+        remove_memory_logger_handler(memory_logger, memory_log_handler)
         remove_context_log_handler(context_log_handler)
 
 
@@ -744,6 +847,19 @@ def run_context_group_worker(
 
 def main() -> int:
     args = parse_args()
+    if args.existing_state_dir:
+        args.existing_state_dir = args.existing_state_dir.expanduser().resolve()
+        if not args.existing_state_dir.is_dir():
+            raise FileNotFoundError(
+                f"--existing-state-dir does not exist: {args.existing_state_dir}"
+            )
+        if args.output_dir:
+            requested_output_dir = args.output_dir.expanduser().resolve()
+            if requested_output_dir == args.existing_state_dir:
+                raise ValueError(
+                    "--output-dir must differ from --existing-state-dir so the "
+                    "existing memory DBs are not overwritten."
+                )
     records = filter_records(
         load_records(args.input),
         question_ids=args.question_id,
@@ -897,6 +1013,7 @@ def main() -> int:
         "reader_answered": reader_answered,
         "gold_coverage_rate": gold_covered / result_count if result_count else 0.0,
         "recall_path": args.recall_path,
+        "reused_existing_db": bool(args.existing_state_dir),
         "actual_recall_path_counts": {
             path: sum(
                 1

@@ -149,7 +149,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reader-base-url")
     parser.add_argument("--reader-api-key")
     parser.add_argument("--reader-timeout", type=int)
-    parser.add_argument("--reader-max-tokens", type=int, default=4096)
+    parser.add_argument("--reader-max-tokens", type=int, default=8192)
     parser.add_argument("--reader-temperature", type=float, default=0.0)
     parser.add_argument(
         "--reader-max-context-chars",
@@ -263,17 +263,12 @@ def configure_logging(
         stream_handler.setFormatter(formatter)
         root.addHandler(stream_handler)
 
-    manager_level = getattr(logging, str(manager_log_level).upper(), logging.INFO)
-    logging.getLogger("memory").setLevel(manager_level)
-    logging.getLogger("memory.memory_manager").setLevel(manager_level)
-
-
 @contextmanager
 def question_memory_logging(
     question_state_dir: Path,
     *,
     manager_log_level: str,
-) -> Iterable[Path]:
+) -> Iterable[Tuple[Path, logging.Logger]]:
     """Capture memory package logs for one benchmark instance.
 
     The benchmark can run either in one process or multiple worker processes.
@@ -282,22 +277,26 @@ def question_memory_logging(
     """
     question_state_dir.mkdir(parents=True, exist_ok=True)
     log_path = question_state_dir / "memory_manager.log"
-    manager_logger = logging.getLogger("memory")
+    memory_logger = logging.getLogger(
+        f"memory.pipeline.longmemeval.{question_state_dir.name}"
+    )
     manager_level = getattr(logging, str(manager_log_level).upper(), logging.INFO)
-    previous_level = manager_logger.level
+    for existing_handler in list(memory_logger.handlers):
+        memory_logger.removeHandler(existing_handler)
+        existing_handler.close()
 
     formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
     handler = logging.FileHandler(log_path, mode="w", encoding="utf-8")
     handler.setLevel(manager_level)
     handler.setFormatter(formatter)
-    manager_logger.setLevel(manager_level)
-    manager_logger.addHandler(handler)
+    memory_logger.setLevel(manager_level)
+    memory_logger.addHandler(handler)
+    memory_logger.propagate = False
     try:
-        yield log_path
+        yield log_path, memory_logger
     finally:
-        manager_logger.removeHandler(handler)
+        memory_logger.removeHandler(handler)
         handler.close()
-        manager_logger.setLevel(previous_level)
 
 
 def load_project_config(config_path: Path) -> Dict[str, Any]:
@@ -751,8 +750,7 @@ def db_counts(db: SessionDB) -> Dict[str, int]:
         "facts": "memory_facts",
         "states": "memory_states",
         "actionable_items": "memory_actionable_items",
-        "index_entries": "memory_index_entries",
-        "entities": "entity_nodes",
+        "entities": "memory_entity_nodes",
     }
     counts: Dict[str, int] = {}
     for key, table in tables.items():
@@ -1148,8 +1146,8 @@ def build_instance_memory_context(
     with question_memory_logging(
         question_state_dir,
         manager_log_level=str(args.manager_log_level),
-    ) as memory_log_path:
-        logging.getLogger("memory").info(
+    ) as (memory_log_path, memory_logger):
+        memory_logger.info(
             "Question memory log started: question_id=%s db_path=%s",
             question_id,
             db_path,
@@ -1167,6 +1165,7 @@ def build_instance_memory_context(
             runtime = MemoryRuntime(
                 manager,
                 memory_runtime_config=memory_runtime_config,
+                logger=memory_logger,
             )
             validate_runtime(manager)
 
@@ -1352,7 +1351,7 @@ def run_instance_memory_context_worker(
         embedding_config=embedding_config,
     )
     logging.info(
-        "[%s/%s] Finished %s: sessions=%s episodes=%s facts=%s states=%s actionable_items=%s index_entries=%s recall_chars=%s",
+        "[%s/%s] Finished %s: sessions=%s episodes=%s facts=%s states=%s actionable_items=%srecall_chars=%s",
         index,
         total,
         question_id,
@@ -1361,7 +1360,6 @@ def run_instance_memory_context_worker(
         result["db_counts"]["facts"],
         result["db_counts"]["states"],
         result["db_counts"]["actionable_items"],
-        result["db_counts"]["index_entries"],
         result["recall_context_chars"],
     )
     return index, result
@@ -1499,7 +1497,7 @@ def main() -> int:
                 )
                 result = memory_results_by_index[index]
                 logging.info(
-                    "[%s/%s] Memory context ready for %s: sessions=%s episodes=%s facts=%s states=%s actionable_items=%s index_entries=%s recall_chars=%s",
+                    "[%s/%s] Memory context ready for %s: sessions=%s episodes=%s facts=%s states=%s actionable_items=%srecall_chars=%s",
                     index,
                     len(selected),
                     question_id,
@@ -1508,7 +1506,6 @@ def main() -> int:
                     result["db_counts"]["facts"],
                     result["db_counts"]["states"],
                     result["db_counts"]["actionable_items"],
-                    result["db_counts"]["index_entries"],
                     result["recall_context_chars"],
                 )
             except Exception as exc:

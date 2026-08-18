@@ -110,7 +110,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reader-base-url")
     parser.add_argument("--reader-api-key")
     parser.add_argument("--reader-timeout", type=int)
-    parser.add_argument("--reader-max-tokens", type=int, default=1024)
+    parser.add_argument("--reader-max-tokens", type=int, default=8192)
     parser.add_argument("--reader-temperature", type=float, default=0.0)
     parser.add_argument("--reader-max-context-chars", type=int, default=16000)
     parser.add_argument("--recall-top-k", type=int, default=8)
@@ -161,28 +161,30 @@ def configure_logging(
         stream_handler = logging.StreamHandler()
         stream_handler.setFormatter(formatter)
         root.addHandler(stream_handler)
-    manager_level = getattr(logging, str(manager_log_level).upper(), logging.INFO)
-    logging.getLogger("memory").setLevel(manager_level)
-    logging.getLogger("memory.memory_manager").setLevel(manager_level)
-
-
 @contextmanager
-def sample_memory_logging(sample_state_dir: Path, manager_log_level: str) -> Iterator[Path]:
-    """Write MemoryNodeManager logs beside one LoCoMo sample database."""
+def sample_memory_logging(
+    sample_state_dir: Path,
+    manager_log_level: str,
+) -> Iterator[Tuple[Path, logging.Logger]]:
+    """Write memory pipeline logs beside one LoCoMo sample database."""
     sample_state_dir.mkdir(parents=True, exist_ok=True)
     log_path = sample_state_dir / "memory_manager.log"
-    manager_logger = logging.getLogger("memory")
-    previous_level = manager_logger.level
+    memory_logger = logging.getLogger(
+        f"memory.pipeline.locomo.{sample_state_dir.name}"
+    )
+    for existing_handler in list(memory_logger.handlers):
+        memory_logger.removeHandler(existing_handler)
+        existing_handler.close()
     handler = logging.FileHandler(log_path, mode="w", encoding="utf-8")
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
-    manager_logger.addHandler(handler)
-    manager_logger.setLevel(getattr(logging, str(manager_log_level).upper(), logging.INFO))
+    memory_logger.addHandler(handler)
+    memory_logger.setLevel(getattr(logging, str(manager_log_level).upper(), logging.INFO))
+    memory_logger.propagate = False
     try:
-        yield log_path
+        yield log_path, memory_logger
     finally:
-        manager_logger.removeHandler(handler)
+        memory_logger.removeHandler(handler)
         handler.close()
-        manager_logger.setLevel(previous_level)
 
 
 def _expand_env_refs(value: Any) -> Any:
@@ -375,8 +377,7 @@ def db_counts(db: SessionDB) -> Dict[str, int]:
         "facts": "memory_facts",
         "states": "memory_states",
         "actionable_items": "memory_actionable_items",
-        "index_entries": "memory_index_entries",
-        "entities": "entity_nodes",
+        "entities": "memory_entity_nodes",
     }
     return {
         name: int((db._conn.execute(f"SELECT COUNT(*) AS count FROM {table}").fetchone() or {"count": 0})["count"])
@@ -473,7 +474,10 @@ def build_sample_memory_context(
     sample_id = str(sample.get("sample_id") or "unknown_sample")
     sample_state_dir = args.state_dir / sample_id
     db_path = sample_state_dir / "memory.db"
-    with sample_memory_logging(sample_state_dir, args.manager_log_level) as memory_log_path:
+    with sample_memory_logging(
+        sample_state_dir,
+        args.manager_log_level,
+    ) as (memory_log_path, memory_logger):
         db = SessionDB(db_path=db_path)
         try:
             operation_reporter = MemoryOperationReporter()
@@ -487,6 +491,7 @@ def build_sample_memory_context(
             runtime = MemoryRuntime(
                 manager,
                 memory_runtime_config=memory_runtime_config,
+                logger=memory_logger,
             )
             validate_runtime(manager)
             sessions = sorted_locomo_sessions(sample, int(args.max_sessions))
@@ -505,7 +510,9 @@ def build_sample_memory_context(
             )
             reflect_runs = int(reflect_operation_report.get("submitted") or 0)
             counts = db_counts(db)
-            recall_time_end = format_memory_time(sessions[-1][1] + timedelta(hours=1)) if sessions else None
+            recall_time_end = format_memory_time(
+                sessions[-1][1] + timedelta(hours=1)
+            ) if sessions else None
             output_qas = json.loads(json.dumps(sample.get("qa") or []))
             detail_rows: List[Dict[str, Any]] = []
             for qa_index, qa in selected_qas(sample, args):
@@ -639,10 +646,39 @@ def truncate_text(value: str, max_chars: int) -> str:
 def answer_with_reader(args: argparse.Namespace, question: str, category: Any, memory_context: str) -> str:
     if not memory_context.strip():
         return NO_INFORMATION_ANSWER
+    category_text = str(category or "").strip()
+    if category_text == "5":
+        category_instruction = (
+            "This is an adversarial or distractor question. Answer only when "
+            "the retrieved memory directly supports the requested fact. Do not "
+            "infer an answer from unrelated or merely similar memories. If the "
+            "direct evidence is absent, answer exactly "
+            f"{NO_INFORMATION_ANSWER}."
+        )
+    elif category_text == "1":
+        category_instruction = (
+            "This is a multi-hop question. Return only the requested atomic "
+            "answer items in the order asked, separated by commas. Do not add "
+            "numbering, explanations, or evidence."
+        )
+    elif category_text == "2":
+        category_instruction = (
+            "This is a temporal question. Return only the relevant date, year, "
+            "duration, or concise relative time."
+        )
+    else:
+        category_instruction = (
+            "Return only the shortest direct answer phrase needed for the "
+            "question."
+        )
     prompt = (
         "Answer this LoCoMo long-term conversational-memory question using only the retrieved memory.\n"
-        "Return a concise answer phrase, using exact names, dates, places, and wording when available. "
-        "For temporal questions give the best supported date or relative date. "
+        "Output only the final answer. Do not provide reasoning, explanations, "
+        "introductions, conclusions, evidence, markdown, or a restatement of the question. "
+        "Use exact names, dates, places, numbers, and short phrases from the memory whenever available. "
+        "Do not paraphrase an answer when an exact answer appears in the memory. "
+        "If multiple answer items are required, separate them with commas and do not add numbering. "
+        f"{category_instruction}\n"
         f"If the memory is insufficient, answer exactly: {NO_INFORMATION_ANSWER}\n\n"
         f"Category: {category}\nQuestion: {question}\n\nRetrieved memory:\n"
         f"{truncate_text(memory_context, int(args.reader_max_context_chars))}\n\nAnswer:"

@@ -82,7 +82,7 @@ class StoreFactExtractionManager(MemoryNodeManager):
             or not self._llm_base_url
             or str(self._llm_base_url).strip().lower() == "none"
         ):
-            logging.info(
+            self._logger.info(
                 "LLM call #%s kind=%s skipped: missing llm_api_key or llm_base_url",
                 self._test_llm_call_count,
                 call_kind,
@@ -103,7 +103,7 @@ class StoreFactExtractionManager(MemoryNodeManager):
             payload["thinking"] = {"type": self._test_llm_thinking}
         if self._test_llm_json_mode:
             payload["response_format"] = {"type": "json_object"}
-        logging.info(
+        self._logger.info(
             "LLM call #%s kind=%s model=%s prompt_chars=%s max_tokens=%s "
             "thinking=%s json_mode=%s",
             self._test_llm_call_count,
@@ -123,7 +123,7 @@ class StoreFactExtractionManager(MemoryNodeManager):
                 choice = choices[0]
                 content = choice.get("message", {}).get("content", "") or ""
                 finish_reason = choice.get("finish_reason")
-                logging.info(
+                self._logger.info(
                     "LLM result #%s kind=%s finish_reason=%s response_chars=%s usage=%s",
                     self._test_llm_call_count,
                     call_kind,
@@ -138,21 +138,21 @@ class StoreFactExtractionManager(MemoryNodeManager):
                 #     content,
                 # )
                 if finish_reason == "length":
-                    logging.warning(
+                    self._logger.warning(
                         "LLM result #%s was truncated; increase --llm-max-tokens",
                         self._test_llm_call_count,
                     )
                 return content
-            logging.error(
+            self._logger.error(
                 "LLM response #%s kind=%s contained no choices: %s",
                 self._test_llm_call_count,
                 call_kind,
                 response_data,
             )
         except requests.exceptions.RequestException as exc:
-            logging.error("LLM request failed for %s with model %s: %s", url, self._llm_model, exc)
+            self._logger.error("LLM request failed for %s with model %s: %s", url, self._llm_model, exc)
         except (KeyError, ValueError, TypeError) as exc:
-            logging.error("LLM response parse failed for %s with model %s: %s", url, self._llm_model, exc)
+            self._logger.error("LLM response parse failed for %s with model %s: %s", url, self._llm_model, exc)
         return ""
 
     def _start_async_work(self, **kwargs: Any) -> None:
@@ -300,8 +300,8 @@ def load_test_turns(
 
 def iter_stored_nodes(db: SessionDB, start_id: int) -> Iterable[Dict[str, Any]]:
     rows = db._conn.execute(
-        """SELECT id, episode_id, source_type, time_key, summary, keywords,
-                  fact_type, fact_kind, fact_subject, entities,
+        """SELECT id, episode_id, source_type, event_time_key, dialogue_time_key, summary, keywords,
+                  fact_type, fact_kind, entities,
                   fact_root_topic, fact_aspect_topic,
                   confidence, importance, metadata, created_at, updated_at
              FROM memory_facts
@@ -532,9 +532,31 @@ def configure_logging(log_path: Path, log_level: str, manager_log_level: str) ->
     stream_handler = logging.StreamHandler()
     stream_handler.setFormatter(formatter)
     root.addHandler(stream_handler)
-    logging.getLogger("agent.memory_node_manager").setLevel(
-        getattr(logging, str(manager_log_level).upper(), logging.INFO)
-    )
+def configure_memory_logger(
+    log_path: Path,
+    manager_log_level: str,
+) -> Tuple[logging.Logger, logging.Handler]:
+    """Create a non-propagating logger for memory pipeline operations."""
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    memory_logger = logging.getLogger("memory.pipeline.store_fact_test")
+    for existing_handler in list(memory_logger.handlers):
+        memory_logger.removeHandler(existing_handler)
+        existing_handler.close()
+    memory_logger.setLevel(getattr(logging, str(manager_log_level).upper(), logging.INFO))
+    memory_logger.propagate = False
+    handler = logging.FileHandler(log_path, mode="w", encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    memory_logger.addHandler(handler)
+    return memory_logger, handler
+
+
+def close_memory_logger(
+    memory_logger: logging.Logger,
+    handler: logging.Handler,
+) -> None:
+    """Close the dedicated memory pipeline logger."""
+    memory_logger.removeHandler(handler)
+    handler.close()
 
 
 def _configured_embedding_api_key_env(embedding_config: Dict[str, Any]) -> str:
@@ -604,9 +626,6 @@ def validate_embedding_runtime(
 
 
 def log_memory_index_state(db: SessionDB, event: str) -> None:
-    index_count = db._conn.execute(
-        "SELECT COUNT(*) AS count FROM memory_index_entries"
-    ).fetchone()["count"]
     fact_count = db._conn.execute(
         "SELECT COUNT(*) AS count FROM memory_facts"
     ).fetchone()["count"]
@@ -617,12 +636,11 @@ def log_memory_index_state(db: SessionDB, event: str) -> None:
         "SELECT COUNT(*) AS count FROM memory_actionable_items"
     ).fetchone()["count"]
     logging.info(
-        "Memory index state event=%s facts=%s states=%s actionable_items=%s index_entries=%s",
+        "Memory index state event=%s facts=%s states=%s actionable_items=%s",
         event,
         fact_count,
         state_count,
         actionable_count,
-        index_count,
     )
 
 
@@ -660,6 +678,11 @@ def main() -> int:
     llm_config["llm_api_key"] = str(args.llm_api_key or "")
     llm_config["llm_timeout"] = args.llm_timeout
     memory_manager_config["enable_entity_extraction"] = False
+    memory_log_path = args.output_dir / "memory_manager.log"
+    memory_logger, memory_log_handler = configure_memory_logger(
+        memory_log_path,
+        args.manager_log_level,
+    )
     operation_reporter = MemoryOperationReporter()
     manager = StoreFactExtractionManager(
         db,
@@ -675,12 +698,14 @@ def main() -> int:
     runtime = MemoryRuntime(
         manager,
         memory_runtime_config=memory_runtime_config,
+        logger=memory_logger,
     )
     try:
         validate_embedding_runtime(manager, db, embedding_config)
         log_memory_index_state(db, "initialized")
     except Exception:
         db.close()
+        close_memory_logger(memory_logger, memory_log_handler)
         raise
 
     stored_turns = 0
@@ -692,7 +717,7 @@ def main() -> int:
             for local_index, (sample_id, turn_index, user, assistant, hour_offset, is_last_turn) in enumerate(turns):
                 flat_index = args.start + local_index
                 # Keep sample-level spacing at one hour for reflect tests, while
-                # giving each turn a unique timestamp so memory_nodes.time_key
+                # giving each turn a unique timestamp so dialogue-time ordering
                 # does not collide on "#00" across turns in the same sample.
                 turn_timestamp = base_turn_timestamp + timedelta(hours=hour_offset, seconds=turn_index)
                 before_id = db._conn.execute("SELECT COALESCE(MAX(id), 0) AS max_id FROM memory_facts").fetchone()["max_id"]
@@ -802,6 +827,7 @@ def main() -> int:
     finally:
         log_memory_index_state(db, "finished")
         db.close()
+        close_memory_logger(memory_logger, memory_log_handler)
 
     memory_operation_report = operation_reporter.snapshot()
     operation_counts = memory_operation_report.get("counts") or {}
@@ -813,6 +839,7 @@ def main() -> int:
         "output_root_dir": str(args.output_root_dir),
         "output_dir": str(args.output_dir),
         "log_path": str(args.log_path),
+        "memory_log_path": str(memory_log_path),
         "db_path": str(db_path),
         "report_path": str(report_path),
         "turns_processed": len(turns),
