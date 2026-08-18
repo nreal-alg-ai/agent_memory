@@ -5475,7 +5475,7 @@ class MemoryNodeManager:
             )
         )
         raw_candidates, raw_candidates_by_level = (
-            self._merge_recall_stage1_raw_candidates(
+            self._expand_and_merge_recall_stage1_raw_candidates(
                 entity_candidates=[
                     *entity_fact_candidates,
                     *entity_state_candidates,
@@ -5500,6 +5500,7 @@ class MemoryNodeManager:
         ) = self._recall_stage1_calculate_candidate_matching_score(
             candidates=raw_candidates,
             query=query,
+            search_terms=terms,
             is_contextual_query=is_contextual_query,
             reference_time=reference_time,
         )
@@ -5636,7 +5637,7 @@ class MemoryNodeManager:
             "elapsed_ms": round((time.monotonic() - started_at) * 1000, 2),
         }
 
-    def _merge_recall_stage1_raw_candidates(
+    def _expand_and_merge_recall_stage1_raw_candidates(
         self,
         *,
         entity_candidates: Sequence[Dict[str, Any]],
@@ -5852,6 +5853,8 @@ class MemoryNodeManager:
             "exact_actionable",
             "exact_topic",
             "exact_name",
+            "topic_overlap",
+            "name_overlap",
             "entity_mapping",
             "bm25_lexical",
             "high_priority_actionable",
@@ -5925,6 +5928,7 @@ class MemoryNodeManager:
         *,
         candidates: Sequence[Dict[str, Any]],
         query: str,
+        search_terms: Sequence[str] = (),
         is_contextual_query: bool = False,
         reference_time: Optional[str] = None,
     ) -> Tuple[
@@ -5946,6 +5950,7 @@ class MemoryNodeManager:
             match = self._recall_stage1_calculate_single_candidate_matching_score(
                 candidate,
                 query,
+                search_terms=search_terms,
             )
             score_components = dict(match.get("score_components") or {})
             index_level = str(candidate.get("index_level") or "")
@@ -6038,7 +6043,6 @@ class MemoryNodeManager:
                 )
                 if not match["matched"] and match.get("filter_reason") == "":
                     match["filter_reason"] = "candidate_score_below_threshold"
-            candidate["_recall_fast_match_anchor"] = match.get("anchor") or ""
             candidate["_recall_score"] = match.get("rank_score", 0.0)
             candidate["_recall_type_score"] = match.get("rank_score", 0.0)
             candidate["_recall_candidate_source"] = (
@@ -6097,9 +6101,9 @@ class MemoryNodeManager:
     ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
         """Select already-ranked candidates with per-layer preferred limits."""
         candidates_by_layer: Dict[str, Sequence[Dict[str, Any]]] = {
-            "fact": ranked_fact_candidates,
-            "state": ranked_state_candidates,
-            "actionable_item": ranked_actionable_items,
+            "facts": ranked_fact_candidates,
+            "states": ranked_state_candidates,
+            "actionable_items": ranked_actionable_items,
         }
         selected_candidates: List[Dict[str, Any]] = []
         seen_targets: set[Tuple[str, int]] = set()
@@ -6155,8 +6159,10 @@ class MemoryNodeManager:
         self,
         candidate: Dict[str, Any],
         query: str,
+        *,
+        search_terms: Sequence[str] = (),
     ) -> Dict[str, Any]:
-        """Collect raw exact-match evidence for one Stage 1 candidate.
+        """Collect exact and lexical-overlap evidence for one candidate.
 
         This method deliberately does not decide whether the whole recall is
         trustworthy.  That decision is made from all filtered candidates by
@@ -6212,11 +6218,36 @@ class MemoryNodeManager:
             if self._recall_stage1_contains_anchor(query, anchor)
         ]
 
+        normalized_search_terms = [
+            cleaned
+            for value in search_terms or ()
+            if (cleaned := self._recall_stage1_clean_anchor(value))
+        ]
+
+        topic_overlap = self._topic_name_overlap(
+            normalized_search_terms,
+            topic_values,
+            allow_substring=False,
+        ) if normalized_search_terms and topic_values else 0.0
+        name_overlap = self._topic_name_overlap(
+            normalized_search_terms,
+            name_values,
+            allow_substring=False,
+        ) if normalized_search_terms and name_values else 0.0
+        
+        strong_overlap_threshold = 0.90
+        strong_topic_overlap = topic_overlap >= strong_overlap_threshold
+        strong_name_overlap = name_overlap >= strong_overlap_threshold
+
         evidence: List[str] = []
         if exact_topics:
             evidence.append("exact_topic")
         if exact_names:
             evidence.append("exact_name")
+        if topic_overlap > 0.0:
+            evidence.append("topic_overlap")
+        if name_overlap > 0.0:
+            evidence.append("name_overlap")
         bm25_score = self._clamp_float(
             candidate.get("_recall_bm25_score"),
             0.0,
@@ -6231,18 +6262,38 @@ class MemoryNodeManager:
             evidence.append("entity_mapping")
 
         if exact_topics:
-            topic_score = min(0.54, 0.48 + 0.03 * (len(exact_topics) - 1))
+            exact_topic_score = min(
+                0.54,
+                0.48 + 0.03 * (len(exact_topics) - 1),
+            )
         else:
-            topic_score = 0.0
+            exact_topic_score = 0.0
+        # A lexical overlap is weaker than an exact query anchor, but it must
+        # still affect ranking when no exact topic was found.
+        topic_overlap_score = (
+            min(0.36, 0.36 * topic_overlap)
+            if not exact_topics
+            else 0.0
+        )
         if exact_names:
-            name_score = min(0.48, 0.42 + 0.03 * (len(exact_names) - 1))
+            exact_name_score = min(
+                0.48,
+                0.42 + 0.03 * (len(exact_names) - 1),
+            )
         else:
-            name_score = 0.0
+            exact_name_score = 0.0
+        name_overlap_score = (
+            min(0.30, 0.30 * name_overlap)
+            if not exact_names
+            else 0.0
+        )
         bm25_component = 0.45 * bm25_score if lexical_source_hit else 0.0
         mapping_score = 0.30 if entity_mapping_hit else 0.0
         score_components = {
-            "exact_topic": round(topic_score, 4),
-            "exact_name": round(name_score, 4),
+            "exact_topic": round(exact_topic_score, 4),
+            "exact_name": round(exact_name_score, 4),
+            "topic_overlap": round(topic_overlap_score, 4),
+            "name_overlap": round(name_overlap_score, 4),
             "entity_mapping": round(mapping_score, 4),
             "bm25_identity_text": round(bm25_component, 4),
         }
@@ -6251,7 +6302,12 @@ class MemoryNodeManager:
             lexical_source_hit
             and bm25_score >= 0.55
         )
-        strong_anchor = bool(exact_topics or exact_names)
+        strong_anchor = bool(
+            exact_topics
+            or exact_names
+            or strong_topic_overlap
+            or strong_name_overlap
+        )
         candidate_min_score = self._clamp_float(
             getattr(self, "_recall_fast_candidate_min_score", None),
             0.0,
@@ -6288,6 +6344,12 @@ class MemoryNodeManager:
                 or candidate.get("title")
                 or ""
             )
+        elif topic_overlap > 0.0:
+            match_type = "topic_overlap"
+            anchor = ", ".join(topic_values)
+        elif name_overlap > 0.0:
+            match_type = "name_overlap"
+            anchor = ", ".join(name_values)
         else:
             return {
                 "matched": False,
@@ -6307,6 +6369,8 @@ class MemoryNodeManager:
                 "filter_reason": "no_matching_evidence",
                 "bm25_score": round(bm25_score, 4),
                 "bm25_raw_score": candidate.get("_bm25_score"),
+                "topic_overlap": round(topic_overlap, 4),
+                "name_overlap": round(name_overlap, 4),
                 "score_components": score_components,
             }
 
@@ -6331,6 +6395,8 @@ class MemoryNodeManager:
                 "filter_reason": "candidate_score_below_threshold",
                 "bm25_score": round(bm25_score, 4),
                 "bm25_raw_score": candidate.get("_bm25_score"),
+                "topic_overlap": round(topic_overlap, 4),
+                "name_overlap": round(name_overlap, 4),
                 "score_components": score_components,
             }
         return {
@@ -6350,6 +6416,8 @@ class MemoryNodeManager:
             "filter_reason": "",
             "bm25_score": round(bm25_score, 4),
             "bm25_raw_score": candidate.get("_bm25_score"),
+            "topic_overlap": round(topic_overlap, 4),
+            "name_overlap": round(name_overlap, 4),
             "score_components": score_components,
             "strong_anchor": strong_anchor,
         }
@@ -7744,14 +7812,68 @@ class MemoryNodeManager:
         scored: List[Tuple[float, str, int, Dict[str, Any]]] = []
         for position, entry in enumerate(candidates):
             raw = entry.get("_hydrated") if isinstance(entry.get("_hydrated"), dict) else {}
-            text = _compact_whitespace(entry.get("identity_text") or "").lower()
-            term_hits = sum(1 for term in terms if term and term.lower() in text)
-            term_coverage = term_hits / max(1, min(len(terms), 8))
-            phrase_hits = 0
-            for quoted in re.findall(r"'([^']+)'|\"([^\"]+)\"", query):
-                phrase = (quoted[0] or quoted[1]).lower()
-                if phrase and phrase in text:
-                    phrase_hits += 1
+            metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
+
+            def extend_values(target: List[str], value: Any) -> None:
+                if isinstance(value, (list, tuple, set)):
+                    for item in value:
+                        extend_values(target, item)
+                    return
+                clean = _compact_whitespace(value)
+                if clean and clean not in target:
+                    target.append(clean)
+
+            topic_values: List[str] = []
+            name_values: List[str] = []
+            state_scope = str(raw.get("state_scope") or "")
+            if memory_type == "fact":
+                extend_values(topic_values, raw.get("fact_root_topic"))
+                extend_values(topic_values, raw.get("fact_aspect_topic"))
+            elif memory_type == "state":
+                extend_values(name_values, raw.get("canonical_name"))
+                if state_scope == "topic_state":
+                    extend_values(topic_values, raw.get("canonical_name"))
+                    extend_values(
+                        topic_values,
+                        metadata.get("aspect_topic_names"),
+                    )
+                    extend_values(
+                        topic_values,
+                        metadata.get("canonical_topics"),
+                    )
+                else:
+                    extend_values(
+                        name_values,
+                        metadata.get("attribute_name_aliases"),
+                    )
+                    extend_values(
+                        topic_values,
+                        metadata.get("canonical_topics"),
+                    )
+            else:
+                extend_values(name_values, raw.get("canonical_name"))
+                extend_values(topic_values, metadata.get("canonical_topics"))
+                extend_values(topic_values, raw.get("canonical_topics"))
+
+            topic_overlap = (
+                self._topic_name_overlap(
+                    terms,
+                    topic_values,
+                    allow_substring=False,
+                )
+                if terms and topic_values
+                else 0.0
+            )
+            name_overlap = (
+                self._topic_name_overlap(
+                    terms,
+                    name_values,
+                    allow_substring=False,
+                )
+                if terms and name_values
+                else 0.0
+            )
+            structured_overlap = max(topic_overlap, name_overlap)
             similarity = max(0.0, self._cal_embedding_similarity(
                 query_embedding,
                 entry.get("embedding"),
@@ -7776,8 +7898,6 @@ class MemoryNodeManager:
                 entry.get("_recall_bm25_score") is not None
                 or entry.get("_bm25_score") is not None
             )
-            phrase_score = min(1.0, phrase_hits / 2.0)
-            hit_score = min(1.0, term_hits / 3.0)
 
             # Use a weighted average over available signals. Entity-mapping
             # candidates often have no BM25 result, and candidates from an
@@ -7788,11 +7908,8 @@ class MemoryNodeManager:
                 relevance_parts.append((0.42, similarity))
             if has_bm25_signal:
                 relevance_parts.append((0.28, bm25_score))
-            if terms:
-                relevance_parts.append((0.18, term_coverage))
-                relevance_parts.append((0.07, hit_score))
-            if query:
-                relevance_parts.append((0.05, phrase_score))
+            if terms and (topic_values or name_values):
+                relevance_parts.append((0.25, structured_overlap))
             relevance_weight = sum(weight for weight, _value in relevance_parts)
             relevance_score = (
                 sum(weight * value for weight, value in relevance_parts)
@@ -7805,10 +7922,7 @@ class MemoryNodeManager:
                 if any(marker in query_lower for marker in ("when", "before", "after", "什么时候", "之前", "之后")):
                     type_bonus += 0.03
             elif memory_type == "state":
-                if raw.get("canonical_name") and any(
-                    str(term).lower() in str(raw.get("canonical_name")).lower()
-                    for term in terms
-                ):
+                if structured_overlap >= 0.90:
                     type_bonus += 0.05
             else:
                 if any(marker in query_lower for marker in (
@@ -7833,9 +7947,9 @@ class MemoryNodeManager:
             item["_recall_score_components"] = {
                 "embedding_similarity": round(float(similarity), 4),
                 "bm25_identity_text": round(float(bm25_score), 4),
-                "term_coverage": round(float(term_coverage), 4),
-                "term_hits": term_hits,
-                "phrase_hits": phrase_hits,
+                "topic_overlap": round(float(topic_overlap), 4),
+                "name_overlap": round(float(name_overlap), 4),
+                "structured_overlap": round(float(structured_overlap), 4),
                 "relevance_score": round(float(relevance_score), 4),
                 "type_bonus": round(float(type_bonus), 4),
                 "provenance_bonus": provenance_profile["provenance_bonus"],
@@ -7868,7 +7982,7 @@ class MemoryNodeManager:
         query_embedding: Optional[np.ndarray],
         min_embedding_similarity: Optional[float],
     ) -> List[Dict[str, Any]]:
-        ranked = self._rank_recall_candidates_by_type(
+        return self._rank_recall_candidates_by_type(
             candidates,
             memory_type="fact",
             terms=terms,
@@ -7876,16 +7990,6 @@ class MemoryNodeManager:
             query_embedding=query_embedding,
             min_embedding_similarity=min_embedding_similarity,
         )
-        ranked.sort(
-            key=lambda item: (
-                float(item.get("_recall_type_score") or 0.0),
-                str(item.get("time_start") or ""),
-            ),
-            reverse=True,
-        )
-        for rank, item in enumerate(ranked, 1):
-            item["_recall_rank"] = rank
-        return ranked
 
     def _rank_recall_state_candidates(
         self,
@@ -7978,20 +8082,12 @@ class MemoryNodeManager:
             ),
         )
 
-        layer_limits = {
-            "fact": max(0, int(final_limits.get("facts", 0) or 0)),
-            "state": max(0, int(final_limits.get("states", 0) or 0)),
-            "actionable_item": max(
-                0,
-                int(final_limits.get("actionable_items", 0) or 0),
-            ),
-        }
         selected_candidates, _selected_by_layer = (
             self._recall_get_selected_candidates_by_layer(
                 ranked_fact_candidates=ranked_facts,
                 ranked_state_candidates=ranked_states,
                 ranked_actionable_items=ranked_actionable,
-                layer_limits=layer_limits,
+                layer_limits=final_limits,
             )
         )
         return selected_candidates
