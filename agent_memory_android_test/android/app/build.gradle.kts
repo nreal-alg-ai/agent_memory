@@ -109,6 +109,56 @@ chaquopy {
     }
 }
 
+fun registerChaquopyFts5Task(variant: String) {
+    val variantName = variant.replaceFirstChar { it.uppercase() }
+    val task = tasks.register("enableChaquopyFts5$variantName") {
+        dependsOn("generate${variantName}PythonJniLibs", "generate${variantName}PythonMiscAssets")
+        outputs.upToDateWhen { false }
+        doLast {
+            val targetCache = File(System.getProperty("user.home"), ".gradle/caches/modules-2/files-2.1/com.chaquo.python/target")
+            val targetZip = fileTree(targetCache).matching {
+                include("**/target-3.11.*-arm64-v8a.zip")
+            }.files.maxByOrNull { it.lastModified() }
+                ?: error("Chaquopy Python target archive was not found under $targetCache")
+            val ndkRoot = sequenceOf(
+                System.getenv("ANDROID_NDK_HOME")?.let(::File),
+                System.getenv("ANDROID_HOME")?.let { File(it, "ndk") },
+                File(System.getProperty("user.home"), "Library/Android/sdk/ndk"),
+                File("/opt/homebrew/share/android-commandlinetools/ndk"),
+            ).filterNotNull()
+                .flatMap { root ->
+                    if (root.resolve("toolchains/llvm").isDirectory) sequenceOf(root)
+                    else root.listFiles()?.asSequence().orEmpty()
+                }
+                .filter { it.resolve("toolchains/llvm").isDirectory }
+                .maxByOrNull { it.name }
+                ?: error("Android NDK was not found")
+            exec {
+                commandLine(
+                    "python3",
+                    File(rootProject.projectDir, "tools/build_fts5_sqlite.py"),
+                    "--cache-dir", layout.buildDirectory.dir("fts5-runtime").get().asFile,
+                    "--target-zip", targetZip,
+                    "--stdlib-imy", layout.buildDirectory.file("python/assets/misc/$variant/chaquopy/stdlib-arm64-v8a.imy").get().asFile,
+                    "--output", layout.buildDirectory.file("fts5-runtime/custom/_sqlite3.cpython-311.so").get().asFile,
+                    "--ndk-root", ndkRoot,
+                    "--abi", "arm64-v8a",
+                    "--api", "26",
+                )
+            }
+        }
+    }
+    tasks.matching {
+        it.name == "merge${variantName}Assets" || it.name == "package${variantName}"
+    }.configureEach {
+        dependsOn(task)
+        outputs.upToDateWhen { false }
+    }
+}
+
+registerChaquopyFts5Task("debug")
+registerChaquopyFts5Task("release")
+
 dependencies {
     implementation(files(fetchSherpaAar))
     testImplementation("junit:junit:4.13.2")

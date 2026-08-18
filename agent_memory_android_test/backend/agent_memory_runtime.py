@@ -18,12 +18,15 @@ class AgentMemoryRuntime:
         embedding_config: Optional[Dict[str, Any]] = None,
         memory_manager_config: Optional[Dict[str, Any]] = None,
         memory_runtime_config: Optional[Dict[str, Any]] = None,
+        database_lock: Optional[Any] = None,
     ) -> None:
         from memory.memory_database import SessionDB
         from memory.memory_manager import MemoryNodeManager
         from memory.memory_runtime import MemoryRuntime
 
         self._db_path = str(db_path)
+        self._lock = database_lock or threading.RLock()
+        self._closed = False
         self._db = None
         try:
             self._db = SessionDB(db_path=self._db_path)
@@ -44,9 +47,6 @@ class AgentMemoryRuntime:
                 except Exception:
                     pass
             raise
-        self._lock = threading.RLock()
-        self._closed = False
-
     @property
     def db_path(self) -> str:
         return self._db_path

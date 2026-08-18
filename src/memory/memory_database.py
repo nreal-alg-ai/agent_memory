@@ -167,9 +167,14 @@ class SessionDB:
     def __init__(self, db_path: Path | str) -> None:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
+        self._conn = sqlite3.connect(
+            str(self.db_path),
+            check_same_thread=False,
+            timeout=30.0,
+        )
         self._conn.row_factory = sqlite3.Row
         self._transaction_depth = 0
+        self._conn.execute("PRAGMA busy_timeout=30000")
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._init_schema()
@@ -184,13 +189,13 @@ class SessionDB:
         reader._conn = sqlite3.connect(
             str(self.db_path),
             check_same_thread=False,
-            timeout=5.0,
+            timeout=30.0,
         )
         reader._conn.row_factory = sqlite3.Row
         reader._transaction_depth = 0
         reader._conn.execute("PRAGMA query_only=ON")
         reader._conn.execute("PRAGMA foreign_keys=ON")
-        reader._conn.execute("PRAGMA busy_timeout=5000")
+        reader._conn.execute("PRAGMA busy_timeout=30000")
         return reader
 
     @contextmanager
@@ -570,49 +575,6 @@ class SessionDB:
                 "ALTER TABLE memory_states ADD COLUMN canonical_name_embedding BLOB"
             )
 
-    def _init_index_fts(self) -> None:
-        """Create the lightweight lexical index used for first-pass recall."""
-        self._conn.execute(
-            """
-            CREATE VIRTUAL TABLE IF NOT EXISTS memory_index_entries_fts USING fts5(
-                title,
-                summary_for_retrieval,
-                keywords,
-                entities,
-                canonical_topics,
-                participants,
-                memory_path
-            )
-            """
-        )
-        self._backfill_index_fts()
-
-    def _backfill_index_fts(self) -> None:
-        """Populate FTS rows for existing index cards not yet synchronized."""
-        self._conn.execute(
-            """
-            INSERT INTO memory_index_entries_fts (
-                rowid, title, summary_for_retrieval, keywords, entities,
-                canonical_topics, participants, memory_path
-            )
-            SELECT
-                i.id,
-                i.title,
-                i.summary_for_retrieval,
-                i.keywords,
-                i.entities,
-                i.canonical_topics,
-                i.participants,
-                i.memory_path
-            FROM memory_index_entries i
-            WHERE NOT EXISTS (
-                SELECT 1
-                FROM memory_index_entries_fts f
-                WHERE f.rowid = i.id
-            )
-            """
-        )
-
     @staticmethod
     def _terms_to_fts_query(terms: Sequence[str]) -> str:
         quoted: List[str] = []
@@ -642,41 +604,6 @@ class SessionDB:
             if len(normalized) >= 32:
                 return normalized
         return normalized
-
-    def _sync_index_entry_fts(
-        self,
-        *,
-        row_id: int,
-        title: str,
-        summary_for_retrieval: str,
-        keywords: str,
-        entities: Sequence[str],
-        canonical_topics: Sequence[str],
-        participants: Sequence[str],
-        memory_path: str,
-    ) -> None:
-        self._conn.execute(
-            "DELETE FROM memory_index_entries_fts WHERE rowid = ?",
-            (int(row_id),),
-        )
-        self._conn.execute(
-            """
-            INSERT INTO memory_index_entries_fts (
-                rowid, title, summary_for_retrieval, keywords, entities,
-                canonical_topics, participants, memory_path
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                int(row_id),
-                str(title or ""),
-                str(summary_for_retrieval or ""),
-                str(keywords or ""),
-                " ".join(str(item or "") for item in entities or []),
-                " ".join(str(item or "") for item in canonical_topics or []),
-                " ".join(str(item or "") for item in participants or []),
-                str(memory_path or ""),
-            ),
-        )
 
     def insert_episode(
         self,

@@ -58,6 +58,17 @@ def _log(message: str) -> None:
         pass
 
 
+def _verify_fts5_support() -> None:
+    """Fail fast if the Chaquopy SQLite extension was built without FTS5."""
+
+    connection = sqlite3.connect(":memory:")
+    try:
+        connection.execute("CREATE VIRTUAL TABLE __agent_memory_fts5_probe USING fts5(content)")
+        _log("SQLite FTS5 probe ok")
+    finally:
+        connection.close()
+
+
 class SpeakerStore:
     """声纹样本存储与分类（包装层自己的 JSON 文件，不含原始 PCM）。"""
 
@@ -463,16 +474,22 @@ def start(config_json: str) -> str:
         runtime: Optional[AgentMemoryRuntime] = None
         admin: Optional[AgentMemoryAdmin] = None
         server: Optional[ThreadingHTTPServer] = None
+        database_lock = threading.RLock()
         try:
+            _verify_fts5_support()
             runtime = AgentMemoryRuntime(
                 db_path=data_dir / "memory.db",
                 llm_config=llm_config,
                 embedding_config=embedding_config,
                 memory_manager_config=memory_manager_config,
                 memory_runtime_config=memory_runtime_config,
+                database_lock=database_lock,
             )
             _log("start runtime init ok")
-            admin = AgentMemoryAdmin(db_path=str(data_dir / "memory.db"))
+            admin = AgentMemoryAdmin(
+                db_path=str(data_dir / "memory.db"),
+                database_lock=database_lock,
+            )
             speakers = SpeakerStore(path=str(data_dir / "speaker_profiles.json"))
             replies = ReplyQueue()
             captures = CaptureRegistry()

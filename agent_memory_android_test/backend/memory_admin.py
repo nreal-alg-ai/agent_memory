@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 
 _SEARCHABLE = {
@@ -27,11 +27,17 @@ _SEARCHABLE = {
 class AgentMemoryAdmin:
     """独立连接读写 agent_memory 的 SQLite，供 HTTP API 使用。"""
 
-    def __init__(self, db_path: str) -> None:
+    def __init__(self, db_path: str, *, database_lock: Optional[Any] = None) -> None:
         self._db_path = db_path
-        self._lock = threading.RLock()
-        self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        self._lock = database_lock or threading.RLock()
+        self._conn = sqlite3.connect(
+            db_path,
+            check_same_thread=False,
+            timeout=30.0,
+        )
         self._conn.row_factory = sqlite3.Row
+        self._conn.execute("PRAGMA busy_timeout=30000")
+        self._conn.execute("PRAGMA foreign_keys=ON")
 
     def close(self) -> None:
         try:
