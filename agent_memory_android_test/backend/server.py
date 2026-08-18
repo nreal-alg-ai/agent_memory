@@ -23,7 +23,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from .agent_memory_runtime import AgentMemoryRuntime
 from .audio_event_handler import (
     is_assistant_query,
     is_speaker_enrollment,
@@ -263,7 +262,9 @@ class _BackendRuntime:
     def __init__(
         self,
         *,
-        runtime: AgentMemoryRuntime,
+        runtime: Any,
+        db: Any,
+        operation_lock: threading.RLock,
         admin: AgentMemoryAdmin,
         speakers: SpeakerStore,
         replies: ReplyQueue,
@@ -283,6 +284,8 @@ class _BackendRuntime:
         embedding_base_url: str = "",
     ) -> None:
         self.runtime = runtime
+        self.db = db
+        self.operation_lock = operation_lock
         self.admin = admin
         self.speakers = speakers
         self.replies = replies
@@ -461,7 +464,11 @@ def start(config_json: str) -> str:
             embedding_base_url = embedding_config["base_url"]
         memory_manager_config = {
             "memory_enabled": True,
+            "enable_memory_state_update": True,
+            "enable_memory_actionable_item_update": False,
             "recall_fact_min_embedding_similarity": 0,
+            "recall_state_min_embedding_similarity": 0.35,
+            "recall_actionable_item_min_embedding_similarity": 0.35,
             "memory_prompt_language_mode": "zh",
         }
         memory_runtime_config = {
@@ -471,19 +478,27 @@ def start(config_json: str) -> str:
             "transcript_episode_max_chars": 12000,
             "transcript_episode_max_gap_seconds": 60,
         }
-        runtime: Optional[AgentMemoryRuntime] = None
+        from memory.memory_database import SessionDB
+        from memory.memory_manager import MemoryNodeManager
+        from memory.memory_runtime import MemoryRuntime
+
+        runtime: Optional[MemoryRuntime] = None
+        db: Any = None
         admin: Optional[AgentMemoryAdmin] = None
         server: Optional[ThreadingHTTPServer] = None
         database_lock = threading.RLock()
         try:
             _verify_fts5_support()
-            runtime = AgentMemoryRuntime(
-                db_path=data_dir / "memory.db",
-                llm_config=llm_config,
+            db = SessionDB(db_path=data_dir / "memory.db")
+            manager = MemoryNodeManager(
+                db,
                 embedding_config=embedding_config,
                 memory_manager_config=memory_manager_config,
+                llm_config=llm_config,
+            )
+            runtime = MemoryRuntime(
+                manager,
                 memory_runtime_config=memory_runtime_config,
-                database_lock=database_lock,
             )
             _log("start runtime init ok")
             admin = AgentMemoryAdmin(
@@ -509,6 +524,8 @@ def start(config_json: str) -> str:
             thread.start()
             _runtime = _BackendRuntime(
                 runtime=runtime,
+                db=db,
+                operation_lock=database_lock,
                 admin=admin,
                 speakers=speakers,
                 replies=replies,
@@ -539,7 +556,12 @@ def start(config_json: str) -> str:
             _log(f"start failed: {exc}\n{traceback.format_exc()}")
             if runtime is not None:
                 try:
-                    runtime.close()
+                    runtime.flush_task_queue(timeout=10.0)
+                except Exception:
+                    pass
+            if db is not None:
+                try:
+                    db.close()
                 except Exception:
                     pass
             if admin is not None:
@@ -577,7 +599,11 @@ def stop() -> str:
         pass
     runtime.thread.join(timeout=5.0)
     runtime.admin.close()
-    runtime.runtime.close()
+    with runtime.operation_lock:
+        try:
+            runtime.runtime.flush_task_queue(timeout=10.0)
+        finally:
+            runtime.db.close()
     return json.dumps({"running": False}, ensure_ascii=False)
 
 
@@ -650,7 +676,12 @@ def _queue_assistant_query(
 
     def _process() -> None:
         try:
-            recall = runtime.runtime.recall(query=query, top_k=8, budget="mid")
+            with runtime.operation_lock:
+                recall = runtime.runtime.trigger_memory_recall(
+                    query=query,
+                    top_k=8,
+                    budget="mid",
+                )
             memory_context = str(recall.get("memory_context") or "")
             reply = chat_with_memory(
                 user_message=query,
@@ -658,7 +689,11 @@ def _queue_assistant_query(
                 llm_config=_runtime_llm_config(),
             )
             try:
-                runtime.runtime.store_interaction(user_message=query, assistant_reply=reply)
+                with runtime.operation_lock:
+                    runtime.runtime.accept_single_interaction_turn(
+                        user_message=query,
+                        assistant_response=reply,
+                    )
             except Exception as exc:
                 _log(f"store_interaction failed: {exc}")
             runtime.replies.mark_completed(
@@ -692,12 +727,17 @@ def _ingest_ambient(
     if capture_id:
         runtime.captures.add_segment(capture_id)
     try:
-        result = runtime.runtime.ingest_ambient_segment(
-            speaker=preprocessed["speaker"],
-            text=preprocessed["text"],
-            timestamp=preprocessed.get("timestamp"),
-            source_type=preprocessed.get("source_type") or "allday_recording",
-        )
+        segment = {
+            "speaker": preprocessed["speaker"],
+            "text": preprocessed["text"],
+        }
+        if preprocessed.get("timestamp") is not None:
+            segment["timestamp"] = preprocessed["timestamp"]
+        with runtime.operation_lock:
+            result = runtime.runtime.accept_single_transcript_segment(
+                segment=segment,
+                source_type=preprocessed.get("source_type") or "allday_recording",
+            )
         return {
             "event_id": event_id,
             "status": "completed",
@@ -983,7 +1023,9 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/agent-memory/reflect":
             runtime = self._current()
-            report = runtime.runtime.trigger_reflect()
+            with runtime.operation_lock:
+                report = runtime.runtime.trigger_memory_reflect()
+                runtime.runtime.flush_task_queue(timeout=20.0)
             self._send_json({"reflect": report, "stats": runtime.admin.stats()})
             return
         if parsed.path == "/api/agent-memory/import":
@@ -1017,14 +1059,23 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json({"detail": "message is required"}, status=HTTPStatus.BAD_REQUEST)
             return
         try:
-            recall = runtime.runtime.recall(query=message, top_k=8, budget="mid")
+            with runtime.operation_lock:
+                recall = runtime.runtime.trigger_memory_recall(
+                    query=message,
+                    top_k=8,
+                    budget="mid",
+                )
             memory_context = str(recall.get("memory_context") or "")
             reply = chat_with_memory(
                 user_message=message,
                 memory_context=memory_context,
                 llm_config=_runtime_llm_config(),
             )
-            runtime.runtime.store_interaction(user_message=message, assistant_reply=reply)
+            with runtime.operation_lock:
+                runtime.runtime.accept_single_interaction_turn(
+                    user_message=message,
+                    assistant_response=reply,
+                )
         except ChatServiceError as exc:
             reply = f"回复生成失败：{exc}"
             memory_context = ""
@@ -1056,11 +1107,11 @@ class _Handler(BaseHTTPRequestHandler):
         if not text:
             self._send_json({"detail": "text is required"}, status=HTTPStatus.BAD_REQUEST)
             return
-        result = runtime.runtime.ingest_ambient_segment(
-            speaker="user",
-            text=text,
-            source_type="manual_import",
-        )
+        with runtime.operation_lock:
+            result = runtime.runtime.accept_single_transcript_segment(
+                segment={"speaker": "user", "text": text},
+                source_type="manual_import",
+            )
         self._send_json({"stored": True, "result": result, "stats": runtime.admin.stats()})
 
     def _runtime_info(self) -> Dict[str, Any]:
