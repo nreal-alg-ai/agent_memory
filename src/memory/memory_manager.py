@@ -5786,9 +5786,9 @@ class MemoryNodeManager:
         actionable = bool(is_actionable_query)
         base_raw_limit = max(8, min(32, k * 3))
         raw_candidate_limits = {
-            "facts": base_raw_limit,
-            "states": base_raw_limit,
-            "actionable_items": base_raw_limit,
+            "fact": base_raw_limit,
+            "state": base_raw_limit,
+            "actionable_item": base_raw_limit,
         }
 
         # Contextual recall needs a wider recent-fact and active-topic pool;
@@ -5798,10 +5798,10 @@ class MemoryNodeManager:
         contextual_extra = max(4, min(16, k * 2))
         actionable_extra = max(4, min(16, k * 2))
         if contextual:
-            raw_candidate_limits["facts"] += contextual_extra
-            raw_candidate_limits["states"] += contextual_extra
+            raw_candidate_limits["fact"] += contextual_extra
+            raw_candidate_limits["state"] += contextual_extra
         if actionable:
-            raw_candidate_limits["actionable_items"] += actionable_extra
+            raw_candidate_limits["actionable_item"] += actionable_extra
         raw_candidate_limits = {
             key: min(48, value)
             for key, value in raw_candidate_limits.items()
@@ -6099,11 +6099,15 @@ class MemoryNodeManager:
         ranked_actionable_items: Sequence[Dict[str, Any]],
         layer_limits: Dict[str, int],
     ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
-        """Select already-ranked candidates with per-layer preferred limits."""
+        """Select ranked candidates with per-layer limits."""
         candidates_by_layer: Dict[str, Sequence[Dict[str, Any]]] = {
-            "facts": ranked_fact_candidates,
-            "states": ranked_state_candidates,
-            "actionable_items": ranked_actionable_items,
+            "fact": ranked_fact_candidates,
+            "state": ranked_state_candidates,
+            "actionable_item": ranked_actionable_items,
+        }
+        layer_limits = {
+            str(layer): max(0, int(limit or 0))
+            for layer, limit in (layer_limits or {}).items()
         }
         selected_candidates: List[Dict[str, Any]] = []
         seen_targets: set[Tuple[str, int]] = set()
@@ -6704,54 +6708,25 @@ class MemoryNodeManager:
         limit: int,
         database: Optional[SessionDB] = None,
     ) -> List[Dict[str, Any]]:
-        """Add bounded facts from episodes represented by Stage 1 candidates."""
+        """Expand only indexed fact candidates to their sibling episode facts."""
         db = database or self._db
         episode_ids: List[int] = []
         seed_targets: Dict[int, List[str]] = {}
-        evidence_fact_ids: List[int] = []
         for candidate in candidates or []:
+            if str(candidate.get("index_level") or "").strip().lower() != "fact":
+                continue
             raw = candidate.get("_hydrated") if isinstance(candidate.get("_hydrated"), dict) else {}
-            raw_episode_ids = [raw.get("episode_id")]
-            raw_episode_ids.extend(
-                fact.get("episode_id")
-                for fact in candidate.get("_supporting_facts") or []
-                if isinstance(fact, dict)
+            value = raw.get("episode_id")
+            if not str(value or "").strip().isdigit():
+                continue
+            episode_id = int(value)
+            if episode_id not in episode_ids:
+                episode_ids.append(episode_id)
+            seed_targets.setdefault(episode_id, []).append(
+                f"{candidate.get('target_table')}#{candidate.get('target_id')}"
             )
-            for value in raw.get("evidence_fact_ids") or []:
-                try:
-                    fact_id = int(value)
-                except (TypeError, ValueError):
-                    continue
-                if fact_id not in evidence_fact_ids:
-                    evidence_fact_ids.append(fact_id)
-            for value in raw_episode_ids:
-                if not str(value or "").strip().isdigit():
-                    continue
-                episode_id = int(value)
-                if episode_id not in episode_ids:
-                    episode_ids.append(episode_id)
-                seed_targets.setdefault(episode_id, []).append(
-                    f"{candidate.get('target_table')}#{candidate.get('target_id')}"
-                )
-                if len(episode_ids) >= 8:
-                    break
             if len(episode_ids) >= 8:
                 break
-        if evidence_fact_ids:
-            for fact in db.memory_facts_by_ids(evidence_fact_ids):
-                episode_id = fact.get("episode_id")
-                if not str(episode_id or "").strip().isdigit():
-                    continue
-                episode_id = int(episode_id)
-                if episode_id not in episode_ids:
-                    episode_ids.append(episode_id)
-                seed_targets.setdefault(episode_id, [])
-                for candidate in candidates or []:
-                    target = f"{candidate.get('target_table')}#{candidate.get('target_id')}"
-                    if target not in seed_targets[episode_id]:
-                        seed_targets[episode_id].append(target)
-                if len(episode_ids) >= 8:
-                    break
         if not episode_ids:
             return []
 
@@ -7386,11 +7361,6 @@ class MemoryNodeManager:
             "state": [],
             "actionable_item": [],
         }
-        raw_limit_keys = {
-            "fact": "facts",
-            "state": "states",
-            "actionable_item": "actionable_items",
-        }
         for mapping in mappings:
             for field, level in (
                 ("fact_id", "fact"),
@@ -7399,7 +7369,7 @@ class MemoryNodeManager:
             ):
                 level_limit = max(
                     0,
-                    int(candidate_limits.get(raw_limit_keys[level], 0) or 0),
+                    int(candidate_limits.get(level, 0) or 0),
                 )
                 if len(ids_by_level[level]) >= level_limit:
                     continue
@@ -7480,9 +7450,9 @@ class MemoryNodeManager:
         )
         rows_by_table: Dict[str, List[Dict[str, Any]]] = {}
         raw_limit_keys = {
-            "memory_facts": "facts",
-            "memory_states": "states",
-            "memory_actionable_items": "actionable_items",
+            "memory_facts": "fact",
+            "memory_states": "state",
+            "memory_actionable_items": "actionable_item",
         }
         for table, _level, loader in table_specs:
             loader_kwargs = {
@@ -7792,7 +7762,7 @@ class MemoryNodeManager:
             "expansion_penalty": round(expansion_penalty, 4),
         }
 
-    def _rank_recall_candidates_by_type(
+    def  _rank_recall_candidates_by_type(
         self,
         candidates: List[Dict[str, Any]],
         *,
@@ -7983,7 +7953,7 @@ class MemoryNodeManager:
         min_embedding_similarity: Optional[float],
     ) -> List[Dict[str, Any]]:
         return self._rank_recall_candidates_by_type(
-            candidates,
+            candidates, 
             memory_type="fact",
             terms=terms,
             query=query,
@@ -8044,9 +8014,9 @@ class MemoryNodeManager:
         """Rank each raw layer independently, then merge the ranked candidates."""
 
         final_limits = final_candidate_limits or {
-            "facts": len(facts),
-            "states": len(states),
-            "actionable_items": len(actionable_items),
+            "fact": len(facts),
+            "state": len(states),
+            "actionable_item": len(actionable_items),
         }
         ranked_facts = self._rank_recall_fact_candidates(
             facts,
@@ -8841,9 +8811,9 @@ class MemoryNodeManager:
 
         base_raw_limit = max(8, min(32, k * 3))
         supplement_limits = {
-            "facts": base_raw_limit,
-            "states": base_raw_limit,
-            "actionable_items": base_raw_limit,
+            "fact": base_raw_limit,
+            "state": base_raw_limit,
+            "actionable_item": base_raw_limit,
         }
 
         supplement_limits = {
@@ -8852,25 +8822,23 @@ class MemoryNodeManager:
         }
 
         final_limits = {
-            "facts": k,
-            "states": k,
-            "actionable_items": k,
+            "fact": k,
+            "state": k,
+            "actionable_item": k,
         }
 
         lower = str(query or "").lower()
         if self._needs_broad_evidence(query):
-            final_limits["facts"] = max(final_limits["facts"], int(math.ceil(k * 0.85)))
+            final_limits["fact"] = max(final_limits["fact"], int(math.ceil(k * 0.85)))
         preferred = set(preferred_layer_preferences or [])
-        aliases = {"actionable": "actionable_items", "action": "actionable_items"}
-        preferred = {aliases.get(level, level) for level in preferred}
         if preferred:
             for key in final_limits:
-                if key.rstrip("s") in preferred or key in preferred:
+                if key in preferred:
                     final_limits[key] += max(1, int(math.ceil(k * 0.15)))
         if any(marker in lower for marker in ("todo", "task", "remind", "decision", "commit", "待办", "任务", "提醒", "决定", "承诺")):
-            final_limits["actionable_items"] = max(final_limits["actionable_items"], int(math.ceil(k * 0.55)))
+            final_limits["actionable_item"] = max(final_limits["actionable_item"], int(math.ceil(k * 0.55)))
         if any(marker in lower for marker in ("prefer", "usually", "habit", "偏好", "通常", "习惯", "长期", "状态")):
-            final_limits["states"] = max(final_limits["states"], int(math.ceil(k * 0.5)))
+            final_limits["state"] = max(final_limits["state"], int(math.ceil(k * 0.5)))
 
         return final_limits, supplement_limits
 
