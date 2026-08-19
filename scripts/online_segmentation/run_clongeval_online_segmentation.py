@@ -81,7 +81,6 @@ class SegmentDecision:
     score: Optional[float] = None
     semantic_surprise: Optional[float] = None
     robust_surprise: Optional[float] = None
-    absolute_surprise: Optional[float] = None
     cohesion_before: Optional[float] = None
     cohesion_after: Optional[float] = None
     cohesion_drop: Optional[float] = None
@@ -105,10 +104,10 @@ class FinalizedSegment:
 class SegmentationConfig:
     threshold: float = 0.60
     bias: float = -1.10
-    surprise_history_window: int = 64
+    surprise_history_window: int = 16
     min_surprise_history: int = 5
     robust_surprise_weight: float = 1.0
-    absolute_surprise_weight: float = 1.0
+    robust_surprise_scale_floor: float = 0.05
     cohesion_drop_weight: float = 1.0
     length_weight: float = 0.40
     turn_count_weight: float = 0.40
@@ -116,7 +115,6 @@ class SegmentationConfig:
     target_chunk_tokens: int = 600
     max_chunk_tokens: int = 900
     max_exchanges: int = 10
-    finalize_at_target: bool = True
 
 
 def parse_args() -> argparse.Namespace:
@@ -148,12 +146,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Do not include raw exchange text in the JSON output.",
     )
-    parser.add_argument("--threshold", type=float, default=0.60)
+    parser.add_argument("--threshold", type=float, default=0.50)
     parser.add_argument("--bias", type=float, default=-1.10)
-    parser.add_argument("--surprise-history-window", type=int, default=64)
+    parser.add_argument("--surprise-history-window", type=int, default=16)
     parser.add_argument("--min-surprise-history", type=int, default=5)
     parser.add_argument("--robust-surprise-weight", type=float, default=1.0)
-    parser.add_argument("--absolute-surprise-weight", type=float, default=1.0)
+    parser.add_argument("--robust-surprise-scale-floor", type=float, default=0.05)
     parser.add_argument("--cohesion-drop-weight", type=float, default=1.0)
     parser.add_argument("--length-weight", type=float, default=0.40)
     parser.add_argument("--turn-count-weight", type=float, default=0.40)
@@ -161,13 +159,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-chunk-tokens", type=int, default=600)
     parser.add_argument("--max-chunk-tokens", type=int, default=900)
     parser.add_argument("--max-exchanges", type=int, default=10)
-    parser.add_argument(
-        "--no-finalize-at-target",
-        action="store_false",
-        dest="finalize_at_target",
-        help="Keep growing segments past the target size until probability/hard caps cut.",
-    )
-    parser.set_defaults(finalize_at_target=True)
     parser.add_argument(
         "--embedding-provider",
         help="Override memory_manager.embedding.provider, for example local_hash.",
@@ -411,18 +402,16 @@ def robust_surprise_signal(
     surprise: float,
     history: Sequence[float],
     min_history: int,
+    scale_floor: float,
 ) -> float:
-    if len(history) < min_history:
+    required_history = max(1, int(min_history))
+    if len(history) < required_history:
         return 0.0
     values = np.asarray(list(history), dtype=np.float32)
     median = float(np.median(values))
     mad = float(np.median(np.abs(values - median)))
-    scale = max(1e-6, 1.4826 * mad)
-    return clipped((surprise - median) / scale, -2.0, 4.0)
-
-
-def absolute_surprise_signal(surprise: float) -> float:
-    return clipped((surprise - 0.20) / 0.14, -1.0, 2.5)
+    scale = max(float(scale_floor), 1.4826 * mad)
+    return clipped((surprise - median) / scale, -2.0, 2.0)
 
 
 def linear(value: float, start: float, end: float, low: float, high: float) -> float:
@@ -471,7 +460,9 @@ class OnlineSemanticSegmenter:
     def __init__(self, embedding_client: EmbeddingClient, config: SegmentationConfig) -> None:
         self.embedding_client = embedding_client
         self.config = config
-        self.surprise_history: Deque[float] = deque(maxlen=max(1, config.surprise_history_window))
+        self.surprise_history: Deque[float] = deque(
+            maxlen=max(1, config.surprise_history_window)
+        )
 
     def embed_exchange(self, exchange: Exchange) -> ActiveExchange:
         embedding = self.embedding_client.embed_text(exchange.text)
@@ -572,22 +563,22 @@ class OnlineSemanticSegmenter:
         recent_sim = cosine_similarity(incoming.embedding, recent_embedding)
         semantic_surprise = 1.0 - max(centroid_sim, recent_sim)
 
-        cohesion_before = cohesion(active_embeddings)
-        cohesion_after = cohesion([*active_embeddings, incoming.embedding])
-        cohesion_drop = max(0.0, cohesion_before - cohesion_after)
         robust_surprise = robust_surprise_signal(
             semantic_surprise,
             list(self.surprise_history),
             self.config.min_surprise_history,
+            self.config.robust_surprise_scale_floor,
         )
-        absolute_surprise = absolute_surprise_signal(semantic_surprise)
+
+        cohesion_before = cohesion(active_embeddings)
+        cohesion_after = cohesion([*active_embeddings, incoming.embedding])
+        cohesion_drop = max(0.0, cohesion_before - cohesion_after)
         prospective_tokens = sum(item.exchange.token_count for item in active) + incoming.exchange.token_count
         prospective_exchanges = len(active) + 1
         length_signal = length_pressure(prospective_tokens, self.config)
         turn_signal = turn_count_pressure(prospective_exchanges)
         score = (
             self.config.robust_surprise_weight * robust_surprise
-            + self.config.absolute_surprise_weight * absolute_surprise
             + self.config.cohesion_drop_weight * cohesion_drop
             + self.config.length_weight * length_signal
             + self.config.turn_count_weight * turn_signal
@@ -602,7 +593,6 @@ class OnlineSemanticSegmenter:
             score=score,
             semantic_surprise=semantic_surprise,
             robust_surprise=robust_surprise,
-            absolute_surprise=absolute_surprise,
             cohesion_before=cohesion_before,
             cohesion_after=cohesion_after,
             cohesion_drop=cohesion_drop,
@@ -622,7 +612,7 @@ class OnlineSemanticSegmenter:
             return True
         if len(active) >= self.config.max_exchanges:
             return True
-        return bool(self.config.finalize_at_target and token_count >= self.config.target_chunk_tokens)
+        return False
 
     def _post_append_reason(self, active: Sequence[ActiveExchange]) -> str:
         token_count = sum(item.exchange.token_count for item in active)
@@ -630,8 +620,6 @@ class OnlineSemanticSegmenter:
             return "capacity_limit"
         if len(active) >= self.config.max_exchanges:
             return "exchange_count_limit"
-        if self.config.finalize_at_target and token_count >= self.config.target_chunk_tokens:
-            return "target_length"
         return "segment_complete"
 
     def _finalize(
@@ -659,13 +647,15 @@ def build_segmentation_config(args: argparse.Namespace) -> SegmentationConfig:
         raise ValueError("--max-chunk-tokens must be >= --target-chunk-tokens")
     if args.max_exchanges <= 0:
         raise ValueError("--max-exchanges must be positive")
+    if args.robust_surprise_scale_floor <= 0:
+        raise ValueError("--robust-surprise-scale-floor must be positive")
     return SegmentationConfig(
         threshold=float(args.threshold),
         bias=float(args.bias),
         surprise_history_window=max(1, int(args.surprise_history_window)),
         min_surprise_history=max(0, int(args.min_surprise_history)),
         robust_surprise_weight=float(args.robust_surprise_weight),
-        absolute_surprise_weight=float(args.absolute_surprise_weight),
+        robust_surprise_scale_floor=float(args.robust_surprise_scale_floor),
         cohesion_drop_weight=float(args.cohesion_drop_weight),
         length_weight=float(args.length_weight),
         turn_count_weight=float(args.turn_count_weight),
@@ -673,7 +663,6 @@ def build_segmentation_config(args: argparse.Namespace) -> SegmentationConfig:
         target_chunk_tokens=int(args.target_chunk_tokens),
         max_chunk_tokens=int(args.max_chunk_tokens),
         max_exchanges=int(args.max_exchanges),
-        finalize_at_target=bool(args.finalize_at_target),
     )
 
 
@@ -704,7 +693,6 @@ def serialize_decision(decision: SegmentDecision) -> Dict[str, Any]:
         "score": round_float(decision.score),
         "semantic_surprise": round_float(decision.semantic_surprise),
         "robust_surprise": round_float(decision.robust_surprise),
-        "absolute_surprise": round_float(decision.absolute_surprise),
         "cohesion_before": round_float(decision.cohesion_before),
         "cohesion_after": round_float(decision.cohesion_after),
         "cohesion_drop": round_float(decision.cohesion_drop),
