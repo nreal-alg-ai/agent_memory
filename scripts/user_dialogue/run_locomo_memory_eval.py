@@ -212,7 +212,7 @@ def load_project_config(config_path: Path) -> Dict[str, Any]:
 def resolve_runtime_args(args: argparse.Namespace) -> None:
     config = load_project_config(args.config)
     model_config = config.get("model") if isinstance(config.get("model"), dict) else {}
-    _runtime_config, manager_config, llm_config, _embedding_config = split_memory_config(config)
+    runtime_config, manager_config, llm_config, _embedding_config = split_memory_config(config)
     chat_config = config.get("chat") if isinstance(config.get("chat"), dict) else {}
     args.llm_model = args.llm_model or str(llm_config.get("llm_name") or model_config.get("default") or DEFAULT_LLM_MODEL)
     args.llm_base_url = args.llm_base_url or str(llm_config.get("llm_base_url") or model_config.get("base_url") or DEFAULT_LLM_BASE_URL)
@@ -221,8 +221,16 @@ def resolve_runtime_args(args: argparse.Namespace) -> None:
     args.llm_api_key = args.llm_api_key or str(llm_config.get("llm_api_key") or model_config.get("api_key") or "")
     args.llm_timeout = args.llm_timeout or int(str(llm_config.get("llm_timeout", 120)))
     args.llm_thinking = args.llm_thinking or str(llm_config.get("llm_thinking") or "disabled")
-    args.memory_prompt_language = args.memory_prompt_language or str(manager_config.get("memory_prompt_language_mode") or "source")
-    args.memory_output_language = args.memory_output_language or str(manager_config.get("memory_output_language_mode") or "source")
+    args.memory_prompt_language = args.memory_prompt_language or str(
+        runtime_config.get("memory_prompt_language_mode")
+        or manager_config.get("memory_prompt_language_mode")
+        or "source"
+    )
+    args.memory_output_language = args.memory_output_language or str(
+        runtime_config.get("memory_output_language_mode")
+        or manager_config.get("memory_output_language_mode")
+        or "source"
+    )
     args.recall_budget = args.recall_budget or str(manager_config.get("recall_budget") or "mid")
     args.recall_gate_mode = args.recall_gate_mode or str(manager_config.get("recall_gate_mode") or "force")
     args.reader_model = args.reader_model or str(chat_config.get("llm_name") or args.llm_model)
@@ -261,6 +269,8 @@ def prepare_runtime_configs(
     llm_config["llm_json_mode"] = bool(args.llm_json_mode)
     memory_manager_config["memory_prompt_language_mode"] = str(args.memory_prompt_language)
     memory_manager_config["memory_output_language_mode"] = str(args.memory_output_language)
+    memory_runtime_config["memory_prompt_language_mode"] = str(args.memory_prompt_language)
+    memory_runtime_config["memory_output_language_mode"] = str(args.memory_output_language)
     memory_manager_config["recall_gate_mode"] = str(args.recall_gate_mode)
     return memory_runtime_config, memory_manager_config, llm_config, embedding_config
 

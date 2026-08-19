@@ -329,7 +329,7 @@ def _expand_env_refs(value: Any) -> Any:
 def resolve_llm_args(args: argparse.Namespace) -> None:
     config = load_project_config(args.config)
     model_config = config.get("model", {}) if isinstance(config.get("model"), dict) else {}
-    _runtime_config, manager_config, llm_config, _embedding_config = split_memory_config(config)
+    runtime_config, manager_config, llm_config, _embedding_config = split_memory_config(config)
     chat_config = config.get("chat", {}) if isinstance(config.get("chat"), dict) else {}
 
     args.llm_model = (
@@ -366,7 +366,8 @@ def resolve_llm_args(args: argparse.Namespace) -> None:
     args.memory_prompt_language = (
         args.memory_prompt_language
         or str(
-            manager_config.get("memory_prompt_language_mode")
+            runtime_config.get("memory_prompt_language_mode")
+            or manager_config.get("memory_prompt_language_mode")
             or manager_config.get("prompt_language_mode")
             or "source"
         )
@@ -374,7 +375,8 @@ def resolve_llm_args(args: argparse.Namespace) -> None:
     args.memory_output_language = (
         args.memory_output_language
         or str(
-            manager_config.get("memory_output_language_mode")
+            runtime_config.get("memory_output_language_mode")
+            or manager_config.get("memory_output_language_mode")
             or manager_config.get("output_language_mode")
             or "source"
         )
@@ -671,6 +673,8 @@ def prepare_runtime_configs(
     llm_config["llm_json_mode"] = bool(args.llm_json_mode)
     memory_manager_config["memory_prompt_language_mode"] = str(args.memory_prompt_language)
     memory_manager_config["memory_output_language_mode"] = str(args.memory_output_language)
+    memory_runtime_config["memory_prompt_language_mode"] = str(args.memory_prompt_language)
+    memory_runtime_config["memory_output_language_mode"] = str(args.memory_output_language)
     memory_manager_config["enable_interpretation_feedback"] = bool(
         args.enable_feedback_analysis
     )
