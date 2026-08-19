@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hmac
 import json
+import logging
 import mimetypes
 import os
 import secrets
@@ -21,7 +22,7 @@ from http import HTTPStatus
 from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from .audio_event_handler import (
     is_assistant_query,
@@ -55,6 +56,25 @@ def _log(message: str) -> None:
             handle.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}\n")
     except Exception:
         pass
+
+
+def _configure_memory_logger(
+    log_path: Path,
+) -> Tuple[logging.Logger, logging.Handler]:
+    """Create the file logger used by the memory manager/runtime pipeline."""
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    memory_logger = logging.getLogger("memory.pipeline.android")
+    for existing_handler in list(memory_logger.handlers):
+        memory_logger.removeHandler(existing_handler)
+        existing_handler.close()
+    memory_logger.setLevel(logging.INFO)
+    memory_logger.propagate = False
+    handler = logging.FileHandler(log_path, encoding="utf-8")
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    )
+    memory_logger.addHandler(handler)
+    return memory_logger, handler
 
 
 def _verify_fts5_support() -> None:
@@ -282,6 +302,8 @@ class _BackendRuntime:
         embedding_provider: str = "",
         embedding_model: str = "",
         embedding_base_url: str = "",
+        memory_logger: Optional[logging.Logger] = None,
+        memory_log_handler: Optional[logging.Handler] = None,
     ) -> None:
         self.runtime = runtime
         self.db = db
@@ -303,6 +325,8 @@ class _BackendRuntime:
         self.embedding_provider = str(embedding_provider or "")
         self.embedding_model = str(embedding_model or "")
         self.embedding_base_url = str(embedding_base_url or "")
+        self.memory_logger = memory_logger
+        self.memory_log_handler = memory_log_handler
 
     def embedding_status(self) -> Dict[str, Any]:
         """Probe the effective embedding endpoint and report remote vs hash."""
@@ -487,18 +511,25 @@ def start(config_json: str) -> str:
         admin: Optional[AgentMemoryAdmin] = None
         server: Optional[ThreadingHTTPServer] = None
         database_lock = threading.RLock()
+        memory_logger: Optional[logging.Logger] = None
+        memory_log_handler: Optional[logging.Handler] = None
         try:
             _verify_fts5_support()
             db = SessionDB(db_path=data_dir / "memory.db")
+            memory_logger, memory_log_handler = _configure_memory_logger(
+                app_home / "logs" / "memory_manager.log"
+            )
             manager = MemoryNodeManager(
                 db,
                 embedding_config=embedding_config,
                 memory_manager_config=memory_manager_config,
                 llm_config=llm_config,
+                logger=memory_logger,
             )
             runtime = MemoryRuntime(
                 manager,
                 memory_runtime_config=memory_runtime_config,
+                logger=memory_logger,
             )
             _log("start runtime init ok")
             admin = AgentMemoryAdmin(
@@ -547,6 +578,8 @@ def start(config_json: str) -> str:
                 embedding_provider=embedding_provider,
                 embedding_model=embedding_model,
                 embedding_base_url=embedding_base_url,
+                memory_logger=memory_logger,
+                memory_log_handler=memory_log_handler,
             )
             _log(f"HTTP server bound 127.0.0.1:{server.server_address[1]} thread_alive={thread.is_alive()}")
             return json.dumps(_public_payload(_runtime), ensure_ascii=False)
@@ -574,6 +607,9 @@ def start(config_json: str) -> str:
                     server.server_close()
                 except Exception:
                     pass
+            if memory_logger is not None and memory_log_handler is not None:
+                memory_logger.removeHandler(memory_log_handler)
+                memory_log_handler.close()
             raise
 
 
@@ -604,6 +640,9 @@ def stop() -> str:
             runtime.runtime.flush_task_queue(timeout=10.0)
         finally:
             runtime.db.close()
+    if runtime.memory_logger is not None and runtime.memory_log_handler is not None:
+        runtime.memory_logger.removeHandler(runtime.memory_log_handler)
+        runtime.memory_log_handler.close()
     return json.dumps({"running": False}, ensure_ascii=False)
 
 
