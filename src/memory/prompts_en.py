@@ -7,6 +7,11 @@ System note: For facts, dialogue_time is when the conversation/transcript discus
 
 MEMORY_RETRIEVED_SECTION_SPECS_EN = (
     (
+        "[Retrieved Facts]",
+        "These are ranked narrative facts retrieved directly from memory_facts.",
+        "fact",
+    ),
+    (
         "[Long-term States]",
         "These are evolving state projections derived from memory facts. Treat them as summarized context, not direct user quotations.",
         "state",
@@ -15,11 +20,6 @@ MEMORY_RETRIEVED_SECTION_SPECS_EN = (
         "[Actionable Items]",
         "These are decisions, tasks, commitments, risks, or open questions that may require follow-up.",
         "actionable_item",
-    ),
-    (
-        "[Retrieved Facts]",
-        "These are ranked narrative facts retrieved directly from memory_facts.",
-        "fact",
     ),
 )
 

@@ -125,11 +125,35 @@ remote_audio:
 memory_runtime:
   memory_prompt_language_mode: zh
   memory_output_language_mode: zh
-  max_pending_interaction_turns: 5
-  max_pending_interaction_chars: 2000
-  transcript_episode_max_gap_seconds: 60.0
-  transcript_episode_max_segments: 80
-  transcript_episode_max_chars: 12000
+  assistant_wakeup_segmentation:
+    max_pending_interaction_turns: 10
+    max_pending_interaction_tokens: 500
+    min_pending_interaction_turns: 2
+    min_pending_interaction_tokens: 200
+    threshold: 0.6
+    bias: -1.1
+    surprise_history_window: 64
+    min_surprise_history: 5
+    robust_surprise_weight: 0.8
+    absolute_surprise_weight: 0.8
+    cohesion_drop_weight: 0.8
+    length_weight: 0.40
+    turn_count_weight: 0.4
+    max_time_gap_seconds: 30
+
+  allday_recording_segmentation:
+    transcript_episode_max_segments: 80
+    transcript_episode_max_chars: 12000
+    threshold: 0.6
+    surprise_history_window: 64
+    min_surprise_history: 5
+    robust_surprise_weight: 0.8
+    absolute_surprise_weight: 0.8
+    cohesion_drop_weight: 0.8
+    turn_count_weight: 0.4
+    min_chunk_tokens: 500
+    max_chunk_tokens: 2000
+    max_time_gap_seconds: 60.0
 
 memory_manager:
   memory_enabled: true

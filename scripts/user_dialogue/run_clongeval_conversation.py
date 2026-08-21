@@ -125,7 +125,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.set_defaults(llm_json_mode=None)
     parser.add_argument("--max-pending-interaction-turns", type=int)
-    parser.add_argument("--max-pending-interaction-chars", type=int)
+    parser.add_argument("--max-pending-interaction-tokens", type=int)
     parser.add_argument("--enable-reflect", action="store_true")
     parser.add_argument(
         "--reflect-every-days",
@@ -350,9 +350,9 @@ def replay_context_into_memory(
 
     def flush_pending_store_turns() -> bool:
         nonlocal store_batches
-        pending_before_flush = len(runtime._pending_interaction_turns)
+        pending_before_flush = len(runtime.get_pending_interaction_turns())
         stored = bool(pending_before_flush and runtime.flush_task_queue())
-        if stored and not runtime._pending_interaction_turns:
+        if stored and not runtime.has_pending_interaction_turns():
             store_batches += 1
             return True
         return False
@@ -401,7 +401,7 @@ def replay_context_into_memory(
                 "report": reflect_submit,
             })
 
-    if runtime._pending_interaction_turns:
+    if runtime.has_pending_interaction_turns():
         flush_pending_store_turns()
 
     return {
@@ -472,8 +472,14 @@ def prepare_runtime(
     args.reflect_limit = max(1, int(args.reflect_limit or memory_manager_config.get("reflect_limit", 100) or 100))
     args.recall_top_k = max(1, int(args.recall_top_k or memory_manager_config.get("retrieval_top_k", 8) or 8))
     args.recall_budget = str(args.recall_budget or memory_manager_config.get("recall_budget", "mid") or "mid")
-    memory_runtime_config["max_pending_interaction_turns"] = args.max_pending_interaction_turns
-    memory_runtime_config["max_pending_interaction_chars"] = args.max_pending_interaction_chars
+    segmentation_config = memory_runtime_config.setdefault(
+        "assistant_wakeup_segmentation",
+        {},
+    )
+    if args.max_pending_interaction_turns is not None:
+        segmentation_config["max_pending_interaction_turns"] = args.max_pending_interaction_turns
+    if args.max_pending_interaction_tokens is not None:
+        segmentation_config["max_pending_interaction_tokens"] = args.max_pending_interaction_tokens
     llm_config["llm_name"] = str(args.llm_model)
     llm_config["llm_base_url"] = str(args.llm_base_url)
     llm_config["llm_api_key"] = str(args.llm_api_key or "")

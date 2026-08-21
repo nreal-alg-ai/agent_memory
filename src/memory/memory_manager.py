@@ -56,6 +56,7 @@ from .prompts_zh import (
     UNIFIED_MEMORY_EXTRACTION_PROMPT_ZH,
     UNIFIED_TOPIC_STATE_UPDATE_PROMPT_ZH,
 )
+from .utils import _cal_embedding_cosine_similarity
 
 RecallTimeBounds = Optional[Tuple[Optional[str], Optional[str]]]
 
@@ -629,35 +630,6 @@ class MemoryNodeManager:
             self._embedding_client = EmbeddingClient(self._embedding_cfg)
         return True
 
-    @staticmethod
-    def _as_embedding_vector(value: Any) -> Optional[np.ndarray]:
-        if value is None:
-            return None
-        vector = np.asarray(value, dtype=np.float32)
-        if vector.ndim > 1:
-            vector = vector.reshape(-1)
-        if vector.size == 0:
-            return None
-        return vector
-
-    @classmethod
-    def _cal_embedding_similarity(cls, left: Any, right: Any) -> float:
-        a = cls._as_embedding_vector(left)
-        b = cls._as_embedding_vector(right)
-        if a is None or b is None:
-            return 0.0
-        av = a.reshape(-1)
-        bv = b.reshape(-1)
-        keep = min(av.size, bv.size)
-        if keep <= 0:
-            return 0.0
-        av = av[:keep]
-        bv = bv[:keep]
-        denom = float(np.linalg.norm(av) * np.linalg.norm(bv))
-        if denom <= 0:
-            return 0.0
-        return float(np.dot(av, bv) / denom)
-
     # ── Store path: raw segments -> episode -> facts -> index cards ──────
 
     @property
@@ -667,6 +639,10 @@ class MemoryNodeManager:
     def set_logger(self, logger: Optional[logging.Logger]) -> None:
         """Set the logger used by memory store, reflect, and recall operations."""
         self._logger = logger or logging.getLogger(__name__)
+
+    def set_embedding_client(self, embedding_client: Optional[EmbeddingClient]) -> None:
+        """Share a pre-initialized embedding client with memory runtime callers."""
+        self._embedding_client = embedding_client
 
     def _task_worker_loop(self) -> None:
         while not self._task_shutdown_event.is_set() or not self._task_queue.empty():
@@ -2808,11 +2784,11 @@ class MemoryNodeManager:
                 [state_root_name],
                 allow_substring=False,
             )
-            identity_embedding_similarity = self._cal_embedding_similarity(
+            identity_embedding_similarity = _cal_embedding_cosine_similarity(
                 candidate_identity_embedding,
                 state.get("identity_text_embedding"),
             )
-            canonical_name_embedding_similarity = self._cal_embedding_similarity(
+            canonical_name_embedding_similarity = _cal_embedding_cosine_similarity(
                 candidate_name_embedding,
                 state.get("canonical_name_embedding"),
             )
@@ -3853,11 +3829,11 @@ class MemoryNodeManager:
                 candidate_attribute_aliases,
                 state_attribute_aliases,
             )
-            identity_embedding_similarity = self._cal_embedding_similarity(
+            identity_embedding_similarity = _cal_embedding_cosine_similarity(
                 candidate_identity_embedding,
                 state.get("identity_text_embedding"),
             )
-            canonical_name_embedding_similarity = self._cal_embedding_similarity(
+            canonical_name_embedding_similarity = _cal_embedding_cosine_similarity(
                 candidate_name_embedding,
                 state.get("canonical_name_embedding"),
             )
@@ -7844,7 +7820,7 @@ class MemoryNodeManager:
                 else 0.0
             )
             structured_overlap = max(topic_overlap, name_overlap)
-            similarity = max(0.0, self._cal_embedding_similarity(
+            similarity = max(0.0, _cal_embedding_cosine_similarity(
                 query_embedding,
                 entry.get("embedding"),
             ))

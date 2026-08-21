@@ -7,6 +7,11 @@ MEMORY_RETRIEVED_FORMAT_PROMPT_ZH = """[统一记忆]
 
 MEMORY_RETRIEVED_SECTION_SPECS_ZH = (
     (
+        "[检索事实]",
+        "这些是直接从 memory_facts 检索出的、按相关性排序的叙事事实。",
+        "fact",
+    ),
+    (
         "[长期状态]",
         "这些是根据 memory facts 反思得到的演化状态，应作为摘要上下文理解，不是用户的直接原话。",
         "state",
@@ -15,11 +20,6 @@ MEMORY_RETRIEVED_SECTION_SPECS_ZH = (
         "[行动事项]",
         "这些是可能需要后续跟进的决定、任务、承诺、风险或开放问题。",
         "actionable_item",
-    ),
-    (
-        "[检索事实]",
-        "这些是直接从 memory_facts 检索出的、按相关性排序的叙事事实。",
-        "fact",
     ),
 )
 

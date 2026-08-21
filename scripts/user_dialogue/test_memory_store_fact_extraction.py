@@ -37,6 +37,7 @@ from memory.memory_manager import (
 from memory.memory_database import SessionDB
 from memory.memory_runtime import MemoryRuntime
 from memory.config import split_memory_config
+from memory.utils import _as_embedding_vector
 
 
 DEFAULT_INPUT = Path("/Users/zhouboyu/Documents/agent_memory/test_data/user_dialogue/history_dialogue.json")
@@ -414,11 +415,11 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--max-pending-interaction-chars",
+        "--max-pending-interaction-tokens",
         type=int,
         help=(
             "Extract facts early when pending dialogue exceeds this many "
-            "characters. Defaults to memory_runtime.max_pending_interaction_chars."
+            "tokens. Defaults to memory_runtime.assistant_wakeup_segmentation."
         ),
     )
     parser.add_argument(
@@ -482,6 +483,9 @@ def remove_existing_outputs(db_path: Path, report_path: Path, overwrite: bool) -
 def resolve_llm_args(args: argparse.Namespace) -> None:
     config = load_project_config(args.config)
     _runtime_config, _manager_config, llm_config, _embedding_config = split_memory_config(config)
+    segmentation_config = _runtime_config.get("assistant_wakeup_segmentation")
+    if not isinstance(segmentation_config, dict):
+        segmentation_config = {}
     args.llm_model = (
         args.llm_model
         or str(llm_config.get("llm_name") or "")
@@ -507,16 +511,16 @@ def resolve_llm_args(args: argparse.Namespace) -> None:
         1,
         int(
             args.max_pending_interaction_turns
-            or _runtime_config.get("max_pending_interaction_turns", 1)
+            or segmentation_config.get("max_pending_interaction_turns", 1)
             or 1
         ),
     )
-    args.max_pending_interaction_chars = max(
+    args.max_pending_interaction_tokens = max(
         1,
         int(
-            args.max_pending_interaction_chars
-            or _runtime_config.get("max_pending_interaction_chars", 2000)
-            or 2000
+            args.max_pending_interaction_tokens
+            or segmentation_config.get("max_pending_interaction_tokens", 500)
+            or 500
         ),
     )
 
@@ -608,7 +612,7 @@ def validate_embedding_runtime(
             "The configured embedding provider returned no vector. Check "
             "config.yaml memory_manager.embedding credentials, base_url, and model."
         )
-    probe_vector = manager._as_embedding_vector(probe)
+    probe_vector = _as_embedding_vector(probe)
     if probe_vector is None:
         raise RuntimeError("The configured embedding provider returned an invalid vector")
     expected_dim = int(getattr(manager._embedding_client, "dimension", probe_vector.size))
@@ -671,8 +675,12 @@ def main() -> int:
         llm_config,
         embedding_config,
     ) = split_memory_config(config)
-    memory_runtime_config["max_pending_interaction_turns"] = args.max_pending_interaction_turns
-    memory_runtime_config["max_pending_interaction_chars"] = args.max_pending_interaction_chars
+    segmentation_config = memory_runtime_config.setdefault(
+        "assistant_wakeup_segmentation",
+        {},
+    )
+    segmentation_config["max_pending_interaction_turns"] = args.max_pending_interaction_turns
+    segmentation_config["max_pending_interaction_tokens"] = args.max_pending_interaction_tokens
     llm_config["llm_name"] = str(args.llm_model)
     llm_config["llm_base_url"] = str(args.llm_base_url)
     llm_config["llm_api_key"] = str(args.llm_api_key or "")
@@ -721,7 +729,7 @@ def main() -> int:
                 # does not collide on "#00" across turns in the same sample.
                 turn_timestamp = base_turn_timestamp + timedelta(hours=hour_offset, seconds=turn_index)
                 before_id = db._conn.execute("SELECT COALESCE(MAX(id), 0) AS max_id FROM memory_facts").fetchone()["max_id"]
-                pending_before = [dict(turn) for turn in runtime._pending_interaction_turns]
+                pending_before = runtime.get_pending_interaction_turns()
                 pending_with_current = pending_before + [{
                     "user_message": user,
                     "assistant_response": assistant,
@@ -729,9 +737,12 @@ def main() -> int:
                 pending_character_count = (
                     runtime.interaction_turns_character_count(pending_with_current)
                 )
-                extraction_due = runtime.should_flush_pending_interaction_turns(
-                    pending_with_current
-                )
+                extraction_due = runtime._interaction_segmenter.should_finalize_after_append_exchange(
+                    [
+                        runtime._interaction_turn_to_online_exchange(item, index)
+                        for index, item in enumerate(pending_with_current, 1)
+                    ],
+                )[0]
                 ok = runtime.accept_single_interaction_turn(
                     user,
                     assistant,
@@ -753,14 +764,12 @@ def main() -> int:
                     "sample_hour_offset": hour_offset,
                     "turn_second_offset": turn_index,
                     "turn_timestamp": turn_timestamp.isoformat(),
-                    "max_pending_interaction_turns": runtime._max_pending_interaction_turns,
-                    "max_pending_interaction_chars": runtime._max_pending_interaction_chars,
                     "pending_character_count": pending_character_count,
                     "fact_extraction_due": extraction_due,
                     "source_turn_count": (
                         len(pending_before) + 1 if extraction_due else 0
                     ),
-                    "pending_turn_count": len(runtime._pending_interaction_turns),
+                    "pending_turn_count": len(runtime.get_pending_interaction_turns()),
                     "queued": bool(ok.get("queued")),
                     "store_total_elapsed_ms": float(
                         store_operation_report.get("elapsed_ms") or 0.0
@@ -781,7 +790,7 @@ def main() -> int:
                     turn_index,
                     extraction_due,
                     len(pending_before) + 1 if extraction_due else 0,
-                    len(runtime._pending_interaction_turns),
+                    len(runtime.get_pending_interaction_turns()),
                     ok,
                     len(nodes),
                 )
@@ -816,13 +825,13 @@ def main() -> int:
                         reflect_report.get("states_updated"),
                         reflect_report.get("actionable_items_updated"),
                     )
-        pending_before_final_flush = len(runtime._pending_interaction_turns)
+        pending_before_final_flush = len(runtime.get_pending_interaction_turns())
         if not runtime.flush_task_queue():
             raise RuntimeError("Timed out while draining final pending memory stores")
         logging.info(
             "Final memory runtime flush completed pending_before=%s pending_after=%s",
             pending_before_final_flush,
-            len(runtime._pending_interaction_turns),
+            len(runtime.get_pending_interaction_turns()),
         )
     finally:
         log_memory_index_state(db, "finished")
@@ -845,9 +854,9 @@ def main() -> int:
         "turns_processed": len(turns),
         "turns_with_facts": stored_turns,
         "facts_stored": stored_facts,
-        "max_pending_interaction_turns": runtime._max_pending_interaction_turns,
-        "max_pending_interaction_chars": runtime._max_pending_interaction_chars,
-        "pending_turns": len(runtime._pending_interaction_turns),
+        "max_pending_interaction_turns": runtime._interaction_segmenter.config.max_pending_turns,
+        "max_pending_interaction_tokens": runtime._interaction_segmenter.config.max_pending_tokens,
+        "pending_turns": len(runtime.get_pending_interaction_turns()),
         "store_episode_submitted": int(store_operation_report.get("submitted") or 0),
         "store_episode_succeeded": int(store_operation_report.get("succeeded") or 0),
         "store_total_elapsed_ms": float(store_operation_report.get("total_elapsed_ms") or 0.0),

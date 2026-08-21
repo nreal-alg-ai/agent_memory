@@ -15,17 +15,14 @@ import argparse
 import hashlib
 import json
 import logging
-import math
 import os
 import re
 import sys
-from collections import Counter, OrderedDict, deque
-from dataclasses import dataclass
+from collections import Counter, OrderedDict
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
-
-import numpy as np
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SRC_ROOT = REPO_ROOT / "src"
@@ -35,6 +32,12 @@ for import_root in (SRC_ROOT, REPO_ROOT):
 
 from memory.config import split_memory_config
 from memory.embedding_client import EmbeddingClient
+from memory.memory_runtime import (
+    OnlineSegmentExchange,
+    OnlineSegmentationConfig,
+    OnlineSemanticSegmenter,
+    SegmentDecision as MemorySegmentDecision,
+)
 
 
 DEFAULT_INPUT = (
@@ -68,53 +71,12 @@ class Exchange:
 
 
 @dataclass
-class ActiveExchange:
-    exchange: Exchange
-    embedding: np.ndarray
-
-
-@dataclass
-class SegmentDecision:
-    exchange_index: int
-    reason: str
-    cut_probability: Optional[float] = None
-    score: Optional[float] = None
-    semantic_surprise: Optional[float] = None
-    robust_surprise: Optional[float] = None
-    cohesion_before: Optional[float] = None
-    cohesion_after: Optional[float] = None
-    cohesion_drop: Optional[float] = None
-    length_signal: Optional[float] = None
-    turn_signal: Optional[float] = None
-    centroid_similarity: Optional[float] = None
-    recent_similarity: Optional[float] = None
-    prospective_tokens: Optional[int] = None
-    prospective_exchanges: Optional[int] = None
-
-
-@dataclass
 class FinalizedSegment:
     segment_index: int
     reason: str
-    exchanges: List[ActiveExchange]
-    decision: SegmentDecision
-
-
-@dataclass
-class SegmentationConfig:
-    threshold: float = 0.60
-    bias: float = -1.10
-    surprise_history_window: int = 16
-    min_surprise_history: int = 5
-    robust_surprise_weight: float = 1.0
-    robust_surprise_scale_floor: float = 0.05
-    cohesion_drop_weight: float = 1.0
-    length_weight: float = 0.40
-    turn_count_weight: float = 0.40
-    min_chunk_tokens: int = 300
-    target_chunk_tokens: int = 600
-    max_chunk_tokens: int = 900
-    max_exchanges: int = 10
+    exchanges: List[Exchange]
+    decision: MemorySegmentDecision
+    finalize_decision: MemorySegmentDecision
 
 
 def parse_args() -> argparse.Namespace:
@@ -146,19 +108,21 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Do not include raw exchange text in the JSON output.",
     )
-    parser.add_argument("--threshold", type=float, default=0.50)
-    parser.add_argument("--bias", type=float, default=-1.10)
-    parser.add_argument("--surprise-history-window", type=int, default=16)
-    parser.add_argument("--min-surprise-history", type=int, default=5)
-    parser.add_argument("--robust-surprise-weight", type=float, default=1.0)
-    parser.add_argument("--robust-surprise-scale-floor", type=float, default=0.05)
-    parser.add_argument("--cohesion-drop-weight", type=float, default=1.0)
-    parser.add_argument("--length-weight", type=float, default=0.40)
-    parser.add_argument("--turn-count-weight", type=float, default=0.40)
-    parser.add_argument("--min-chunk-tokens", type=int, default=300)
-    parser.add_argument("--target-chunk-tokens", type=int, default=600)
-    parser.add_argument("--max-chunk-tokens", type=int, default=900)
-    parser.add_argument("--max-exchanges", type=int, default=10)
+    parser.add_argument("--threshold", type=float)
+    parser.add_argument("--bias", type=float)
+    parser.add_argument("--surprise-history-window", type=int)
+    parser.add_argument("--min-surprise-history", type=int)
+    parser.add_argument("--robust-surprise-weight", type=float)
+    parser.add_argument("--absolute-surprise-weight", type=float)
+    parser.add_argument("--cohesion-drop-weight", type=float)
+    parser.add_argument("--length-weight", type=float)
+    parser.add_argument("--turn-count-weight", type=float)
+    parser.add_argument("--max-pending-turns", type=int)
+    parser.add_argument("--max-pending-tokens", type=int)
+    parser.add_argument("--min-pending-tokens", type=int)
+    parser.add_argument("--min-pending-turns", type=int)
+    parser.add_argument("--min-segment-override-probability", type=float)
+    parser.add_argument("--max-time-gap-seconds", type=float)
     parser.add_argument(
         "--embedding-provider",
         help="Override memory_manager.embedding.provider, for example local_hash.",
@@ -352,317 +316,61 @@ def build_exchanges(days: Sequence[Dict[str, Any]]) -> List[Exchange]:
     return exchanges
 
 
-def sigmoid(value: float) -> float:
-    if value >= 0:
-        z = math.exp(-value)
-        return 1.0 / (1.0 + z)
-    z = math.exp(value)
-    return z / (1.0 + z)
-
-
-def as_vector(value: Any) -> np.ndarray:
-    vector = np.asarray(value, dtype=np.float32)
-    if vector.ndim > 1:
-        vector = vector.reshape(-1)
-    if vector.size == 0:
-        raise ValueError("Embedding provider returned an empty vector")
-    return vector
-
-
-def cosine_similarity(left: np.ndarray, right: np.ndarray) -> float:
-    keep = min(left.size, right.size)
-    if keep <= 0:
-        return 0.0
-    a = left[:keep].reshape(-1)
-    b = right[:keep].reshape(-1)
-    denominator = float(np.linalg.norm(a) * np.linalg.norm(b))
-    if denominator <= 0:
-        return 0.0
-    return float(np.dot(a, b) / denominator)
-
-
-def centroid(embeddings: Sequence[np.ndarray]) -> np.ndarray:
-    if not embeddings:
-        raise ValueError("Cannot compute centroid for an empty segment")
-    return np.mean(np.vstack([as_vector(item) for item in embeddings]), axis=0)
-
-
-def cohesion(embeddings: Sequence[np.ndarray]) -> float:
-    if not embeddings:
-        return 0.0
-    center = centroid(embeddings)
-    return float(np.mean([cosine_similarity(item, center) for item in embeddings]))
-
-
-def clipped(value: float, low: float, high: float) -> float:
-    return min(high, max(low, value))
-
-
-def robust_surprise_signal(
-    surprise: float,
-    history: Sequence[float],
-    min_history: int,
-    scale_floor: float,
-) -> float:
-    required_history = max(1, int(min_history))
-    if len(history) < required_history:
-        return 0.0
-    values = np.asarray(list(history), dtype=np.float32)
-    median = float(np.median(values))
-    mad = float(np.median(np.abs(values - median)))
-    scale = max(float(scale_floor), 1.4826 * mad)
-    return clipped((surprise - median) / scale, -2.0, 2.0)
-
-
-def linear(value: float, start: float, end: float, low: float, high: float) -> float:
-    if end <= start:
-        return high
-    ratio = clipped((value - start) / (end - start), 0.0, 1.0)
-    return low + ratio * (high - low)
-
-
-def length_pressure(token_count: int, config: SegmentationConfig) -> float:
-    min_tokens = max(1, int(config.min_chunk_tokens))
-    target_tokens = max(min_tokens + 1, int(config.target_chunk_tokens))
-    max_tokens = max(target_tokens + 1, int(config.max_chunk_tokens))
-    length = float(max(0, token_count))
-    early_boundary = 0.7 * min_tokens
-
-    if length < early_boundary:
-        return -1.30
-    if length < min_tokens:
-        return linear(length, early_boundary, min_tokens, -0.80, 0.0)
-    if length < target_tokens:
-        return linear(length, min_tokens, target_tokens, 0.45, 1.90)
-    if length < max_tokens:
-        return linear(length, target_tokens, max_tokens, 1.90, 2.80)
-    return 3.00
-
-
-def turn_count_pressure(exchange_count: int) -> float:
-    count = max(1, int(exchange_count))
-    if count == 1:
-        return -0.85
-    if count == 2:
-        return -0.15
-    if count == 3:
-        return 0.15
-    return min(1.0, 0.30 + 0.15 * (count - 4))
-
-
 def round_float(value: Optional[float], digits: int = 6) -> Optional[float]:
     if value is None:
         return None
     return round(float(value), digits)
 
 
-class OnlineSemanticSegmenter:
-    def __init__(self, embedding_client: EmbeddingClient, config: SegmentationConfig) -> None:
-        self.embedding_client = embedding_client
-        self.config = config
-        self.surprise_history: Deque[float] = deque(
-            maxlen=max(1, config.surprise_history_window)
-        )
+def build_segmentation_config(args: argparse.Namespace) -> OnlineSegmentationConfig:
+    runtime_config, _manager_config, _llm_config, _embedding_config = split_memory_config(
+        load_project_config(args.config)
+    )
+    segmentation_config = runtime_config.get("assistant_wakeup_segmentation")
+    if not isinstance(segmentation_config, dict):
+        segmentation_config = {}
+    values = dict(segmentation_config)
+    overrides = {
+        "threshold": args.threshold,
+        "bias": args.bias,
+        "surprise_history_window": args.surprise_history_window,
+        "min_surprise_history": args.min_surprise_history,
+        "robust_surprise_weight": args.robust_surprise_weight,
+        "absolute_surprise_weight": args.absolute_surprise_weight,
+        "cohesion_drop_weight": args.cohesion_drop_weight,
+        "length_weight": args.length_weight,
+        "turn_count_weight": args.turn_count_weight,
+        "max_pending_interaction_turns": args.max_pending_turns,
+        "max_pending_interaction_tokens": args.max_pending_tokens,
+        "min_pending_interaction_tokens": args.min_pending_tokens,
+        "min_pending_interaction_turns": args.min_pending_turns,
+        "min_segment_override_probability": args.min_segment_override_probability,
+        "max_time_gap_seconds": args.max_time_gap_seconds,
+    }
+    values.update({key: value for key, value in overrides.items() if value is not None})
 
-    def embed_exchange(self, exchange: Exchange) -> ActiveExchange:
-        embedding = self.embedding_client.embed_text(exchange.text)
-        return ActiveExchange(exchange=exchange, embedding=as_vector(embedding))
+    def number(key: str, default: Any) -> Any:
+        value = values.get(key)
+        return default if value in (None, "") else value
 
-    def segment(self, exchanges: Sequence[Exchange]) -> List[FinalizedSegment]:
-        active: List[ActiveExchange] = []
-        finalized: List[FinalizedSegment] = []
-
-        for exchange in exchanges:
-            incoming = self.embed_exchange(exchange)
-            if not active:
-                active.append(incoming)
-                startup_decision = SegmentDecision(
-                    exchange_index=exchange.index,
-                    reason="start_segment",
-                    prospective_tokens=exchange.token_count,
-                    prospective_exchanges=1,
-                )
-                if self._should_finalize_after_append(active):
-                    finalized.append(self._finalize(
-                        finalized,
-                        active,
-                        self._post_append_reason(active),
-                        startup_decision,
-                    ))
-                    active = []
-                continue
-
-            decision = self._score_boundary(active, incoming)
-
-            if decision.prospective_tokens and decision.prospective_tokens > self.config.max_chunk_tokens:
-                finalized.append(self._finalize(finalized, active, "capacity_limit", decision))
-                active = [incoming]
-                if self._should_finalize_after_append(active):
-                    finalized.append(self._finalize(
-                        finalized,
-                        active,
-                        self._post_append_reason(active),
-                        SegmentDecision(
-                            exchange_index=exchange.index,
-                            reason="post_capacity_new_segment",
-                            prospective_tokens=exchange.token_count,
-                            prospective_exchanges=1,
-                        ),
-                    ))
-                    active = []
-            elif (decision.cut_probability or 0.0) >= self.config.threshold:
-                finalized.append(self._finalize(finalized, active, "semantic_boundary", decision))
-                active = [incoming]
-                if self._should_finalize_after_append(active):
-                    finalized.append(self._finalize(
-                        finalized,
-                        active,
-                        self._post_append_reason(active),
-                        SegmentDecision(
-                            exchange_index=exchange.index,
-                            reason="post_boundary_new_segment",
-                            prospective_tokens=exchange.token_count,
-                            prospective_exchanges=1,
-                        ),
-                    ))
-                    active = []
-            else:
-                active.append(incoming)
-                if self._should_finalize_after_append(active):
-                    finalized.append(self._finalize(
-                        finalized,
-                        active,
-                        self._post_append_reason(active),
-                        decision,
-                    ))
-                    active = []
-
-        if active:
-            finalized.append(self._finalize(
-                finalized,
-                active,
-                "session_flush",
-                SegmentDecision(
-                    exchange_index=active[-1].exchange.index,
-                    reason="session_flush",
-                    prospective_tokens=sum(item.exchange.token_count for item in active),
-                    prospective_exchanges=len(active),
-                ),
-            ))
-        return finalized
-
-    def _score_boundary(
-        self,
-        active: Sequence[ActiveExchange],
-        incoming: ActiveExchange,
-    ) -> SegmentDecision:
-        active_embeddings = [item.embedding for item in active]
-        active_centroid = centroid(active_embeddings)
-        recent_embedding = active[-1].embedding
-        centroid_sim = cosine_similarity(incoming.embedding, active_centroid)
-        recent_sim = cosine_similarity(incoming.embedding, recent_embedding)
-        semantic_surprise = 1.0 - max(centroid_sim, recent_sim)
-
-        robust_surprise = robust_surprise_signal(
-            semantic_surprise,
-            list(self.surprise_history),
-            self.config.min_surprise_history,
-            self.config.robust_surprise_scale_floor,
-        )
-
-        cohesion_before = cohesion(active_embeddings)
-        cohesion_after = cohesion([*active_embeddings, incoming.embedding])
-        cohesion_drop = max(0.0, cohesion_before - cohesion_after)
-        prospective_tokens = sum(item.exchange.token_count for item in active) + incoming.exchange.token_count
-        prospective_exchanges = len(active) + 1
-        length_signal = length_pressure(prospective_tokens, self.config)
-        turn_signal = turn_count_pressure(prospective_exchanges)
-        score = (
-            self.config.robust_surprise_weight * robust_surprise
-            + self.config.cohesion_drop_weight * cohesion_drop
-            + self.config.length_weight * length_signal
-            + self.config.turn_count_weight * turn_signal
-        )
-        cut_probability = sigmoid(self.config.bias + score)
-        self.surprise_history.append(float(semantic_surprise))
-
-        return SegmentDecision(
-            exchange_index=incoming.exchange.index,
-            reason="score",
-            cut_probability=cut_probability,
-            score=score,
-            semantic_surprise=semantic_surprise,
-            robust_surprise=robust_surprise,
-            cohesion_before=cohesion_before,
-            cohesion_after=cohesion_after,
-            cohesion_drop=cohesion_drop,
-            length_signal=length_signal,
-            turn_signal=turn_signal,
-            centroid_similarity=centroid_sim,
-            recent_similarity=recent_sim,
-            prospective_tokens=prospective_tokens,
-            prospective_exchanges=prospective_exchanges,
-        )
-
-    def _should_finalize_after_append(self, active: Sequence[ActiveExchange]) -> bool:
-        if not active:
-            return False
-        token_count = sum(item.exchange.token_count for item in active)
-        if token_count >= self.config.max_chunk_tokens:
-            return True
-        if len(active) >= self.config.max_exchanges:
-            return True
-        return False
-
-    def _post_append_reason(self, active: Sequence[ActiveExchange]) -> str:
-        token_count = sum(item.exchange.token_count for item in active)
-        if token_count >= self.config.max_chunk_tokens:
-            return "capacity_limit"
-        if len(active) >= self.config.max_exchanges:
-            return "exchange_count_limit"
-        return "segment_complete"
-
-    def _finalize(
-        self,
-        finalized: Sequence[FinalizedSegment],
-        active: Sequence[ActiveExchange],
-        reason: str,
-        decision: SegmentDecision,
-    ) -> FinalizedSegment:
-        decision.reason = reason
-        return FinalizedSegment(
-            segment_index=len(finalized) + 1,
-            reason=reason,
-            exchanges=list(active),
-            decision=decision,
-        )
-
-
-def build_segmentation_config(args: argparse.Namespace) -> SegmentationConfig:
-    if args.min_chunk_tokens <= 0:
-        raise ValueError("--min-chunk-tokens must be positive")
-    if args.target_chunk_tokens < args.min_chunk_tokens:
-        raise ValueError("--target-chunk-tokens must be >= --min-chunk-tokens")
-    if args.max_chunk_tokens < args.target_chunk_tokens:
-        raise ValueError("--max-chunk-tokens must be >= --target-chunk-tokens")
-    if args.max_exchanges <= 0:
-        raise ValueError("--max-exchanges must be positive")
-    if args.robust_surprise_scale_floor <= 0:
-        raise ValueError("--robust-surprise-scale-floor must be positive")
-    return SegmentationConfig(
-        threshold=float(args.threshold),
-        bias=float(args.bias),
-        surprise_history_window=max(1, int(args.surprise_history_window)),
-        min_surprise_history=max(0, int(args.min_surprise_history)),
-        robust_surprise_weight=float(args.robust_surprise_weight),
-        robust_surprise_scale_floor=float(args.robust_surprise_scale_floor),
-        cohesion_drop_weight=float(args.cohesion_drop_weight),
-        length_weight=float(args.length_weight),
-        turn_count_weight=float(args.turn_count_weight),
-        min_chunk_tokens=int(args.min_chunk_tokens),
-        target_chunk_tokens=int(args.target_chunk_tokens),
-        max_chunk_tokens=int(args.max_chunk_tokens),
-        max_exchanges=int(args.max_exchanges),
+    return OnlineSegmentationConfig(
+        threshold=float(number("threshold", 0.60)),
+        bias=float(number("bias", -1.10)),
+        surprise_history_window=max(1, int(number("surprise_history_window", 64))),
+        min_surprise_history=max(0, int(number("min_surprise_history", 5))),
+        robust_surprise_weight=float(number("robust_surprise_weight", 0.8)),
+        absolute_surprise_weight=float(number("absolute_surprise_weight", 0.8)),
+        cohesion_drop_weight=float(number("cohesion_drop_weight", 0.8)),
+        length_weight=float(number("length_weight", 0.40)),
+        turn_count_weight=float(number("turn_count_weight", 0.40)),
+        max_pending_turns=max(1, int(number("max_pending_interaction_turns", 5))),
+        max_pending_tokens=max(1, int(number("max_pending_interaction_tokens", 500))),
+        min_pending_tokens=max(1, int(number("min_pending_interaction_tokens", 100))),
+        min_pending_turns=max(1, int(number("min_pending_interaction_turns", 2))),
+        min_segment_override_probability=float(
+            number("min_segment_override_probability", 0.90)
+        ),
+        max_time_gap_seconds=float(number("max_time_gap_seconds", -1.0)),
     )
 
 
@@ -685,14 +393,16 @@ def build_embedding_config(args: argparse.Namespace) -> Dict[str, Any]:
     return embedding_config
 
 
-def serialize_decision(decision: SegmentDecision) -> Dict[str, Any]:
+def serialize_decision(decision: MemorySegmentDecision) -> Dict[str, Any]:
     return {
         "exchange_index": decision.exchange_index,
         "reason": decision.reason,
+        "score_available": decision.cut_probability is not None,
         "cut_probability": round_float(decision.cut_probability),
         "score": round_float(decision.score),
         "semantic_surprise": round_float(decision.semantic_surprise),
         "robust_surprise": round_float(decision.robust_surprise),
+        "absolute_surprise": round_float(decision.absolute_surprise),
         "cohesion_before": round_float(decision.cohesion_before),
         "cohesion_after": round_float(decision.cohesion_after),
         "cohesion_drop": round_float(decision.cohesion_drop),
@@ -702,22 +412,23 @@ def serialize_decision(decision: SegmentDecision) -> Dict[str, Any]:
         "recent_similarity": round_float(decision.recent_similarity),
         "prospective_tokens": decision.prospective_tokens,
         "prospective_exchanges": decision.prospective_exchanges,
+        "time_gap_seconds": round_float(decision.time_gap_seconds),
     }
 
 
-def serialize_exchange(item: ActiveExchange, include_text: bool) -> Dict[str, Any]:
+def serialize_exchange(item: Exchange, include_text: bool) -> Dict[str, Any]:
     data = {
-        "index": item.exchange.index,
-        "day_index": item.exchange.day_index,
-        "pair_index": item.exchange.pair_index,
-        "date": item.exchange.date_text,
-        "token_count": item.exchange.token_count,
+        "index": item.index,
+        "day_index": item.day_index,
+        "pair_index": item.pair_index,
+        "date": item.date_text,
+        "token_count": item.token_count,
     }
     if include_text:
         data.update({
-            "user": item.exchange.user,
-            "assistant": item.exchange.assistant,
-            "text": item.exchange.text,
+            "user": item.user,
+            "assistant": item.assistant,
+            "text": item.text,
         })
     return data
 
@@ -734,7 +445,13 @@ def serialize_segment(segment: FinalizedSegment, include_text: bool) -> Dict[str
         "exchange_end": exchanges[-1]["index"] if exchanges else None,
         "date_start": exchanges[0]["date"] if exchanges else None,
         "date_end": exchanges[-1]["date"] if exchanges else None,
+        "boundary_decision_source": (
+            "semantic_score"
+            if segment.decision.cut_probability is not None
+            else "finalize_only"
+        ),
         "boundary_decision": serialize_decision(segment.decision),
+        "finalize_decision": serialize_decision(segment.finalize_decision),
         "exchanges": exchanges,
     }
 
@@ -743,7 +460,7 @@ def summarize_segments(segments: Sequence[FinalizedSegment]) -> Dict[str, Any]:
     segment_count = len(segments)
     exchange_counts = [len(segment.exchanges) for segment in segments]
     token_counts = [
-        sum(item.exchange.token_count for item in segment.exchanges)
+        sum(item.token_count for item in segment.exchanges)
         for segment in segments
     ]
     reasons = Counter(segment.reason for segment in segments)
@@ -768,14 +485,72 @@ def segment_context_group(
     context: str,
     records: Sequence[Dict[str, Any]],
     embedding_client: EmbeddingClient,
-    segmentation_config: SegmentationConfig,
+    segmentation_config: OnlineSegmentationConfig,
     include_text: bool,
 ) -> Dict[str, Any]:
     group_id = context_group_id(context, group_index)
     days = parse_context_days(context)
     exchanges = build_exchanges(days)
     segmenter = OnlineSemanticSegmenter(embedding_client, segmentation_config)
-    segments = segmenter.segment(exchanges)
+    exchange_by_index = {exchange.index: exchange for exchange in exchanges}
+    segments: List[FinalizedSegment] = []
+    last_scoring_decision: Optional[MemorySegmentDecision] = None
+
+    def finalize_pending(
+        decision: MemorySegmentDecision,
+        scoring_decision: Optional[MemorySegmentDecision] = None,
+    ) -> None:
+        nonlocal last_scoring_decision
+        pending = segmenter.pending_exchange_snapshot()
+        if not pending:
+            return
+        segment_reason = str(decision.reason or "segment_boundary")
+        display_decision = replace(scoring_decision or decision)
+        display_decision.reason = segment_reason
+        segments.append(FinalizedSegment(
+            segment_index=len(segments) + 1,
+            reason=segment_reason,
+            exchanges=[
+                exchange_by_index[item.index]
+                for item in pending
+                if item.index in exchange_by_index
+            ],
+            decision=display_decision,
+            finalize_decision=replace(decision),
+        ))
+        segmenter.clear_pending_exchanges()
+        last_scoring_decision = None
+
+    for exchange in exchanges:
+        incoming = OnlineSegmentExchange(
+            index=exchange.index,
+            text=exchange.text,
+            token_count=exchange.token_count,
+            timestamp=parse_date(exchange.date_text).isoformat(),
+            raw={
+                "user_message": exchange.user,
+                "assistant_response": exchange.assistant,
+                "date": exchange.date_text,
+            },
+        )
+        if segmenter.has_pending_exchanges():
+            should_finalize, decision = segmenter.should_finalize_pending_exchanges(
+                incoming,
+            )
+            if decision.cut_probability is not None:
+                last_scoring_decision = decision
+            if should_finalize:
+                finalize_pending(decision, last_scoring_decision)
+        segmenter.append_pending_exchange(incoming)
+
+    pending = segmenter.pending_exchange_snapshot()
+    if pending:
+        finalize_pending(MemorySegmentDecision(
+            exchange_index=pending[-1].index,
+            reason="session_flush",
+            prospective_tokens=sum(item.token_count for item in pending),
+            prospective_exchanges=len(pending),
+        ), last_scoring_decision)
     logging.info(
         "Segmented %s: records=%s days=%s exchanges=%s segments=%s",
         group_id,

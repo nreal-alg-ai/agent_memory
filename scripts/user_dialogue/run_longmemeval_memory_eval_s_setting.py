@@ -42,6 +42,7 @@ from memory.memory_manager import (
 )
 from memory.memory_runtime import MemoryRuntime
 from memory.config import split_memory_config
+from memory.utils import _as_embedding_vector
 import memory.memory_database as memory_database_module
 from memory.memory_database import SessionDB
 
@@ -227,11 +228,11 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--fact-extraction-max-chars",
+        "--fact-extraction-max-tokens",
         type=int,
         default=None,
         help=(
-            "Override memory_runtime.max_pending_interaction_chars from config.yaml. "
+            "Override memory_runtime.max_pending_interaction_tokens from config.yaml. "
             "When omitted, use the config.yaml value."
         ),
     )
@@ -656,9 +657,13 @@ def prepare_runtime_configs(
 ) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
     config = load_project_config(args.config)
     memory_runtime_config, memory_manager_config, llm_config, embedding_config = split_memory_config(config)
-    configured_max_pending_turns = memory_runtime_config.get("max_pending_interaction_turns")
+    segmentation_config = memory_runtime_config.setdefault(
+        "assistant_wakeup_segmentation",
+        {},
+    )
+    configured_max_pending_turns = segmentation_config.get("max_pending_interaction_turns")
     if configured_max_pending_turns in (None, ""):
-        configured_max_pending_turns = memory_runtime_config.get("max_pending_interaction_turns", 1)
+        configured_max_pending_turns = segmentation_config.get("max_pending_interaction_turns", 1)
     max_pending_interaction_turns = max(
         1,
         int(
@@ -668,21 +673,19 @@ def prepare_runtime_configs(
         ),
     )
     args.fact_extraction_interval = max_pending_interaction_turns
-    memory_runtime_config["max_pending_interaction_turns"] = max_pending_interaction_turns
-    configured_max_chars = memory_runtime_config.get("max_pending_interaction_chars")
-    if configured_max_chars in (None, ""):
-        configured_max_chars = memory_runtime_config.get("max_pending_interaction_chars")
-    if args.fact_extraction_max_chars is not None or configured_max_chars not in (None, ""):
-        max_pending_interaction_chars = max(
+    segmentation_config["max_pending_interaction_turns"] = max_pending_interaction_turns
+    configured_max_tokens = segmentation_config.get("max_pending_interaction_tokens")
+    if args.fact_extraction_max_tokens is not None or configured_max_tokens not in (None, ""):
+        max_pending_interaction_tokens = max(
             1,
             int(
-                args.fact_extraction_max_chars
-                if args.fact_extraction_max_chars is not None
-                else configured_max_chars
+                args.fact_extraction_max_tokens
+                if args.fact_extraction_max_tokens is not None
+                else configured_max_tokens
             ),
         )
-        args.fact_extraction_max_chars = max_pending_interaction_chars
-        memory_runtime_config["max_pending_interaction_chars"] = max_pending_interaction_chars
+        args.fact_extraction_max_tokens = max_pending_interaction_tokens
+        segmentation_config["max_pending_interaction_tokens"] = max_pending_interaction_tokens
     llm_config["llm_name"] = str(args.llm_model)
     llm_config["llm_base_url"] = str(args.llm_base_url)
     llm_config["llm_api_key"] = str(args.llm_api_key or "")
@@ -734,7 +737,7 @@ def validate_runtime(manager: MemoryNodeManager) -> None:
     if not manager._ensure_embedding_client():
         raise RuntimeError("Failed to initialize the configured embedding client")
     probe = manager._embedding_client.embed_text("LongMemEval embedding probe")
-    probe_vector = manager._as_embedding_vector(probe)
+    probe_vector = _as_embedding_vector(probe)
     if probe_vector is None:
         raw_shape = getattr(probe, "shape", None)
         raw_size = getattr(probe, "size", None)
@@ -1118,11 +1121,11 @@ def replay_sessions_into_memory(
         if reflect_submit.get("queued") and not runtime.flush_task_queue():
             raise RuntimeError("Timed out while draining queued memory reflect")
     
-    if runtime._pending_interaction_turns:
-        pending_before_flush = len(runtime._pending_interaction_turns)
+    if runtime.has_pending_interaction_turns():
+        pending_before_flush = len(runtime.get_pending_interaction_turns())
         if not runtime.flush_task_queue():
             raise RuntimeError("Timed out while draining queued memory stores")
-        if runtime._pending_interaction_turns:
+        if runtime.has_pending_interaction_turns():
             logging.warning(
                 "Replay finished with %s pending turns still buffered. "
                 "The final batch could not be force-stored.",
