@@ -180,7 +180,7 @@ memory_manager:
   save_db_name: memory.db
   retrieval_top_k: 8
   recall_detailed_logging: true
-  recall_fast_candidate_min_score: 0.35
+  recall_fast_candidate_min_score: 0.30
   recall_fast_candidate_score_threshold: 0.65
 
   store_queue_maxsize: 100
@@ -188,7 +188,7 @@ memory_manager:
   reflect_interval_seconds: 7200
   reflect_limit: 100
   recall_budget: mid
-  recall_fact_min_embedding_similarity: 0
-  recall_state_min_embedding_similarity: 0.35
-  recall_actionable_item_min_embedding_similarity: 0.35
+  recall_fact_min_embedding_similarity: 0.30
+  recall_state_min_embedding_similarity: 0.25
+  recall_actionable_item_min_embedding_similarity: 0.25
   recall_gate_mode: auto

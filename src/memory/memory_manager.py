@@ -5832,7 +5832,6 @@ class MemoryNodeManager:
             "topic_overlap",
             "name_overlap",
             "entity_mapping",
-            "bm25_lexical",
             "high_priority_actionable",
             "recent_fact_context",
             "recent_active_topic",
@@ -6228,16 +6227,9 @@ class MemoryNodeManager:
             evidence.append("topic_overlap")
         if name_overlap > 0.0:
             evidence.append("name_overlap")
-        bm25_score = self._clamp_float(
-            candidate.get("_recall_bm25_score"),
-            0.0,
-            1.0,
-            0.0,
-        )
         candidate_source = str(candidate.get("_recall_candidate_source") or "")
         candidate_sources = self._recall_candidate_source_channels(candidate_source)
         entity_mapping_hit = "entity_mapping" in candidate_sources
-        lexical_source_hit = "lexical" in candidate_sources
         if entity_mapping_hit:
             evidence.append("entity_mapping")
 
@@ -6267,7 +6259,6 @@ class MemoryNodeManager:
             if not exact_names
             else 0.0
         )
-        bm25_component = 0.45 * bm25_score if lexical_source_hit else 0.0
         mapping_score = 0.30 if entity_mapping_hit else 0.0
         score_components = {
             "exact_topic": round(exact_topic_score, 4),
@@ -6275,13 +6266,8 @@ class MemoryNodeManager:
             "topic_overlap": round(topic_overlap_score, 4),
             "name_overlap": round(name_overlap_score, 4),
             "entity_mapping": round(mapping_score, 4),
-            "bm25_identity_text": round(bm25_component, 4),
         }
         rank_score = min(1.0, sum(score_components.values()))
-        lexical_bm25_match = bool(
-            lexical_source_hit
-            and bm25_score >= 0.55
-        )
         strong_anchor = bool(
             exact_topics
             or exact_names
@@ -6315,15 +6301,6 @@ class MemoryNodeManager:
             anchor = ", ".join(candidate.get("_recall_entity_names") or []) or (
                 candidate.get("title") or candidate.get("summary_for_retrieval") or ""
             )
-        elif lexical_bm25_match:
-            match_type = "bm25_lexical"
-            anchor = (
-                candidate.get("identity_text")
-                or raw.get("identity_text")
-                or candidate.get("summary_for_retrieval")
-                or candidate.get("title")
-                or ""
-            )
         elif topic_overlap > 0.0:
             match_type = "topic_overlap"
             anchor = ", ".join(topic_values)
@@ -6347,15 +6324,11 @@ class MemoryNodeManager:
                 "candidate_score_passed": False,
                 "candidate_score_threshold": candidate_min_score,
                 "filter_reason": "no_matching_evidence",
-                "bm25_score": round(bm25_score, 4),
-                "bm25_raw_score": candidate.get("_bm25_score"),
                 "topic_overlap": round(topic_overlap, 4),
                 "name_overlap": round(name_overlap, 4),
                 "score_components": score_components,
             }
 
-        if lexical_source_hit and bm25_score:
-            evidence.append("bm25_identity_text")
         if not candidate_score_passed:
             return {
                 "matched": False,
@@ -6373,8 +6346,6 @@ class MemoryNodeManager:
                 "candidate_score_passed": False,
                 "candidate_score_threshold": candidate_min_score,
                 "filter_reason": "candidate_score_below_threshold",
-                "bm25_score": round(bm25_score, 4),
-                "bm25_raw_score": candidate.get("_bm25_score"),
                 "topic_overlap": round(topic_overlap, 4),
                 "name_overlap": round(name_overlap, 4),
                 "score_components": score_components,
@@ -6394,8 +6365,6 @@ class MemoryNodeManager:
             "candidate_score_passed": True,
             "candidate_score_threshold": candidate_min_score,
             "filter_reason": "",
-            "bm25_score": round(bm25_score, 4),
-            "bm25_raw_score": candidate.get("_bm25_score"),
             "topic_overlap": round(topic_overlap, 4),
             "name_overlap": round(name_overlap, 4),
             "score_components": score_components,
@@ -6412,8 +6381,6 @@ class MemoryNodeManager:
         exact_topic_count = 0
         exact_name_count = 0
         entity_mapping_candidate_count = 0
-        max_bm25_score = 0.0
-        bm25_support_candidate_count = 0
         max_candidate_score = 0.0
         strong_anchor_candidate_count = 0
 
@@ -6444,46 +6411,24 @@ class MemoryNodeManager:
                 self._recall_stage1_normalize_match_text(value)
                 for value in names
             )
-            bm25_score = self._clamp_float(
-                details.get("bm25_score"),
-                0.0,
-                1.0,
-                0.0,
-            )
-            candidate_sources = {
-                str(value)
-                for value in details.get("candidate_sources") or []
-            }
-            if bm25_score and "lexical" in candidate_sources:
-                max_bm25_score = max(max_bm25_score, bm25_score)
-                bm25_support_candidate_count += 1
 
         # Candidate-level evidence already includes exact topic/name, entity
-        # mapping, and BM25 components. Reuse the strongest candidate score
-        # and BM25 score instead of rescanning identity_text here.
-        lexical_support_score = max_bm25_score
-        score = max(max_candidate_score, lexical_support_score)
+        # mapping, and overlap components. Reuse the strongest candidate
+        # score instead of rescanning identity_text here.
+        score = max_candidate_score
         score = round(min(1.0, score), 4)
 
         strong_anchor = bool(
             exact_topic_anchors
             or exact_name_anchors
         )
-        bm25_lexical_support = bool(
-            bm25_support_candidate_count
-            and max_bm25_score >= 0.75
-        )
         trusted = bool(candidates) and (
             strong_anchor
-            or (
-                score >= self._recall_fast_candidate_score_threshold
-                and bm25_lexical_support
-            )
+            or score >= self._recall_fast_candidate_score_threshold
         )
         return {
             "score": score,
             "best_candidate_score": round(max_candidate_score, 4),
-            "lexical_support_score": round(lexical_support_score, 4),
             "trusted": trusted,
             "threshold": self._recall_fast_candidate_score_threshold,
             "candidate_count": len(candidates),
@@ -6493,9 +6438,6 @@ class MemoryNodeManager:
             "unique_exact_name_count": len(exact_name_anchors),
             "entity_mapping_candidate_count": entity_mapping_candidate_count,
             "strong_anchor_candidate_count": strong_anchor_candidate_count,
-            "max_bm25_score": round(max_bm25_score, 4),
-            "bm25_support_candidate_count": bm25_support_candidate_count,
-            "bm25_lexical_support": bm25_lexical_support,
             "strong_anchor": strong_anchor,
         }
 
@@ -7840,22 +7782,24 @@ class MemoryNodeManager:
                 1.0,
                 0.0,
             )
-            has_bm25_signal = bool(
-                entry.get("_recall_bm25_score") is not None
-                or entry.get("_bm25_score") is not None
+            entity_mapping_hit = "entity_mapping" in set(
+                provenance_profile.get("source_names") or []
             )
+            entity_mapping_score = 1.0 if entity_mapping_hit else 0.0
 
             # Use a weighted average over available signals. Entity-mapping
-            # candidates often have no BM25 result, and candidates from an
-            # embedding-only path may have no lexical terms; neither should be
-            # penalized merely because a signal is unavailable.
+            # candidates often have no BM25 result, so the mapping itself is
+            # an explicit relevance signal rather than only a provenance tie
+            # breaker. Candidates from an embedding-only path may have no
+            # lexical terms; neither should be penalized merely because a
+            # signal is unavailable.
             relevance_parts: List[Tuple[float, float]] = []
             if query_embedding is not None and entry.get("embedding") is not None:
                 relevance_parts.append((0.42, similarity))
-            if has_bm25_signal:
-                relevance_parts.append((0.28, bm25_score))
             if terms and (topic_values or name_values):
                 relevance_parts.append((0.25, structured_overlap))
+            if entity_mapping_hit:
+                relevance_parts.append((0.20, entity_mapping_score))
             relevance_weight = sum(weight for weight, _value in relevance_parts)
             relevance_score = (
                 sum(weight * value for weight, value in relevance_parts)
@@ -7893,6 +7837,7 @@ class MemoryNodeManager:
             item["_recall_score_components"] = {
                 "embedding_similarity": round(float(similarity), 4),
                 "bm25_identity_text": round(float(bm25_score), 4),
+                "entity_mapping": round(float(entity_mapping_score), 4),
                 "topic_overlap": round(float(topic_overlap), 4),
                 "name_overlap": round(float(name_overlap), 4),
                 "structured_overlap": round(float(structured_overlap), 4),
@@ -7973,6 +7918,107 @@ class MemoryNodeManager:
             min_embedding_similarity=min_embedding_similarity,
         )
 
+    @staticmethod
+    def _recall_candidate_evidence_fact_ids(
+        candidate: Dict[str, Any],
+    ) -> set[int]:
+        """Return the persisted evidence fact ids attached to a candidate."""
+        raw = (
+            candidate.get("_hydrated")
+            if isinstance(candidate.get("_hydrated"), dict)
+            else {}
+        )
+        values = candidate.get("evidence_fact_ids")
+        if values is None:
+            values = raw.get("evidence_fact_ids")
+        if isinstance(values, str):
+            try:
+                values = json.loads(values)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                values = []
+        if values is None:
+            return set()
+        if not isinstance(values, (list, tuple, set)):
+            values = [values]
+        evidence_fact_ids: set[int] = set()
+        for value in values:
+            try:
+                evidence_fact_ids.add(int(value))
+            except (TypeError, ValueError):
+                continue
+        return evidence_fact_ids
+
+    def _assemble_recall_evidence_candidates(
+        self,
+        *,
+        ranked_fact_candidates: Sequence[Dict[str, Any]],
+        ranked_state_candidates: Sequence[Dict[str, Any]],
+        ranked_actionable_items: Sequence[Dict[str, Any]],
+        layer_limits: Dict[str, int],
+    ) -> List[Dict[str, Any]]:
+        """Assemble ranked candidates by removing state/action duplicates.
+
+        Facts are already ranked and deduplicated before this step, so they
+        establish the evidence baseline. A state or actionable item whose
+        persisted evidence_fact_ids are all present in the selected facts is
+        omitted as a derived duplicate. Candidates without evidence ids are
+        retained conservatively because coverage cannot be proven.
+        """
+        limits = {
+            str(layer): max(0, int(limit or 0))
+            for layer, limit in (layer_limits or {}).items()
+        }
+        selected_candidates: List[Dict[str, Any]] = []
+        selected_fact_ids: set[int] = set()
+
+        fact_limit = limits.get("fact", len(ranked_fact_candidates))
+        for candidate in ranked_fact_candidates:
+            if sum(
+                1
+                for item in selected_candidates
+                if str(item.get("index_level") or "") == "fact"
+            ) >= fact_limit:
+                break
+            selected_candidates.append(candidate)
+            try:
+                selected_fact_ids.add(int(candidate.get("target_id")))
+            except (TypeError, ValueError):
+                continue
+
+        def append_uncovered_candidates(
+            candidates: Sequence[Dict[str, Any]],
+            *,
+            layer: str,
+        ) -> None:
+            layer_limit = limits.get(layer, len(candidates))
+            selected_count = sum(
+                1
+                for item in selected_candidates
+                if str(item.get("index_level") or "") == layer
+            )
+            for candidate in candidates:
+                if selected_count >= layer_limit:
+                    break
+                evidence_fact_ids = self._recall_candidate_evidence_fact_ids(
+                    candidate
+                )
+                if evidence_fact_ids and evidence_fact_ids.issubset(
+                    selected_fact_ids
+                ):
+                    continue
+                selected_candidates.append(candidate)
+                selected_count += 1
+
+        append_uncovered_candidates(
+            ranked_state_candidates,
+            layer="state",
+        )
+        append_uncovered_candidates(
+            ranked_actionable_items,
+            layer="actionable_item",
+        )
+        return selected_candidates
+
     def _rank_recall_raw_candidates(
         self,
         *,
@@ -8028,13 +8074,11 @@ class MemoryNodeManager:
             ),
         )
 
-        selected_candidates, _selected_by_layer = (
-            self._recall_get_selected_candidates_by_layer(
-                ranked_fact_candidates=ranked_facts,
-                ranked_state_candidates=ranked_states,
-                ranked_actionable_items=ranked_actionable,
-                layer_limits=final_limits,
-            )
+        selected_candidates = self._assemble_recall_evidence_candidates(
+            ranked_fact_candidates=ranked_facts,
+            ranked_state_candidates=ranked_states,
+            ranked_actionable_items=ranked_actionable,
+            layer_limits=final_limits,
         )
         return selected_candidates
     
