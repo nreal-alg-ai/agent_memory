@@ -9,18 +9,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import numpy as np
-
 ROOT = Path(__file__).resolve().parents[2]
 SRC_ROOT = ROOT / "src"
 for import_root in (SRC_ROOT, ROOT):
     if str(import_root) not in sys.path:
         sys.path.insert(0, str(import_root))
 
-from voice.asr import ASRBackend, WhisperASR  # noqa: E402
-from voice.audio import load_audio_mono, slice_audio  # noqa: E402
-from voice.text_utils import normalize_text  # noqa: E402
-from voice.vad_detector import StreamingSileroVAD  # noqa: E402
+from voice.voice_runtime import VoiceRuntime  # noqa: E402
 
 
 DEFAULT_CONFIG = Path(__file__).resolve().with_name("test_nonstreaming_vad_asr_config.yaml")
@@ -83,7 +78,7 @@ class NonStreamingASREvent:
     end: float
     duration: float
     frame_count: int
-    speech_ratio: float
+    speech_ratio: Optional[float]
     text: str
 
 
@@ -146,173 +141,65 @@ def main() -> None:
     logger.log(f"Run directory: {run_dir}")
 
     try:
-        audio, sample_rate = load_audio_mono(audio_path, config.runtime.sample_rate)
-        if config.runtime.max_duration_s is not None:
-            audio = audio[: int(config.runtime.max_duration_s * sample_rate)]
-
-        frame_samples = _seconds_to_samples(config.vad.frame_ms / 1000.0, sample_rate)
-        if frame_samples != 512 and sample_rate == 16000:
-            logger.log(
-                "Warning: Silero streaming VAD commonly expects 512 samples at 16 kHz "
-                f"(32 ms), current frame has {frame_samples} samples."
-            )
-
-        vad = StreamingSileroVAD(
-            sample_rate=sample_rate,
-            threshold=config.vad.threshold,
-            min_silence_duration_ms=config.vad.min_silence_ms,
-            speech_pad_ms=config.vad.speech_pad_ms,
-        )
-        asr = WhisperASR(_WhisperASRRuntimeConfig(config, sample_rate))
+        voice_runtime = VoiceRuntime(_voice_runtime_config(config))
         logger.log(
             "Non-streaming VAD+ASR test: "
             f"audio={audio_path}, frame={config.vad.frame_ms:.1f}ms, "
-            f"sample_rate={sample_rate}, model={config.asr.whisper_model_id}"
+            f"sample_rate={config.runtime.sample_rate}, "
+            f"model={config.asr.whisper_model_id}"
         )
 
-        events = _run_nonstreaming_vad_asr(audio, sample_rate, config, vad, asr, logger)
+        voice_report = voice_runtime.process_audio_file(audio_path)
+        events = _events_from_voice_report(voice_report, config)
+        for event in events:
+            logger.event(event)
+            if event.text or config.output.print_empty:
+                logger.log(_format_asr_event(event))
         if config.output.output_jsonl is not None:
             _write_jsonl(config.output.output_jsonl.expanduser().resolve(), events)
         logger.log(f"Saved log to: {logger.log_path}")
         logger.log(f"Saved events to: {logger.events_path}")
         logger.log(f"Finished with {len(events)} ASR segments.")
     finally:
+        if "voice_runtime" in locals():
+            voice_runtime.close()
         logger.close()
 
 
-class _WhisperASRRuntimeConfig:
-    def __init__(self, config: AppConfig, sample_rate: int) -> None:
-        self.sample_rate = sample_rate
-        self.language = config.runtime.language
-        self.device = config.runtime.device
-        self.whisper_model_id = config.asr.whisper_model_id
-        self.whisper_chunk_length_s = config.asr.whisper_chunk_length_s
-        self.whisper_condition_on_prev_tokens = config.asr.whisper_condition_on_prev_tokens
-        self.whisper_max_new_tokens = config.asr.whisper_max_new_tokens
-        self.whisper_no_repeat_ngram_size = config.asr.whisper_no_repeat_ngram_size
-        self.whisper_repetition_penalty = config.asr.whisper_repetition_penalty
+def _voice_runtime_config(config: AppConfig) -> Dict[str, Any]:
+    """Translate this script's config dataclasses to VoiceRuntime config."""
+    return {
+        "runtime": asdict(config.runtime),
+        "vad": asdict(config.vad),
+        "asr": asdict(config.asr),
+        "output": asdict(config.output),
+    }
 
 
-def _run_nonstreaming_vad_asr(
-    audio: np.ndarray,
-    sample_rate: int,
+def _events_from_voice_report(
+    report: Dict[str, Any],
     config: AppConfig,
-    vad: StreamingSileroVAD,
-    asr: ASRBackend,
-    logger: RunLogger,
 ) -> List[NonStreamingASREvent]:
-    frame_samples = _seconds_to_samples(config.vad.frame_ms / 1000.0, sample_rate)
-    total_frames = int(np.ceil(len(audio) / frame_samples))
+    """Preserve the script's event output format from VoiceRuntime segments."""
     events: List[NonStreamingASREvent] = []
-    speech_start: Optional[float] = None
-    speech_frame_count = 0
-    total_segment_frame_count = 0
-
-    for frame_index in range(total_frames):
-        frame_start_sample = frame_index * frame_samples
-        frame_end_sample = min(len(audio), frame_start_sample + frame_samples)
-        frame_start = frame_start_sample / sample_rate
-        frame_end = min(frame_end_sample, len(audio)) / sample_rate
-        frame = audio[frame_start_sample:frame_end_sample]
-        if frame.size < frame_samples:
-            frame = np.pad(frame, (0, frame_samples - frame.size))
-
-        vad_active = vad.accept_frame(frame, frame_start=frame_start, frame_end=frame_end)
-        transition = vad.last_transition
-        if config.output.log_frames:
-            logger.log(_format_frame_log(frame_index, total_frames, frame_start, frame_end, vad_active))
-
-        if vad_active:
-            if speech_start is None:
-                speech_start = (
-                    transition.time
-                    if transition is not None and transition.event_type == "start"
-                    else frame_start
-                )
-                speech_frame_count = 0
-                total_segment_frame_count = 0
-                logger.log(f"[VAD speech_start] time={speech_start:.3f}s")
-            speech_frame_count += 1
-            total_segment_frame_count += 1
-            continue
-
-        if speech_start is None:
-            continue
-
-        speech_end = (
-            transition.time
-            if transition is not None and transition.event_type == "end"
-            else frame_start
+    frame_ms = max(1.0, float(config.vad.frame_ms))
+    for index, segment in enumerate(report.get("segments") or [], 1):
+        metadata = segment.get("metadata") or {}
+        start = float(metadata.get("audio_start_s") or 0.0)
+        end = float(metadata.get("audio_end_s") or start)
+        duration = max(0.0, end - start)
+        events.append(
+            NonStreamingASREvent(
+                segment_index=int(segment.get("segment_index") or index),
+                start=round(start, 3),
+                end=round(end, 3),
+                duration=round(duration, 3),
+                frame_count=max(1, round(duration * 1000.0 / frame_ms)),
+                speech_ratio=None,
+                text=str(segment.get("text") or ""),
+            )
         )
-        event = _transcribe_segment(
-            segment_index=len(events) + 1,
-            audio=audio,
-            sample_rate=sample_rate,
-            config=config,
-            asr=asr,
-            start=speech_start,
-            end=speech_end,
-            speech_frame_count=speech_frame_count,
-            total_frame_count=max(1, total_segment_frame_count),
-        )
-        _record_event(event, config, logger, events)
-        speech_start = None
-        speech_frame_count = 0
-        total_segment_frame_count = 0
-
-    if speech_start is not None:
-        audio_end = len(audio) / sample_rate
-        event = _transcribe_segment(
-            segment_index=len(events) + 1,
-            audio=audio,
-            sample_rate=sample_rate,
-            config=config,
-            asr=asr,
-            start=speech_start,
-            end=audio_end,
-            speech_frame_count=speech_frame_count,
-            total_frame_count=max(1, total_segment_frame_count),
-        )
-        _record_event(event, config, logger, events)
-
     return events
-
-
-def _transcribe_segment(
-    segment_index: int,
-    audio: np.ndarray,
-    sample_rate: int,
-    config: AppConfig,
-    asr: ASRBackend,
-    start: float,
-    end: float,
-    speech_frame_count: int,
-    total_frame_count: int,
-) -> NonStreamingASREvent:
-    chunk = slice_audio(audio, sample_rate, start, end)
-    text = normalize_text(asr.transcribe_segment(chunk), config.output.simplify_chinese)
-    speech_ratio = speech_frame_count / total_frame_count if total_frame_count else 0.0
-    return NonStreamingASREvent(
-        segment_index=segment_index,
-        start=round(start, 3),
-        end=round(end, 3),
-        duration=round(max(0.0, end - start), 3),
-        frame_count=total_frame_count,
-        speech_ratio=round(speech_ratio, 4),
-        text=text,
-    )
-
-
-def _record_event(
-    event: NonStreamingASREvent,
-    config: AppConfig,
-    logger: RunLogger,
-    events: List[NonStreamingASREvent],
-) -> None:
-    events.append(event)
-    logger.event(event)
-    if event.text or config.output.print_empty:
-        logger.log(_format_asr_event(event))
 
 
 def load_config(config_path: Path) -> AppConfig:
@@ -370,26 +257,17 @@ def _resolve_path(value: Any, base_dir: Path) -> Path:
     return (base_dir / path).resolve()
 
 
-def _format_frame_log(
-    frame_index: int,
-    total_frames: int,
-    frame_start: float,
-    frame_end: float,
-    vad_active: bool,
-) -> str:
-    speech = "speech" if vad_active else "silence"
-    return (
-        f"[VAD frame={frame_index + 1:06d}/{total_frames:06d}] "
-        f"time={frame_start:8.3f}-{frame_end:8.3f}s vad={speech}"
-    )
-
-
 def _format_asr_event(event: NonStreamingASREvent) -> str:
+    speech_ratio = (
+        f"{event.speech_ratio:.2f}"
+        if event.speech_ratio is not None
+        else "n/a"
+    )
     return (
         f"[ASR SEGMENT {event.segment_index:04d}] "
         f"time={event.start:8.3f}-{event.end:8.3f}s "
         f"duration={event.duration:6.3f}s "
-        f"frames={event.frame_count} speech_ratio={event.speech_ratio:.2f} "
+        f"frames={event.frame_count} speech_ratio={speech_ratio} "
         f"text={event.text}"
     )
 
@@ -420,13 +298,6 @@ def _safe_name(value: str) -> str:
         for char in value
     ]
     return "".join(safe_chars).strip("._") or "audio"
-
-
-def _seconds_to_samples(seconds: float, sample_rate: int) -> int:
-    samples = round(seconds * sample_rate)
-    if samples <= 0:
-        raise ValueError("Time values must be positive.")
-    return samples
 
 
 def _json_safe(value: Any) -> Any:
