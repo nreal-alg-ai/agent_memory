@@ -528,13 +528,8 @@ def build_sample_memory_context(
                 question = str(qa.get("question") or "").strip()
                 recall_report = runtime.trigger_memory_recall(
                     question,
-                    top_k=int(args.recall_top_k),
-                    budget=str(args.recall_budget),
                     tags=["locomo", f"sample_id:{sample_id}"],
                     time_end=recall_time_end,
-                    recall_gate_mode=str(args.recall_gate_mode),
-                    memory_source_override=args.recall_memory_source,
-                    recall_path=str(args.recall_path),
                 )
                 memory_context = str(recall_report.get("memory_context") or "")
                 recall_operation_report = operation_reporter.latest_report("recall")

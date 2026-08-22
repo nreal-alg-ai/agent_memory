@@ -1,9 +1,4 @@
-"""MCP adapter for the unified memory runtime.
-
-The project intentionally keeps the MCP transport small and dependency-free.
-The public service class is independent from the stdio protocol, so it can be
-embedded in another host later without duplicating memory-runtime behavior.
-"""
+"""MCP adapter for audio-backed memory ingestion and memory recall."""
 
 from __future__ import annotations
 
@@ -12,9 +7,12 @@ import logging
 import sys
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, TextIO
+from typing import Any, Dict, List, Optional, TextIO, TYPE_CHECKING
 
-from .memory_runtime import MemoryRuntime
+from ..memory.memory_runtime import MemoryRuntime
+
+if TYPE_CHECKING:
+    from ..voice.voice_runtime import VoiceRuntime
 
 
 MCP_PROTOCOL_VERSION = "2024-11-05"
@@ -32,7 +30,6 @@ def _json_compatible(value: Any) -> Any:
         return {str(key): _json_compatible(item) for key, item in value.items()}
     if isinstance(value, (list, tuple, set)):
         return [_json_compatible(item) for item in value]
-    # Handles numpy scalar values without making numpy a server dependency.
     item = getattr(value, "item", None)
     if callable(item):
         try:
@@ -58,164 +55,223 @@ def _string_list(value: Any, field_name: str) -> Optional[List[str]]:
 
 
 class MemoryMCPService:
-    """Expose the four application-facing operations over a memory runtime."""
+    """Expose audio-to-memory ingestion and memory recall over MCP."""
 
     def __init__(
         self,
-        runtime: MemoryRuntime,
+        memory_runtime: MemoryRuntime,
+        voice_runtime: "VoiceRuntime",
         *,
         queue_timeout: float = 30.0,
     ) -> None:
-        self.runtime = runtime
+        self.memory_runtime = memory_runtime
+        self.voice_runtime = voice_runtime
         self.queue_timeout = max(0.0, float(queue_timeout))
 
-    def accept_single_interaction_turn(
+    def process_audio_file(
         self,
         *,
-        user_message: str,
-        assistant_response: str = "",
-        tags: Optional[List[str]] = None,
-        turn_timestamp: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """Accept one user/assistant exchange and return its queue report."""
-        if not str(user_message or "").strip() and not str(assistant_response or "").strip():
-            raise ValueError("user_message or assistant_response must be non-empty")
-        report = self.runtime.accept_single_interaction_turn(
-            user_message=str(user_message or ""),
-            assistant_response=str(assistant_response or ""),
-            tags=tags,
-            turn_timestamp=turn_timestamp,
-        )
-        return _json_compatible(report)
-
-    def accept_single_transcript_segment(
-        self,
-        *,
-        segment: Dict[str, Any],
+        audio_path: str,
         source_type: str = "allday_recording",
+        session_start: Optional[str] = None,
         tags: Optional[List[str]] = None,
+        run_reflect: bool = True,
     ) -> Dict[str, Any]:
-        """Accept one transcript segment and return its queue report."""
-        if not isinstance(segment, dict):
-            raise ValueError("segment must be an object")
-        report = self.runtime.accept_single_transcript_segment(
-            dict(segment),
-            source_type=str(source_type or "allday_recording"),
-            tags=tags,
+        """Transcribe an audio file and submit its segments to memory."""
+        if not str(audio_path or "").strip():
+            raise ValueError("audio_path must be non-empty")
+        source = str(source_type or "allday_recording").strip()
+        voice_report = self.voice_runtime.process_audio_file(
+            audio_path,
+            session_start=session_start,
         )
+        segments = list(voice_report.get("segments") or [])
+        store_reports: List[Dict[str, Any]] = []
+        for segment in segments:
+            store_reports.append(
+                self.memory_runtime.accept_single_transcript_segment(
+                    segment,
+                    source_type=source,
+                    tags=tags,
+                )
+            )
+
+        queue_flushed = self.memory_runtime.flush_task_queue(timeout=self.queue_timeout)
+        reflect_report: Optional[Dict[str, Any]] = None
+        reflect_flushed: Optional[bool] = None
+        if run_reflect and queue_flushed and segments:
+            reflect_report = self.memory_runtime.trigger_memory_reflect()
+            reflect_flushed = self.memory_runtime.flush_task_queue(
+                timeout=self.queue_timeout,
+            )
+
+        queued_count = sum(bool(report.get("queued")) for report in store_reports)
+        report = {
+            "status": "ok" if queue_flushed else "queue_flush_timeout",
+            "source_type": source,
+            "audio": {
+                key: value
+                for key, value in voice_report.items()
+                if key != "segments"
+            },
+            "transcript_segments": segments,
+            "submitted_segment_count": len(store_reports),
+            "store_queue_event_count": queued_count,
+            "store_reports": store_reports,
+            "store_queue_flushed": queue_flushed,
+            "run_reflect": bool(run_reflect),
+            "reflect_report": reflect_report,
+            "reflect_queue_flushed": reflect_flushed,
+        }
         return _json_compatible(report)
 
-    def trigger_memory_reflect(
+    def process_audio_files(
         self,
         *,
-        limit: Optional[int] = None,
-        reflect_timestamp: Optional[str] = None,
+        files: List[Dict[str, Any]],
+        source_type: str = "allday_recording",
+        session_start: Optional[str] = None,
+        tags: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
-        """Flush pending input, queue reflection, and return its report."""
-        kwargs: Dict[str, Any] = {}
-        if limit is not None:
-            kwargs["limit"] = max(1, int(limit))
-        if reflect_timestamp is not None:
-            kwargs["reflect_timestamp"] = reflect_timestamp
-        report = self.runtime.trigger_memory_reflect(**kwargs)
-        return _json_compatible(report)
+        """Process multiple files sequentially using the single-file workflow.
+
+        Each file independently runs ``process_audio_file``. This preserves the
+        existing per-file MemoryRuntime flush and reflect behavior while keeping
+        the voice models resident for the duration of the batch.
+        """
+        if not isinstance(files, list) or not files:
+            raise ValueError("files must be a non-empty array")
+
+        file_reports: List[Dict[str, Any]] = []
+        for index, file_spec in enumerate(files, 1):
+            if not isinstance(file_spec, dict):
+                file_reports.append({
+                    "status": "failed",
+                    "file_index": index,
+                    "error": "each files item must be an object",
+                })
+                continue
+            path = str(file_spec.get("audio_path") or "").strip()
+            if not path:
+                file_reports.append({
+                    "status": "failed",
+                    "file_index": index,
+                    "error": "audio_path must be non-empty",
+                })
+                continue
+
+            file_tags = list(tags or [])
+            item_tags = file_spec.get("tags")
+            if item_tags is not None:
+                if not isinstance(item_tags, list):
+                    file_reports.append({
+                        "status": "failed",
+                        "file_index": index,
+                        "audio_path": path,
+                        "error": "files[].tags must be an array of strings",
+                    })
+                    continue
+                file_tags.extend(str(tag) for tag in item_tags if str(tag).strip())
+
+            try:
+                report = self.process_audio_file(
+                    audio_path=path,
+                    source_type=str(file_spec.get("source_type") or source_type),
+                    session_start=(
+                        _optional_string(file_spec.get("session_start"))
+                        or session_start
+                    ),
+                    tags=file_tags,
+                    run_reflect=True,
+                )
+                report["file_index"] = index
+                file_reports.append(report)
+            except Exception as exc:
+                file_reports.append({
+                    "status": "failed",
+                    "file_index": index,
+                    "audio_path": path,
+                    "error": str(exc),
+                })
+
+        succeeded = [report for report in file_reports if report.get("status") == "ok"]
+        failed = [report for report in file_reports if report.get("status") == "failed"]
+        status = "ok" if not failed else "partial_failure" if succeeded else "failed"
+        return _json_compatible({
+            "status": status,
+            "file_count": len(file_reports),
+            "succeeded_file_count": len(succeeded),
+            "failed_file_count": len(failed),
+            "submitted_segment_count": sum(
+                int(report.get("submitted_segment_count") or 0)
+                for report in succeeded
+            ),
+            "store_queue_event_count": sum(
+                int(report.get("store_queue_event_count") or 0)
+                for report in succeeded
+            ),
+            "files": file_reports,
+        })
 
     def trigger_memory_recall(
         self,
         *,
         query: str,
-        top_k: Optional[int] = None,
-        budget: Optional[str] = None,
         tags: Optional[List[str]] = None,
         time_end: Optional[str] = None,
-        recall_gate_mode: Optional[str] = None,
-        memory_source_override: Optional[List[str]] = None,
-        recall_path: str = "normal",
-        prompt_language: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Run immediate recall and return memory context plus recall metadata."""
+        """Run immediate recall and return memory context plus metadata."""
         if not str(query or "").strip():
             raise ValueError("query must be non-empty")
-        kwargs: Dict[str, Any] = {
-            "query": str(query),
-            "recall_path": str(recall_path or "normal"),
-        }
-        if top_k is not None:
-            kwargs["top_k"] = max(1, int(top_k))
-        if budget is not None:
-            kwargs["budget"] = str(budget)
-        if tags is not None:
-            kwargs["tags"] = tags
-        if time_end is not None:
-            kwargs["time_end"] = time_end
-        if recall_gate_mode is not None:
-            kwargs["recall_gate_mode"] = str(recall_gate_mode)
-        if memory_source_override is not None:
-            kwargs["memory_source_override"] = memory_source_override
-        if prompt_language is not None:
-            kwargs["prompt_language"] = str(prompt_language)
-        report = self.runtime.trigger_memory_recall(**kwargs)
+        report = self.memory_runtime.trigger_memory_recall(
+            str(query),
+            tags=tags,
+            time_end=time_end,
+        )
         return _json_compatible(report)
 
     def close(self) -> None:
-        """Drain queued writes and release the database/worker resources."""
-        self.runtime.close(timeout=self.queue_timeout)
+        """Drain queued writes and release memory and voice resources."""
+        try:
+            self.memory_runtime.close(timeout=self.queue_timeout)
+        finally:
+            close_voice = getattr(self.voice_runtime, "close", None)
+            if callable(close_voice):
+                close_voice()
 
 
 TOOLS: List[Dict[str, Any]] = [
     {
-        "name": "accept_single_interaction_turn",
+        "name": "process_audio_files",
         "description": (
-            "Accept one user/assistant interaction turn. MemoryRuntime buffers "
-            "turns and queues extraction when the configured boundary is reached."
+            "Process multiple audio files sequentially with shared VAD, ASR, and "
+            "speaker models. Each file is independently stored and reflected."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "user_message": {"type": "string"},
-                "assistant_response": {"type": "string", "default": ""},
-                "tags": {"type": "array", "items": {"type": "string"}},
-                "turn_timestamp": {
-                    "type": "string",
-                    "description": "ISO-8601 timestamp; omitted to use current time.",
-                },
-            },
-            "required": ["user_message"],
-            "additionalProperties": False,
-        },
-    },
-    {
-        "name": "accept_single_transcript_segment",
-        "description": (
-            "Accept one ambient transcript segment. MemoryRuntime groups compatible "
-            "segments before submitting an episode for extraction."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "segment": {
-                    "type": "object",
-                    "description": "Transcript object containing text and optional timestamps.",
+                "files": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "audio_path": {"type": "string"},
+                            "source_type": {"type": "string"},
+                            "session_start": {"type": "string"},
+                            "tags": {"type": "array", "items": {"type": "string"}},
+                        },
+                        "required": ["audio_path"],
+                        "additionalProperties": False,
+                    },
                 },
                 "source_type": {"type": "string", "default": "allday_recording"},
+                "session_start": {
+                    "type": "string",
+                    "description": "Optional ISO-8601 timestamp for audio time zero.",
+                },
                 "tags": {"type": "array", "items": {"type": "string"}},
             },
-            "required": ["segment"],
-            "additionalProperties": False,
-        },
-    },
-    {
-        "name": "trigger_memory_reflect",
-        "description": (
-            "Flush pending input and queue reflection to update topic/entity states "
-            "and actionable items."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "limit": {"type": "integer", "minimum": 1},
-                "reflect_timestamp": {"type": "string"},
-            },
+            "required": ["files"],
             "additionalProperties": False,
         },
     },
@@ -229,17 +285,8 @@ TOOLS: List[Dict[str, Any]] = [
             "type": "object",
             "properties": {
                 "query": {"type": "string"},
-                "top_k": {"type": "integer", "minimum": 1},
-                "budget": {"type": "string", "enum": ["low", "mid", "high"]},
                 "tags": {"type": "array", "items": {"type": "string"}},
                 "time_end": {"type": "string"},
-                "recall_gate_mode": {"type": "string", "enum": ["auto", "force", "off"]},
-                "memory_source_override": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                },
-                "recall_path": {"type": "string", "enum": ["stage1", "stage2", "normal"]},
-                "prompt_language": {"type": "string", "enum": ["zh", "en", "source"]},
             },
             "required": ["query"],
             "additionalProperties": False,
@@ -323,7 +370,6 @@ class StdioMCPServer:
             try:
                 stream.write((header + payload).decode("utf-8"))
             except TypeError:
-                # Useful for embedding/tests that provide a raw BytesIO.
                 stream.write(header + payload)
             stream.flush()
 
@@ -332,8 +378,6 @@ class StdioMCPServer:
         method = str(request.get("method") or "")
         params = request.get("params") or {}
         if request_id is None:
-            # MCP notifications, including notifications/initialized, do not
-            # receive a JSON-RPC response.
             return None
         try:
             if method == "initialize":
@@ -341,10 +385,7 @@ class StdioMCPServer:
                 result = {
                     "protocolVersion": client_version,
                     "capabilities": {"tools": {"listChanged": False}},
-                    "serverInfo": {
-                        "name": "agent-memory",
-                        "version": "0.1.0",
-                    },
+                    "serverInfo": {"name": "agent-memory", "version": "0.1.0"},
                 }
             elif method == "ping":
                 result = {}
@@ -367,51 +408,26 @@ class StdioMCPServer:
         arguments = params.get("arguments") or {}
         if not isinstance(arguments, dict):
             raise ValueError("tools/call arguments must be an object")
-        if name == "accept_single_interaction_turn":
-            result = self.service.accept_single_interaction_turn(
-                user_message=str(arguments.get("user_message") or ""),
-                assistant_response=str(arguments.get("assistant_response") or ""),
-                tags=_string_list(arguments.get("tags"), "tags"),
-                turn_timestamp=_optional_string(arguments.get("turn_timestamp")),
-            )
-        elif name == "accept_single_transcript_segment":
-            segment = arguments.get("segment")
-            if not isinstance(segment, dict):
-                raise ValueError("segment must be an object")
-            result = self.service.accept_single_transcript_segment(
-                segment=segment,
+        if name == "process_audio_files":
+            files = arguments.get("files")
+            if not isinstance(files, list):
+                raise ValueError("files must be an array")
+            result = self.service.process_audio_files(
+                files=files,
                 source_type=str(arguments.get("source_type") or "allday_recording"),
+                session_start=_optional_string(arguments.get("session_start")),
                 tags=_string_list(arguments.get("tags"), "tags"),
-            )
-        elif name == "trigger_memory_reflect":
-            result = self.service.trigger_memory_reflect(
-                limit=arguments.get("limit"),
-                reflect_timestamp=_optional_string(arguments.get("reflect_timestamp")),
             )
         elif name == "trigger_memory_recall":
             result = self.service.trigger_memory_recall(
                 query=str(arguments.get("query") or ""),
-                top_k=arguments.get("top_k"),
-                budget=_optional_string(arguments.get("budget")),
                 tags=_string_list(arguments.get("tags"), "tags"),
                 time_end=_optional_string(arguments.get("time_end")),
-                recall_gate_mode=_optional_string(arguments.get("recall_gate_mode")),
-                memory_source_override=_string_list(
-                    arguments.get("memory_source_override"),
-                    "memory_source_override",
-                ),
-                recall_path=str(arguments.get("recall_path") or "normal"),
-                prompt_language=_optional_string(arguments.get("prompt_language")),
             )
         else:
             raise ValueError(f"Unknown tool: {name}")
         return {
-            "content": [
-                {
-                    "type": "text",
-                    "text": json.dumps(result, ensure_ascii=False),
-                }
-            ],
+            "content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False)}],
             "structuredContent": result,
             "isError": False,
         }

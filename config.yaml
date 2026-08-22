@@ -4,31 +4,8 @@
 # --kws/--no-kws, --speaker-identification/--no-speaker-identification,
 # and --allday-recording/--no-allday-recording.
 
-runtime:
-  # Use "mic" for local microphone, or "file" to replay an audio file as a stream.
-  source: file
-  # audio: /Users/zhouboyu/Documents/voice_recording/external/Eval_Ali/Eval_Ali_far/audio_dir/R8001_M8004_MS801.wav
-  # Optional. When set, main.py replays these files sequentially and keeps models resident.
-  # audio_files takes precedence over audio.
-  audio_files: [
-    # /Users/zhouboyu/Documents/voice_recording/tmp_result/ai_glasses_voice/20260721_155749_remote_audio/remote_microphone_20260721_155803.wav
-    /Users/zhouboyu/Documents/voice_recording/external/Eval_Ali/Eval_Ali_near/audio_dir/R8001_M8004_N_SPK8013.wav,
-    # /Users/zhouboyu/Documents/voice_recording/external/Eval_Ali/Eval_Ali_near/audio_dir/R8001_M8004_N_SPK8014.wav,
-    # /Users/zhouboyu/Documents/voice_recording/external/Eval_Ali/Eval_Ali_near/audio_dir/R8001_M8004_N_SPK8015.wav,
-    # /Users/zhouboyu/Documents/voice_recording/external/Eval_Ali/Eval_Ali_near/audio_dir/R8001_M8004_N_SPK8016.wav,
-    # /Users/zhouboyu/Documents/voice_recording/external/Eval_Ali/Eval_Ali_near/audio_dir/R8003_M8001_N_SPK8001.wav,
-    # /Users/zhouboyu/Documents/voice_recording/external/Eval_Ali/Eval_Ali_near/audio_dir/R8003_M8001_N_SPK8002.wav,
-    # /Users/zhouboyu/Documents/voice_recording/external/Eval_Ali/Eval_Ali_near/audio_dir/R8003_M8001_N_SPK8003.wav,
-    # /Users/zhouboyu/Documents/voice_recording/external/Eval_Ali/Eval_Ali_near/audio_dir/R8003_M8001_N_SPK8004.wav,
-    # /Users/zhouboyu/Documents/voice_recording/external/Eval_Ali/Eval_Ali_near/audio_dir/R8007_M8010_N_SPK8050.wav,
-    # /Users/zhouboyu/Documents/voice_recording/external/Eval_Ali/Eval_Ali_near/audio_dir/R8007_M8010_N_SPK8054.wav,
-    # /Users/zhouboyu/Documents/voice_recording/external/Eval_Ali/Eval_Ali_near/audio_dir/R8007_M8010_N_SPK8055.wav,
-    # /Users/zhouboyu/Documents/voice_recording/external/Eval_Ali/Eval_Ali_near/audio_dir/R8007_M8010_N_SPK8056.wav,
-    # /Users/zhouboyu/Documents/voice_recording/external/Eval_Ali/Eval_Ali_near/audio_dir/R8007_M8011_N_SPK8066.wav,
-    # /Users/zhouboyu/Documents/voice_recording/external/Eval_Ali/Eval_Ali_near/audio_dir/R8007_M8011_N_SPK8067.wav,
-    # /Users/zhouboyu/Documents/voice_recording/external/Eval_Ali/Eval_Ali_near/audio_dir/R8007_M8011_N_SPK8068.wav,
-    # /Users/zhouboyu/Documents/voice_recording/external/Eval_Ali/Eval_Ali_near/audio_dir/R8007_M8011_N_SPK8069.wav,
-  ]
+voice_runtime:
+
   # Simulated wall-clock gap between two consecutive audio files.
   audio_gap_s: 120.0
   result_root: tmp_result/ai_glasses_voice
@@ -40,64 +17,54 @@ runtime:
   mic_device: null
   mic_channels: 1
 
-vad:
-  frame_ms: 32.0
-  threshold: 0.5
-  min_silence_ms: 100
-  speech_pad_ms: 30
-  window_frames: 5
-  activate_ratio: 0.6
-  deactivate_ratio: 0.4
+  vad:
+    frame_ms: 32.0
+    threshold: 0.5
+    min_silence_ms: 100
+    speech_pad_ms: 30
+    window_frames: 5
+    activate_ratio: 0.6
+    deactivate_ratio: 0.4
 
-streaming_asr:
-  paraformer_streaming_model_id: funasr/paraformer-zh-streaming
-  trigger_s: 0.6
-  simplify_chinese: true
-  print_empty: false
+  streaming_asr:
+    paraformer_streaming_model_id: funasr/paraformer-zh-streaming
+    trigger_s: 0.6
+    simplify_chinese: true
+    print_empty: false
 
-nonstreaming_asr:
-  paraformer_model_id: funasr/paraformer-zh
-  simplify_chinese: true
-  print_empty: false
+  nonstreaming_asr:
+    paraformer_model_id: funasr/paraformer-zh
+    simplify_chinese: true
+    print_empty: false
 
-kws:
-  enabled: false
-  tokens: assets/sherp-onnx/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20/tokens.txt
-  encoder: assets/sherp-onnx/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20/encoder-epoch-13-avg-2-chunk-16-left-64.onnx
-  decoder: assets/sherp-onnx/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20/decoder-epoch-13-avg-2-chunk-16-left-64.onnx
-  joiner: assets/sherp-onnx/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20/joiner-epoch-13-avg-2-chunk-16-left-64.onnx
-  keywords_file: assets/sherp-onnx/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20/keywords_script.txt
-  inline_keywords: null
-  num_threads: 2
-  provider: cpu
-  device: 0
-  feature_dim: 80
-  max_active_paths: 4
-  keywords_score: 1.0
-  keywords_threshold: 0.25
-  num_trailing_blanks: 1
+  kws:
+    enabled: false
+    tokens: assets/sherp-onnx/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20/tokens.txt
+    encoder: assets/sherp-onnx/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20/encoder-epoch-13-avg-2-chunk-16-left-64.onnx
+    decoder: assets/sherp-onnx/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20/decoder-epoch-13-avg-2-chunk-16-left-64.onnx
+    joiner: assets/sherp-onnx/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20/joiner-epoch-13-avg-2-chunk-16-left-64.onnx
+    keywords_file: assets/sherp-onnx/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20/keywords_script.txt
+    inline_keywords: null
+    num_threads: 2
+    provider: cpu
+    device: 0
+    feature_dim: 80
+    max_active_paths: 4
+    keywords_score: 1.0
+    keywords_threshold: 0.25
+    num_trailing_blanks: 1
 
-speaker_identification:
-  enabled: true
-  model_id: iic/speech_campplus_sv_zh-cn_16k-common
-  window_s: 2.048
-  similarity_threshold: 0.5
-  reference_memory_size: 10
-  min_new_reference_segments: 2
-  min_new_reference_duration_s: 2.0
-  user_similarity_threshold: null
-  user_reference_audio: []
-  speaker_assignment_method: agglomerative
-
-assistant_wakeup:
-  enabled: false
-
-allday_recording:
-  enabled: true
-  max_pending_segment_num: 20
-  max_pending_duration_s: 300.0
-  max_pending_gap_s: 30.0
-  min_segment_s: 0.0
+  speaker_identification:
+    enabled: true
+    model_id: iic/speech_campplus_sv_zh-cn_16k-common
+    window_s: 2.048
+    similarity_threshold: 0.5
+    reference_memory_size: 10
+    min_new_reference_segments: 2
+    min_new_reference_duration_s: 2.0
+    user_similarity_threshold: null
+    user_reference_audio: []
+    speaker_assignment_method: agglomerative
 
 chat:
   enabled: false
@@ -105,22 +72,6 @@ chat:
   llm_name: deepseek-v4-flash
   llm_base_url: https://api.deepseek.com
   llm_api_key: ${DEEPSEEK_API_KEY}
-
-remote_audio:
-  # Bind to 0.0.0.0 so phones on the same LAN can open http://电脑IP:8765.
-  # Phone browsers usually require HTTPS for microphone access. Configure
-  # ssl_certfile/ssl_keyfile and open https://电脑IP:8765 if HTTP is blocked.
-  host: 0.0.0.0
-  port: 8765
-  auth_token: null
-  client_title: AI Glasses Voice
-  max_clients: 1
-  incoming_sample_format: pcm16
-  status_interval_s: 2.0
-  save_received_audio: false
-  ssl_certfile: certs/voice_recording.pem
-  ssl_keyfile: certs/voice_recording-key.pem
-  user_reference_audio_dir: assets/user_reference_audio_files
 
 memory_runtime:
   memory_prompt_language_mode: zh
@@ -179,6 +130,9 @@ memory_manager:
 
   save_db_name: memory.db
   retrieval_top_k: 8
+  retrieval_budget:
+  retrievel_source_override:
+  retrivel_path: normal
   recall_detailed_logging: true
   recall_fast_candidate_min_score: 0.30
   recall_fast_candidate_score_threshold: 0.65

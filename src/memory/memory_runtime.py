@@ -278,16 +278,26 @@ class MemoryRuntime:
         
         return report
     
-    def trigger_memory_recall(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+    def trigger_memory_recall(
+        self,
+        query: str,
+        *,
+        tags: Optional[List[str]] = None,
+        time_end: Optional[str] = None,
+        prompt_language: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """Run recall immediately through the manager without adding buffering."""
-        if not kwargs.get("prompt_language"):
-            query = kwargs.get("query")
-            if query is None and args:
-                query = args[0]
-            kwargs["prompt_language"] = self._resolve_prompt_language_from_segments(
+        resolved_prompt_language = str(prompt_language or "").strip().lower()
+        if not resolved_prompt_language:
+            resolved_prompt_language = self._resolve_prompt_language_from_segments(
                 [{"text": str(query or "")}]
             )
-        return self._memory_manager.process_memory_recall_immediately(*args, **kwargs)
+        return self._memory_manager.process_memory_recall_immediately(
+            query=str(query or ""),
+            tags=tags,
+            time_end=time_end,
+            prompt_language=resolved_prompt_language,
+        )
 
     def flush_task_queue(self, timeout: Optional[float] = None) -> bool:
         """Wait for queued store and reflection tasks at an explicit boundary."""

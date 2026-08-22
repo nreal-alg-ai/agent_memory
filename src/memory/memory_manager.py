@@ -486,12 +486,34 @@ class MemoryNodeManager:
             self._memory_cfg.get("enable_memory_actionable_item_update", True),
             True,
         )
-        self._top_k = int(self._memory_cfg.get("retrieval_top_k", 8) or 8)
+        self._top_k = max(1, int(self._memory_cfg.get("retrieval_top_k", 8) or 8))
         self._recall_detailed_logging = self._config_bool(
             self._memory_cfg.get("recall_detailed_logging", False),
             False,
         )
-        self._recall_budget = str(self._memory_cfg.get("recall_budget", "mid") or "mid")
+        configured_retrieval_budget = self._memory_cfg.get("retrieval_budget")
+        self._recall_budget = str(
+            configured_retrieval_budget
+            or self._memory_cfg.get("recall_budget", "mid")
+            or "mid"
+        )
+        configured_source_override = self._memory_cfg.get(
+            "retrievel_source_override"
+        )
+        if isinstance(configured_source_override, str):
+            configured_source_override = [
+                item.strip()
+                for item in configured_source_override.split(",")
+                if item.strip()
+            ]
+        self._retrieval_source_override = (
+            self._normalize_source_override(configured_source_override)
+            if isinstance(configured_source_override, (list, tuple, set))
+            else None
+        )
+        self._retrieval_path = str(
+            self._memory_cfg.get("retrivel_path", "normal") or "normal"
+        ).strip().lower()
         self._recall_fact_min_embedding_similarity = self._clamp_float(
             self._memory_cfg.get("recall_fact_min_embedding_similarity"),
             0.0,
@@ -5191,13 +5213,8 @@ class MemoryNodeManager:
     def process_memory_recall_immediately(
         self,
         query: str,
-        top_k: int = None,
-        budget: str = None,
         tags: Optional[List[str]] = None,
         time_end: Optional[str] = None,
-        recall_gate_mode: Optional[str] = None,
-        memory_source_override: Optional[Sequence[str]] = None,
-        recall_path: str = "normal",
         prompt_language: str = "zh",
     ) -> Dict[str, Any]:
         """Run recall immediately against the latest committed memory snapshot."""
@@ -5207,13 +5224,12 @@ class MemoryNodeManager:
         with self._db.reader_transaction() as reader_db:
             return self._recall_sync(
                 query=query,
-                top_k=top_k,
-                budget=budget,
+                top_k=self._top_k,
+                budget=self._recall_budget,
                 tags=tags,
                 time_end=time_end,
-                recall_gate_mode=recall_gate_mode,
-                memory_source_override=memory_source_override,
-                recall_path=recall_path,
+                memory_source_override=self._retrieval_source_override,
+                recall_path=self._retrieval_path,
                 prompt_language=prompt_language,
                 database=reader_db,
             )
@@ -5225,7 +5241,6 @@ class MemoryNodeManager:
         budget: str = None,
         tags: Optional[List[str]] = None,
         time_end: Optional[str] = None,
-        recall_gate_mode: Optional[str] = None,
         memory_source_override: Optional[Sequence[str]] = None,
         recall_path: str = "normal",
         prompt_language: str = "zh",
@@ -5262,7 +5277,6 @@ class MemoryNodeManager:
                 "tags": tags or [],
                 "requested_time_end": time_end,
                 "time_end": reference_time,
-                "recall_gate_mode": recall_gate_mode,
                 "memory_source_override": list(memory_source_override or []),
                 "recall_path": normalized_recall_path,
                 "prompt_language": prompt_language,

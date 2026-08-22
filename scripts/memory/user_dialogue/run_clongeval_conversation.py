@@ -41,7 +41,7 @@ for import_root in (SRC_ROOT, REPO_ROOT, SCRIPT_ROOT):
 from memory.memory_manager import MemoryOperationReporter
 from memory.memory_runtime import MemoryRuntime
 from memory.config import split_memory_config
-from test_memory_store_fact_extraction import (
+from scripts.memory.user_dialogue.test_memory_store_fact_extraction import (
     configure_logging,
     load_project_config,
     log_memory_index_state,
@@ -688,10 +688,6 @@ def process_context_group(
         for record_index, record in enumerate(group_records, 1):
             recall_report = runtime.trigger_memory_recall(
                 str(record["query"]),
-                top_k=args.recall_top_k,
-                budget=args.recall_budget,
-                recall_gate_mode=str(memory_manager_config.get("recall_gate_mode") or "auto"),
-                recall_path=args.recall_path,
             )
             recall_context = str(recall_report.get("memory_context") or "")
             covered = gold_answer_in_context(record.get("answer", ""), recall_context)

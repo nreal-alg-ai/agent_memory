@@ -4,8 +4,7 @@
 This script builds an isolated memory DB per benchmark instance, replays the
 timestamped history into ``MemoryNodeManager``, runs reflection, recalls memory
 for the benchmark question, and uses a reader LLM to produce a final
-``hypothesis`` answer. It can also reuse an existing per-question memory DB to
-run only recall and reader answering.
+``hypothesis`` answer.
 
 The output format matches LongMemEval's evaluator expectations:
 ``{"question_id": "...", "hypothesis": "..."}``
@@ -22,7 +21,6 @@ import shutil
 import sys
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -52,14 +50,15 @@ _ENV_REF_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 
 DEFAULT_INPUT = Path(
-    "/Users/zhouboyu/Documents/xreal/项目/agent_memory/benchmark/LongMemEval/data/longmemeval_oracle.json"
+    "/Users/zhouboyu/Documents/xreal/项目/agent_memory/benchmark/LongMemEval/data/longmemeval_s_cleaned.json"
 )
-DEFAULT_OUTPUT_ROOT_DIR = REPO_ROOT / "tmp" / "longmemeval"
+DEFAULT_OUTPUT_ROOT_DIR = REPO_ROOT / "tmp" / "longmemeval_s_setting"
 
 
 @dataclass(frozen=True)
 class SessionReplayStats:
     turn_pairs_total: int
+    stored_pairs: int
     skipped_assistant_only: int
     orphan_user_chunks: int
 
@@ -80,15 +79,6 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--state-dir", type=Path)
-    parser.add_argument(
-        "--existing-state-dir",
-        type=Path,
-        help=(
-            "Reuse existing per-question DBs from "
-            "<dir>/<question_id>/memory.db. When set, skip history replay, "
-            "store, and reflect; only rerun recall and reader answering."
-        ),
-    )
     parser.add_argument("--log-path", type=Path)
     parser.add_argument("--detail-output", type=Path, help="Optional per-instance detail JSON.")
     parser.add_argument("--start", type=int, default=0)
@@ -109,9 +99,27 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-sessions", type=int, default=0, help="0 means all sessions.")
     parser.add_argument(
+        "--sessions-after-answer",
+        type=int,
+        default=5,
+        help=(
+            "Replay each answer_session_id plus this many sessions after it "
+            "in chronological order. Defaults to 5 to reduce LongMemEval-S "
+            "memory-building LLM cost."
+        ),
+    )
+    parser.add_argument(
         "--overwrite",
         action="store_true",
         help="Replace existing output/state files for this run.",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Continue an existing run directory by skipping question_ids already "
+            "present in the brief JSONL output and appending the remaining answers."
+        ),
     )
     parser.add_argument("--llm-model")
     parser.add_argument("--llm-base-url")
@@ -148,7 +156,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reader-base-url")
     parser.add_argument("--reader-api-key")
     parser.add_argument("--reader-timeout", type=int)
-    parser.add_argument("--reader-max-tokens", type=int, default=8192)
+    parser.add_argument("--reader-max-tokens", type=int, default=4096)
     parser.add_argument("--reader-temperature", type=float, default=0.0)
     parser.add_argument(
         "--reader-max-context-chars",
@@ -176,20 +184,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--recall-gate-mode",
-        default="force",
+        default=None,
         choices=["auto", "force"],
         help=(
             "Recall gate behavior passed to MemoryNodeManager. "
             "'auto' uses gate analysis; 'force' always attempts recall. Defaults to config.yaml."
-        ),
-    )
-    parser.add_argument(
-        "--recall-memory-source",
-        action="append",
-        choices=["assistant_wakeup", "allday_recording"],
-        help=(
-            "Force memory recall to search the specified memory source. "
-            "Can be passed multiple times. When omitted, recall uses LLM source analysis."
         ),
     )
     parser.add_argument(
@@ -236,7 +235,7 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--log-level", default="INFO")
-    parser.add_argument("--manager-log-level", default="DEBUG")
+    parser.add_argument("--manager-log-level", default="INFO")
     return parser.parse_args()
 
 
@@ -262,40 +261,9 @@ def configure_logging(
         stream_handler.setFormatter(formatter)
         root.addHandler(stream_handler)
 
-@contextmanager
-def question_memory_logging(
-    question_state_dir: Path,
-    *,
-    manager_log_level: str,
-) -> Iterable[Tuple[Path, logging.Logger]]:
-    """Capture memory package logs for one benchmark instance.
-
-    The benchmark can run either in one process or multiple worker processes.
-    A per-question handler keeps MemoryNodeManager's internal logs next to that
-    question's database regardless of the execution mode.
-    """
-    question_state_dir.mkdir(parents=True, exist_ok=True)
-    log_path = question_state_dir / "memory_manager.log"
-    memory_logger = logging.getLogger(
-        f"memory.pipeline.longmemeval.{question_state_dir.name}"
-    )
     manager_level = getattr(logging, str(manager_log_level).upper(), logging.INFO)
-    for existing_handler in list(memory_logger.handlers):
-        memory_logger.removeHandler(existing_handler)
-        existing_handler.close()
-
-    formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
-    handler = logging.FileHandler(log_path, mode="w", encoding="utf-8")
-    handler.setLevel(manager_level)
-    handler.setFormatter(formatter)
-    memory_logger.setLevel(manager_level)
-    memory_logger.addHandler(handler)
-    memory_logger.propagate = False
-    try:
-        yield log_path, memory_logger
-    finally:
-        memory_logger.removeHandler(handler)
-        handler.close()
+    logging.getLogger("memory").setLevel(manager_level)
+    logging.getLogger("memory.memory_manager").setLevel(manager_level)
 
 
 def load_project_config(config_path: Path) -> Dict[str, Any]:
@@ -431,7 +399,13 @@ def remove_existing_outputs(
     detail_output_path: Optional[Path],
     state_dir: Path,
     overwrite: bool,
+    resume: bool = False,
 ) -> None:
+    if overwrite and resume:
+        raise ValueError("--overwrite and --resume cannot be used together")
+    if resume:
+        return
+
     existing: List[Path] = []
     if output_path.exists():
         existing.append(output_path)
@@ -554,7 +528,7 @@ def normalize_unique_timestamp(
 def sorted_history_sessions(
     item: Dict[str, Any],
     *,
-    max_sessions: int,
+    max_sessions: int = 0,
 ) -> List[Tuple[str, datetime, List[Dict[str, Any]], int]]:
     session_ids = list(item.get("haystack_session_ids") or [])
     session_dates = list(item.get("haystack_dates") or [])
@@ -572,6 +546,51 @@ def sorted_history_sessions(
     if max_sessions > 0:
         packed = packed[:max_sessions]
     return packed
+
+
+def select_answer_window_sessions(
+    item: Dict[str, Any],
+    sessions: Sequence[Tuple[str, datetime, List[Dict[str, Any]], int]],
+    *,
+    sessions_after_answer: int,
+) -> List[Tuple[str, datetime, List[Dict[str, Any]], int]]:
+    answer_session_ids = [
+        str(value)
+        for value in (item.get("answer_session_ids") or [])
+        if str(value or "").strip()
+    ]
+    if not answer_session_ids:
+        return list(sessions)
+
+    after_count = max(0, int(sessions_after_answer or 0))
+    positions_by_session_id: Dict[str, List[int]] = {}
+    for position, (session_id, _session_dt, _turns, _idx) in enumerate(sessions):
+        positions_by_session_id.setdefault(str(session_id), []).append(position)
+
+    selected_positions: set[int] = set()
+    missing_answer_session_ids: List[str] = []
+    for answer_session_id in answer_session_ids:
+        positions = positions_by_session_id.get(answer_session_id)
+        if not positions:
+            missing_answer_session_ids.append(answer_session_id)
+            continue
+        for position in positions:
+            end_position = min(len(sessions), position + after_count + 1)
+            selected_positions.update(range(position, end_position))
+
+    if missing_answer_session_ids:
+        logging.warning(
+            "Question %s answer_session_ids not found in haystack_session_ids: %s",
+            item.get("question_id"),
+            missing_answer_session_ids,
+        )
+    if not selected_positions:
+        return []
+    return [
+        session
+        for position, session in enumerate(sessions)
+        if position in selected_positions
+    ]
 
 
 def effective_question_datetime(
@@ -643,15 +662,15 @@ def prepare_runtime_configs(
         "assistant_wakeup_segmentation",
         {},
     )
-    configured_max_turns = segmentation_config.get("max_pending_interaction_turns")
-    if configured_max_turns in (None, ""):
-        configured_max_turns = segmentation_config.get("max_pending_interaction_turns", 1)
+    configured_max_pending_turns = segmentation_config.get("max_pending_interaction_turns")
+    if configured_max_pending_turns in (None, ""):
+        configured_max_pending_turns = segmentation_config.get("max_pending_interaction_turns", 1)
     max_pending_interaction_turns = max(
         1,
         int(
             args.fact_extraction_interval
             if args.fact_extraction_interval is not None
-            else configured_max_turns
+            else configured_max_pending_turns
         ),
     )
     args.fact_extraction_interval = max_pending_interaction_turns
@@ -1116,6 +1135,7 @@ def replay_sessions_into_memory(
 
     return SessionReplayStats(
         turn_pairs_total=turn_pairs_total,
+        stored_pairs=0,
         skipped_assistant_only=skipped_assistant_only,
         orphan_user_chunks=orphan_user_chunks,
     )
@@ -1138,139 +1158,101 @@ def build_instance_memory_context(
 
     question_state_dir = args.state_dir / question_id
     question_state_dir.mkdir(parents=True, exist_ok=True)
-    reused_existing_db = args.existing_state_dir is not None
-    db_path = (
-        Path(args.existing_state_dir) / question_id / "memory.db"
-        if reused_existing_db
-        else question_state_dir / "memory.db"
-    )
-    if reused_existing_db and not db_path.is_file():
-        raise FileNotFoundError(
-            "Existing memory DB not found for question "
-            f"{question_id}: {db_path}"
+    db_path = question_state_dir / "memory.db"
+
+    runtime: Optional[MemoryRuntime] = None
+    try:
+        operation_reporter = MemoryOperationReporter()
+        runtime = MemoryRuntime(
+            db_path=db_path,
+            memory_runtime_config=memory_runtime_config,
+            memory_manager_config=memory_manager_config,
+            operation_reporter=operation_reporter,
         )
+        db = runtime.database
+        manager = runtime.manager
+        validate_runtime(manager)
 
-    with question_memory_logging(
-        question_state_dir,
-        manager_log_level=str(args.manager_log_level),
-    ) as (memory_log_path, memory_logger):
-        memory_logger.info(
-            "Question memory log started: question_id=%s db_path=%s",
-            question_id,
-            db_path,
+        all_sessions = sorted_history_sessions(item)
+        answer_window_sessions = select_answer_window_sessions(
+            item,
+            all_sessions,
+            sessions_after_answer=int(args.sessions_after_answer),
         )
-        runtime: Optional[MemoryRuntime] = None
-        try:
-            operation_reporter = MemoryOperationReporter()
-            runtime = MemoryRuntime(
-                db_path=db_path,
-                memory_runtime_config=memory_runtime_config,
-                memory_manager_config=memory_manager_config,
-                operation_reporter=operation_reporter,
-                logger=memory_logger,
-            )
-            db = runtime.database
-            manager = runtime.manager
-            validate_runtime(manager)
+        sessions = answer_window_sessions
+        if int(args.max_sessions) > 0:
+            sessions = sessions[: int(args.max_sessions)]
+        replay_stats = replay_sessions_into_memory(
+            runtime=runtime,
+            item=item,
+            sessions=sessions,
+            enable_reflect=args.enable_reflect,
+            reflect_every_sessions=max(1, int(args.reflect_every_sessions)),
+            reflect_limit=int(args.reflect_limit),
+        )
+        if not runtime.flush_task_queue():
+            raise RuntimeError("Timed out while draining queued memory stores")
+        memory_operation_report = operation_reporter.snapshot()
+        operation_counts = memory_operation_report.get("counts") or {}
+        store_operation_report = operation_counts.get("memory_store") or {}
+        reflect_operation_report = operation_counts.get("memory_reflect") or {}
+        replay_stats = SessionReplayStats(
+            turn_pairs_total=replay_stats.turn_pairs_total,
+            stored_pairs=int(store_operation_report.get("succeeded") or 0),
+            skipped_assistant_only=replay_stats.skipped_assistant_only,
+            orphan_user_chunks=replay_stats.orphan_user_chunks,
+        )
+        reflect_runs = int(reflect_operation_report.get("submitted") or 0)
+        effective_question_dt = effective_question_datetime(question_dt, sessions)
+        effective_question_date_text = format_memory_time(effective_question_dt)
+        counts = db_counts(db)
+        recall_report = runtime.trigger_memory_recall(
+            question,
+            time_end=effective_question_date_text,
+        )
+        memory_context = str(recall_report.get("memory_context") or "")
+        memory_operation_report = operation_reporter.snapshot()
+        operation_counts = memory_operation_report.get("counts") or {}
+        recall_operation_report = operation_counts.get("recall") or {}
 
-            sessions = sorted_history_sessions(item, max_sessions=int(args.max_sessions))
-            if reused_existing_db:
-                replay_stats = SessionReplayStats(
-                    turn_pairs_total=0,
-                    skipped_assistant_only=0,
-                    orphan_user_chunks=0,
-                )
-            else:
-                replay_stats = replay_sessions_into_memory(
-                    runtime=runtime,
-                    item=item,
-                    sessions=sessions,
-                    enable_reflect=args.enable_reflect,
-                    reflect_every_sessions=max(1, int(args.reflect_every_sessions)),
-                    reflect_limit=int(args.reflect_limit),
-                )
-            if not runtime.flush_task_queue():
-                raise RuntimeError("Timed out while draining queued memory stores")
-            effective_question_dt = effective_question_datetime(question_dt, sessions)
-            effective_question_date_text = format_memory_time(effective_question_dt)
-            counts = db_counts(db)
-            recall_report = runtime.trigger_memory_recall(
-                question,
-                top_k=int(args.recall_top_k),
-                budget=str(args.recall_budget),
-                time_end=effective_question_date_text,
-                recall_gate_mode=str(args.recall_gate_mode),
-                memory_source_override=args.recall_memory_source,
-                recall_path=str(args.recall_path),
-            )
-            memory_context = str(recall_report.get("memory_context") or "")
-            memory_operation_report = operation_reporter.snapshot()
-            operation_counts = memory_operation_report.get("counts") or {}
-            store_operation_report = operation_counts.get("memory_store") or {}
-            reflect_operation_report = operation_counts.get("memory_reflect") or {}
-            recall_operation_report = operation_counts.get("recall") or {}
-            store_turn_calls = replay_stats.turn_pairs_total
-            stored_pairs = int(store_operation_report.get("submitted") or 0)
-            reflect_runs = int(reflect_operation_report.get("submitted") or 0)
-            store_total_elapsed_ms = float(
-                store_operation_report.get("total_elapsed_ms") or 0.0
-            )
-            reflect_total_elapsed_ms = float(
-                reflect_operation_report.get("total_elapsed_ms") or 0.0
-            )
-            recall_total_elapsed_ms = float(
-                recall_operation_report.get("total_elapsed_ms")
-                or recall_report.get("elapsed_ms")
-                or 0.0
-            )
-
-            return {
-                "question_id": question_id,
-                "question_type": question_type,
-                "question": question,
-                "question_date": question_date_text,
-                "effective_question_date": effective_question_date_text,
-                "answer": str(item.get("answer") or ""),
-                "history_session_count": len(sessions),
-                "replayed_turn_pairs": replay_stats.turn_pairs_total,
-                "turn_pairs_with_stored_facts": stored_pairs,
-                "skipped_assistant_only_turns": replay_stats.skipped_assistant_only,
-                "orphan_user_chunks": replay_stats.orphan_user_chunks,
-                "reflect_runs": reflect_runs,
-                "db_path": str(db_path),
-                "reused_existing_db": reused_existing_db,
-                "memory_log_path": str(memory_log_path),
-                "db_counts": counts,
-                "recall_context_chars": len(memory_context or ""),
-                "recall_context": memory_context,
-                "recall_memory_source_override": list(args.recall_memory_source or []),
-                "recall_path": str(args.recall_path),
-                "requested_recall_path": str(
-                    recall_report.get("requested_recall_path") or args.recall_path
-                ),
-                "actual_recall_path": str(
-                    recall_report.get("actual_recall_path") or "unknown"
-                ),
-                "recall_status": str(
-                    recall_report.get("status")
-                    or ("ok" if memory_context else "empty")
-                ),
-                "store_turn_calls": store_turn_calls,
-                "store_episode_submitted": stored_pairs,
-                "store_flushes": stored_pairs,
-                "store_total_elapsed_ms": store_total_elapsed_ms,
-                "reflect_total_elapsed_ms": reflect_total_elapsed_ms,
-                "recall_total_elapsed_ms": recall_total_elapsed_ms,
-                "memory_total_elapsed_ms": round(
-                    store_total_elapsed_ms
-                    + reflect_total_elapsed_ms
-                    + recall_total_elapsed_ms,
-                    2,
-                ),
-            }
-        finally:
-            if runtime is not None:
-                runtime.close()
+        return {
+            "question_id": question_id,
+            "question_type": question_type,
+            "question": question,
+            "question_date": question_date_text,
+            "effective_question_date": effective_question_date_text,
+            "answer": str(item.get("answer") or ""),
+            "answer_session_ids": list(item.get("answer_session_ids") or []),
+            "sessions_after_answer": int(args.sessions_after_answer),
+            "full_history_session_count": len(all_sessions),
+            "answer_window_session_count": len(answer_window_sessions),
+            "history_session_count": len(sessions),
+            "replayed_turn_pairs": replay_stats.turn_pairs_total,
+            "turn_pairs_with_stored_facts": replay_stats.stored_pairs,
+            "skipped_assistant_only_turns": replay_stats.skipped_assistant_only,
+            "orphan_user_chunks": replay_stats.orphan_user_chunks,
+            "reflect_runs": reflect_runs,
+            "db_path": str(db_path),
+            "db_counts": counts,
+            "recall_context_chars": len(memory_context or ""),
+            "recall_context": memory_context,
+            "requested_recall_path": recall_report.get("requested_recall_path", args.recall_path),
+            "actual_recall_path": recall_report.get("actual_recall_path", "unknown"),
+            "recall_status": recall_report.get("status", "empty"),
+            "store_total_elapsed_ms": float(store_operation_report.get("total_elapsed_ms") or 0.0),
+            "reflect_total_elapsed_ms": float(reflect_operation_report.get("total_elapsed_ms") or 0.0),
+            "recall_total_elapsed_ms": float(recall_operation_report.get("total_elapsed_ms") or 0.0),
+            "memory_total_elapsed_ms": round(
+                float(store_operation_report.get("total_elapsed_ms") or 0.0)
+                + float(reflect_operation_report.get("total_elapsed_ms") or 0.0)
+                + float(recall_operation_report.get("total_elapsed_ms") or 0.0),
+                2,
+            ),
+            "memory_operation_report": memory_operation_report,
+        }
+    finally:
+        if runtime is not None:
+            runtime.close()
 
 
 def answer_instance_from_memory_context(
@@ -1356,7 +1338,7 @@ def run_instance_memory_context_worker(
         embedding_config=embedding_config,
     )
     logging.info(
-        "[%s/%s] Finished %s: sessions=%s episodes=%s facts=%s states=%s actionable_items=%srecall_chars=%s",
+        "[%s/%s] Finished %s: sessions=%s episodes=%s facts=%s states=%s actionable_items=%s recall_chars=%s",
         index,
         total,
         question_id,
@@ -1373,37 +1355,67 @@ def run_instance_memory_context_worker(
 def write_jsonl_row(path: Path, row: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
+        handle.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
 def write_json_output(path: Path, rows: Iterable[Dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
-        json.dumps(list(rows), ensure_ascii=False, indent=2, default=str),
+        json.dumps(list(rows), ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+
+
+def load_completed_question_ids(path: Path) -> set[str]:
+    if not path.exists():
+        return set()
+
+    completed: set[str] = set()
+    with path.open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, 1):
+            text = line.strip()
+            if not text:
+                continue
+            try:
+                row = json.loads(text)
+            except json.JSONDecodeError as exc:
+                logging.warning(
+                    "Ignoring malformed resume output row %s in %s: %s",
+                    line_number,
+                    path,
+                    exc,
+                )
+                continue
+            question_id = str(row.get("question_id") or "").strip()
+            if question_id:
+                completed.add(question_id)
+    return completed
+
+
+def load_existing_detail_rows(path: Path) -> List[Dict[str, Any]]:
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        logging.warning("Ignoring malformed existing detail output %s: %s", path, exc)
+        return []
+    if not isinstance(data, list):
+        logging.warning("Ignoring non-list existing detail output %s", path)
+        return []
+    return [item for item in data if isinstance(item, dict)]
 
 
 def main() -> int:
     args = parse_args()
     resolve_llm_args(args)
     brief_output, detail_output = resolve_output_paths(args)
-    if args.existing_state_dir:
-        args.existing_state_dir = Path(args.existing_state_dir)
-        if not args.existing_state_dir.is_dir():
-            raise FileNotFoundError(
-                f"--existing-state-dir does not exist: {args.existing_state_dir}"
-            )
-        if args.existing_state_dir.resolve() == args.state_dir.resolve():
-            raise ValueError(
-                "--existing-state-dir must differ from --state-dir so existing "
-                "memory DBs are not removed with this run's outputs."
-            )
     remove_existing_outputs(
         output_path=brief_output,
         detail_output_path=detail_output,
         state_dir=args.state_dir,
         overwrite=bool(args.overwrite),
+        resume=bool(args.resume),
     )
     brief_output.parent.mkdir(parents=True, exist_ok=True)
     args.state_dir.mkdir(parents=True, exist_ok=True)
@@ -1416,8 +1428,49 @@ def main() -> int:
         start=int(args.start),
         limit=int(args.limit),
     )
+    selected_before_resume = len(selected)
+    completed_question_ids: set[str] = set()
+    existing_detail_rows: List[Dict[str, Any]] = []
+    if args.resume:
+        completed_question_ids = load_completed_question_ids(brief_output)
+        existing_detail_rows = [
+            row
+            for row in load_existing_detail_rows(detail_output)
+            if str(row.get("question_id") or "").strip() in completed_question_ids
+        ]
+        if completed_question_ids:
+            selected = [
+                item
+                for item in selected
+                if str(item.get("question_id") or "").strip() not in completed_question_ids
+            ]
+        logging.info(
+            "Resume mode enabled: loaded %s completed question_ids from %s; "
+            "%s/%s selected instances remain",
+            len(completed_question_ids),
+            brief_output,
+            len(selected),
+            selected_before_resume,
+        )
     if not selected:
-        raise RuntimeError("No LongMemEval instances selected")
+        summary = {
+            "input": str(args.input),
+            "output_root_dir": str(args.output_root_dir),
+            "output_dir": str(args.output_dir),
+            "output": str(brief_output),
+            "detail_output": str(detail_output),
+            "state_dir": str(args.state_dir),
+            "log_path": str(args.log_path),
+            "instances_requested": selected_before_resume,
+            "instances_skipped_completed": selected_before_resume - len(selected),
+            "instances_succeeded": 0,
+            "instances_failed": 0,
+            "resume": bool(args.resume),
+            "memory_prompt_language": args.memory_prompt_language,
+            "memory_output_language": args.memory_output_language,
+        }
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+        return 0
 
     (
         memory_runtime_config,
@@ -1429,7 +1482,7 @@ def main() -> int:
     failure_count = 0
     memory_results_by_index: Dict[int, Dict[str, Any]] = {}
     errors_by_index: Dict[int, Dict[str, str]] = {}
-    detail_rows: List[Dict[str, Any]] = []
+    detail_rows: List[Dict[str, Any]] = list(existing_detail_rows)
 
     workers = max(1, int(args.workers or 1))
     if workers > 1:
@@ -1502,7 +1555,7 @@ def main() -> int:
                 )
                 result = memory_results_by_index[index]
                 logging.info(
-                    "[%s/%s] Memory context ready for %s: sessions=%s episodes=%s facts=%s states=%s actionable_items=%srecall_chars=%s",
+                    "[%s/%s] Memory context ready for %s: sessions=%s episodes=%s facts=%s states=%s actionable_items=%s recall_chars=%s",
                     index,
                     len(selected),
                     question_id,
@@ -1585,11 +1638,13 @@ def main() -> int:
         "output": str(brief_output),
         "detail_output": str(detail_output),
         "state_dir": str(args.state_dir),
-        "existing_state_dir": str(args.existing_state_dir or ""),
         "log_path": str(args.log_path),
         "instances_requested": len(selected),
+        "instances_requested_before_resume": selected_before_resume,
+        "instances_skipped_completed": selected_before_resume - len(selected),
         "instances_succeeded": success_count,
         "instances_failed": failure_count,
+        "resume": bool(args.resume),
         "llm_model": args.llm_model,
         "reader_model": args.reader_model,
         "llm_thinking": args.llm_thinking,
@@ -1600,9 +1655,9 @@ def main() -> int:
         "recall_top_k": args.recall_top_k,
         "recall_budget": args.recall_budget,
         "recall_gate_mode": args.recall_gate_mode,
-        "recall_memory_source_override": list(args.recall_memory_source or []),
         "feedback_analysis_enabled": args.enable_feedback_analysis,
         "reflect_every_sessions": args.reflect_every_sessions,
+        "sessions_after_answer": args.sessions_after_answer,
         "fact_extraction_interval": args.fact_extraction_interval,
     }
     print(json.dumps(summary, ensure_ascii=False, indent=2))

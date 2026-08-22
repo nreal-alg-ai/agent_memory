@@ -37,7 +37,8 @@ if str(SRC_ROOT) not in sys.path:
 
 from memory.config import split_memory_config
 from memory.memory_runtime import MemoryRuntime
-from memory.mcp_server import MemoryMCPService, StdioMCPServer
+from mcp.mcp_server import MemoryMCPService, StdioMCPServer
+from voice.voice_runtime import VoiceRuntime
 
 
 _ENV_REF_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
@@ -101,20 +102,31 @@ def parse_args() -> argparse.Namespace:
 
 def build_service(args: argparse.Namespace) -> tuple[MemoryMCPService, logging.Logger]:
     config = load_config(args.config)
-    runtime_config, manager_config = split_memory_config(config)
+    memory_runtime_config, memory_manager_config, voice_runtime_config = split_memory_config(
+        config,
+        include_voice_runtime=True,
+    )
     logger = build_logger(args.log_path, args.log_level)
     try:
-        runtime = MemoryRuntime(
+        memory_runtime = MemoryRuntime(
             db_path=args.db_path,
-            memory_runtime_config=runtime_config,
-            memory_manager_config=manager_config,
+            memory_runtime_config=memory_runtime_config,
+            memory_manager_config=memory_manager_config,
             logger=logger,
         )
+        voice_logger = logger.getChild("voice")
+        voice_runtime = VoiceRuntime(
+            voice_runtime_config,
+            logger=voice_logger,
+        )
         return MemoryMCPService(
-            runtime,
+            memory_runtime,
+            voice_runtime,
             queue_timeout=args.queue_timeout,
         ), logger
     except Exception:
+        if "memory_runtime" in locals():
+            memory_runtime.close()
         raise
 
 
