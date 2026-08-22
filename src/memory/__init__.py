@@ -8,10 +8,13 @@ episodes -> facts -> states -> index entries.
 from .memory_database import SessionDB
 from .memory_manager import MemoryNodeManager, MemoryOperationReporter
 from .memory_runtime import MemoryRuntime
+from .mcp_server import MemoryMCPService, StdioMCPServer
 
 __all__ = [
     "MemoryNodeManager",
     "MemoryOperationReporter",
     "MemoryRuntime",
+    "MemoryMCPService",
+    "StdioMCPServer",
     "SessionDB",
 ]
