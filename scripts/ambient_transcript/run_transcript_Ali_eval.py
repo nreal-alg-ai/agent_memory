@@ -20,11 +20,9 @@ SRC = REPO_ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from memory.memory_database import SessionDB
 from memory.memory_manager import (
     DEFAULT_LLM_BASE_URL,
     DEFAULT_LLM_MODEL,
-    MemoryNodeManager,
     MemoryOperationReporter,
 )
 from memory.memory_runtime import MemoryRuntime
@@ -84,9 +82,9 @@ def main() -> None:
     (
         memory_runtime_config,
         memory_manager_config,
-        llm_config,
-        embedding_config,
     ) = split_memory_config(config)
+    llm_config = memory_manager_config["llm"]
+    embedding_config = memory_manager_config["embedding"]
     if args.disable_llm:
         llm_config["llm_api_key"] = ""
     if args.max_segments_per_episode:
@@ -129,18 +127,12 @@ def main() -> None:
     llm_config["llm_api_key"] = args.llm_api_key or llm_config.get("llm_api_key") or ""
     llm_config["llm_api_key"] = expand_env_refs(llm_config["llm_api_key"])
 
-    db = SessionDB(db_path)
     operation_reporter = MemoryOperationReporter()
-    manager = MemoryNodeManager(
-        db,
-        embedding_config=embedding_config,
-        memory_manager_config=memory_manager_config,
-        llm_config=llm_config,
-        operation_reporter=operation_reporter,
-    )
     runtime = MemoryRuntime(
-        manager,
+        db_path=db_path,
         memory_runtime_config=memory_runtime_config,
+        memory_manager_config=memory_manager_config,
+        operation_reporter=operation_reporter,
         logger=memory_logger,
     )
 
@@ -208,7 +200,7 @@ def main() -> None:
     }
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     logging.info("Wrote report: %s", report_path)
-    db.close()
+    runtime.close()
     memory_logger.removeHandler(memory_log_handler)
     memory_log_handler.close()
     print(json.dumps(report, ensure_ascii=False, indent=2))

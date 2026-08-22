@@ -443,16 +443,22 @@ class MemoryNodeManager:
         *,
         embedding_config: Optional[Dict[str, Any]] = None,
         memory_manager_config: Optional[Dict[str, Any]] = None,
-        llm_config: Optional[Dict[str, Any]] = None,
         operation_reporter: Optional[MemoryOperationReporter] = None,
         logger: Optional[logging.Logger] = None,
     ) -> None:
         self._db = db
         self._logger = logger or logging.getLogger(__name__)
         self._operation_reporter = operation_reporter or MemoryOperationReporter()
-        self._embedding_cfg = dict(embedding_config or {})
         self._memory_cfg = dict(memory_manager_config or {})
-        self._llm_cfg = dict(llm_config or {})
+        configured_embedding = self._memory_cfg.get("embedding")
+        self._embedding_cfg = dict(
+            embedding_config
+            or (configured_embedding if isinstance(configured_embedding, dict) else {})
+        )
+        configured_llm = self._memory_cfg.get("llm")
+        self._llm_cfg = dict(
+            configured_llm if isinstance(configured_llm, dict) else {}
+        )
         self._llm_model = str(self._llm_cfg.get("llm_name") or DEFAULT_LLM_MODEL)
         self._llm_base_url = self._normalize_llm_base_url(
             str(self._llm_cfg.get("llm_base_url") or DEFAULT_LLM_BASE_URL)

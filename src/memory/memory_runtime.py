@@ -8,563 +8,129 @@ turns or transcript segments into the manager's raw episode segments.
 from __future__ import annotations
 
 import logging
-import time
 import re
-import math
-from collections import deque
-from dataclasses import dataclass
-from datetime import datetime
+from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
 from .embedding_client import EmbeddingClient
-from .utils import _as_embedding_vector, _cal_embedding_cosine_similarity, _sigmoid, _centroid, _cohesion
+from .memory_database import SessionDB
 
 from .memory_manager import (
+    MemoryOperationReporter,
     MemoryNodeManager,
     _compact_whitespace,
     _now_text,
     _to_timestamp_text,
 )
+from .memory_segmentation import (
+    OnlineSemanticSegmenter,
+    build_online_segmentation_config,
+    convert_interaction_turn_to_online_exchange
+)
 
 INTERACTION_TOKEN_RE = re.compile(r"[\u4e00-\u9fff]|[A-Za-z0-9_.$'-]+|[^\s]")
 
-
-@dataclass
-class SegmentDecision:
-    exchange_index: int
-    reason: str
-    cut_probability: Optional[float] = None
-    score: Optional[float] = None
-    semantic_surprise: Optional[float] = None
-    robust_surprise: Optional[float] = None
-    absolute_surprise: Optional[float] = None
-    cohesion_before: Optional[float] = None
-    cohesion_after: Optional[float] = None
-    cohesion_drop: Optional[float] = None
-    length_signal: Optional[float] = None
-    turn_signal: Optional[float] = None
-    centroid_similarity: Optional[float] = None
-    recent_similarity: Optional[float] = None
-    prospective_tokens: Optional[int] = None
-    prospective_exchanges: Optional[int] = None
-    time_gap_seconds: Optional[float] = None
-
-
-@dataclass
-class OnlineSegmentExchange:
-    index: int
-    text: str
-    token_count: int
-    timestamp: str = ""
-    raw: Optional[Dict[str, Any]] = None
-
-
-@dataclass
-class ActiveExchange:
-    exchange: Any
-    embedding: np.ndarray
-
-
-@dataclass
-class OnlineSegmentationConfig:
-    threshold: float = 0.60
-    bias: float = -1.10
-    surprise_history_window: int = 64
-    min_surprise_history: int = 5
-    robust_surprise_weight: float = 0.8
-    absolute_surprise_weight: float = 0.8
-    cohesion_drop_weight: float = 1.0
-    length_weight: float = 0.40
-    turn_count_weight: float = 0.40
-    max_pending_turns: int = 0
-    max_pending_tokens: int = 500
-    min_pending_tokens: int = 100
-    min_pending_turns: int = 2
-    min_segment_override_probability: float = 0.90
-    max_time_gap_seconds: float = -1.0
-
-
-def _estimate_interaction_token_count(text: str) -> int:
-    return max(1, len(INTERACTION_TOKEN_RE.findall(str(text or ""))))
-
-
-def _exchange_text_from_turn(turn: Dict[str, Any]) -> str:
-    user_text = _compact_whitespace(turn.get("user_message") or "")
-    assistant_text = _compact_whitespace(turn.get("assistant_response") or "")
-    return f"用户：{user_text}\n助手：{assistant_text}".strip()
-
-def _clipped(value: float, low: float, high: float) -> float:
-    return min(high, max(low, value))
-
-
-def robust_surprise_signal(
-    surprise: float,
-    history: Sequence[float],
-    min_history: int,
-) -> float:
-    required_history = max(1, int(min_history))
-    if len(history) < required_history:
-        return 0.0
-    values = np.asarray(list(history), dtype=np.float32)
-    median = float(np.median(values))
-    mad = float(np.median(np.abs(values - median)))
-    scale = max(1e-6, mad)
-    return _clipped((surprise - median) / scale, -2.0, 4.0)
-
-
-def absolute_surprise_signal(surprise: float) -> float:
-    return _clipped((surprise - 0.20) / 0.14, -1.0, 2.5)
-
-
-def _linear(value: float, start: float, end: float, low: float, high: float) -> float:
-    if end <= start:
-        return high
-    ratio = _clipped((value - start) / (end - start), 0.0, 1.0)
-    return low + ratio * (high - low)
-
-
-def length_pressure(token_count: int, config: OnlineSegmentationConfig) -> float:
-    min_tokens = max(1, int(config.min_pending_tokens))
-    max_tokens = max(min_tokens + 1, int(config.max_pending_tokens))
-    length = float(max(0, token_count))
-    early_boundary = 0.7 * min_tokens
-
-    if length < early_boundary:
-        return -1.30
-    if length < min_tokens:
-        return _linear(length, early_boundary, min_tokens, -0.80, 0.0)
-    if length < max_tokens:
-        return _linear(length, min_tokens, max_tokens, 0.45, 2.80)
-    return 3.00
-
-
-def turn_count_pressure(exchange_count: int) -> float:
-    count = max(1, int(exchange_count))
-    if count == 1:
-        return -0.85
-    if count == 2:
-        return -0.15
-    if count == 3:
-        return 0.15
-    return min(1.0, 0.30 + 0.15 * (count - 4))
-
-
-class OnlineSemanticSegmenter:
-    """Embedding-based online semantic boundary detector for dialogue exchanges."""
-
-    def __init__(
-        self,
-        embedding_client: EmbeddingClient,
-        config: Optional[OnlineSegmentationConfig] = None,
-    ) -> None:
-        self.embedding_client = embedding_client
-        self.config = config or OnlineSegmentationConfig()
-        self.surprise_history: Deque[float] = deque(
-            maxlen=max(1, self.config.surprise_history_window),
-        )
-        self._pending_online_exchanges: List[OnlineSegmentExchange] = []
-        self._pending_online_exchanges_embedding: List[np.ndarray] = []
-        self._prepared_incoming_embedding: Optional[
-            Tuple[OnlineSegmentExchange, np.ndarray]
-        ] = None
-
-    def append_pending_exchange(self, exchange: OnlineSegmentExchange) -> None:
-        """Append an exchange to the segmenter's pending online buffer."""
-        embedding: Optional[np.ndarray] = None
-        if (
-            self._prepared_incoming_embedding is not None
-            and self._prepared_incoming_embedding[0] is exchange
-        ):
-            embedding = self._prepared_incoming_embedding[1]
-        elif self._prepared_incoming_embedding is not None:
-            self._prepared_incoming_embedding = None
-        if embedding is None:
-            embedding = self.embed_exchange(exchange).embedding
-        self._pending_online_exchanges.append(exchange)
-        self._pending_online_exchanges_embedding.append(embedding)
-        self._prepared_incoming_embedding = None
-
-    def pending_exchange_snapshot(self) -> List[OnlineSegmentExchange]:
-        """Return a shallow copy of the current pending online exchanges."""
-        return list(self._pending_online_exchanges)
-
-    def has_pending_exchanges(self) -> bool:
-        """Return whether the segmenter has exchanges waiting for storage."""
-        return bool(self._pending_online_exchanges)
-
-    def clear_pending_exchanges(self) -> None:
-        """Clear exchanges after the corresponding memory task was queued."""
-        self._pending_online_exchanges.clear()
-        self._pending_online_exchanges_embedding.clear()
-
-    def embed_exchange(self, exchange: Any) -> ActiveExchange:
-        embedding = self.embedding_client.embed_text(self.exchange_text(exchange))
-        vector = _as_embedding_vector(embedding)
-        if vector is None:
-            raise ValueError("Embedding provider returned an invalid vector")
-        return ActiveExchange(exchange=exchange, embedding=vector)
-
-    def should_finalize_pending_exchanges(
-        self,
-        incoming_exchange: Any,
-    ) -> Tuple[bool, SegmentDecision]:
-        active_exchanges = self._pending_online_exchanges
-        time_gap_seconds = (
-            self.exchange_time_gap_seconds(active_exchanges[-1], incoming_exchange)
-            if active_exchanges
-            else None
-        )
-        if not active_exchanges:
-            decision = SegmentDecision(
-                exchange_index=self.exchange_index(incoming_exchange),
-                reason="start_segment",
-                prospective_tokens=self.exchange_token_count(incoming_exchange),
-                prospective_exchanges=1,
-                time_gap_seconds=time_gap_seconds,
-            )
-            return False, decision
-        existing_capacity_reason = self._pending_capacity_reason(active_exchanges)
-        if existing_capacity_reason:
-            return True, SegmentDecision(
-                exchange_index=self.exchange_index(incoming_exchange),
-                reason=existing_capacity_reason,
-                prospective_tokens=sum(
-                    self.exchange_token_count(item) for item in active_exchanges
-                ),
-                prospective_exchanges=len(active_exchanges),
-                time_gap_seconds=time_gap_seconds,
-            )
-        if self.time_gap_exceeded(time_gap_seconds):
-            return True, SegmentDecision(
-                exchange_index=self.exchange_index(incoming_exchange),
-                reason="time_gap",
-                prospective_tokens=sum(
-                    self.exchange_token_count(item) for item in active_exchanges
-                ),
-                prospective_exchanges=len(active_exchanges),
-                time_gap_seconds=time_gap_seconds,
-            )
-        active = [
-            ActiveExchange(exchange=exchange, embedding=embedding)
-            for exchange, embedding in zip(
-                active_exchanges,
-                self._pending_online_exchanges_embedding,
-            )
-        ]
-        incoming = self.embed_exchange(incoming_exchange)
-        self._prepared_incoming_embedding = (
-            incoming_exchange,
-            incoming.embedding,
-        )
-        decision = self.score_boundary(active, incoming)
-        decision.time_gap_seconds = time_gap_seconds
-        if self.semantic_boundary_allowed(active, decision):
-            decision.reason = "semantic_boundary"
-            return True, decision
-        decision.reason = "append"
-        return False, decision
-
-    def _pending_capacity_reason(
-        self,
-        exchanges: Sequence[Any],
-    ) -> Optional[str]:
-        """Return the pending turn or character hard-limit reason."""
-        if not exchanges:
-            return None
-        if (
-            self.config.max_pending_turns > 0
-            and len(exchanges) >= self.config.max_pending_turns
-        ):
-            return "pending_turn_limit"
-        token_count = sum(self.exchange_token_count(exchange) for exchange in exchanges)
-        if (
-            self.config.max_pending_tokens > 0
-            and token_count >= self.config.max_pending_tokens
-        ):
-            return "pending_token_limit"
-        return None
-
-    def score_boundary(
-        self,
-        active: Sequence[ActiveExchange],
-        incoming: ActiveExchange,
-    ) -> SegmentDecision:
-        active_embeddings = [item.embedding for item in active]
-        active_centroid = _centroid(active_embeddings)
-        recent_embedding = active[-1].embedding
-        centroid_sim = _cal_embedding_cosine_similarity(incoming.embedding, active_centroid)
-        recent_sim = _cal_embedding_cosine_similarity(incoming.embedding, recent_embedding)
-        semantic_surprise = 1.0 - max(centroid_sim, recent_sim)
-
-        robust_surprise = robust_surprise_signal(
-            semantic_surprise,
-            list(self.surprise_history),
-            self.config.min_surprise_history,
-        )
-        absolute_surprise = absolute_surprise_signal(semantic_surprise)
-
-        cohesion_before = _cohesion(active_embeddings)
-        cohesion_after = _cohesion([*active_embeddings, incoming.embedding])
-        cohesion_drop = max(0.0, cohesion_before - cohesion_after)
-        prospective_tokens = sum(self.exchange_token_count(item.exchange) for item in active) + self.exchange_token_count(incoming.exchange)
-        prospective_exchanges = len(active) + 1
-        length_signal = length_pressure(prospective_tokens, self.config)
-        turn_signal = turn_count_pressure(prospective_exchanges)
-        score = (
-            self.config.robust_surprise_weight * robust_surprise
-            + self.config.absolute_surprise_weight * absolute_surprise
-            + self.config.cohesion_drop_weight * cohesion_drop
-            + self.config.length_weight * length_signal
-            + self.config.turn_count_weight * turn_signal
-        )
-        cut_probability = _sigmoid(self.config.bias + score)
-        self.surprise_history.append(float(semantic_surprise))
-
-        return SegmentDecision(
-            exchange_index=self.exchange_index(incoming.exchange),
-            reason="score",
-            cut_probability=cut_probability,
-            score=score,
-            semantic_surprise=semantic_surprise,
-            robust_surprise=robust_surprise,
-            absolute_surprise=absolute_surprise,
-            cohesion_before=cohesion_before,
-            cohesion_after=cohesion_after,
-            cohesion_drop=cohesion_drop,
-            length_signal=length_signal,
-            turn_signal=turn_signal,
-            centroid_similarity=centroid_sim,
-            recent_similarity=recent_sim,
-            prospective_tokens=prospective_tokens,
-            prospective_exchanges=prospective_exchanges,
-        )
-
-    def semantic_boundary_allowed(
-        self,
-        active: Sequence[ActiveExchange],
-        decision: SegmentDecision,
-    ) -> bool:
-        if (decision.cut_probability or 0.0) < self.config.threshold:
-            return False
-        min_exchanges = max(1, int(self.config.min_pending_turns))
-        if len(active) >= min_exchanges:
-            return True
-        return (decision.cut_probability or 0.0) >= float(
-            self.config.min_segment_override_probability,
-        )
-
-    def time_gap_exceeded(self, time_gap_seconds: Optional[float]) -> bool:
-        return bool(
-            self.config.max_time_gap_seconds >= 0
-            and time_gap_seconds is not None
-            and time_gap_seconds > self.config.max_time_gap_seconds
-        )
-
-    @staticmethod
-    def exchange_text(exchange: Any) -> str:
-        return str(getattr(exchange, "text", "") or "")
-
-    @staticmethod
-    def exchange_token_count(exchange: Any) -> int:
-        value = getattr(exchange, "token_count", None)
-        if value is not None:
-            return max(1, int(value))
-        return _estimate_interaction_token_count(OnlineSemanticSegmenter.exchange_text(exchange))
-
-    @staticmethod
-    def exchange_index(exchange: Any) -> int:
-        return int(getattr(exchange, "index", 0) or 0)
-
-    @staticmethod
-    def exchange_timestamp(exchange: Any) -> str:
-        return _to_timestamp_text(getattr(exchange, "timestamp", "")) or ""
-
-    @classmethod
-    def exchange_time_gap_seconds(
-        cls,
-        previous_exchange: Any,
-        incoming_exchange: Any,
-    ) -> Optional[float]:
-        return cls.timestamp_gap_seconds(
-            cls.exchange_timestamp(previous_exchange),
-            cls.exchange_timestamp(incoming_exchange),
-        )
-
-    @staticmethod
-    def timestamp_gap_seconds(
-        previous_end: Any,
-        current_start: Any,
-    ) -> Optional[float]:
-        """Return the gap between two timestamp values, if both are valid."""
-        if not previous_end or not current_start:
-            return None
-        try:
-            previous = datetime.fromisoformat(
-                str(previous_end).replace("Z", "+00:00"),
-            )
-            current = datetime.fromisoformat(
-                str(current_start).replace("Z", "+00:00"),
-            )
-        except ValueError:
-            return None
-        return (current - previous).total_seconds()
 
 class MemoryRuntime:
     """Normalize application input and batch it before episode storage."""
 
     def __init__(
         self,
-        manager: MemoryNodeManager,
         *,
+        db_path: Path | str,
         memory_runtime_config: Optional[Dict[str, Any]] = None,
-        embedding_config: Optional[Dict[str, Any]] = None,
-        embedding_client: Optional[EmbeddingClient] = None,
+        memory_manager_config: Optional[Dict[str, Any]] = None,
+        operation_reporter: Optional[MemoryOperationReporter] = None,
         logger: Optional[logging.Logger] = None,
     ) -> None:
-        """Initialize the runtime buffers and batching thresholds."""
-        self._manager = manager
+        """Initialize memory storage, manager, and runtime batching.
+
+        Application-facing callers provide ``db_path`` and the two memory
+        config mappings. The runtime owns the ``SessionDB``, embedding client,
+        and standard ``MemoryNodeManager`` lifecycle.
+        """
+        manager_config = dict(memory_manager_config or {})
+        configured_embedding = manager_config.get("embedding")
+        embedding_config = (
+            dict(configured_embedding)
+            if isinstance(configured_embedding, dict)
+            else {}
+        )
+
+        database = SessionDB(Path(db_path).expanduser().resolve())
+        try:
+            manager = MemoryNodeManager(
+                database,
+                embedding_config=dict(embedding_config or {}),
+                memory_manager_config=manager_config,
+                operation_reporter=operation_reporter,
+                logger=logger,
+            )
+        except Exception:
+            database.close()
+            raise
+        self._memory_database = database
+        self._memory_manager = manager
         self._logger = logger or logging.getLogger(__name__)
         if logger is not None:
-            self._manager.set_logger(logger)
-        config = dict(memory_runtime_config or {})
+            self._memory_manager.set_logger(logger)
+        runtime_config = dict(memory_runtime_config or {})
         self._prompt_language_mode = str(
-            config.get("memory_prompt_language_mode")
+            runtime_config.get("memory_prompt_language_mode")
             or "source"
         ).strip().lower()
-        self._embedding_client = embedding_client or EmbeddingClient(
+        self._embedding_client = EmbeddingClient(
             dict(embedding_config or getattr(manager, "_embedding_cfg", {}) or {}),
         )
-        if hasattr(self._manager, "set_embedding_client"):
-            self._manager.set_embedding_client(self._embedding_client)
-        interaction_segmentation_config = self._build_online_segmentation_config(config)
+        if hasattr(self._memory_manager, "set_embedding_client"):
+            self._memory_manager.set_embedding_client(self._embedding_client)
+        interaction_segmentation_config = build_online_segmentation_config(runtime_config)
         self._interaction_segmenter = OnlineSemanticSegmenter(
             self._embedding_client,
             interaction_segmentation_config,
         )
         self._transcript_episode_max_segments = max(
             1,
-            int(config.get("transcript_episode_max_segments") or 80),
+            int(runtime_config.get("transcript_episode_max_segments") or 80),
         )
         self._transcript_episode_max_chars = max(
             1,
-            int(config.get("transcript_episode_max_chars") or 12000),
+            int(runtime_config.get("transcript_episode_max_chars") or 12000),
         )
-        transcript_gap_seconds = config.get("transcript_episode_max_gap_seconds")
+        transcript_gap_seconds = runtime_config.get("transcript_episode_max_gap_seconds")
         self._transcript_episode_max_gap_seconds = float(
             60.0 if transcript_gap_seconds is None else transcript_gap_seconds
         )
         self._pending_transcript_segments: List[Dict[str, Any]] = []
         self._pending_transcript_context: Optional[Dict[str, Any]] = None
 
-    def _build_online_segmentation_config(
-        self,
-        config: Dict[str, Any],
-    ) -> OnlineSegmentationConfig:
-        """Build the assistant-wakeup segmentation config from runtime config.
+    def close(self, timeout: Optional[float] = 30.0) -> None:
+        """Drain owned tasks and release resources created by this runtime."""
+        try:
+            self.flush_task_queue(timeout=timeout)
+        finally:
+            try:
+                self._memory_manager.shutdown_task_worker(
+                    wait=True,
+                    timeout=timeout,
+                )
+            finally:
+                if self._memory_database is not None:
+                    self._memory_database.close()
 
-        ``memory_runtime`` contains separate configurations for assistant
-        wakeup and all-day recording.  The interaction segmenter currently
-        consumes only ``assistant_wakeup_segmentation``; the all-day recording
-        configuration remains reserved for the transcript pipeline.
-        """
-        segmentation_config = config.get("assistant_wakeup_segmentation")
-        if not isinstance(segmentation_config, dict):
-            segmentation_config = {}
-        max_gap = segmentation_config.get("max_time_gap_seconds")
-        return OnlineSegmentationConfig(
-            threshold=self._config_float(segmentation_config, "threshold", 0.60),
-            bias=self._config_float(segmentation_config, "bias", -1.10),
-            surprise_history_window=max(
-                1,
-                self._config_int(segmentation_config, "surprise_history_window", 64),
-            ),
-            min_surprise_history=max(
-                0,
-                self._config_int(segmentation_config, "min_surprise_history", 5),
-            ),
-            robust_surprise_weight=self._config_float(
-                segmentation_config,
-                "robust_surprise_weight",
-                0.8,
-            ),
-            absolute_surprise_weight=self._config_float(
-                segmentation_config,
-                "absolute_surprise_weight",
-                0.8,
-            ),
-            cohesion_drop_weight=self._config_float(
-                segmentation_config,
-                "cohesion_drop_weight",
-                1.0,
-            ),
-            length_weight=self._config_float(segmentation_config, "length_weight", 0.40),
-            turn_count_weight=self._config_float(
-                segmentation_config,
-                "turn_count_weight",
-                0.40,
-            ),
-            max_pending_turns=max(
-                1,
-                self._config_int(
-                    segmentation_config,
-                    "max_pending_interaction_turns",
-                    5,
-                ),
-            ),
-            max_pending_tokens=max(
-                1,
-                self._config_int(
-                    segmentation_config,
-                    "max_pending_interaction_tokens",
-                    500,
-                ),
-            ),
-            min_pending_tokens=max(
-                1,
-                self._config_int(segmentation_config, "min_pending_interaction_tokens", 100),
-            ),
-            min_pending_turns=max(
-                1,
-                self._config_int(segmentation_config, "min_pending_interaction_turns", 2),
-            ),
-            min_segment_override_probability=self._config_float(
-                segmentation_config,
-                "min_segment_override_probability",
-                0.90,
-            ),
-            max_time_gap_seconds=float(-1.0 if max_gap in (None, "") else max_gap),
-        )
+    @property
+    def manager(self) -> MemoryNodeManager:
+        """Return the manager owned by this runtime for diagnostics/adapters."""
+        return self._memory_manager
 
-    @staticmethod
-    def _config_int(config: Dict[str, Any], key: str, default: int) -> int:
-        value = config.get(key)
-        if value in (None, ""):
-            return int(default)
-        return int(value)
-
-    @staticmethod
-    def _config_float(config: Dict[str, Any], key: str, default: float) -> float:
-        value = config.get(key)
-        if value in (None, ""):
-            return float(default)
-        return float(value)
-
-    @staticmethod
-    def _interaction_turn_to_online_exchange(
-        turn: Dict[str, Any],
-        index: int,
-    ) -> OnlineSegmentExchange:
-        text = _exchange_text_from_turn(turn)
-        timestamp = _to_timestamp_text(turn.get("turn_timestamp")) or ""
-        return OnlineSegmentExchange(
-            index=index,
-            text=text,
-            token_count=_estimate_interaction_token_count(text),
-            timestamp=timestamp,
-            raw=dict(turn),
-        )
+    @property
+    def database(self) -> SessionDB:
+        """Return the database used by the owned manager."""
+        if self._memory_database is not None:
+            return self._memory_database
+        return self._memory_manager._db
 
     def accept_single_interaction_turn(
         self,
@@ -576,7 +142,7 @@ class MemoryRuntime:
         **extra: Any,
     ) -> Dict[str, Any]:
         """Buffer one interaction and store a complete batch when due."""
-        if not self._manager.enabled:
+        if not self._memory_manager.enabled:
             return {"queued": False, "reason": "memory_disabled"}
         if turn_timestamp is None:
             turn_timestamp = extra.get("timestamp")
@@ -592,7 +158,7 @@ class MemoryRuntime:
         queued = False
         reason = "threshold_not_reached"
         pending_exchanges = self._interaction_segmenter.pending_exchange_snapshot()
-        incoming_exchange = self._interaction_turn_to_online_exchange(
+        incoming_exchange = convert_interaction_turn_to_online_exchange(
             turn,
             len(pending_exchanges) + 1,
         )
@@ -636,7 +202,7 @@ class MemoryRuntime:
         tags: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """Buffer one transcript segment and queue completed transcript episodes."""
-        if not self._manager.enabled:
+        if not self._memory_manager.enabled:
             return {"queued": False, "reason": "memory_disabled"}
         if not isinstance(segment, dict):
             return {"queued": False, "reason": "invalid_segment"}
@@ -706,7 +272,7 @@ class MemoryRuntime:
         interaction_flush_report = self._flush_pending_interaction_turns()
         transcript_flush_report = self._flush_pending_transcript_segments()
 
-        report = self._manager.submit_memory_reflect_task(*args, **kwargs) or {}
+        report = self._memory_manager.submit_memory_reflect_task(*args, **kwargs) or {}
         report["pending_interaction_flush"] = interaction_flush_report
         report["pending_transcript_flush"] = transcript_flush_report
         
@@ -721,7 +287,7 @@ class MemoryRuntime:
             kwargs["prompt_language"] = self._resolve_prompt_language_from_segments(
                 [{"text": str(query or "")}]
             )
-        return self._manager.process_memory_recall_immediately(*args, **kwargs)
+        return self._memory_manager.process_memory_recall_immediately(*args, **kwargs)
 
     def flush_task_queue(self, timeout: Optional[float] = None) -> bool:
         """Wait for queued store and reflection tasks at an explicit boundary."""
@@ -729,7 +295,7 @@ class MemoryRuntime:
             self._flush_pending_interaction_turns()
         if self._pending_transcript_segments:
             self._flush_pending_transcript_segments()
-        return self._manager.flush_task_queue(timeout=timeout)
+        return self._memory_manager.flush_task_queue(timeout=timeout)
 
     def get_pending_interaction_turns(self) -> List[Dict[str, Any]]:
         """Return raw turns currently held by the interaction segmenter."""
@@ -750,7 +316,7 @@ class MemoryRuntime:
             prompt_language,
         ) = self._normalize_interaction_turns_to_memory_raw_segments(turns)
         tags = sorted({tag for turn in turns for tag in turn.get("tags", [])})
-        return self._manager.submit_memory_store_task(
+        return self._memory_manager.submit_memory_store_task(
             raw_segments=raw_segments,
             source_type="assistant_wakeup",
             tags=tags,
@@ -776,7 +342,7 @@ class MemoryRuntime:
                 for tag in segment.get("tags") or []
                 if tag is not None and str(tag).strip()
             )
-        return self._manager.submit_memory_store_task(
+        return self._memory_manager.submit_memory_store_task(
             raw_segments=list(raw_segments),
             source_type=str(context.get("source_type") or "allday_recording"),
             tags=sorted(tags),

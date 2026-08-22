@@ -323,9 +323,7 @@ def round_float(value: Optional[float], digits: int = 6) -> Optional[float]:
 
 
 def build_segmentation_config(args: argparse.Namespace) -> OnlineSegmentationConfig:
-    runtime_config, _manager_config, _llm_config, _embedding_config = split_memory_config(
-        load_project_config(args.config)
-    )
+    runtime_config, _manager_config = split_memory_config(load_project_config(args.config))
     segmentation_config = runtime_config.get("assistant_wakeup_segmentation")
     if not isinstance(segmentation_config, dict):
         segmentation_config = {}
@@ -375,9 +373,8 @@ def build_segmentation_config(args: argparse.Namespace) -> OnlineSegmentationCon
 
 
 def build_embedding_config(args: argparse.Namespace) -> Dict[str, Any]:
-    _runtime_config, _manager_config, _llm_config, embedding_config = split_memory_config(
-        load_project_config(args.config)
-    )
+    _runtime_config, manager_config = split_memory_config(load_project_config(args.config))
+    embedding_config = manager_config["embedding"]
     overrides = {
         "provider": args.embedding_provider,
         "model": args.embedding_model,

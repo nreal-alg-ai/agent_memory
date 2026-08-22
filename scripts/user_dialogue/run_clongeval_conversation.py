@@ -12,9 +12,8 @@ CLongEval conversation records are JSONL objects with this shape::
 
 The same context is often reused by several questions. This runner groups
 records by exact context, replays each context into one isolated memory DB,
-and then runs all of that context's questions against the same manager. It
-uses the project config.yaml and the StoreFactExtractionManager test adapter
-so memory extraction behavior stays aligned with the existing store test.
+and then runs all of that context's questions against the same memory runtime.
+It uses the project config.yaml for the shared runtime and manager settings.
 """
 
 from __future__ import annotations
@@ -39,12 +38,10 @@ for import_root in (SRC_ROOT, REPO_ROOT, SCRIPT_ROOT):
     if str(import_root) not in sys.path:
         sys.path.insert(0, str(import_root))
 
-from memory.memory_database import SessionDB
 from memory.memory_manager import MemoryOperationReporter
 from memory.memory_runtime import MemoryRuntime
 from memory.config import split_memory_config
 from test_memory_store_fact_extraction import (
-    StoreFactExtractionManager,
     configure_logging,
     load_project_config,
     log_memory_index_state,
@@ -317,7 +314,7 @@ def group_records_by_context(
     return list(grouped.items())
 
 
-def db_counts(db: SessionDB) -> Dict[str, int]:
+def db_counts(db: Any) -> Dict[str, int]:
     counts: Dict[str, int] = {}
     for table in (
         "memory_episodes",
@@ -333,7 +330,7 @@ def db_counts(db: SessionDB) -> Dict[str, int]:
 def replay_context_into_memory(
     *,
     runtime: MemoryRuntime,
-    db: SessionDB,
+    db: Any,
     days: Sequence[Dict[str, Any]],
     group_id: str,
     enable_reflect: bool,
@@ -447,7 +444,7 @@ def build_reader_prompt(query: str, memory_context: str) -> str:
     )
 
 
-def run_reader(manager: StoreFactExtractionManager, query: str, memory_context: str, max_chars: int) -> str:
+def run_reader(manager: Any, query: str, memory_context: str, max_chars: int) -> str:
     if not memory_context.strip():
         return ""
     raw = manager._call_llm(
@@ -464,7 +461,9 @@ def prepare_runtime(
 ) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
     resolve_llm_args(args)
     config = load_project_config(args.config)
-    memory_runtime_config, memory_manager_config, llm_config, embedding_config = split_memory_config(config)
+    memory_runtime_config, memory_manager_config = split_memory_config(config)
+    llm_config = memory_manager_config["llm"]
+    embedding_config = memory_manager_config["embedding"]
     if args.llm_thinking is None:
         args.llm_thinking = str(llm_config.get("llm_thinking") or "disabled")
     if args.llm_json_mode is None:
@@ -621,10 +620,10 @@ def process_context_group(
         len(context),
     )
     days = [] if reused_existing_db else parse_context_days(context)
-    db = SessionDB(db_path)
     context_log_handler = add_context_log_handler(context_log_path)
     memory_logger: Optional[logging.Logger] = None
     memory_log_handler: Optional[logging.Handler] = None
+    runtime: Optional[MemoryRuntime] = None
     results: List[Dict[str, Any]] = []
     try:
         memory_logger, memory_log_handler = configure_memory_logger(
@@ -642,22 +641,15 @@ def process_context_group(
             db_path,
         )
         operation_reporter = MemoryOperationReporter()
-        manager = StoreFactExtractionManager(
-            db,
-            embedding_config=embedding_config,
-            memory_manager_config=memory_manager_config,
-            llm_config=llm_config,
-            operation_reporter=operation_reporter,
-            report_rows=[],
-            llm_max_tokens=args.llm_max_tokens,
-            llm_thinking=args.llm_thinking or "disabled",
-            llm_json_mode=args.llm_json_mode,
-        )
         runtime = MemoryRuntime(
-            manager,
+            db_path=db_path,
             memory_runtime_config=memory_runtime_config,
+            memory_manager_config=memory_manager_config,
+            operation_reporter=operation_reporter,
             logger=memory_logger,
         )
+        db = runtime.database
+        manager = runtime.manager
         if not args.skip_embedding_validation:
             validate_embedding_runtime(manager, db, embedding_config)
         log_memory_index_state(db, f"before_context:{group_id}")
@@ -782,8 +774,9 @@ def process_context_group(
             "results": results,
         }
     finally:
-        log_memory_index_state(db, f"finished_context:{group_id}")
-        db.close()
+        if runtime is not None:
+            log_memory_index_state(runtime.database, f"finished_context:{group_id}")
+            runtime.close()
         remove_memory_logger_handler(memory_logger, memory_log_handler)
         remove_context_log_handler(context_log_handler)
 

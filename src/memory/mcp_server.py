@@ -14,8 +14,6 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, TextIO
 
-from .memory_database import SessionDB
-from .memory_manager import MemoryNodeManager
 from .memory_runtime import MemoryRuntime
 
 
@@ -65,14 +63,10 @@ class MemoryMCPService:
     def __init__(
         self,
         runtime: MemoryRuntime,
-        manager: MemoryNodeManager,
-        database: SessionDB,
         *,
         queue_timeout: float = 30.0,
     ) -> None:
         self.runtime = runtime
-        self.manager = manager
-        self.database = database
         self.queue_timeout = max(0.0, float(queue_timeout))
 
     def accept_single_interaction_turn(
@@ -165,16 +159,7 @@ class MemoryMCPService:
 
     def close(self) -> None:
         """Drain queued writes and release the database/worker resources."""
-        try:
-            self.runtime.flush_task_queue(timeout=self.queue_timeout)
-        finally:
-            try:
-                self.manager.shutdown_task_worker(
-                    wait=True,
-                    timeout=self.queue_timeout,
-                )
-            finally:
-                self.database.close()
+        self.runtime.close(timeout=self.queue_timeout)
 
 
 TOOLS: List[Dict[str, Any]] = [

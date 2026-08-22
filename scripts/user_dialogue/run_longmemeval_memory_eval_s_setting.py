@@ -37,14 +37,12 @@ for import_root in (SRC_ROOT, REPO_ROOT):
 from memory.memory_manager import (
     DEFAULT_LLM_BASE_URL,
     DEFAULT_LLM_MODEL,
-    MemoryNodeManager,
     MemoryOperationReporter,
 )
 from memory.memory_runtime import MemoryRuntime
 from memory.config import split_memory_config
 from memory.utils import _as_embedding_vector
 import memory.memory_database as memory_database_module
-from memory.memory_database import SessionDB
 
 
 _READER_HTTP_SESSION: Optional[requests.Session] = None
@@ -298,7 +296,8 @@ def _expand_env_refs(value: Any) -> Any:
 def resolve_llm_args(args: argparse.Namespace) -> None:
     config = load_project_config(args.config)
     model_config = config.get("model", {}) if isinstance(config.get("model"), dict) else {}
-    runtime_config, manager_config, llm_config, _embedding_config = split_memory_config(config)
+    runtime_config, manager_config = split_memory_config(config)
+    llm_config = manager_config["llm"]
     chat_config = config.get("chat", {}) if isinstance(config.get("chat"), dict) else {}
 
     args.llm_model = (
@@ -656,7 +655,9 @@ def prepare_runtime_configs(
     args: argparse.Namespace,
 ) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
     config = load_project_config(args.config)
-    memory_runtime_config, memory_manager_config, llm_config, embedding_config = split_memory_config(config)
+    memory_runtime_config, memory_manager_config = split_memory_config(config)
+    llm_config = memory_manager_config["llm"]
+    embedding_config = memory_manager_config["embedding"]
     segmentation_config = memory_runtime_config.setdefault(
         "assistant_wakeup_segmentation",
         {},
@@ -703,7 +704,7 @@ def prepare_runtime_configs(
     return memory_runtime_config, memory_manager_config, llm_config, embedding_config
 
 
-def validate_runtime(manager: MemoryNodeManager) -> None:
+def validate_runtime(manager: Any) -> None:
     embedding_cfg = getattr(manager, "_embedding_cfg", {}) or {}
     configured_api_key = str(embedding_cfg.get("api_key") or "").strip()
     api_key_env = str(embedding_cfg.get("api_key_env") or "").strip()
@@ -769,7 +770,7 @@ def validate_runtime(manager: MemoryNodeManager) -> None:
         )
 
 
-def db_counts(db: SessionDB) -> Dict[str, int]:
+def db_counts(db: Any) -> Dict[str, int]:
     tables = {
         "episodes": "memory_episodes",
         "facts": "memory_facts",
@@ -1159,20 +1160,17 @@ def build_instance_memory_context(
     question_state_dir.mkdir(parents=True, exist_ok=True)
     db_path = question_state_dir / "memory.db"
 
-    db = SessionDB(db_path=db_path)
+    runtime: Optional[MemoryRuntime] = None
     try:
         operation_reporter = MemoryOperationReporter()
-        manager = MemoryNodeManager(
-            db,
-            embedding_config=embedding_config,
+        runtime = MemoryRuntime(
+            db_path=db_path,
+            memory_runtime_config=memory_runtime_config,
             memory_manager_config=memory_manager_config,
-            llm_config=llm_config,
             operation_reporter=operation_reporter,
         )
-        runtime = MemoryRuntime(
-            manager,
-            memory_runtime_config=memory_runtime_config,
-        )
+        db = runtime.database
+        manager = runtime.manager
         validate_runtime(manager)
 
         all_sessions = sorted_history_sessions(item)
@@ -1257,7 +1255,8 @@ def build_instance_memory_context(
             "memory_operation_report": memory_operation_report,
         }
     finally:
-        db.close()
+        if runtime is not None:
+            runtime.close()
 
 
 def answer_instance_from_memory_context(

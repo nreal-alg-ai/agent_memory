@@ -34,7 +34,6 @@ from memory.memory_manager import (
     MemoryNodeManager,
     MemoryOperationReporter,
 )
-from memory.memory_database import SessionDB
 from memory.memory_runtime import MemoryRuntime
 from memory.config import split_memory_config
 from memory.utils import _as_embedding_vector
@@ -299,7 +298,7 @@ def load_test_turns(
     return flatten_dialogue(input_path)
 
 
-def iter_stored_nodes(db: SessionDB, start_id: int) -> Iterable[Dict[str, Any]]:
+def iter_stored_nodes(db: Any, start_id: int) -> Iterable[Dict[str, Any]]:
     rows = db._conn.execute(
         """SELECT id, episode_id, source_type, event_time_key, dialogue_time_key, summary, keywords,
                   fact_type, fact_kind, entities,
@@ -482,7 +481,8 @@ def remove_existing_outputs(db_path: Path, report_path: Path, overwrite: bool) -
 
 def resolve_llm_args(args: argparse.Namespace) -> None:
     config = load_project_config(args.config)
-    _runtime_config, _manager_config, llm_config, _embedding_config = split_memory_config(config)
+    _runtime_config, _manager_config = split_memory_config(config)
+    llm_config = _manager_config["llm"]
     segmentation_config = _runtime_config.get("assistant_wakeup_segmentation")
     if not isinstance(segmentation_config, dict):
         segmentation_config = {}
@@ -574,7 +574,7 @@ def _configured_embedding_api_key_env(embedding_config: Dict[str, Any]) -> str:
 
 def validate_embedding_runtime(
     manager: MemoryNodeManager,
-    db: SessionDB,
+    db: Any,
     embedding_config: Dict[str, Any],
 ) -> None:
     """Fail early when the configured embedding client cannot produce vectors."""
@@ -629,7 +629,7 @@ def validate_embedding_runtime(
     )
 
 
-def log_memory_index_state(db: SessionDB, event: str) -> None:
+def log_memory_index_state(db: Any, event: str) -> None:
     fact_count = db._conn.execute(
         "SELECT COUNT(*) AS count FROM memory_facts"
     ).fetchone()["count"]
@@ -666,15 +666,13 @@ def main() -> int:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     remove_existing_outputs(db_path, report_path, args.overwrite)
 
-    report_rows: List[Dict[str, Any]] = []
-    db = SessionDB(db_path=db_path)
     config = load_project_config(args.config)
     (
         memory_runtime_config,
         memory_manager_config,
-        llm_config,
-        embedding_config,
     ) = split_memory_config(config)
+    llm_config = memory_manager_config["llm"]
+    embedding_config = memory_manager_config["embedding"]
     segmentation_config = memory_runtime_config.setdefault(
         "assistant_wakeup_segmentation",
         {},
@@ -692,27 +690,20 @@ def main() -> int:
         args.manager_log_level,
     )
     operation_reporter = MemoryOperationReporter()
-    manager = StoreFactExtractionManager(
-        db,
-        embedding_config=embedding_config,
-        memory_manager_config=memory_manager_config,
-        llm_config=llm_config,
-        operation_reporter=operation_reporter,
-        report_rows=report_rows,
-        llm_max_tokens=args.llm_max_tokens,
-        llm_thinking=args.llm_thinking,
-        llm_json_mode=args.llm_json_mode,
-    )
     runtime = MemoryRuntime(
-        manager,
+        db_path=db_path,
         memory_runtime_config=memory_runtime_config,
+        memory_manager_config=memory_manager_config,
+        operation_reporter=operation_reporter,
         logger=memory_logger,
     )
+    db = runtime.database
+    manager = runtime.manager
     try:
         validate_embedding_runtime(manager, db, embedding_config)
         log_memory_index_state(db, "initialized")
     except Exception:
-        db.close()
+        runtime.close()
         close_memory_logger(memory_logger, memory_log_handler)
         raise
 
@@ -734,15 +725,6 @@ def main() -> int:
                     "user_message": user,
                     "assistant_response": assistant,
                 }]
-                pending_character_count = (
-                    runtime.interaction_turns_character_count(pending_with_current)
-                )
-                extraction_due = runtime._interaction_segmenter.should_finalize_after_append_exchange(
-                    [
-                        runtime._interaction_turn_to_online_exchange(item, index)
-                        for index, item in enumerate(pending_with_current, 1)
-                    ],
-                )[0]
                 ok = runtime.accept_single_interaction_turn(
                     user,
                     assistant,
@@ -764,11 +746,6 @@ def main() -> int:
                     "sample_hour_offset": hour_offset,
                     "turn_second_offset": turn_index,
                     "turn_timestamp": turn_timestamp.isoformat(),
-                    "pending_character_count": pending_character_count,
-                    "fact_extraction_due": extraction_due,
-                    "source_turn_count": (
-                        len(pending_before) + 1 if extraction_due else 0
-                    ),
                     "pending_turn_count": len(runtime.get_pending_interaction_turns()),
                     "queued": bool(ok.get("queued")),
                     "store_total_elapsed_ms": float(
@@ -782,14 +759,12 @@ def main() -> int:
                 report.write(json.dumps(row, ensure_ascii=False) + "\n")
                 report.flush()
                 logging.info(
-                    "[%s/%s] %s turn=%s extraction_due=%s "
-                    "source_turns=%s pending=%s stored=%s facts=%s",
+                    "[%s/%s] %s turn=%s "
+                    "pending=%s stored=%s facts=%s",
                     flat_index - args.start + 1,
                     len(turns),
                     sample_id,
                     turn_index,
-                    extraction_due,
-                    len(pending_before) + 1 if extraction_due else 0,
                     len(runtime.get_pending_interaction_turns()),
                     ok,
                     len(nodes),
@@ -835,7 +810,7 @@ def main() -> int:
         )
     finally:
         log_memory_index_state(db, "finished")
-        db.close()
+        runtime.close()
         close_memory_logger(memory_logger, memory_log_handler)
 
     memory_operation_report = operation_reporter.snapshot()

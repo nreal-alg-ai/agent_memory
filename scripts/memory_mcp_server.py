@@ -36,8 +36,6 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from memory.config import split_memory_config
-from memory.memory_database import SessionDB
-from memory.memory_manager import MemoryNodeManager
 from memory.memory_runtime import MemoryRuntime
 from memory.mcp_server import MemoryMCPService, StdioMCPServer
 
@@ -103,31 +101,20 @@ def parse_args() -> argparse.Namespace:
 
 def build_service(args: argparse.Namespace) -> tuple[MemoryMCPService, logging.Logger]:
     config = load_config(args.config)
-    runtime_config, manager_config, llm_config, embedding_config = split_memory_config(config)
-    database = SessionDB(args.db_path.expanduser().resolve())
+    runtime_config, manager_config = split_memory_config(config)
     logger = build_logger(args.log_path, args.log_level)
     try:
-        manager = MemoryNodeManager(
-            database,
-            embedding_config=embedding_config,
-            memory_manager_config=manager_config,
-            llm_config=llm_config,
-            logger=logger,
-        )
         runtime = MemoryRuntime(
-            manager,
+            db_path=args.db_path,
             memory_runtime_config=runtime_config,
-            embedding_config=embedding_config,
+            memory_manager_config=manager_config,
             logger=logger,
         )
         return MemoryMCPService(
             runtime,
-            manager,
-            database,
             queue_timeout=args.queue_timeout,
         ), logger
     except Exception:
-        database.close()
         raise
 
 

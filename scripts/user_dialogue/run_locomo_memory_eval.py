@@ -36,14 +36,12 @@ for import_root in (SRC_ROOT, REPO_ROOT):
 from memory.memory_manager import (
     DEFAULT_LLM_BASE_URL,
     DEFAULT_LLM_MODEL,
-    MemoryNodeManager,
     MemoryOperationReporter,
 )
 from memory.memory_runtime import MemoryRuntime
 from memory.config import split_memory_config
 from memory.utils import _as_embedding_vector
 import memory.memory_database as memory_database_module
-from memory.memory_database import SessionDB
 
 
 DEFAULT_INPUT = Path(
@@ -213,7 +211,8 @@ def load_project_config(config_path: Path) -> Dict[str, Any]:
 def resolve_runtime_args(args: argparse.Namespace) -> None:
     config = load_project_config(args.config)
     model_config = config.get("model") if isinstance(config.get("model"), dict) else {}
-    runtime_config, manager_config, llm_config, _embedding_config = split_memory_config(config)
+    runtime_config, manager_config = split_memory_config(config)
+    llm_config = manager_config["llm"]
     chat_config = config.get("chat") if isinstance(config.get("chat"), dict) else {}
     args.llm_model = args.llm_model or str(llm_config.get("llm_name") or model_config.get("default") or DEFAULT_LLM_MODEL)
     args.llm_base_url = args.llm_base_url or str(llm_config.get("llm_base_url") or model_config.get("base_url") or DEFAULT_LLM_BASE_URL)
@@ -246,7 +245,9 @@ def prepare_runtime_configs(
     args: argparse.Namespace,
 ) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
     config = load_project_config(args.config)
-    memory_runtime_config, memory_manager_config, llm_config, embedding_config = split_memory_config(config)
+    memory_runtime_config, memory_manager_config = split_memory_config(config)
+    llm_config = memory_manager_config["llm"]
+    embedding_config = memory_manager_config["embedding"]
     segmentation_config = memory_runtime_config.setdefault(
         "assistant_wakeup_segmentation",
         {},
@@ -382,7 +383,7 @@ def paired_dialog_turns(turns: Sequence[Dict[str, Any]], date_text: str) -> Tupl
     return pairs, orphan_count
 
 
-def db_counts(db: SessionDB) -> Dict[str, int]:
+def db_counts(db: Any) -> Dict[str, int]:
     tables = {
         "episodes": "memory_episodes",
         "facts": "memory_facts",
@@ -396,7 +397,7 @@ def db_counts(db: SessionDB) -> Dict[str, int]:
     }
 
 
-def validate_runtime(manager: MemoryNodeManager) -> None:
+def validate_runtime(manager: Any) -> None:
     embedding_cfg = getattr(manager, "_embedding_cfg", {}) or {}
     logging.info("Embedding runtime: python=%s faiss_available=%s provider=%s model=%s base_url=%s dimensions=%s", sys.version.split()[0], memory_database_module._HAS_FAISS, embedding_cfg.get("provider"), embedding_cfg.get("model"), embedding_cfg.get("base_url"), embedding_cfg.get("dimensions"))
     if not manager._ensure_embedding_client():
@@ -489,21 +490,18 @@ def build_sample_memory_context(
         sample_state_dir,
         args.manager_log_level,
     ) as (memory_log_path, memory_logger):
-        db = SessionDB(db_path=db_path)
+        runtime: Optional[MemoryRuntime] = None
         try:
             operation_reporter = MemoryOperationReporter()
-            manager = MemoryNodeManager(
-                db,
-                embedding_config=embedding_config,
-                memory_manager_config=memory_manager_config,
-                llm_config=llm_config,
-                operation_reporter=operation_reporter,
-            )
             runtime = MemoryRuntime(
-                manager,
+                db_path=db_path,
                 memory_runtime_config=memory_runtime_config,
+                memory_manager_config=memory_manager_config,
+                operation_reporter=operation_reporter,
                 logger=memory_logger,
             )
+            db = runtime.database
+            manager = runtime.manager
             validate_runtime(manager)
             sessions = sorted_locomo_sessions(sample, int(args.max_sessions))
             replay_stats, _ = replay_sample_into_memory(runtime, sample, sessions, args)
@@ -595,7 +593,8 @@ def build_sample_memory_context(
             }
             return output, detail_rows
         finally:
-            db.close()
+            if runtime is not None:
+                runtime.close()
 
 
 def sample_worker(
