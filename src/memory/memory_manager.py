@@ -486,15 +486,13 @@ class MemoryNodeManager:
             self._memory_cfg.get("enable_memory_actionable_item_update", True),
             True,
         )
-        self._top_k = max(1, int(self._memory_cfg.get("retrieval_top_k", 8) or 8))
+        self._top_k = max(1, int(self._memory_cfg.get("recall_top_k", 8) or 8))
         self._recall_detailed_logging = self._config_bool(
             self._memory_cfg.get("recall_detailed_logging", False),
             False,
         )
-        configured_retrieval_budget = self._memory_cfg.get("retrieval_budget")
         self._recall_budget = str(
-            configured_retrieval_budget
-            or self._memory_cfg.get("recall_budget", "mid")
+            self._memory_cfg.get("recall_budget", "mid")
             or "mid"
         )
         configured_source_override = self._memory_cfg.get(
@@ -511,35 +509,35 @@ class MemoryNodeManager:
             if isinstance(configured_source_override, (list, tuple, set))
             else None
         )
-        self._retrieval_path = str(
-            self._memory_cfg.get("retrivel_path", "normal") or "normal"
+        self._recall_path = str(
+            self._memory_cfg.get("recall_path", "normal") or "normal"
         ).strip().lower()
-        self._recall_fact_min_embedding_similarity = self._clamp_float(
+        self._recall_stage2_fact_min_embedding_similarity = self._clamp_float(
             self._memory_cfg.get("recall_fact_min_embedding_similarity"),
             0.0,
             1.0,
             0.35,
         )
-        self._recall_state_min_embedding_similarity = self._clamp_float(
-            self._memory_cfg.get("recall_state_min_embedding_similarity"),
+        self._recall_stage2_state_min_embedding_similarity = self._clamp_float(
+            self._memory_cfg.get("recall_stage2_state_min_embedding_similarity"),
             0.0,
             1.0,
             0.35,
         )
-        self._recall_actionable_item_min_embedding_similarity = self._clamp_float(
-            self._memory_cfg.get("recall_actionable_item_min_embedding_similarity"),
+        self._recall_stage2_actionable_item_min_embedding_similarity = self._clamp_float(
+            self._memory_cfg.get("recall_stage2_actionable_item_min_embedding_similarity"),
             0.0,
             1.0,
             0.35,
         )
-        self._recall_fast_candidate_score_threshold = self._clamp_float(
-            self._memory_cfg.get("recall_fast_candidate_score_threshold"),
+        self._recall_stage1_candidate_trusted_score_threshold = self._clamp_float(
+            self._memory_cfg.get("recall_stage1_candidate_trusted_score_threshold"),
             0.0,
             1.0,
             0.65,
         )
-        self._recall_fast_candidate_min_score = self._clamp_float(
-            self._memory_cfg.get("recall_fast_candidate_min_score"),
+        self._recall_stage1_candidate_min_score = self._clamp_float(
+            self._memory_cfg.get("recall_stage1_candidate_min_score"),
             0.0,
             1.0,
             0.35,
@@ -561,10 +559,6 @@ class MemoryNodeManager:
             "high": max(420, int(self._memory_cfg.get("recall_entry_chars_high", 1100) or 1100)),
         }
         self._embedding_client: Optional[EmbeddingClient] = None
-        self._enable_topic_state_resolution = self._config_bool(
-            self._memory_cfg.get("enable_topic_state_resolution", True),
-            True,
-        )
         self._topic_state_max_topics_per_episode = max(
             1,
             int(self._memory_cfg.get("topic_state_max_topics_per_episode", 3) or 3),
@@ -586,13 +580,9 @@ class MemoryNodeManager:
             int(self._memory_cfg.get("pending_unresolved_topic_max", 200) or 200),
         )
         self._pending_unresolved_topics: List[Dict[str, Any]] = []
-        self._enable_entity_scoped_state_resolution = self._config_bool(
-            self._memory_cfg.get("enable_entity_scoped_state_resolution", True),
-            True,
-        )
         self._task_queue_maxsize = max(
             1,
-            int(self._memory_cfg.get("store_queue_maxsize", 100) or 100),
+            int(self._memory_cfg.get("task_queue_maxsize", 100) or 100),
         )
         self._task_queue: queue.Queue[Dict[str, Any]] = queue.Queue(
             maxsize=self._task_queue_maxsize,
@@ -2380,17 +2370,7 @@ class MemoryNodeManager:
         facts: List[Dict[str, Any]],
     ) -> Dict[str, int]:
         update_started_at = time.monotonic()
-        if not self._enable_topic_state_resolution:
-            report = {
-                "enabled": 0,
-                "updated": 0,
-                "unresolved": 0,
-                "pending_unresolved": len(self._pending_unresolved_topics),
-            }
-            self._log_info("memory_reflect", "topic_state_update_finish", {
-                **report,
-            })
-            return report
+
         candidates = self._build_topic_state_candidates_from_facts(facts)
         updated = 0
         unresolved = 0
@@ -3519,16 +3499,6 @@ class MemoryNodeManager:
         facts: List[Dict[str, Any]],
     ) -> Dict[str, int]:
         update_started_at = time.monotonic()
-        if not self._enable_entity_scoped_state_resolution:
-            report = {"enabled": 0, "updated": 0}
-            self._log_info("memory_reflect", "entity_state_update_finish", {
-                **report,
-                "elapsed_ms": round(
-                    (time.monotonic() - update_started_at) * 1000,
-                    2,
-                ),
-            })
-            return report
         existing_entity_states = self._db.get_recent_memory_states(
             state_type=sorted(self._entity_scoped_state_types()),
             limit=80,
@@ -5229,7 +5199,7 @@ class MemoryNodeManager:
                 tags=tags,
                 time_end=time_end,
                 memory_source_override=self._retrieval_source_override,
-                recall_path=self._retrieval_path,
+                recall_path=self._recall_path,
                 prompt_language=prompt_language,
                 database=reader_db,
             )
@@ -6294,14 +6264,9 @@ class MemoryNodeManager:
             or strong_topic_overlap
             or strong_name_overlap
         )
-        candidate_min_score = self._clamp_float(
-            getattr(self, "_recall_fast_candidate_min_score", None),
-            0.0,
-            1.0,
-            0.35,
-        )
+
         candidate_score_passed = bool(
-            strong_anchor or rank_score >= candidate_min_score
+            strong_anchor or rank_score >= self._recall_stage1_candidate_min_score
         )
 
         if index_level == "actionable_item" and (exact_topics or exact_names):
@@ -6342,7 +6307,7 @@ class MemoryNodeManager:
                 "entity_mapping_hit": entity_mapping_hit,
                 "strong_anchor": False,
                 "candidate_score_passed": False,
-                "candidate_score_threshold": candidate_min_score,
+                "candidate_score_threshold": self._recall_stage1_candidate_min_score,
                 "filter_reason": "no_matching_evidence",
                 "topic_overlap": round(topic_overlap, 4),
                 "name_overlap": round(name_overlap, 4),
@@ -6364,7 +6329,7 @@ class MemoryNodeManager:
                 "entity_mapping_hit": entity_mapping_hit,
                 "strong_anchor": strong_anchor,
                 "candidate_score_passed": False,
-                "candidate_score_threshold": candidate_min_score,
+                "candidate_score_threshold": self._recall_stage1_candidate_min_score,
                 "filter_reason": "candidate_score_below_threshold",
                 "topic_overlap": round(topic_overlap, 4),
                 "name_overlap": round(name_overlap, 4),
@@ -6383,7 +6348,7 @@ class MemoryNodeManager:
             "candidate_sources": sorted(candidate_sources - {""}),
             "entity_mapping_hit": entity_mapping_hit,
             "candidate_score_passed": True,
-            "candidate_score_threshold": candidate_min_score,
+            "candidate_score_threshold": self._recall_stage1_candidate_min_score,
             "filter_reason": "",
             "topic_overlap": round(topic_overlap, 4),
             "name_overlap": round(name_overlap, 4),
@@ -6444,13 +6409,13 @@ class MemoryNodeManager:
         )
         trusted = bool(candidates) and (
             strong_anchor
-            or score >= self._recall_fast_candidate_score_threshold
+            or score >= self._recall_stage1_candidate_trusted_score_threshold
         )
         return {
             "score": score,
             "best_candidate_score": round(max_candidate_score, 4),
             "trusted": trusted,
-            "threshold": self._recall_fast_candidate_score_threshold,
+            "threshold": self._recall_stage1_candidate_trusted_score_threshold,
             "candidate_count": len(candidates),
             "exact_topic_count": exact_topic_count,
             "unique_exact_topic_count": len(exact_topic_anchors),
@@ -8066,7 +8031,7 @@ class MemoryNodeManager:
             query=query,
             query_embedding=query_embedding,
             min_embedding_similarity=(
-                self._recall_fact_min_embedding_similarity
+                self._recall_stage2_fact_min_embedding_similarity
                 if fact_min_embedding_similarity is None
                 else fact_min_embedding_similarity
             ),
@@ -8077,7 +8042,7 @@ class MemoryNodeManager:
             query=query,
             query_embedding=query_embedding,
             min_embedding_similarity=(
-                self._recall_state_min_embedding_similarity
+                self._recall_stage2_state_min_embedding_similarity
                 if state_min_embedding_similarity is None
                 else state_min_embedding_similarity
             ),
@@ -8088,7 +8053,7 @@ class MemoryNodeManager:
             query=query,
             query_embedding=query_embedding,
             min_embedding_similarity=(
-                self._recall_actionable_item_min_embedding_similarity
+                self._recall_stage2_actionable_item_min_embedding_similarity
                 if actionable_item_min_embedding_similarity is None
                 else actionable_item_min_embedding_similarity
             ),

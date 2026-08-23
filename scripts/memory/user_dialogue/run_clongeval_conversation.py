@@ -31,7 +31,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[3]
 SRC_ROOT = REPO_ROOT / "src"
 SCRIPT_ROOT = REPO_ROOT / "scripts" / "user_dialogue"
 for import_root in (SRC_ROOT, REPO_ROOT, SCRIPT_ROOT):
@@ -469,7 +469,7 @@ def prepare_runtime(
     if args.llm_json_mode is None:
         args.llm_json_mode = bool(llm_config.get("llm_json_mode", True))
     args.reflect_limit = max(1, int(args.reflect_limit or memory_manager_config.get("reflect_limit", 100) or 100))
-    args.recall_top_k = max(1, int(args.recall_top_k or memory_manager_config.get("retrieval_top_k", 8) or 8))
+    args.recall_top_k = max(1, int(args.recall_top_k or memory_manager_config.get("recall_top_k", 8) or 8))
     args.recall_budget = str(args.recall_budget or memory_manager_config.get("recall_budget", "mid") or "mid")
     segmentation_config = memory_runtime_config.setdefault(
         "assistant_wakeup_segmentation",

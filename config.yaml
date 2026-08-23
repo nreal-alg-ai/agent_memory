@@ -7,7 +7,6 @@
 voice_runtime:
 
   # Simulated wall-clock gap between two consecutive audio files.
-  audio_gap_s: 120.0
   result_root: tmp_result/ai_glasses_voice
   sample_rate: 16000
   language: zh
@@ -144,21 +143,19 @@ memory_manager:
     dimensions: 2048
     normalize: true
 
-  save_db_name: memory.db
-  retrieval_top_k: 8
-  retrieval_budget:
-  retrievel_source_override:
-  retrivel_path: normal
-  recall_detailed_logging: true
-  recall_fast_candidate_min_score: 0.30
-  recall_fast_candidate_score_threshold: 0.65
+  task_queue_maxsize: 100
 
-  store_queue_maxsize: 100
-
-  reflect_interval_seconds: 7200
   reflect_limit: 100
+  
+  recall_top_k: 8
   recall_budget: mid
-  recall_fact_min_embedding_similarity: 0.30
-  recall_state_min_embedding_similarity: 0.25
-  recall_actionable_item_min_embedding_similarity: 0.25
-  recall_gate_mode: auto
+  recall_path: normal
+  retrievel_source_override:
+
+  recall_detailed_logging: true
+  recall_stage1_candidate_min_score: 0.30
+  recall_stage1_candidate_trusted_score_threshold: 0.65
+
+  recall_stage2_fact_min_embedding_similarity: 0.30
+  recall_stage2_state_min_embedding_similarity: 0.25
+  recall_stage2_actionable_item_min_embedding_similarity: 0.25

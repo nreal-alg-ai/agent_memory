@@ -30,7 +30,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import requests
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[3]
 SRC_ROOT = REPO_ROOT / "src"
 for import_root in (SRC_ROOT, REPO_ROOT):
     if str(import_root) not in sys.path:
@@ -385,10 +385,6 @@ def resolve_llm_args(args: argparse.Namespace) -> None:
         args.recall_budget
         or str(manager_config.get("recall_budget") or "mid")
     )
-    args.recall_gate_mode = (
-        args.recall_gate_mode
-        or str(manager_config.get("recall_gate_mode") or manager_config.get("recall_mode") or "force")
-    )
 
     args.reader_model = (
         args.reader_model
@@ -681,7 +677,6 @@ def prepare_runtime_configs(
     memory_manager_config["enable_interpretation_feedback"] = bool(
         args.enable_feedback_analysis
     )
-    memory_manager_config["recall_gate_mode"] = str(args.recall_gate_mode)
     return memory_runtime_config, memory_manager_config, llm_config, embedding_config
 
 
@@ -1594,7 +1589,6 @@ def main() -> int:
         "workers": workers,
         "recall_top_k": args.recall_top_k,
         "recall_budget": args.recall_budget,
-        "recall_gate_mode": args.recall_gate_mode,
         "recall_memory_source_override": list(args.recall_memory_source or []),
         "feedback_analysis_enabled": args.enable_feedback_analysis,
         "reflect_every_sessions": args.reflect_every_sessions,

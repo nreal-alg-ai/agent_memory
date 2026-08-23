@@ -27,7 +27,7 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tupl
 
 import requests
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[3]
 SRC_ROOT = REPO_ROOT / "src"
 for import_root in (SRC_ROOT, REPO_ROOT):
     if str(import_root) not in sys.path:
@@ -232,7 +232,6 @@ def resolve_runtime_args(args: argparse.Namespace) -> None:
         or "source"
     )
     args.recall_budget = args.recall_budget or str(manager_config.get("recall_budget") or "mid")
-    args.recall_gate_mode = args.recall_gate_mode or str(manager_config.get("recall_gate_mode") or "force")
     args.reader_model = args.reader_model or str(chat_config.get("llm_name") or args.llm_model)
     args.reader_base_url = args.reader_base_url or str(chat_config.get("llm_base_url") or args.llm_base_url)
     if args.reader_base_url.rstrip("/") == "https://api.deepseek.com":
@@ -273,7 +272,6 @@ def prepare_runtime_configs(
     memory_manager_config["memory_output_language_mode"] = str(args.memory_output_language)
     memory_runtime_config["memory_prompt_language_mode"] = str(args.memory_prompt_language)
     memory_runtime_config["memory_output_language_mode"] = str(args.memory_output_language)
-    memory_manager_config["recall_gate_mode"] = str(args.recall_gate_mode)
     return memory_runtime_config, memory_manager_config, llm_config, embedding_config
 
 

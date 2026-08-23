@@ -22,7 +22,7 @@ from typing import Any, Dict, Iterable, List, Tuple
 
 import requests
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[3]
 SRC_ROOT = REPO_ROOT / "src"
 for import_root in (SRC_ROOT, REPO_ROOT):
     if str(import_root) not in sys.path:
