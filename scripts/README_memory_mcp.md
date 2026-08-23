@@ -8,15 +8,13 @@ stdio transport. The server owns one `SessionDB`, `MemoryNodeManager`, and
 
 ```bash
 /Applications/miniconda3/envs/python3_11/bin/python \
-  /Users/zhouboyu/Documents/agent_memory/scripts/memory_mcp_server.py \
-  --config /Users/zhouboyu/Documents/agent_memory/config.yaml \
-  --db-path /Users/zhouboyu/Documents/agent_memory/tmp/mcp/memory.db \
-  --log-path /Users/zhouboyu/Documents/agent_memory/tmp/mcp/memory.log
+  /Users/zhouboyu/Documents/agent_memory/scripts/memory_mcp_server.py
 ```
 
 The MCP protocol uses stdout. Memory logs go to stderr by default, or to
-`--log-path` when supplied. Environment references such as `${GLM_API_KEY}` in
-`config.yaml` are expanded during startup.
+`memory_mcp_server.log_path` when supplied. Database path, log level, queue
+timeout, runtime/model settings, and environment references such as
+`${GLM_API_KEY}` are all read from `config.yaml` during startup.
 
 Example client configuration:
 
@@ -26,11 +24,7 @@ Example client configuration:
     "agent-memory": {
       "command": "/Applications/miniconda3/envs/python3_11/bin/python",
       "args": [
-        "/Users/zhouboyu/Documents/agent_memory/scripts/memory_mcp_server.py",
-        "--config",
-        "/Users/zhouboyu/Documents/agent_memory/config.yaml",
-        "--db-path",
-        "/Users/zhouboyu/Documents/agent_memory/tmp/mcp/memory.db"
+        "/Users/zhouboyu/Documents/agent_memory/scripts/memory_mcp_server.py"
       ]
     }
   }

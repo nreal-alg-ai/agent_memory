@@ -8,21 +8,18 @@ Example client configuration::
         "agent-memory": {
           "command": "python",
           "args": [
-            "/Users/zhouboyu/Documents/agent_memory/scripts/memory_mcp_server.py",
-            "--db-path",
-            "/Users/zhouboyu/Documents/agent_memory/tmp/mcp/memory.db"
+            "/Users/zhouboyu/Documents/agent_memory/scripts/memory_mcp_server.py"
           ]
         }
       }
     }
 
-The server writes MCP frames to stdout. Logs are sent to stderr (or to the
-path supplied by ``--log-path``), so they never corrupt the protocol stream.
+The server writes MCP frames to stdout. Logs are sent to stderr or to the path
+configured in ``config.yaml``, so they never corrupt the protocol stream.
 """
 
 from __future__ import annotations
 
-import argparse
 import logging
 import os
 import re
@@ -42,6 +39,7 @@ from voice.voice_runtime import VoiceRuntime
 
 
 _ENV_REF_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+DEFAULT_CONFIG_PATH = REPO_ROOT / "config.yaml"
 
 
 def _expand_env_refs(value: Any) -> Any:
@@ -80,36 +78,68 @@ def build_logger(log_path: Path | None, level: str) -> logging.Logger:
     return logger
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run agent-memory as an MCP stdio server.")
-    parser.add_argument("--config", type=Path, default=REPO_ROOT / "config.yaml")
-    parser.add_argument(
-        "--db-path",
-        type=Path,
-        default=Path("memory.db"),
-        help="SQLite memory database path. Defaults to ./memory.db.",
-    )
-    parser.add_argument("--log-path", type=Path, help="Optional memory log file path.")
-    parser.add_argument("--log-level", default="INFO")
-    parser.add_argument(
-        "--queue-timeout",
-        type=float,
-        default=30.0,
-        help="Seconds to wait for queued writes during graceful shutdown.",
-    )
-    return parser.parse_args()
+def _resolve_config_path(value: Any) -> Path:
+    """Resolve the config path, including compatibility with local helpers."""
+    if isinstance(value, (str, Path)):
+        return Path(value).expanduser().resolve()
+    legacy_config = getattr(value, "config", None)
+    if legacy_config is not None:
+        return Path(legacy_config).expanduser().resolve()
+    return DEFAULT_CONFIG_PATH
 
 
-def build_service(args: argparse.Namespace) -> tuple[MemoryMCPService, logging.Logger]:
-    config = load_config(args.config)
+def _resolve_configured_path(value: Any, config_path: Path) -> Path | None:
+    if value is None or not str(value).strip():
+        return None
+    path = Path(str(value)).expanduser()
+    if not path.is_absolute():
+        path = config_path.parent / path
+    return path.resolve()
+
+
+def _explicit_override(config_source: Any, key: str) -> Any:
+    if isinstance(config_source, (str, Path)) or config_source is None:
+        return None
+    value = getattr(config_source, key, None)
+    if value is None or not str(value).strip():
+        return None
+    return value
+
+
+def build_service(config_source: Any = None) -> tuple[MemoryMCPService, logging.Logger]:
+    config_path = _resolve_config_path(config_source)
+    config = load_config(config_path)
+    server_config = config.get("memory_mcp_server") or {}
+    if not isinstance(server_config, dict):
+        raise ValueError("memory_mcp_server in config.yaml must be a mapping")
+    db_path = _resolve_configured_path(server_config.get("db_path"), config_path)
+    db_override = _explicit_override(config_source, "db_path")
+    if db_override is not None:
+        db_path = _resolve_configured_path(db_override, config_path)
+    if db_path is None:
+        raise ValueError("memory_mcp_server.db_path must be configured")
+    log_path = _resolve_configured_path(server_config.get("log_path"), config_path)
+    log_override = _explicit_override(config_source, "log_path")
+    if log_override is not None:
+        log_path = _resolve_configured_path(log_override, config_path)
+    log_level = str(
+        _explicit_override(config_source, "log_level")
+        or server_config.get("log_level")
+        or "INFO"
+    )
+    queue_timeout = float(
+        _explicit_override(config_source, "queue_timeout")
+        if _explicit_override(config_source, "queue_timeout") is not None
+        else server_config.get("queue_timeout", 30.0)
+    )
     memory_runtime_config, memory_manager_config, voice_runtime_config = split_memory_config(
         config,
         include_voice_runtime=True,
     )
-    logger = build_logger(args.log_path, args.log_level)
+    logger = build_logger(log_path, log_level)
     try:
         memory_runtime = MemoryRuntime(
-            db_path=args.db_path,
+            db_path=db_path,
             memory_runtime_config=memory_runtime_config,
             memory_manager_config=memory_manager_config,
             logger=logger,
@@ -122,7 +152,7 @@ def build_service(args: argparse.Namespace) -> tuple[MemoryMCPService, logging.L
         return MemoryMCPService(
             memory_runtime,
             voice_runtime,
-            queue_timeout=args.queue_timeout,
+            queue_timeout=queue_timeout,
         ), logger
     except Exception:
         if "memory_runtime" in locals():
@@ -131,9 +161,11 @@ def build_service(args: argparse.Namespace) -> tuple[MemoryMCPService, logging.L
 
 
 def main() -> int:
-    args = parse_args()
-    service, logger = build_service(args)
-    logger.info("Memory MCP server started db_path=%s", args.db_path.expanduser().resolve())
+    service, logger = build_service()
+    config = load_config(DEFAULT_CONFIG_PATH)
+    server_config = config.get("memory_mcp_server") or {}
+    db_path = _resolve_configured_path(server_config.get("db_path"), DEFAULT_CONFIG_PATH)
+    logger.info("Memory MCP server started db_path=%s", db_path)
     StdioMCPServer(service, logger=logger).serve_forever()
     logger.info("Memory MCP server stopped")
     return 0

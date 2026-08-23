@@ -7,12 +7,15 @@ import logging
 import sys
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, TextIO, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, TextIO
 
-from ..memory.memory_runtime import MemoryRuntime
+REPO_ROOT = Path(__file__).resolve().parents[2]
+SRC_ROOT = REPO_ROOT / "src"
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
 
-if TYPE_CHECKING:
-    from ..voice.voice_runtime import VoiceRuntime
+from memory.memory_runtime import MemoryRuntime
+from voice.voice_runtime import VoiceRuntime
 
 
 MCP_PROTOCOL_VERSION = "2024-11-05"
