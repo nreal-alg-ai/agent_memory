@@ -25,7 +25,23 @@ voice_runtime:
     window_frames: 5
     activate_ratio: 0.6
     deactivate_ratio: 0.4
-
+  
+  asr:
+    whisper_model_id: openai/whisper-large-v3-turbo
+    # whisper_model_id: openai/whisper-tiny
+    whisper_chunk_length_s: null
+    whisper_condition_on_prev_tokens: false
+    whisper_max_new_tokens: 64
+    # These can help tiny models avoid repetition, but may distort normal large-model ASR.
+    whisper_no_repeat_ngram_size: null
+    whisper_repetition_penalty: null
+  
+  output:
+    simplify_chinese: true
+    print_empty: false
+    log_frames: false
+    output_jsonl: null
+  
   streaming_asr:
     paraformer_streaming_model_id: funasr/paraformer-zh-streaming
     trigger_s: 0.6

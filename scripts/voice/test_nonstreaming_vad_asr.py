@@ -4,7 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -15,60 +15,16 @@ for import_root in (SRC_ROOT, ROOT):
     if str(import_root) not in sys.path:
         sys.path.insert(0, str(import_root))
 
+from memory.config import split_memory_config  # noqa: E402
 from voice.voice_runtime import VoiceRuntime  # noqa: E402
 
 
-DEFAULT_CONFIG = Path(__file__).resolve().with_name("test_nonstreaming_vad_asr_config.yaml")
+DEFAULT_CONFIG = ROOT / "config.yaml"
 DEFAULT_AUDIO = (
     ROOT
     / "test_data/ambient_transcript/Eval_Ali/Eval_Ali_far/audio_dir/R8001_M8004_MS801.wav"
 )
 DEFAULT_RESULT_ROOT = ROOT / "tmp_result/nonstreaming_vad_asr"
-
-
-@dataclass
-class RuntimeConfig:
-    audio: Path = DEFAULT_AUDIO
-    result_root: Path = DEFAULT_RESULT_ROOT
-    sample_rate: int = 16000
-    language: str = "zh"
-    device: Optional[str] = None
-    max_duration_s: Optional[float] = None
-
-
-@dataclass
-class VADConfig:
-    frame_ms: float = 32.0
-    threshold: float = 0.5
-    min_silence_ms: int = 100
-    speech_pad_ms: int = 30
-
-
-@dataclass
-class ASRConfig:
-    whisper_model_id: str = "openai/whisper-large-v3-turbo"
-    whisper_chunk_length_s: Optional[float] = None
-    whisper_condition_on_prev_tokens: bool = False
-    whisper_max_new_tokens: Optional[int] = 64
-    whisper_no_repeat_ngram_size: Optional[int] = None
-    whisper_repetition_penalty: Optional[float] = None
-
-
-@dataclass
-class OutputConfig:
-    simplify_chinese: bool = True
-    print_empty: bool = False
-    log_frames: bool = False
-    output_jsonl: Optional[Path] = None
-
-
-@dataclass
-class AppConfig:
-    config_path: Path
-    runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
-    vad: VADConfig = field(default_factory=VADConfig)
-    asr: ASRConfig = field(default_factory=ASRConfig)
-    output: OutputConfig = field(default_factory=OutputConfig)
 
 
 @dataclass
@@ -95,6 +51,29 @@ class RunLogger:
         print(message, flush=True)
         self._log_file.write(message + "\n")
         self._log_file.flush()
+
+    def _log_level(self, level: str, message: str, *args: Any) -> None:
+        if args:
+            try:
+                message = message % args
+            except (TypeError, ValueError):
+                message = " ".join([message, *(str(arg) for arg in args)])
+        self.log(f"[{level}] {message}")
+
+    def debug(self, message: str, *args: Any, **kwargs: Any) -> None:
+        self._log_level("DEBUG", message, *args)
+
+    def info(self, message: str, *args: Any, **kwargs: Any) -> None:
+        self._log_level("INFO", message, *args)
+
+    def warning(self, message: str, *args: Any, **kwargs: Any) -> None:
+        self._log_level("WARNING", message, *args)
+
+    def error(self, message: str, *args: Any, **kwargs: Any) -> None:
+        self._log_level("ERROR", message, *args)
+
+    def exception(self, message: str, *args: Any, **kwargs: Any) -> None:
+        self._log_level("ERROR", message, *args)
 
     def event(self, event: NonStreamingASREvent) -> None:
         self._events_file.write(json.dumps(asdict(event), ensure_ascii=False) + "\n")
@@ -127,36 +106,71 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    config = load_config(args.config)
-    if args.audio is not None:
-        config.runtime.audio = args.audio.expanduser().resolve()
+    config_path = args.config.expanduser().resolve()
+    if not config_path.exists():
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+    try:
+        import yaml
+    except ImportError as exc:
+        raise RuntimeError("YAML config support requires PyYAML.") from exc
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    if not isinstance(config, dict):
+        raise ValueError(f"Expected YAML mapping in config file: {config_path}")
+    _, _, voice_runtime_config = split_memory_config(
+        config,
+        include_voice_runtime=True,
+    )
 
-    audio_path = config.runtime.audio.expanduser().resolve()
+    runtime_config = voice_runtime_config
+    vad_config = voice_runtime_config.get("vad") or {}
+    asr_config = (
+        voice_runtime_config.get("asr")
+        or voice_runtime_config.get("nonstreaming_asr")
+        or {}
+    )
+    output_config = voice_runtime_config.get("output") or {}
+    if args.audio is not None:
+        audio_path = args.audio.expanduser().resolve()
+    else:
+        audio_path = _resolve_path(
+            runtime_config.get("audio") or DEFAULT_AUDIO,
+            config_path.parent,
+        )
+
     if not audio_path.exists():
         raise FileNotFoundError(f"Audio file not found: {audio_path}")
 
-    run_dir = _create_run_dir(config.runtime.result_root.expanduser().resolve(), audio_path)
+    result_root = _resolve_path(
+        runtime_config.get("result_root") or DEFAULT_RESULT_ROOT,
+        config_path.parent,
+    )
+    run_dir = _create_run_dir(result_root, audio_path)
     logger = RunLogger(run_dir)
-    logger.write_config({"config": config, "audio": audio_path})
+    logger.write_config({
+        "config_path": config_path,
+        "voice_runtime_config": voice_runtime_config,
+        "audio": audio_path,
+    })
     logger.log(f"Run directory: {run_dir}")
 
     try:
-        voice_runtime = VoiceRuntime(_voice_runtime_config(config))
+        voice_runtime = VoiceRuntime(voice_runtime_config, logger=logger)
         logger.log(
             "Non-streaming VAD+ASR test: "
-            f"audio={audio_path}, frame={config.vad.frame_ms:.1f}ms, "
-            f"sample_rate={config.runtime.sample_rate}, "
-            f"model={config.asr.whisper_model_id}"
+            f"audio={audio_path}, frame={float(vad_config.get('frame_ms', 32.0)):.1f}ms, "
+            f"sample_rate={int(runtime_config.get('sample_rate', 16000))}, "
+            f"model={asr_config.get('whisper_model_id') or asr_config.get('paraformer_model_id') or 'default'}"
         )
 
         voice_report = voice_runtime.process_audio_file(audio_path)
-        events = _events_from_voice_report(voice_report, config)
+        events = _events_from_voice_report(voice_report, voice_runtime_config)
         for event in events:
             logger.event(event)
-            if event.text or config.output.print_empty:
+            if event.text or bool(output_config.get("print_empty", False)):
                 logger.log(_format_asr_event(event))
-        if config.output.output_jsonl is not None:
-            _write_jsonl(config.output.output_jsonl.expanduser().resolve(), events)
+        output_jsonl = output_config.get("output_jsonl")
+        if output_jsonl:
+            _write_jsonl(_resolve_path(output_jsonl, config_path.parent), events)
         logger.log(f"Saved log to: {logger.log_path}")
         logger.log(f"Saved events to: {logger.events_path}")
         logger.log(f"Finished with {len(events)} ASR segments.")
@@ -166,23 +180,14 @@ def main() -> None:
         logger.close()
 
 
-def _voice_runtime_config(config: AppConfig) -> Dict[str, Any]:
-    """Translate this script's config dataclasses to VoiceRuntime config."""
-    return {
-        "runtime": asdict(config.runtime),
-        "vad": asdict(config.vad),
-        "asr": asdict(config.asr),
-        "output": asdict(config.output),
-    }
-
-
 def _events_from_voice_report(
     report: Dict[str, Any],
-    config: AppConfig,
+    voice_runtime_config: Dict[str, Any],
 ) -> List[NonStreamingASREvent]:
     """Preserve the script's event output format from VoiceRuntime segments."""
     events: List[NonStreamingASREvent] = []
-    frame_ms = max(1.0, float(config.vad.frame_ms))
+    vad_config = voice_runtime_config.get("vad") or {}
+    frame_ms = max(1.0, float(vad_config.get("frame_ms", 32.0)))
     for index, segment in enumerate(report.get("segments") or [], 1):
         metadata = segment.get("metadata") or {}
         start = float(metadata.get("audio_start_s") or 0.0)
@@ -200,54 +205,6 @@ def _events_from_voice_report(
             )
         )
     return events
-
-
-def load_config(config_path: Path) -> AppConfig:
-    config_path = config_path.expanduser().resolve()
-    config = AppConfig(config_path=config_path)
-    if not config_path.exists():
-        raise FileNotFoundError(f"Config file not found: {config_path}")
-    try:
-        import yaml
-    except ImportError as exc:
-        raise RuntimeError("YAML config support requires PyYAML.") from exc
-    payload = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
-    if not isinstance(payload, dict):
-        raise ValueError(f"Expected YAML mapping in config file: {config_path}")
-    base_dir = config_path.parent
-    _load_group(config.runtime, payload, "runtime", base_dir)
-    _load_group(config.vad, payload, "vad", base_dir)
-    _load_group(config.asr, payload, "asr", base_dir)
-    _load_group(config.output, payload, "output", base_dir)
-    unknown_groups = sorted(set(payload) - {"runtime", "vad", "asr", "output"})
-    if unknown_groups:
-        raise ValueError(f"Unknown config group(s): {', '.join(unknown_groups)}")
-    return config
-
-
-def _load_group(target: Any, payload: Dict[str, Any], group_name: str, base_dir: Path) -> None:
-    group = payload.get(group_name)
-    if group is None:
-        return
-    if not isinstance(group, dict):
-        raise ValueError(f"Expected mapping for config group {group_name!r}.")
-    valid_fields = set(getattr(target, "__dataclass_fields__", {}).keys())
-    for key, value in group.items():
-        if key not in valid_fields:
-            raise ValueError(f"Unknown config key: {group_name}.{key}")
-        setattr(target, key, _coerce_value(group_name, key, value, base_dir))
-
-
-def _coerce_value(group_name: str, key: str, value: Any, base_dir: Path) -> Any:
-    if value is None:
-        return None
-    if (group_name, key) in {
-        ("runtime", "audio"),
-        ("runtime", "result_root"),
-        ("output", "output_jsonl"),
-    }:
-        return _resolve_path(value, base_dir)
-    return value
 
 
 def _resolve_path(value: Any, base_dir: Path) -> Path:

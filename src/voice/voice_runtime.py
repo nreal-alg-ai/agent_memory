@@ -8,6 +8,7 @@ database; callers can feed the returned segments into ``MemoryRuntime``.
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -82,6 +83,12 @@ class VoiceRuntime:
         path = Path(audio_path).expanduser().resolve()
         if not path.is_file():
             raise FileNotFoundError(f"Audio file not found: {path}")
+        started_at = time.monotonic()
+        self.logger.info(
+            "process_audio_file start path=%s session_start=%s",
+            path,
+            session_start or "<now>",
+        )
 
         from .audio import load_audio_mono, slice_audio
 
@@ -89,9 +96,21 @@ class VoiceRuntime:
         limit = self.runtime_config.get("max_duration_s")
         if limit is not None:
             audio = audio[: max(0, int(float(limit) * sample_rate))]
+        self.logger.info(
+            "process_audio_file audio_loaded path=%s sample_rate=%s duration_s=%.3f max_duration_s=%s",
+            path,
+            sample_rate,
+            len(audio) / sample_rate if sample_rate else 0.0,
+            limit if limit is not None else "<none>",
+        )
 
         recording_start = self._parse_session_start(session_start)
         spans = self._detect_speech_spans(audio, sample_rate)
+        self.logger.info(
+            "process_audio_file speech_detected path=%s speech_segments=%s",
+            path,
+            len(spans),
+        )
         chunks = [slice_audio(audio, sample_rate, start, end) for start, end in spans]
         assignments = self._identify_speakers(chunks)
         segments: List[Dict[str, Any]] = []
@@ -109,8 +128,8 @@ class VoiceRuntime:
                 ),
             )
             if not text:
-                self.logger.debug(
-                    "ASR returned empty text path=%s segment=%s start=%.3f end=%.3f",
+                self.logger.info(
+                    "process_audio_file asr_empty path=%s segment=%s start=%.3f end=%.3f",
                     path,
                     index,
                     start,
@@ -118,6 +137,15 @@ class VoiceRuntime:
                 )
                 continue
             speaker, speaker_metadata = self._speaker_label(assignment)
+            self.logger.info(
+                "process_audio_file asr_segment path=%s segment=%s start=%.3f end=%.3f speaker=%s text=%s",
+                path,
+                index,
+                start,
+                end,
+                speaker,
+                text,
+            )
             segments.append(
                 {
                     "speaker": speaker,
@@ -134,7 +162,7 @@ class VoiceRuntime:
                 }
             )
 
-        return {
+        report = {
             "status": "ok",
             "audio_path": str(path),
             "sample_rate": sample_rate,
@@ -143,6 +171,14 @@ class VoiceRuntime:
             "transcript_segment_count": len(segments),
             "segments": segments,
         }
+        self.logger.info(
+            "process_audio_file finish path=%s speech_segments=%s transcript_segments=%s elapsed_ms=%.2f",
+            path,
+            len(spans),
+            len(segments),
+            (time.monotonic() - started_at) * 1000.0,
+        )
+        return report
 
     def close(self) -> None:
         """Reset streaming VAD state before the host releases this runtime."""

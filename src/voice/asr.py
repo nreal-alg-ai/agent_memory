@@ -95,6 +95,7 @@ class WhisperASR(BaseASR):
             low_cpu_mem_usage=True,
             use_safetensors=True,
         )
+        self._prepare_generation_config(config)
         self.model.to(self.device)
         pipeline_device = 0 if self.device.startswith("cuda") else -1
         pipe_kwargs: Dict[str, Any] = {
@@ -110,6 +111,22 @@ class WhisperASR(BaseASR):
             pipe_kwargs["chunk_length_s"] = float(chunk_length_s)
         self.pipe = pipeline(**pipe_kwargs)
 
+    def _prepare_generation_config(self, config: WhisperASRConfig) -> None:
+        """Make Whisper generation settings explicit for the pipeline.
+
+        Whisper checkpoints commonly ship a default ``max_length`` and
+        suppression-token settings. Newer Transformers versions warn when
+        those defaults are merged with explicit generation arguments. Keep
+        ``max_new_tokens`` as the single length owner and pass suppression
+        values explicitly at call time so the model and pipeline share one
+        configuration.
+        """
+        generation_config = getattr(self.model, "generation_config", None)
+        if generation_config is None:
+            return
+        if getattr(config, "whisper_max_new_tokens", None) is not None:
+            generation_config.max_length = None
+
     def transcribe_segment(self, audio: np.ndarray) -> str:
         if audio.size == 0:
             return ""
@@ -121,8 +138,18 @@ class WhisperASR(BaseASR):
         }
         if self.config.language:
             generate_kwargs["language"] = self.config.language
+        generation_config = getattr(self.model, "generation_config", None)
+        if generation_config is not None:
+            for key in ("suppress_tokens", "begin_suppress_tokens"):
+                value = getattr(generation_config, key, None)
+                if value is not None:
+                    generate_kwargs[key] = value
         max_new_tokens = getattr(self.config, "whisper_max_new_tokens", None)
         if max_new_tokens is not None:
+            # Transformers may reinsert its global max_length=20 default when
+            # the model generation config leaves max_length unset. Explicitly
+            # clear it at the call site so only max_new_tokens controls length.
+            generate_kwargs["max_length"] = None
             generate_kwargs["max_new_tokens"] = int(max_new_tokens)
         no_repeat_ngram_size = getattr(self.config, "whisper_no_repeat_ngram_size", None)
         if no_repeat_ngram_size is not None:
