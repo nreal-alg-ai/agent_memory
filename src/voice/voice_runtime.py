@@ -321,6 +321,15 @@ class VoiceRuntime:
                 0.0,
                 float(self.speaker_config.get("min_new_reference_duration_s", 3.0)),
             ),
+            min_reference_segment_duration_s=max(
+                0.0,
+                float(
+                    self.speaker_config.get(
+                        "min_reference_segment_duration_s",
+                        1.0,
+                    )
+                ),
+            ),
             user_similarity_threshold=self.speaker_config.get(
                 "user_similarity_threshold"
             ),

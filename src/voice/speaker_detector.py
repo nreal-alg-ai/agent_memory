@@ -101,6 +101,7 @@ class SpeakerReferenceDetector:
         reference_memory_size: int,
         min_new_reference_segments: int = 2,
         min_new_reference_duration_s: float = 3.0,
+        min_reference_segment_duration_s: float = 1.0,
         user_similarity_threshold: Optional[float] = None,
         user_reference_audio_dir: Optional[Path] = None,
         reference_embeddings_path: Optional[Path] = None,
@@ -124,6 +125,10 @@ class SpeakerReferenceDetector:
         self.reference_memory_size = max(1, reference_memory_size)
         self.min_new_reference_segments = max(1, min_new_reference_segments)
         self.min_new_reference_duration_s = max(0.0, min_new_reference_duration_s)
+        self.min_reference_segment_duration_s = max(
+            0.0,
+            min_reference_segment_duration_s,
+        )
         if speaker_assignment_method not in {"reference", "agglomerative"}:
             raise ValueError("speaker_assignment_method must be reference or agglomerative.")
         self.speaker_assignment_method = speaker_assignment_method
@@ -204,7 +209,21 @@ class SpeakerReferenceDetector:
 
         for audio_segment in audio_segments:
             embedding = self._encode_audio(self._segment_audio(audio_segment))
+            reference_eligible = self._reference_segment_is_eligible(
+                self._segment_duration_s(audio_segment)
+            )
             if not self.reference_embeddings:
+                if not reference_eligible:
+                    all_speaker_assignments.append(
+                        SpeakerAssignment(
+                            speaker_id=-1,
+                            similarity=None,
+                            profile_count=0,
+                            reference_count=0,
+                            reason="short_segment_unknown_reference",
+                        )
+                    )
+                    continue
                 speaker_id = self._create_reference(embedding)
                 all_speaker_assignments.append(
                     SpeakerAssignment(
@@ -225,14 +244,31 @@ class SpeakerReferenceDetector:
             best_similarity = similarities[best_index]
             if best_similarity >= self.similarity_threshold:
                 reference = self.reference_embeddings[best_index]
-                self._append_reference_embedding(reference, embedding)
+                if reference_eligible:
+                    self._append_reference_embedding(reference, embedding)
                 all_speaker_assignments.append(
                     SpeakerAssignment(
                         speaker_id=reference.speaker_id,
                         similarity=round(best_similarity, 4),
                         profile_count=len(self.reference_embeddings),
                         reference_count=len(reference.embeddings),
-                        reason="matched_reference",
+                        reason=(
+                            "matched_reference"
+                            if reference_eligible
+                            else "matched_reference_short_segment"
+                        ),
+                    )
+                )
+                continue
+
+            if not reference_eligible:
+                all_speaker_assignments.append(
+                    SpeakerAssignment(
+                        speaker_id=-1,
+                        similarity=round(best_similarity, 4),
+                        profile_count=len(self.reference_embeddings),
+                        reference_count=0,
+                        reason="short_segment_unknown_reference",
                     )
                 )
                 continue
@@ -274,10 +310,11 @@ class SpeakerReferenceDetector:
                 assignment = user_assignment
             else:
                 assignment = self._assign_cluster_to_reference(
-                    cluster_mean_embedding=cluster_mean_embedding,
                     cluster_segment_embeddings=cluster_segment_embeddings,
-                    segment_count=len(cluster_indexes),
-                    duration_s=sum(self._segment_duration_s(segment) for segment in cluster_segments),
+                    cluster_segment_durations=[
+                        self._segment_duration_s(segment)
+                        for segment in cluster_segments
+                    ],
                 )
             for index in cluster_indexes:
                 assignments[index] = assignment
@@ -308,12 +345,39 @@ class SpeakerReferenceDetector:
 
     def _assign_cluster_to_reference(
         self,
-        cluster_mean_embedding: np.ndarray,
         cluster_segment_embeddings: List[np.ndarray],
-        segment_count: int,
-        duration_s: float,
+        cluster_segment_durations: List[float],
     ) -> SpeakerAssignment:
-        can_create_reference = self._can_create_reference(segment_count, duration_s)
+        # Short segments still participate in the current cluster decision,
+        # but they must not update the long-term speaker profile.
+        eligible_embeddings = [
+            embedding
+            for embedding, segment_duration_s in zip(
+                cluster_segment_embeddings,
+                cluster_segment_durations,
+            )
+            if self._reference_segment_is_eligible(segment_duration_s)
+        ]
+        eligible_duration_s = sum(
+            segment_duration_s
+            for segment_duration_s in cluster_segment_durations
+            if self._reference_segment_is_eligible(segment_duration_s)
+        )
+        can_create_reference = self._can_create_reference(
+            len(eligible_embeddings),
+            eligible_duration_s,
+        )
+        if not eligible_embeddings:
+            return SpeakerAssignment(
+                speaker_id=-1,
+                similarity=None,
+                profile_count=len(self.reference_embeddings),
+                reference_count=0,
+                reason="short_cluster_unknown_reference",
+            )
+        eligible_cluster_mean_embedding = _l2_normalize(
+            np.mean(np.vstack(eligible_embeddings), axis=0)
+        )
         if not self.reference_embeddings:
             if not can_create_reference:
                 return SpeakerAssignment(
@@ -324,9 +388,9 @@ class SpeakerReferenceDetector:
                     reason="cluster_insufficient_evidence_unknown",
                 )
 
-            speaker_id = self._create_reference(cluster_segment_embeddings[0])
+            speaker_id = self._create_reference(eligible_embeddings[0])
             reference = self.reference_embeddings[-1]
-            for embedding in cluster_segment_embeddings[1:]:
+            for embedding in eligible_embeddings[1:]:
                 self._append_reference_embedding(reference, embedding)
             return SpeakerAssignment(
                 speaker_id=speaker_id,
@@ -337,14 +401,17 @@ class SpeakerReferenceDetector:
             )
 
         similarities = [
-            _cosine_similarity(self._reference_embedding(reference), cluster_mean_embedding)
+            _cosine_similarity(
+                self._reference_embedding(reference),
+                eligible_cluster_mean_embedding,
+            )
             for reference in self.reference_embeddings
         ]
         best_index = int(np.argmax(similarities))
         best_similarity = similarities[best_index]
         if best_similarity >= self.similarity_threshold:
             reference = self.reference_embeddings[best_index]
-            for embedding in cluster_segment_embeddings:
+            for embedding in eligible_embeddings:
                 self._append_reference_embedding(reference, embedding)
             return SpeakerAssignment(
                 speaker_id=reference.speaker_id,
@@ -364,9 +431,9 @@ class SpeakerReferenceDetector:
                 reason="cluster_weak_matched_reference",
             )
 
-        speaker_id = self._create_reference(cluster_segment_embeddings[0])
+        speaker_id = self._create_reference(eligible_embeddings[0])
         reference = self.reference_embeddings[-1]
-        for embedding in cluster_segment_embeddings[1:]:
+        for embedding in eligible_embeddings[1:]:
             self._append_reference_embedding(reference, embedding)
         return SpeakerAssignment(
             speaker_id=speaker_id,
@@ -425,6 +492,10 @@ class SpeakerReferenceDetector:
             segment_count >= self.min_new_reference_segments
             or duration_s >= self.min_new_reference_duration_s
         )
+
+    def _reference_segment_is_eligible(self, duration_s: float) -> bool:
+        """Return whether a segment may update the long-term profile."""
+        return duration_s >= self.min_reference_segment_duration_s
 
     def _create_reference(self, embedding: np.ndarray) -> int:
         speaker_id = self.next_speaker_id

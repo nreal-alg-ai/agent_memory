@@ -10,7 +10,7 @@ voice_runtime:
   sample_rate: 16000
   language: zh
   device: null
-  max_duration_s: null
+  max_duration_s: 300
   pace_file_realtime: false
   mic_device: null
   mic_channels: 1
@@ -104,6 +104,7 @@ voice_runtime:
     # Maximum number of recent high-confidence embeddings retained per speaker.
     reference_memory_size: 20
     reference_embeddings_path: tmp/mcp/speaker_reference_embeddings.npz
+    min_reference_segment_duration_s: 1.0
     min_new_reference_segments: 2
     min_new_reference_duration_s: 2.0
     user_similarity_threshold: null
