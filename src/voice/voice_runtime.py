@@ -27,9 +27,6 @@ class VoiceRuntime:
         config: Optional[Dict[str, Any]] = None,
         *,
         logger: Optional[logging.Logger] = None,
-        vad: Any = None,
-        asr: Any = None,
-        speaker_identifier: Any = None,
     ) -> None:
         self.config = dict(config or {})
         self.runtime_config = (
@@ -38,40 +35,28 @@ class VoiceRuntime:
             else dict(self.config)
         )
         self.vad_config = self._section("vad")
-        self.asr_config = self._section("asr") or self._section("nonstreaming_asr")
-        if "asr_backend" not in self.asr_config:
-            self.asr_config["asr_backend"] = (
-                "paraformer-offline"
-                if self.asr_config.get("paraformer_model_id")
-                else "whisper"
-            )
+        self.asr_config = self._resolve_asr_config()
         self.config["asr"] = dict(self.asr_config)
         self.speaker_config = self._section("speaker_identification")
         self.logger = logger or logging.getLogger(__name__)
 
         # Imports are kept here so memory-only MCP clients do not need to load
         # the audio model dependencies before the voice runtime is requested.
-        if vad is None:
-            from .vad_detector import StreamingSileroVAD
+        from .vad_detector import StreamingSileroVAD
 
-            vad = StreamingSileroVAD(
-                sample_rate=self._sample_rate(),
-                threshold=float(self.vad_config.get("threshold", 0.5)),
-                min_silence_duration_ms=int(
-                    self.vad_config.get("min_silence_ms", 100)
-                ),
-                speech_pad_ms=int(self.vad_config.get("speech_pad_ms", 30)),
-                window_frames=max(1, int(self.vad_config.get("window_frames", 5))),
-                activate_ratio=float(self.vad_config.get("activate_ratio", 0.6)),
-                deactivate_ratio=float(self.vad_config.get("deactivate_ratio", 0.4)),
-            )
-        self.vad = vad
-        self.asr = asr or self._build_asr()
-        self.speaker_identifier = (
-            speaker_identifier
-            if speaker_identifier is not None
-            else self._build_speaker_identifier()
+        self.vad = StreamingSileroVAD(
+            sample_rate=self._sample_rate(),
+            threshold=float(self.vad_config.get("threshold", 0.5)),
+            min_silence_duration_ms=int(
+                self.vad_config.get("min_silence_ms", 100)
+            ),
+            speech_pad_ms=int(self.vad_config.get("speech_pad_ms", 30)),
+            window_frames=max(1, int(self.vad_config.get("window_frames", 5))),
+            activate_ratio=float(self.vad_config.get("activate_ratio", 0.6)),
+            deactivate_ratio=float(self.vad_config.get("deactivate_ratio", 0.4)),
         )
+        self.asr = self._build_asr()
+        self.speaker_identifier = self._build_speaker_identifier()
 
     def process_audio_file(
         self,
@@ -190,6 +175,110 @@ class VoiceRuntime:
         value = self.config.get(name)
         return dict(value) if isinstance(value, dict) else {}
 
+    def _resolve_asr_config(self) -> Dict[str, Any]:
+        """Flatten the active ASR backend profile for the backend factory."""
+        asr_section = self._section("asr")
+        if isinstance(asr_section.get("backends"), dict):
+            backend_key = str(asr_section.get("backend") or "whisper").strip().lower()
+            common = asr_section.get("common")
+            profiles = asr_section.get("backends")
+            profile = profiles.get(backend_key) if isinstance(profiles, dict) else None
+            if not isinstance(profile, dict) and isinstance(profiles, dict):
+                profile = profiles.get(backend_key.replace("-", "_"))
+            if not isinstance(profile, dict):
+                raise ValueError(f"ASR backend profile not found: {backend_key}")
+            backend = backend_key.replace("_", "-")
+            resolved = {
+                **(dict(common) if isinstance(common, dict) else {}),
+                **profile,
+                "asr_backend": backend,
+            }
+            if backend in {"whisper", "openai-whisper"}:
+                resolved.setdefault("whisper_model_id", resolved.get("model_id"))
+                resolved.setdefault("whisper_chunk_length_s", resolved.get("chunk_length_s"))
+                resolved.setdefault(
+                    "whisper_condition_on_prev_tokens",
+                    resolved.get("condition_on_prev_tokens"),
+                )
+                resolved.setdefault("whisper_max_new_tokens", resolved.get("max_new_tokens"))
+                resolved.setdefault(
+                    "whisper_no_repeat_ngram_size",
+                    resolved.get("no_repeat_ngram_size"),
+                )
+                resolved.setdefault(
+                    "whisper_repetition_penalty",
+                    resolved.get("repetition_penalty"),
+                )
+            elif backend in {"paraformer", "paraformer-offline", "paraformer-nonstreaming"}:
+                resolved.setdefault("paraformer_model_id", resolved.get("model_id"))
+            elif backend == "paraformer-streaming":
+                resolved["asr_backend"] = "paraformer-streaming"
+                resolved.setdefault(
+                    "paraformer_streaming_model_id",
+                    resolved.get("model_id"),
+                )
+                resolved.setdefault(
+                    "funasr_streaming_chunk_size",
+                    resolved.get("chunk_size"),
+                )
+                resolved.setdefault(
+                    "funasr_encoder_chunk_look_back",
+                    resolved.get("encoder_chunk_look_back"),
+                )
+                resolved.setdefault(
+                    "funasr_decoder_chunk_look_back",
+                    resolved.get("decoder_chunk_look_back"),
+                )
+            elif backend in {"parakeet", "parakeet-tdt", "nvidia-parakeet"}:
+                resolved.setdefault("parakeet_model_id", resolved.get("model_id"))
+            elif backend in {
+                "sherpa-onnx-zipformer",
+                "sherpa-zipformer",
+                "zipformer-streaming",
+            }:
+                resolved.setdefault("sherpa_onnx_tokens", resolved.get("tokens"))
+                resolved.setdefault("sherpa_onnx_encoder", resolved.get("encoder"))
+                resolved.setdefault("sherpa_onnx_decoder", resolved.get("decoder"))
+                resolved.setdefault("sherpa_onnx_joiner", resolved.get("joiner"))
+                resolved.setdefault("sherpa_onnx_num_threads", resolved.get("num_threads"))
+                resolved.setdefault("sherpa_onnx_provider", resolved.get("provider"))
+                resolved.setdefault("sherpa_onnx_feature_dim", resolved.get("feature_dim"))
+                resolved.setdefault(
+                    "sherpa_onnx_decoding_method",
+                    resolved.get("decoding_method"),
+                )
+                resolved.setdefault(
+                    "sherpa_onnx_max_active_paths",
+                    resolved.get("max_active_paths"),
+                )
+                resolved.setdefault(
+                    "sherpa_onnx_hotwords_file",
+                    resolved.get("hotwords_file"),
+                )
+                resolved.setdefault(
+                    "sherpa_onnx_hotwords_score",
+                    resolved.get("hotwords_score"),
+                )
+                resolved.setdefault(
+                    "sherpa_onnx_blank_penalty",
+                    resolved.get("blank_penalty"),
+                )
+                resolved.setdefault(
+                    "sherpa_onnx_tail_padding_s",
+                    resolved.get("tail_padding_s"),
+                )
+            return resolved
+
+        # Keep older externally supplied configs readable until all callers migrate.
+        legacy = dict(asr_section or self._section("nonstreaming_asr"))
+        if "asr_backend" not in legacy:
+            legacy["asr_backend"] = (
+                "paraformer-offline"
+                if legacy.get("paraformer_model_id")
+                else "whisper"
+            )
+        return legacy
+
     def _sample_rate(self) -> int:
         return max(1, int(self.runtime_config.get("sample_rate", 16000)))
 
@@ -197,35 +286,9 @@ class VoiceRuntime:
         from .asr import create_asr
 
         config = dict(self.asr_config)
-        config.setdefault("asr_backend", "whisper")
         config.setdefault("sample_rate", self._sample_rate())
         config.setdefault("language", self.runtime_config.get("language", "zh"))
         config.setdefault("device", self.runtime_config.get("device"))
-        config.setdefault("whisper_model_id", "openai/whisper-large-v3-turbo")
-        config.setdefault("whisper_chunk_length_s", None)
-        config.setdefault("whisper_condition_on_prev_tokens", False)
-        config.setdefault("whisper_max_new_tokens", 64)
-        config.setdefault("whisper_no_repeat_ngram_size", None)
-        config.setdefault("whisper_repetition_penalty", None)
-        config.setdefault("parakeet_model_id", "nvidia/parakeet-tdt-0.6b-v3")
-        config.setdefault("paraformer_streaming_model_id", "funasr/paraformer-zh-streaming")
-        config.setdefault("paraformer_model_id", "funasr/paraformer-zh")
-        config.setdefault("funasr_streaming_chunk_size", [60, 10, 5])
-        config.setdefault("funasr_encoder_chunk_look_back", 4)
-        config.setdefault("funasr_decoder_chunk_look_back", 1)
-        config.setdefault("sherpa_onnx_tokens", "")
-        config.setdefault("sherpa_onnx_encoder", "")
-        config.setdefault("sherpa_onnx_decoder", "")
-        config.setdefault("sherpa_onnx_joiner", "")
-        config.setdefault("sherpa_onnx_num_threads", 1)
-        config.setdefault("sherpa_onnx_provider", "cpu")
-        config.setdefault("sherpa_onnx_feature_dim", 80)
-        config.setdefault("sherpa_onnx_decoding_method", "greedy_search")
-        config.setdefault("sherpa_onnx_max_active_paths", 4)
-        config.setdefault("sherpa_onnx_hotwords_file", None)
-        config.setdefault("sherpa_onnx_hotwords_score", 1.5)
-        config.setdefault("sherpa_onnx_blank_penalty", 0.0)
-        config.setdefault("sherpa_onnx_tail_padding_s", 0.66)
         return create_asr(SimpleNamespace(**config))
 
     def _build_speaker_identifier(self) -> Any:
@@ -248,7 +311,7 @@ class VoiceRuntime:
             ),
             reference_memory_size=max(
                 1,
-                int(self.speaker_config.get("reference_memory_size", 10)),
+                int(self.speaker_config.get("reference_memory_size", 20)),
             ),
             min_new_reference_segments=max(
                 1,
@@ -263,6 +326,11 @@ class VoiceRuntime:
             ),
             user_reference_audio_dir=(
                 Path(reference_dir).expanduser() if reference_dir else None
+            ),
+            reference_embeddings_path=(
+                Path(self.speaker_config["reference_embeddings_path"]).expanduser()
+                if self.speaker_config.get("reference_embeddings_path")
+                else None
             ),
             speaker_assignment_method=str(
                 self.speaker_config.get("speaker_assignment_method", "reference")

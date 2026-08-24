@@ -123,11 +123,10 @@ def main() -> None:
 
     runtime_config = voice_runtime_config
     vad_config = voice_runtime_config.get("vad") or {}
-    asr_config = (
-        voice_runtime_config.get("asr")
-        or voice_runtime_config.get("nonstreaming_asr")
-        or {}
-    )
+    asr_section = voice_runtime_config.get("asr") or {}
+    asr_backend = str(asr_section.get("backend") or "whisper")
+    asr_profiles = asr_section.get("backends") or {}
+    asr_config = asr_profiles.get(asr_backend) or asr_section
     output_config = voice_runtime_config.get("output") or {}
     if args.audio is not None:
         audio_path = args.audio.expanduser().resolve()
@@ -140,10 +139,7 @@ def main() -> None:
     if not audio_path.exists():
         raise FileNotFoundError(f"Audio file not found: {audio_path}")
 
-    result_root = _resolve_path(
-        runtime_config.get("result_root") or DEFAULT_RESULT_ROOT,
-        config_path.parent,
-    )
+    result_root = DEFAULT_RESULT_ROOT
     run_dir = _create_run_dir(result_root, audio_path)
     logger = RunLogger(run_dir)
     logger.write_config({
@@ -159,7 +155,7 @@ def main() -> None:
             "Non-streaming VAD+ASR test: "
             f"audio={audio_path}, frame={float(vad_config.get('frame_ms', 32.0)):.1f}ms, "
             f"sample_rate={int(runtime_config.get('sample_rate', 16000))}, "
-            f"model={asr_config.get('whisper_model_id') or asr_config.get('paraformer_model_id') or 'default'}"
+            f"backend={asr_backend}, model={asr_config.get('model_id') or 'default'}"
         )
 
         voice_report = voice_runtime.process_audio_file(audio_path)

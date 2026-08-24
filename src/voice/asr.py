@@ -31,6 +31,15 @@ class WhisperASRConfig(ASRRuntimeConfig, Protocol):
     whisper_repetition_penalty: Optional[float]
 
 
+class Qwen3ASRConfig(ASRRuntimeConfig, Protocol):
+    model_id: str
+    dtype: Any
+    device_map: Optional[str]
+    max_inference_batch_size: int
+    max_new_tokens: int
+    attn_implementation: Optional[str]
+
+
 class ParakeetTDTASRConfig(ASRRuntimeConfig, Protocol):
     parakeet_model_id: str
 
@@ -64,6 +73,7 @@ class SherpaOnnxStreamingZipformerASRConfig(ASRRuntimeConfig, Protocol):
 
 class ASRFactoryConfig(
     WhisperASRConfig,
+    Qwen3ASRConfig,
     ParakeetTDTASRConfig,
     ParaformerStreamingASRConfig,
     ParaformerASRConfig,
@@ -162,6 +172,116 @@ class WhisperASR(BaseASR):
             generate_kwargs=generate_kwargs,
         )
         return result["text"].strip()
+
+
+_QWEN_LANGUAGE_NAMES = {
+    "zh": "Chinese",
+    "zh-cn": "Chinese",
+    "cmn": "Chinese",
+    "en": "English",
+    "yue": "Cantonese",
+    "ja": "Japanese",
+    "ko": "Korean",
+}
+
+
+class Qwen3ASR(BaseASR):
+    """Qwen3-ASR Transformers backend for offline segment transcription."""
+
+    _LANGUAGE_NAMES = _QWEN_LANGUAGE_NAMES
+
+    def __init__(self, config: Qwen3ASRConfig) -> None:
+        super().__init__(config)
+        try:
+            from qwen_asr import Qwen3ASRModel
+        except ImportError as exc:
+            raise RuntimeError(
+                "Qwen3-ASR requires the official qwen-asr package. "
+                "Install it with: pip install -U qwen-asr"
+            ) from exc
+
+        model_kwargs: Dict[str, Any] = {
+            "dtype": _qwen_dtype(getattr(config, "dtype", "auto"), self.device),
+            "device_map": getattr(config, "device_map", None) or self.device,
+            "max_inference_batch_size": max(
+                1,
+                int(getattr(config, "max_inference_batch_size", 1)),
+            ),
+            "max_new_tokens": max(
+                1,
+                int(getattr(config, "max_new_tokens", 256)),
+            ),
+        }
+        attn_implementation = getattr(config, "attn_implementation", None)
+        if attn_implementation:
+            model_kwargs["attn_implementation"] = str(attn_implementation)
+        revision = getattr(config, "revision", None)
+        if revision:
+            model_kwargs["revision"] = str(revision)
+        cache_dir = getattr(config, "cache_dir", None)
+        if cache_dir:
+            model_kwargs["cache_dir"] = str(cache_dir)
+
+        self.model = Qwen3ASRModel.from_pretrained(
+            str(config.model_id),
+            **model_kwargs,
+        )
+        pad_token_id = self._configure_generation_padding()
+        self._ensure_generation_padding_argument(pad_token_id)
+
+    def _configure_generation_padding(self) -> Optional[int]:
+        """Make Qwen's open-ended generation padding explicit.
+
+        ``qwen-asr`` calls the underlying Transformers model directly and its
+        public ``transcribe`` method does not expose ``pad_token_id``. Without
+        this setting Transformers emits the same fallback warning for every
+        audio segment.
+        """
+        processor = getattr(self.model, "processor", None)
+        tokenizer = getattr(processor, "tokenizer", processor)
+        pad_token_id = getattr(tokenizer, "pad_token_id", None)
+        if pad_token_id is None:
+            pad_token_id = getattr(tokenizer, "eos_token_id", None)
+        if pad_token_id is None:
+            return None
+
+        model = getattr(self.model, "model", None)
+        if model is None:
+            return int(pad_token_id)
+        generation_config = getattr(model, "generation_config", None)
+        if generation_config is not None:
+            generation_config.pad_token_id = int(pad_token_id)
+        model_config = getattr(model, "config", None)
+        if model_config is not None:
+            model_config.pad_token_id = int(pad_token_id)
+        return int(pad_token_id)
+
+    def _ensure_generation_padding_argument(self, pad_token_id: Optional[int]) -> None:
+        """Inject padding explicitly for qwen-asr versions that rebuild config."""
+        if pad_token_id is None:
+            return
+        model = getattr(self.model, "model", None)
+        generate = getattr(model, "generate", None)
+        if not callable(generate) or getattr(generate, "_agent_memory_pad_token", False):
+            return
+
+        def generate_with_padding(*args: Any, **kwargs: Any) -> Any:
+            kwargs.setdefault("pad_token_id", int(pad_token_id))
+            return generate(*args, **kwargs)
+
+        setattr(generate_with_padding, "_agent_memory_pad_token", True)
+        model.generate = generate_with_padding
+
+    def transcribe_segment(self, audio: np.ndarray) -> str:
+        if audio.size == 0:
+            return ""
+        results = self.model.transcribe(
+            audio=(_as_float32_mono(audio), int(self.config.sample_rate)),
+            language=_qwen_language(getattr(self.config, "language", None)),
+        )
+        if not results:
+            return ""
+        return _qwen_result_text(results[0])
 
 
 class ParakeetTDTASR(BaseASR):
@@ -469,6 +589,8 @@ def create_asr(config: ASRFactoryConfig) -> ASRBackend:
     backend = config.asr_backend.lower().replace("_", "-")
     if backend in {"whisper", "openai-whisper"}:
         return WhisperASR(config)
+    if backend in {"qwen3-asr", "qwen-asr", "qwen3"}:
+        return Qwen3ASR(config)
     if backend in {"parakeet", "parakeet-tdt", "nvidia-parakeet"}:
         return ParakeetTDTASR(config)
     if backend in {"paraformer", "paraformer-streaming", "funasr-paraformer"}:
@@ -479,7 +601,7 @@ def create_asr(config: ASRFactoryConfig) -> ASRBackend:
         return SherpaOnnxStreamingZipformerASR(config)
     raise ValueError(
         f"Unsupported ASR backend: {config.asr_backend!r}. "
-        "Expected one of: whisper, parakeet, paraformer-streaming, "
+        "Expected one of: whisper, qwen3-asr, parakeet, paraformer-streaming, "
         "paraformer-offline, sherpa-onnx-zipformer."
     )
 
@@ -499,6 +621,33 @@ def _funasr_device(device: str) -> str:
         warnings.warn("FunASR may not support MPS; falling back to CPU.", RuntimeWarning, stacklevel=2)
         return "cpu"
     return "cpu"
+
+
+def _qwen_dtype(value: Any, device: str) -> torch.dtype:
+    """Resolve config dtype without requiring callers to import torch types."""
+    normalized = str(value or "auto").strip().lower()
+    if normalized in {"float32", "fp32"}:
+        return torch.float32
+    if normalized in {"float16", "fp16", "half"}:
+        return torch.float16
+    if normalized in {"bfloat16", "bf16"}:
+        return torch.bfloat16
+    if device.startswith("cuda"):
+        return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    return torch.float32
+
+
+def _qwen_language(value: Any) -> Optional[str]:
+    normalized = str(value or "").strip().lower()
+    if not normalized or normalized in {"auto", "unknown", "none"}:
+        return None
+    return _QWEN_LANGUAGE_NAMES.get(normalized, str(value))
+
+
+def _qwen_result_text(result: Any) -> str:
+    if isinstance(result, dict):
+        return str(result.get("text") or "").strip()
+    return str(getattr(result, "text", "") or "").strip()
 
 
 def _as_float32_mono(audio: np.ndarray) -> np.ndarray:

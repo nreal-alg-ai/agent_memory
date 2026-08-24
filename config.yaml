@@ -7,11 +7,10 @@
 voice_runtime:
 
   # Simulated wall-clock gap between two consecutive audio files.
-  result_root: tmp_result/ai_glasses_voice
   sample_rate: 16000
   language: zh
   device: null
-  max_duration_s: 60
+  max_duration_s: null
   pace_file_realtime: false
   mic_device: null
   mic_channels: 1
@@ -26,14 +25,53 @@ voice_runtime:
     deactivate_ratio: 0.4
   
   asr:
-    whisper_model_id: openai/whisper-large-v3-turbo
-    # whisper_model_id: openai/whisper-tiny
-    whisper_chunk_length_s: null
-    whisper_condition_on_prev_tokens: false
-    whisper_max_new_tokens: 64
-    # These can help tiny models avoid repetition, but may distort normal large-model ASR.
-    whisper_no_repeat_ngram_size: null
-    whisper_repetition_penalty: null
+    backend: qwen3_asr
+    common:
+      language: zh
+      device: null
+      dtype: auto
+    backends:
+      whisper:
+        model_id: openai/whisper-large-v3-turbo
+        # model_id: openai/whisper-tiny
+        chunk_length_s: null
+        condition_on_prev_tokens: false
+        max_new_tokens: 64
+        # These can help tiny models avoid repetition, but may distort normal large-model ASR.
+        no_repeat_ngram_size: null
+        repetition_penalty: null
+      qwen3_asr:
+        model_id: Qwen/Qwen3-ASR-0.6B
+        revision: main
+        cache_dir: null
+        dtype: auto
+        device_map: null
+        max_inference_batch_size: 1
+        max_new_tokens: 256
+        attn_implementation: null
+      paraformer:
+        model_id: funasr/paraformer-zh
+      paraformer_streaming:
+        model_id: funasr/paraformer-zh-streaming
+        chunk_size: [60, 10, 5]
+        encoder_chunk_look_back: 4
+        decoder_chunk_look_back: 1
+      parakeet:
+        model_id: nvidia/parakeet-tdt-0.6b-v3
+      sherpa_onnx_zipformer:
+        tokens: assets/sherpa-onnx/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20/tokens.txt
+        encoder: assets/sherpa-onnx/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20/encoder-epoch-13-avg-2-chunk-16-left-64.onnx
+        decoder: assets/sherpa-onnx/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20/decoder-epoch-13-avg-2-chunk-16-left-64.onnx
+        joiner: assets/sherpa-onnx/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20/joiner-epoch-13-avg-2-chunk-16-left-64.onnx
+        num_threads: 2
+        provider: cpu
+        feature_dim: 80
+        max_active_paths: 4
+        decoding_method: greedy_search
+        hotwords_file: null
+        hotwords_score: 1.0
+        blank_penalty: 0.0
+        tail_padding_s: 0.66
   
   output:
     simplify_chinese: true
@@ -41,17 +79,6 @@ voice_runtime:
     log_frames: false
     output_jsonl: null
   
-  streaming_asr:
-    paraformer_streaming_model_id: funasr/paraformer-zh-streaming
-    trigger_s: 0.6
-    simplify_chinese: true
-    print_empty: false
-
-  nonstreaming_asr:
-    paraformer_model_id: funasr/paraformer-zh
-    simplify_chinese: true
-    print_empty: false
-
   kws:
     enabled: false
     tokens: assets/sherp-onnx/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20/tokens.txt
@@ -74,7 +101,9 @@ voice_runtime:
     model_id: iic/speech_campplus_sv_zh-cn_16k-common
     window_s: 2.048
     similarity_threshold: 0.5
-    reference_memory_size: 10
+    # Maximum number of recent high-confidence embeddings retained per speaker.
+    reference_memory_size: 20
+    reference_embeddings_path: tmp/mcp/speaker_reference_embeddings.npz
     min_new_reference_segments: 2
     min_new_reference_duration_s: 2.0
     user_similarity_threshold: null
@@ -156,7 +185,7 @@ memory_manager:
   
   recall_top_k: 8
   recall_budget: mid
-  recall_path: normal
+  recall_mode: normal
   retrievel_source_override:
 
   recall_detailed_logging: true

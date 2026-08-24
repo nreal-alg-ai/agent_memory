@@ -1,10 +1,12 @@
 import sys
 import tempfile
+import json
+import os
 import numpy as np
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 import soundfile as sf
 import torch
 from sklearn.cluster import AgglomerativeClustering
@@ -32,6 +34,9 @@ def _cosine_similarity(left: np.ndarray, right: np.ndarray) -> float:
 
 DEFAULT_USER_REFERENCE_AUDIO_DIR = (
     Path(__file__).resolve().parents[2] / "assets/user_reference_audio_files"
+)
+DEFAULT_REFERENCE_EMBEDDINGS_PATH = (
+    Path(__file__).resolve().parents[2] / "tmp/mcp/speaker_reference_embeddings.npz"
 )
 SUPPORTED_REFERENCE_AUDIO_EXTENSIONS = {".wav", ".flac", ".ogg", ".mp3", ".m4a"}
 
@@ -98,6 +103,7 @@ class SpeakerReferenceDetector:
         min_new_reference_duration_s: float = 3.0,
         user_similarity_threshold: Optional[float] = None,
         user_reference_audio_dir: Optional[Path] = None,
+        reference_embeddings_path: Optional[Path] = None,
         speaker_assignment_method: str = "reference",
     ) -> None:
         try:
@@ -112,6 +118,7 @@ class SpeakerReferenceDetector:
         if device and device != "cpu":
             kwargs["device"] = device
         self.model = AutoModel(**kwargs)
+        self.model_id = model_id
         self.sample_rate = sample_rate
         self.similarity_threshold = similarity_threshold
         self.reference_memory_size = max(1, reference_memory_size)
@@ -132,7 +139,13 @@ class SpeakerReferenceDetector:
             if user_reference_audio_dir is not None
             else DEFAULT_USER_REFERENCE_AUDIO_DIR
         )
+        self.reference_embeddings_path = (
+            reference_embeddings_path.expanduser().resolve()
+            if reference_embeddings_path is not None
+            else DEFAULT_REFERENCE_EMBEDDINGS_PATH
+        )
         self.next_speaker_id = 1
+        self._load_reference_embeddings()
         self.reload_user_reference_audios()
 
     def load_user_reference_audios(self, audio_paths: List[Path]) -> None:
@@ -234,6 +247,7 @@ class SpeakerReferenceDetector:
                     reason="new_reference",
                 )
             )
+        self._save_reference_embeddings()
         return all_speaker_assignments
 
     def identify_speaker_using_agglomerative_clustering(
@@ -268,6 +282,7 @@ class SpeakerReferenceDetector:
             for index in cluster_indexes:
                 assignments[index] = assignment
 
+        self._save_reference_embeddings()
         return [assignment for assignment in assignments if assignment is not None]
 
     def _assign_cluster_to_user_reference(
@@ -414,13 +429,130 @@ class SpeakerReferenceDetector:
     def _create_reference(self, embedding: np.ndarray) -> int:
         speaker_id = self.next_speaker_id
         self.next_speaker_id += 1
-        self.reference_embeddings.append(SpeakerReference(speaker_id=speaker_id, embeddings=[embedding]))
+        self.reference_embeddings.append(
+            SpeakerReference(
+                speaker_id=speaker_id,
+                embeddings=[_l2_normalize(embedding)],
+            )
+        )
         return speaker_id
 
     def _append_reference_embedding(self, reference: SpeakerReference, embedding: np.ndarray) -> None:
-        reference.embeddings.append(embedding)
+        reference.embeddings.append(_l2_normalize(embedding))
         if len(reference.embeddings) > self.reference_memory_size:
             reference.embeddings = reference.embeddings[-self.reference_memory_size :]
+
+    def _load_reference_embeddings(self) -> None:
+        path = self.reference_embeddings_path
+        if not path.is_file():
+            return
+
+        try:
+            with np.load(path, allow_pickle=False) as archive:
+                if "metadata" not in archive.files:
+                    raise ValueError("missing metadata")
+                metadata_value = archive["metadata"]
+                metadata = json.loads(str(metadata_value.item()))
+                if metadata.get("schema_version") != 1:
+                    raise ValueError(
+                        f"unsupported schema_version={metadata.get('schema_version')}"
+                    )
+                if int(metadata.get("sample_rate", -1)) != self.sample_rate:
+                    raise ValueError(
+                        f"sample_rate mismatch: saved={metadata.get('sample_rate')} "
+                        f"current={self.sample_rate}"
+                    )
+                if str(metadata.get("model_id")) != str(self.model_id):
+                    raise ValueError(
+                        f"model_id mismatch: saved={metadata.get('model_id')} "
+                        f"current={self.model_id}"
+                    )
+
+                references: List[SpeakerReference] = []
+                expected_dim = int(metadata.get("embedding_dim", 0))
+                for item in metadata.get("speakers", []):
+                    speaker_id = int(item["speaker_id"])
+                    key = str(item["key"])
+                    values = np.asarray(archive[key], dtype=np.float32)
+                    if values.ndim != 2 or values.shape[0] == 0:
+                        raise ValueError(f"invalid embedding matrix for speaker {speaker_id}")
+                    if expected_dim and values.shape[1] != expected_dim:
+                        raise ValueError(
+                            f"embedding dimension mismatch for speaker {speaker_id}: "
+                            f"saved={values.shape[1]} expected={expected_dim}"
+                        )
+                    references.append(
+                        SpeakerReference(
+                            speaker_id=speaker_id,
+                            embeddings=[
+                                _l2_normalize(row)
+                                for row in values[-self.reference_memory_size :]
+                            ],
+                        )
+                    )
+
+            self.reference_embeddings = sorted(
+                references,
+                key=lambda reference: reference.speaker_id,
+            )
+            self.next_speaker_id = max(
+                (reference.speaker_id for reference in self.reference_embeddings),
+                default=0,
+            ) + 1
+        except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+            self.reference_embeddings = []
+            self.next_speaker_id = 1
+            # A stale or incompatible profile must not poison the current run.
+            # It will be replaced after the first successful identification.
+            self._reference_load_error = str(exc)
+
+    def _save_reference_embeddings(self) -> None:
+        if not self.reference_embeddings:
+            return
+
+        path = self.reference_embeddings_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        arrays: Dict[str, np.ndarray] = {}
+        speakers = []
+        embedding_dim = 0
+        for reference in self.reference_embeddings:
+            key = f"speaker_{reference.speaker_id}"
+            values = np.asarray(reference.embeddings, dtype=np.float32)
+            if values.ndim != 2 or values.shape[0] == 0:
+                continue
+            embedding_dim = values.shape[1]
+            arrays[key] = values[-self.reference_memory_size :]
+            speakers.append({"speaker_id": reference.speaker_id, "key": key})
+        if not arrays:
+            return
+
+        metadata = {
+            "schema_version": 1,
+            "model_id": self.model_id,
+            "sample_rate": self.sample_rate,
+            "embedding_dim": embedding_dim,
+            "reference_memory_size": self.reference_memory_size,
+            "speakers": speakers,
+        }
+        temporary_path: Optional[Path] = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                suffix=".npz",
+                prefix=f".{path.name}.",
+                dir=path.parent,
+                delete=False,
+            ) as temp_file:
+                temporary_path = Path(temp_file.name)
+            np.savez_compressed(
+                temporary_path,
+                metadata=np.asarray(json.dumps(metadata), dtype=np.str_),
+                **arrays,
+            )
+            os.replace(temporary_path, path)
+        finally:
+            if temporary_path is not None and temporary_path.exists():
+                temporary_path.unlink()
 
     @staticmethod
     def _reference_embedding(reference: SpeakerReference) -> np.ndarray:

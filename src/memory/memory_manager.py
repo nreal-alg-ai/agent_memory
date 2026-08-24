@@ -325,7 +325,7 @@ class MemoryOperationReporter:
                 "operation_type": "recall",
                 "task_id": f"recall-{counts['completed']}",
                 "status": recall_report.get("status"),
-                "actual_recall_path": recall_report.get("actual_recall_path"),
+                "actual_recall_mode": recall_report.get("actual_recall_mode"),
                 "elapsed_ms": elapsed_ms,
                 "timestamp": _now_text(),
             })
@@ -509,8 +509,8 @@ class MemoryNodeManager:
             if isinstance(configured_source_override, (list, tuple, set))
             else None
         )
-        self._recall_path = str(
-            self._memory_cfg.get("recall_path", "normal") or "normal"
+        self._recall_mode = str(
+            self._memory_cfg.get("recall_mode", "normal") or "normal"
         ).strip().lower()
         self._recall_stage2_fact_min_embedding_similarity = self._clamp_float(
             self._memory_cfg.get("recall_fact_min_embedding_similarity"),
@@ -5199,7 +5199,7 @@ class MemoryNodeManager:
                 tags=tags,
                 time_end=time_end,
                 memory_source_override=self._retrieval_source_override,
-                recall_path=self._recall_path,
+                recall_mode=self._recall_mode,
                 prompt_language=prompt_language,
                 database=reader_db,
             )
@@ -5212,27 +5212,27 @@ class MemoryNodeManager:
         tags: Optional[List[str]] = None,
         time_end: Optional[str] = None,
         memory_source_override: Optional[Sequence[str]] = None,
-        recall_path: str = "normal",
+        recall_mode: str = "normal",
         prompt_language: str = "zh",
         database: Optional[SessionDB] = None,
     ) -> Dict[str, Any]:
-        requested_recall_path = str(recall_path or "normal").strip().lower()
+        requested_recall_mode = str(recall_mode or "normal").strip().lower()
         started_at = time.monotonic()
         if not self._memory_enabled or not str(query or "").strip():
             recall_report = {
                 "memory_context": "",
-                "requested_recall_path": requested_recall_path,
-                "actual_recall_path": "none",
+                "requested_recall_mode": requested_recall_mode,
+                "actual_recall_mode": "none",
                 "status": "empty",
                 "elapsed_ms": round((time.monotonic() - started_at) * 1000, 2),
             }
             self._operation_reporter.on_recall_finished(recall_report)
             return recall_report
         try:
-            normalized_recall_path = requested_recall_path
-            if normalized_recall_path not in {"stage1", "stage2", "normal"}:
+            normalized_recall_mode = requested_recall_mode
+            if normalized_recall_mode not in {"stage1", "stage2", "normal"}:
                 raise ValueError(
-                    "recall_path must be one of: stage1, stage2, normal"
+                    "recall_mode must be one of: stage1, stage2, normal"
                 )
             k = max(1, int(top_k or self._top_k or 8))
             b = str(budget or self._recall_budget or "mid")
@@ -5248,7 +5248,7 @@ class MemoryNodeManager:
                 "requested_time_end": time_end,
                 "time_end": reference_time,
                 "memory_source_override": list(memory_source_override or []),
-                "recall_path": normalized_recall_path,
+                "recall_mode": normalized_recall_mode,
                 "prompt_language": prompt_language,
             })
 
@@ -5271,9 +5271,9 @@ class MemoryNodeManager:
             })
 
             memory_text: Optional[str]
-            actual_recall_path: str
-            if normalized_recall_path == "stage2":
-                actual_recall_path = "stage2"
+            actual_recall_mode: str
+            if normalized_recall_mode == "stage2":
+                actual_recall_mode = "stage2"
                 stage1_report = self._process_recall_stage1(
                     query=search_query,
                     top_k=k,
@@ -5315,11 +5315,11 @@ class MemoryNodeManager:
                     prompt_language=prompt_language,
                     database=database,
                 )
-                if normalized_recall_path == "stage1":
-                    actual_recall_path = "stage1"
+                if normalized_recall_mode == "stage1":
+                    actual_recall_mode = "stage1"
                     memory_text = str(stage1_report.get("memory_context") or "")
                 elif not stage1_report.get("trusted"):
-                    actual_recall_path = "stage2"
+                    actual_recall_mode = "stage2"
                     memory_text = self._process_recall_stage2(
                         query=search_query,
                         analysis_query=query,
@@ -5334,12 +5334,12 @@ class MemoryNodeManager:
                     )
                 else:
                     memory_text = str(stage1_report.get("memory_context") or "")
-                    actual_recall_path = "stage1"
+                    actual_recall_mode = "stage1"
             recall_status = "ok" if memory_text else "empty"
             recall_report = {
                 "memory_context": memory_text or "",
-                "requested_recall_path": normalized_recall_path,
-                "actual_recall_path": actual_recall_path,
+                "requested_recall_mode": normalized_recall_mode,
+                "actual_recall_mode": actual_recall_mode,
                 "temporal_mode": temporal_mode,
                 "status": recall_status,
                 "elapsed_ms": round((time.monotonic() - started_at) * 1000, 2),
@@ -5347,8 +5347,8 @@ class MemoryNodeManager:
             }
             self._log_info("memory_recall", "finish", {
                 "status": recall_status,
-                "recall_path": normalized_recall_path,
-                "actual_recall_path": actual_recall_path,
+                "recall_mode": normalized_recall_mode,
+                "actual_recall_mode": actual_recall_mode,
                 "temporal_mode": temporal_mode,
                 "elapsed_ms": round((time.monotonic() - started_at) * 1000, 2),
                 "recall_context_chars": len(memory_text or ""),
