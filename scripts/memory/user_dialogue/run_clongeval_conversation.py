@@ -699,8 +699,8 @@ def process_context_group(
                     recall_context,
                     args.reader_max_context_chars,
                 )
-            actual_recall_path = str(
-                recall_report.get("actual_recall_path") or "unknown"
+            actual_recall_mode = str(
+                recall_report.get("actual_recall_mode") or "unknown"
             )
             memory_operation_report = operation_reporter.snapshot()
             operation_counts = memory_operation_report.get("counts") or {}
@@ -718,9 +718,9 @@ def process_context_group(
                 "answer": record.get("answer", ""),
                 "hypothesis": hypothesis,
                 "answer_in_recall_context": covered,
-                "recall_path": args.recall_path,
-                "requested_recall_path": args.recall_path,
-                "actual_recall_path": actual_recall_path,
+                "recall_mode": args.recall_mode,
+                "requested_recall_mode": args.recall_mode,
+                "actual_recall_mode": actual_recall_mode,
                 "recall_status": str(
                     recall_report.get("status")
                     or ("ok" if recall_context else "empty")
@@ -743,7 +743,7 @@ def process_context_group(
             results.append(result)
             logging.info(
                 "[%s/%s] context_record=%s/%s id=%s group=%s recall_chars=%s "
-                "actual_recall_path=%s answer_in_context=%s",
+                "actual_recall_mode=%s answer_in_context=%s",
                 group_index,
                 total_groups,
                 record_index,
@@ -751,7 +751,7 @@ def process_context_group(
                 record["id"],
                 group_id,
                 len(recall_context or ""),
-                actual_recall_path,
+                actual_recall_mode,
                 covered,
             )
 
@@ -1007,16 +1007,16 @@ def main() -> int:
         "gold_answer_in_recall_context": gold_covered,
         "reader_answered": reader_answered,
         "gold_coverage_rate": gold_covered / result_count if result_count else 0.0,
-        "recall_path": args.recall_path,
+        "recall_mode": args.recall_mode,
         "reused_existing_db": bool(args.existing_state_dir),
-        "actual_recall_path_counts": {
+        "actual_recall_mode_counts": {
             path: sum(
                 1
                 for item in results
-                if item.get("actual_recall_path") == path
+                if item.get("actual_recall_mode") == path
             )
             for path in sorted(
-                {str(item.get("actual_recall_path") or "unknown") for item in results}
+                {str(item.get("actual_recall_mode") or "unknown") for item in results}
             )
         },
         "enable_reflect": bool(args.enable_reflect),

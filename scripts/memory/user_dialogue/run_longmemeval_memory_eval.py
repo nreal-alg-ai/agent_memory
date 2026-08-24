@@ -1234,12 +1234,12 @@ def build_instance_memory_context(
                 "recall_context_chars": len(memory_context or ""),
                 "recall_context": memory_context,
                 "recall_memory_source_override": list(args.recall_memory_source or []),
-                "recall_path": str(args.recall_path),
-                "requested_recall_path": str(
-                    recall_report.get("requested_recall_path") or args.recall_path
+                "recall_mode": str(args.recall_mode),
+                "requested_recall_mode": str(
+                    recall_report.get("requested_recall_mode") or args.recall_mode
                 ),
-                "actual_recall_path": str(
-                    recall_report.get("actual_recall_path") or "unknown"
+                "actual_recall_mode": str(
+                    recall_report.get("actual_recall_mode") or "unknown"
                 ),
                 "recall_status": str(
                     recall_report.get("status")

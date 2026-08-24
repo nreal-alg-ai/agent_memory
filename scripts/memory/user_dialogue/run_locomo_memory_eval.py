@@ -549,8 +549,8 @@ def build_sample_memory_context(
                     "db_counts": counts,
                     "recall_context": memory_context,
                     "recall_context_chars": len(memory_context),
-                    "requested_recall_path": recall_report.get("requested_recall_path", args.recall_path),
-                    "actual_recall_path": recall_report.get("actual_recall_path", "unknown"),
+                    "requested_recall_mode": recall_report.get("requested_recall_mode", args.recall_mode),
+                    "actual_recall_mode": recall_report.get("actual_recall_mode", "unknown"),
                     "recall_status": recall_report.get("status", "empty"),
                     "recall_total_elapsed_ms": recall_elapsed_ms,
                 })
@@ -822,7 +822,7 @@ def main() -> int:
     reader_success, reader_failures = generate_reader_answers(args, outputs, detail_rows)
     write_json(output_path, outputs)
     write_json(detail_path, detail_rows)
-    summary = {"input": str(args.input), "output": str(output_path), "detail_output": str(detail_path), "state_dir": str(args.state_dir), "samples_requested": len(samples), "samples_succeeded": len(samples) - len(errors), "samples_failed": len(errors), "reader_answers_succeeded": reader_success, "reader_answers_failed": reader_failures, "workers": workers, "recall_path": args.recall_path, "fact_extraction_interval": args.fact_extraction_interval}
+    summary = {"input": str(args.input), "output": str(output_path), "detail_output": str(detail_path), "state_dir": str(args.state_dir), "samples_requested": len(samples), "samples_succeeded": len(samples) - len(errors), "samples_failed": len(errors), "reader_answers_succeeded": reader_success, "reader_answers_failed": reader_failures, "workers": workers, "recall_mode": args.recall_mode, "fact_extraction_interval": args.fact_extraction_interval}
     logging.info("LoCoMo evaluation complete: %s", json.dumps(summary, ensure_ascii=False))
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     return 0 if not errors else 1

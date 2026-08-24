@@ -43,8 +43,8 @@ Example client configuration:
   queues state/actionable-item reflection. Use `limit` and
   `reflect_timestamp` to override the configured defaults.
 - `trigger_memory_recall`: immediately searches the latest committed database
-  snapshot. It returns `memory_context`, `actual_recall_path`, and recall
-  timing/diagnostic fields. `recall_path` accepts `stage1`, `stage2`, or
+  snapshot. It returns `memory_context`, `actual_recall_mode`, and recall
+  timing/diagnostic fields. `recall_mode` accepts `stage1`, `stage2`, or
   `normal`.
 
 The server does not expose internal database methods or the manager's private
