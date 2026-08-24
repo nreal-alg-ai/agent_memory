@@ -33,19 +33,21 @@ Example client configuration:
 
 ## Tools
 
-- `accept_single_interaction_turn`: accepts one `user_message` and optional
-  `assistant_response`, tags, and `turn_timestamp`. It returns a queue report;
-  the runtime may keep the turn pending until segmentation decides to flush it.
-- `accept_single_transcript_segment`: accepts one transcript `segment`, with
-  optional `source_type` and tags. Compatible segments are buffered by the
-  runtime.
-- `trigger_memory_reflect`: flushes pending interaction/transcript input and
-  queues state/actionable-item reflection. Use `limit` and
-  `reflect_timestamp` to override the configured defaults.
-- `trigger_memory_recall`: immediately searches the latest committed database
-  snapshot. It returns `memory_context`, `actual_recall_mode`, and recall
-  timing/diagnostic fields. `recall_mode` accepts `stage1`, `stage2`, or
-  `normal`.
+The MCP server exposes only two tools:
+
+- `process_audio_files`: accepts a non-empty `files` array. Each item contains
+  an `audio_path` and may override `source_type`, `session_start`, and `tags`.
+  The server runs VAD, ASR, and speaker identification, submits the resulting
+  transcript segments to memory, flushes the store queue, and runs the
+  configured reflection workflow for each file. The response contains one
+  report per file, including transcription and memory-store results.
+- `trigger_memory_recall`: searches the latest committed memory snapshot using
+  a `query`, with optional `tags` and `time_end`. The response contains the
+  assembled `memory_context`, recall-path metadata, and timing information.
+
+`process_audio_file`, transcript ingestion, reflection, and pending-queue
+operations are internal implementation steps of `process_audio_files`; they are
+not exposed as separate MCP tools.
 
 The server does not expose internal database methods or the manager's private
 fact/state extraction functions. This keeps pending buffering and write
