@@ -137,6 +137,13 @@ def build_service(config_source: Any = None) -> tuple[MemoryMCPService, logging.
         include_voice_runtime=True,
     )
     logger = build_logger(log_path, log_level)
+    logger.info(
+        "Memory MCP service configured config_path=%s cwd=%s db_path=%s log_path=%s",
+        config_path,
+        Path.cwd(),
+        db_path,
+        log_path,
+    )
     try:
         memory_runtime = MemoryRuntime(
             db_path=db_path,
@@ -145,13 +152,20 @@ def build_service(config_source: Any = None) -> tuple[MemoryMCPService, logging.
             logger=logger,
         )
         voice_logger = logger.getChild("voice")
-        voice_runtime = VoiceRuntime(
-            voice_runtime_config,
-            logger=voice_logger,
-        )
+
+        def build_voice_runtime() -> VoiceRuntime:
+            """Load VAD/ASR/speaker models on the first audio request."""
+            logger.info("Loading voice runtime models on first audio request")
+            runtime = VoiceRuntime(
+                voice_runtime_config,
+                logger=voice_logger,
+            )
+            logger.info("Voice runtime models loaded")
+            return runtime
+
         return MemoryMCPService(
             memory_runtime,
-            voice_runtime,
+            voice_runtime_factory=build_voice_runtime,
             queue_timeout=queue_timeout,
         ), logger
     except Exception:
@@ -161,12 +175,20 @@ def build_service(config_source: Any = None) -> tuple[MemoryMCPService, logging.
 
 
 def main() -> int:
+    # Keep stdout exclusively for MCP JSON-RPC. Some ASR dependencies emit
+    # progress/version text to stdout while loading or processing models.
+    protocol_output = sys.stdout
+    sys.stdout = sys.stderr
     service, logger = build_service()
     config = load_config(DEFAULT_CONFIG_PATH)
     server_config = config.get("memory_mcp_server") or {}
     db_path = _resolve_configured_path(server_config.get("db_path"), DEFAULT_CONFIG_PATH)
     logger.info("Memory MCP server started db_path=%s", db_path)
-    StdioMCPServer(service, logger=logger).serve_forever()
+    StdioMCPServer(
+        service,
+        output_stream=protocol_output,
+        logger=logger,
+    ).serve_forever()
     logger.info("Memory MCP server stopped")
     return 0
 

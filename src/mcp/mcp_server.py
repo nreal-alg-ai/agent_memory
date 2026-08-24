@@ -5,9 +5,10 @@ from __future__ import annotations
 import json
 import logging
 import sys
+import threading
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, TextIO
+from typing import Any, Callable, Dict, List, Optional, TextIO
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SRC_ROOT = REPO_ROOT / "src"
@@ -63,13 +64,28 @@ class MemoryMCPService:
     def __init__(
         self,
         memory_runtime: MemoryRuntime,
-        voice_runtime: "VoiceRuntime",
+        voice_runtime: Optional["VoiceRuntime"] = None,
         *,
+        voice_runtime_factory: Optional[Callable[[], "VoiceRuntime"]] = None,
         queue_timeout: float = 30.0,
     ) -> None:
         self.memory_runtime = memory_runtime
         self.voice_runtime = voice_runtime
+        self._voice_runtime_factory = voice_runtime_factory
+        self._voice_runtime_lock = threading.Lock()
+        self._stdio_framing: Optional[str] = None
         self.queue_timeout = max(0.0, float(queue_timeout))
+
+    def _get_voice_runtime(self) -> "VoiceRuntime":
+        """Create the voice runtime only when audio processing is requested."""
+        if self.voice_runtime is not None:
+            return self.voice_runtime
+        if self._voice_runtime_factory is None:
+            raise RuntimeError("Voice runtime is not configured")
+        with self._voice_runtime_lock:
+            if self.voice_runtime is None:
+                self.voice_runtime = self._voice_runtime_factory()
+        return self.voice_runtime
 
     def process_audio_file(
         self,
@@ -84,7 +100,7 @@ class MemoryMCPService:
         if not str(audio_path or "").strip():
             raise ValueError("audio_path must be non-empty")
         source = str(source_type or "allday_recording").strip()
-        voice_report = self.voice_runtime.process_audio_file(
+        voice_report = self._get_voice_runtime().process_audio_file(
             audio_path,
             session_start=session_start,
         )
@@ -329,13 +345,35 @@ class StdioMCPServer:
 
     def _read_message(self) -> Optional[Dict[str, Any]]:
         stream = self.input_stream
+        first_line = stream.buffer.readline() if hasattr(stream, "buffer") else stream.readline()
+        if not first_line:
+            return None
+        if isinstance(first_line, bytes):
+            first_line = first_line.decode("utf-8")
+        first_line = first_line.strip("\r\n")
+        if not first_line:
+            return self._read_message()
+
+        # MCP stdio normally uses one JSON-RPC object per line. Keep accepting
+        # LSP-style Content-Length frames for older local MCP clients.
+        if first_line.lstrip().startswith(("{", "[")):
+            self._stdio_framing = "newline"
+            message = json.loads(first_line)
+            if not isinstance(message, dict):
+                raise ValueError("MCP message must be a JSON object")
+            return message
+
         headers: Dict[str, str] = {}
+        if ":" not in first_line:
+            raise ValueError(f"Invalid MCP header: {first_line}")
+        key, value = first_line.split(":", 1)
+        headers[key.strip().lower()] = value.strip()
         while True:
             line = stream.buffer.readline() if hasattr(stream, "buffer") else stream.readline()
             if not line:
                 return None
             if isinstance(line, bytes):
-                line = line.decode("ascii")
+                line = line.decode("utf-8")
             line = line.strip("\r\n")
             if not line:
                 break
@@ -356,6 +394,7 @@ class StdioMCPServer:
         message = json.loads(raw)
         if not isinstance(message, dict):
             raise ValueError("MCP message must be a JSON object")
+        self._stdio_framing = "content-length"
         return message
 
     def _write_message(self, message: Dict[str, Any]) -> None:
@@ -365,15 +404,21 @@ class StdioMCPServer:
             separators=(",", ":"),
         ).encode("utf-8")
         stream = self.output_stream
-        header = f"Content-Length: {len(payload)}\r\n\r\n".encode("ascii")
+        if self._stdio_framing == "content-length":
+            output = (
+                f"Content-Length: {len(payload)}\r\n\r\n".encode("ascii")
+                + payload
+            )
+        else:
+            output = payload + b"\n"
         if hasattr(stream, "buffer"):
-            stream.buffer.write(header + payload)
+            stream.buffer.write(output)
             stream.buffer.flush()
         else:
             try:
-                stream.write((header + payload).decode("utf-8"))
+                stream.write(output.decode("utf-8"))
             except TypeError:
-                stream.write(header + payload)
+                stream.write(output)
             stream.flush()
 
     def _dispatch(self, request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
