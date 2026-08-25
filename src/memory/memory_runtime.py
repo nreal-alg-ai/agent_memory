@@ -8,11 +8,10 @@ turns or transcript segments into the manager's raw episode segments.
 from __future__ import annotations
 
 import logging
+import json
 import re
 from pathlib import Path
-from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
-
-import numpy as np
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .embedding_client import EmbeddingClient
 from .memory_database import SessionDB
@@ -26,12 +25,14 @@ from .memory_manager import (
 )
 from .memory_segmentation import (
     OnlineSemanticSegmenter,
+    TranscriptSemanticUnit,
+    TranscriptUtteranceAssembler,
     build_online_segmentation_config,
-    convert_interaction_turn_to_online_exchange
+    build_transcript_aggregation_config,
+    build_transcript_segmentation_config,
+    convert_interaction_turn_to_online_exchange,
+    convert_transcript_unit_to_online_exchange,
 )
-
-INTERACTION_TOKEN_RE = re.compile(r"[\u4e00-\u9fff]|[A-Za-z0-9_.$'-]+|[^\s]")
-
 
 class MemoryRuntime:
     """Normalize application input and batch it before episode storage."""
@@ -91,20 +92,24 @@ class MemoryRuntime:
             self._embedding_client,
             interaction_segmentation_config,
         )
-        self._transcript_episode_max_segments = max(
-            1,
-            int(runtime_config.get("transcript_episode_max_segments") or 80),
+        transcript_segmentation_config = build_transcript_segmentation_config(
+            runtime_config,
         )
-        self._transcript_episode_max_chars = max(
-            1,
-            int(runtime_config.get("transcript_episode_max_chars") or 12000),
+        self._transcript_segmenter = OnlineSemanticSegmenter(
+            self._embedding_client,
+            transcript_segmentation_config,
         )
-        transcript_gap_seconds = runtime_config.get("transcript_episode_max_gap_seconds")
-        self._transcript_episode_max_gap_seconds = float(
-            60.0 if transcript_gap_seconds is None else transcript_gap_seconds
+        self._transcript_utterance_assembler = TranscriptUtteranceAssembler(
+            build_transcript_aggregation_config(runtime_config),
         )
-        self._pending_transcript_segments: List[Dict[str, Any]] = []
-        self._pending_transcript_context: Optional[Dict[str, Any]] = None
+        allday_segmentation_config = runtime_config.get(
+            "allday_recording_segmentation",
+        )
+        if not isinstance(allday_segmentation_config, dict):
+            allday_segmentation_config = {}
+        self._transcript_segmentation_log_decisions = bool(
+            allday_segmentation_config.get("log_decisions", False),
+        )
 
     def close(self, timeout: Optional[float] = 30.0) -> None:
         """Drain owned tasks and release resources created by this runtime."""
@@ -206,7 +211,8 @@ class MemoryRuntime:
             return {"queued": False, "reason": "memory_disabled"}
         if not isinstance(segment, dict):
             return {"queued": False, "reason": "invalid_segment"}
-        if not self._transcript_segment_text(segment):
+        normalized_segment = self._normalize_single_transcript_segment(segment)
+        if normalized_segment is None:
             return {"queued": False, "reason": "empty_segment"}
 
         context = {
@@ -219,36 +225,125 @@ class MemoryRuntime:
                 }
             ),
         }
+        normalized_segment["_memory_context"] = dict(context)
+
         queued = False
-        reason = "threshold_not_reached"
-        should_flush = self._should_flush_pending_transcript_before(segment, context)
-        if should_flush:
-            flush_report = self._flush_pending_transcript_segments()
-            queued = bool(flush_report.get("queued")) or queued
-            if queued:
-                reason = ""
-            elif flush_report.get("reason"):
-                reason = str(flush_report.get("reason"))
-            if self._pending_transcript_segments:
-                return {"queued": queued, "reason": reason}
+        completed_unit = self._transcript_utterance_assembler.append(
+            normalized_segment,
+        )
+        if completed_unit is None:
+            return {
+                "queued": False,
+                "reason": "threshold_not_reached",
+            }
+        append_report = self._append_transcript_semantic_unit(completed_unit)
+        queued = bool(append_report.get("queued")) or queued
+        if not append_report.get("accepted"):
+            return {
+                "queued": queued,
+                "reason": str(append_report.get("reason") or "queue_rejected"),
+            }
+        return {
+            "queued": queued,
+            "reason": "" if queued else "threshold_not_reached",
+        }
 
-        self._pending_transcript_context = dict(context)
-        self._pending_transcript_segments.append(dict(segment))
-        return {"queued": queued, "reason": "" if queued else reason}
+    def _append_transcript_semantic_unit(
+        self,
+        unit: TranscriptSemanticUnit,
+    ) -> Dict[str, Any]:
+        """Use one assembled utterance to decide whether the prior episode ends."""
+        queued = False
+        exchange = convert_transcript_unit_to_online_exchange(unit)
+        pending_exchanges = self._transcript_segmenter.pending_exchange_snapshot()
+        if pending_exchanges:
+            should_finalize, decision = (
+                self._transcript_segmenter.should_finalize_pending_exchanges(
+                    exchange,
+                )
+            )
+            self._log_transcript_segmentation_decision(
+                unit,
+                decision=decision,
+            )
+            flush_report = (
+                self._store_pending_transcript_exchanges(
+                    reason=decision.reason,
+                )
+                if should_finalize
+                else None
+            )
+            if flush_report is not None:
+                queued = bool(flush_report.get("queued")) or queued
+                if self._transcript_segmenter.has_pending_exchanges():
+                    return {
+                        "accepted": False,
+                        "queued": queued,
+                        "reason": str(flush_report.get("reason") or "queue_rejected"),
+                    }
+        else:
+            _, decision = self._transcript_segmenter.should_finalize_pending_exchanges(
+                exchange,
+            )
+            self._log_transcript_segmentation_decision(unit, decision=decision)
 
-    def _flush_pending_transcript_segments(self) -> Dict[str, Any]:
-        """Normalize and submit buffered transcript segments as one episode."""
-        if not self._pending_transcript_segments:
+        self._transcript_segmenter.append_pending_exchange(exchange)
+        return {"accepted": True, "queued": queued, "reason": ""}
+
+    def _flush_pending_transcript_segments(
+        self,
+        *,
+        reason: str = "explicit_flush",
+    ) -> Dict[str, Any]:
+        """Finalize the current utterance, then submit pending transcript exchanges."""
+        queued = False
+        completed_unit = self._transcript_utterance_assembler.flush()
+        if completed_unit is not None:
+            append_report = self._append_transcript_semantic_unit(completed_unit)
+            queued = bool(append_report.get("queued")) or queued
+            if not append_report.get("accepted"):
+                return {
+                    "queued": queued,
+                    "reason": str(append_report.get("reason") or "queue_rejected"),
+                }
+        store_report = self._store_pending_transcript_exchanges(reason=reason)
+        return {
+            "queued": bool(store_report.get("queued")) or queued,
+            "reason": str(store_report.get("reason") or ""),
+        }
+
+    def _store_pending_transcript_exchanges(
+        self,
+        *,
+        reason: str,
+    ) -> Dict[str, Any]:
+        """Normalize and submit transcript spans held by the semantic segmenter."""
+        pending_exchanges = self._transcript_segmenter.pending_exchange_snapshot()
+        if not pending_exchanges:
             return {"queued": False, "reason": "no_pending_segments"}
-        segments = list(self._pending_transcript_segments)
-        context = dict(self._pending_transcript_context or {})
+        segments = self._transcript_raw_segments_from_exchanges(pending_exchanges)
+        context = self._transcript_context_from_exchanges(pending_exchanges)
         raw_segments, prompt_language = self._normalize_transcript_segments_into_memory_raw_segments(
             segments,
         )
         if not raw_segments:
-            self._pending_transcript_segments.clear()
-            self._pending_transcript_context = None
+            self._transcript_segmenter.clear_pending_exchanges()
             return {"queued": False, "reason": "invalid_pending_segments"}
+        self._logger.info(
+            "transcript episode batch detail %s",
+            json.dumps(
+                {
+                    "reason": reason,
+                    "source_type": context.get("source_type"),
+                    "tags": context.get("tags") or [],
+                    "raw_segment_count": len(segments),
+                    "semantic_unit_count": len(pending_exchanges),
+                    "prompt_language": prompt_language,
+                    "segments": raw_segments,
+                },
+                ensure_ascii=False,
+            ),
+        )
         queue_report = self._process_transcript_segments(
             raw_segments,
             context,
@@ -256,8 +351,13 @@ class MemoryRuntime:
         )
         queued = bool(queue_report.get("queued"))
         if queued:
-            self._pending_transcript_segments.clear()
-            self._pending_transcript_context = None
+            self._logger.info(
+                "transcript episode queued reason=%s raw_segment_count=%s semantic_unit_count=%s",
+                reason,
+                len(segments),
+                len(pending_exchanges),
+            )
+            self._transcript_segmenter.clear_pending_exchanges()
         return {
             "queued": queued,
             "reason": (
@@ -267,10 +367,86 @@ class MemoryRuntime:
             ),
         }
 
+    @staticmethod
+    def _transcript_raw_segments_from_exchanges(
+        exchanges: Sequence[Any],
+    ) -> List[Dict[str, Any]]:
+        """Expand the original ASR spans retained by transcript exchanges."""
+        segments: List[Dict[str, Any]] = []
+        for exchange in exchanges:
+            raw = exchange.raw if isinstance(exchange.raw, dict) else {}
+            raw_segments = raw.get("raw_segments")
+            if not isinstance(raw_segments, list):
+                continue
+            segments.extend(
+                dict(segment)
+                for segment in raw_segments
+                if isinstance(segment, dict)
+            )
+        return segments
+
+    @staticmethod
+    def _transcript_context_from_exchanges(
+        exchanges: Sequence[Any],
+    ) -> Dict[str, Any]:
+        """Derive one storage context from the raw spans in pending exchanges."""
+        source_type = "allday_recording"
+        tags: set[str] = set()
+        for exchange in exchanges:
+            raw = exchange.raw if isinstance(exchange.raw, dict) else {}
+            raw_segments = raw.get("raw_segments")
+            if not isinstance(raw_segments, list):
+                continue
+            for segment in raw_segments:
+                if not isinstance(segment, dict):
+                    continue
+                context = segment.get("_memory_context")
+                if not isinstance(context, dict):
+                    continue
+                resolved_source_type = str(context.get("source_type") or "").strip()
+                if resolved_source_type:
+                    source_type = resolved_source_type
+                tags.update(
+                    str(tag)
+                    for tag in context.get("tags") or []
+                    if tag is not None and str(tag).strip()
+                )
+        return {"source_type": source_type, "tags": sorted(tags)}
+
+    def _log_transcript_segmentation_decision(
+        self,
+        unit: TranscriptSemanticUnit,
+        *,
+        decision: Optional[Any] = None,
+        reason: Optional[str] = None,
+    ) -> None:
+        """Emit per-unit semantic boundary details when transcript logging is enabled."""
+        if not self._transcript_segmentation_log_decisions:
+            return
+        resolved_reason = str(reason or getattr(decision, "reason", "append"))
+        self._logger.info(
+            "transcript segmentation decision unit=%s reason=%s raw_segment_count=%s "
+            "token_count=%s speakers=%s cut_probability=%s score=%s "
+            "semantic_surprise=%s cohesion_drop=%s time_gap_seconds=%s text=%s",
+            unit.index,
+            resolved_reason,
+            len(unit.raw_segments),
+            unit.token_count,
+            ",".join(unit.speaker_labels),
+            getattr(decision, "cut_probability", None),
+            getattr(decision, "score", None),
+            getattr(decision, "semantic_surprise", None),
+            getattr(decision, "cohesion_drop", None),
+            getattr(decision, "time_gap_seconds", None),
+            unit.text[:240],
+        )
+
     def trigger_memory_reflect(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
         """Queue reflection after pending interaction and transcript storage."""
         interaction_flush_report = self._flush_pending_interaction_turns()
-        transcript_flush_report = self._flush_pending_transcript_segments()
+        transcript_flush_report = self._flush_pending_transcript_segments(
+            reason="reflect",
+        )
 
         report = self._memory_manager.submit_memory_reflect_task(*args, **kwargs) or {}
         report["pending_interaction_flush"] = interaction_flush_report
@@ -303,8 +479,7 @@ class MemoryRuntime:
         """Wait for queued store and reflection tasks at an explicit boundary."""
         if self._interaction_segmenter.has_pending_exchanges():
             self._flush_pending_interaction_turns()
-        if self._pending_transcript_segments:
-            self._flush_pending_transcript_segments()
+        self._flush_pending_transcript_segments(reason="explicit_input_boundary")
         return self._memory_manager.flush_task_queue(timeout=timeout)
 
     def get_pending_interaction_turns(self) -> List[Dict[str, Any]]:
@@ -382,38 +557,6 @@ class MemoryRuntime:
         )
         return "zh" if re.search(r"[\u4e00-\u9fff]", sample) else "en"
 
-    def _should_flush_pending_transcript_before(
-        self,
-        next_segment: Dict[str, Any],
-        next_context: Dict[str, Any],
-    ) -> bool:
-        """Check whether the next segment must start a new transcript episode."""
-        if not self._pending_transcript_segments:
-            return False
-        if self._pending_transcript_context != next_context:
-            return True
-        pending_chars = sum(
-            len(self._transcript_segment_text(segment))
-            for segment in self._pending_transcript_segments
-        )
-        next_chars = len(self._transcript_segment_text(next_segment))
-        previous = self._pending_transcript_segments[-1]
-        gap_seconds = OnlineSemanticSegmenter.timestamp_gap_seconds(
-            self._transcript_segment_end_time(previous)
-            or self._transcript_segment_start_time(previous),
-            self._transcript_segment_start_time(next_segment),
-        )
-        return bool(
-            len(self._pending_transcript_segments)
-            >= self._transcript_episode_max_segments
-            or pending_chars + next_chars > self._transcript_episode_max_chars
-            or (
-                self._transcript_episode_max_gap_seconds >= 0
-                and gap_seconds is not None
-                and gap_seconds > self._transcript_episode_max_gap_seconds
-            )
-        )
-
     @staticmethod
     def _transcript_segment_text(segment: Dict[str, Any]) -> str:
         """Extract and compact the transcript text from supported input fields."""
@@ -487,28 +630,12 @@ class MemoryRuntime:
         """Validate and normalize transcript segments for episode storage."""
         normalized: List[Dict[str, Any]] = []
         for index, segment in enumerate(segments, 1):
-            if not isinstance(segment, dict):
-                continue
-            text = self._transcript_segment_text(segment)
-            if not text:
-                continue
-            speaker = _compact_whitespace(
-                segment.get("speaker")
-                or segment.get("speaker_name")
-                or segment.get("speaker_id")
-                or "unknown_speaker"
+            normalized_segment = self._normalize_single_transcript_segment(
+                segment,
+                fallback_index=index,
             )
-            started_at = self._transcript_segment_start_time(segment)
-            ended_at = self._transcript_segment_end_time(segment)
-            normalized.append({
-                "speaker": speaker or "unknown_speaker",
-                "text": text,
-                "started_at": started_at or _now_text(),
-                "ended_at": ended_at or started_at or _now_text(),
-                "tags": list(segment.get("tags") or []),
-                "segment_index": int(segment.get("segment_index") or index),
-                "metadata": dict(segment.get("metadata") or {}),
-            })
+            if normalized_segment is not None:
+                normalized.append(normalized_segment)
         normalized = sorted(
             normalized,
             key=lambda item: (
@@ -518,3 +645,37 @@ class MemoryRuntime:
             ),
         )
         return normalized, self._resolve_prompt_language_from_segments(normalized)
+
+    def _normalize_single_transcript_segment(
+        self,
+        segment: Any,
+        *,
+        fallback_index: int = 1,
+    ) -> Optional[Dict[str, Any]]:
+        """Normalize one frontend transcript record before utterance assembly."""
+        if not isinstance(segment, dict):
+            return None
+        text = self._transcript_segment_text(segment)
+        if not text:
+            return None
+        speaker = _compact_whitespace(
+            segment.get("speaker")
+            or segment.get("speaker_name")
+            or segment.get("speaker_id")
+            or "unknown_speaker"
+        )
+        started_at = self._transcript_segment_start_time(segment)
+        ended_at = self._transcript_segment_end_time(segment)
+        try:
+            segment_index = int(segment.get("segment_index") or fallback_index)
+        except (TypeError, ValueError):
+            segment_index = fallback_index
+        return {
+            "speaker": speaker or "unknown_speaker",
+            "text": text,
+            "started_at": started_at or _now_text(),
+            "ended_at": ended_at or started_at or _now_text(),
+            "tags": list(segment.get("tags") or []),
+            "segment_index": segment_index,
+            "metadata": dict(segment.get("metadata") or {}),
+        }

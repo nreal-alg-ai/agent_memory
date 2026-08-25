@@ -131,6 +131,8 @@ memory_runtime:
     max_pending_interaction_tokens: 500
     min_pending_interaction_turns: 2
     min_pending_interaction_tokens: 200
+    max_time_gap_seconds: 30
+
     threshold: 0.6
     bias: -1.1
     surprise_history_window: 64
@@ -140,21 +142,31 @@ memory_runtime:
     cohesion_drop_weight: 0.8
     length_weight: 0.40
     turn_count_weight: 0.4
-    max_time_gap_seconds: 30
 
   allday_recording_segmentation:
-    transcript_episode_max_segments: 80
-    transcript_episode_max_chars: 12000
+    max_pending_transcript_units: 40
+    max_pending_transcript_tokens: 1000
+    min_pending_transcript_units: 4
+    min_pending_transcript_tokens: 200
+    max_time_gap_seconds: 60.0
+    
+    segment_merge_max_gap_seconds: 1.0
+    min_transcript_unit_tokens: 40
+    max_transcript_unit_tokens: 120
+    max_transcript_unit_duration_seconds: 20.0
+    short_fragment_max_tokens: 8
+    
     threshold: 0.6
+    bias: -1.1
     surprise_history_window: 64
     min_surprise_history: 5
     robust_surprise_weight: 0.8
     absolute_surprise_weight: 0.8
     cohesion_drop_weight: 0.8
+    length_weight: 0.4
     turn_count_weight: 0.4
-    min_chunk_tokens: 500
-    max_chunk_tokens: 2000
-    max_time_gap_seconds: 60.0
+
+    log_decisions: true
 
 memory_manager:
   memory_enabled: true

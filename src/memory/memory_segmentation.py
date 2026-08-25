@@ -43,6 +43,7 @@ class OnlineSegmentExchange:
     text: str
     token_count: int
     timestamp: str = ""
+    ended_at: str = ""
     raw: Optional[Dict[str, Any]] = None
 
 
@@ -65,10 +66,36 @@ class OnlineSegmentationConfig:
     turn_count_weight: float = 0.40
     max_pending_turns: int = 0
     max_pending_tokens: int = 500
+    max_pending_chars: int = 0
     min_pending_tokens: int = 100
     min_pending_turns: int = 2
     min_segment_override_probability: float = 0.90
     max_time_gap_seconds: float = -1.0
+    enforce_min_pending_tokens: bool = False
+
+
+@dataclass
+class TranscriptAggregationConfig:
+    """Rules for assembling VAD-sized transcript fragments into utterances."""
+
+    max_gap_seconds: float = 1.0
+    min_transcript_unit_tokens: int = 20
+    max_transcript_unit_tokens: int = 120
+    max_transcript_unit_duration_seconds: float = 20.0
+    short_fragment_max_tokens: int = 8
+
+
+@dataclass
+class TranscriptSemanticUnit:
+    """One stable semantic input while retaining every source transcript span."""
+
+    index: int
+    text: str
+    token_count: int
+    started_at: str
+    ended_at: str
+    raw_segments: List[Dict[str, Any]]
+    speaker_labels: List[str]
 
 
 def _estimate_interaction_token_count(text: str) -> int:
@@ -135,30 +162,37 @@ def turn_count_pressure(exchange_count: int) -> float:
         return 0.15
     return min(1.0, 0.30 + 0.15 * (count - 4))
 
-def build_online_segmentation_config(
-    runtime_config: Dict[str, Any],
+def _build_online_segmentation_config(
+    segmentation_config: Dict[str, Any],
+    *,
+    max_pending_turns_key: str,
+    max_pending_turns_default: int,
+    max_pending_tokens_key: str,
+    max_pending_tokens_default: int,
+    min_pending_tokens_key: str,
+    min_pending_tokens_default: int,
+    min_pending_turns_key: str,
+    min_pending_turns_default: int,
+    enforce_min_pending_tokens: bool = False,
 ) -> OnlineSegmentationConfig:
-    """Build the assistant-wakeup segmentation runtime_config from runtime config.
+    """Build one semantic segmenter configuration from a source-specific mapping."""
+    def config_int(key: str, default: int) -> int:
+        value = segmentation_config.get(key)
+        if value in (None, ""):
+            return default
+        return int(value)
 
-    ``memory_runtime`` contains separate configurations for assistant
-    wakeup and all-day recording.  The interaction segmenter currently
-    consumes only ``assistant_wakeup_segmentation``; the all-day recording
-    configuration remains reserved for the transcript pipeline.
-    """
-    segmentation_config = runtime_config.get("assistant_wakeup_segmentation")
-    if not isinstance(segmentation_config, dict):
-        segmentation_config = {}
     max_gap = segmentation_config.get("max_time_gap_seconds")
     return OnlineSegmentationConfig(
         threshold=float(segmentation_config.get("threshold", 0.60)),
         bias=float(segmentation_config.get("bias", -1.10)),
         surprise_history_window=max(
             1,
-            int(segmentation_config.get("surprise_history_window", 64)),
+            config_int("surprise_history_window", 64),
         ),
         min_surprise_history=max(
             0,
-            int(segmentation_config.get("min_surprise_history", 5)),
+            config_int("min_surprise_history", 5),
         ),
         robust_surprise_weight=float(
             segmentation_config.get("robust_surprise_weight", 0.8),
@@ -175,24 +209,105 @@ def build_online_segmentation_config(
         ),
         max_pending_turns=max(
             1,
-            int(segmentation_config.get("max_pending_interaction_turns", 5)),
+            config_int(max_pending_turns_key, max_pending_turns_default),
         ),
         max_pending_tokens=max(
             1,
-            int(segmentation_config.get("max_pending_interaction_tokens", 500)),
+            config_int(max_pending_tokens_key, max_pending_tokens_default),
+        ),
+        max_pending_chars=max(
+            0,
+            config_int("max_pending_transcript_chars", 0),
         ),
         min_pending_tokens=max(
             1,
-            int(segmentation_config.get("min_pending_interaction_tokens", 100)),
+            config_int(min_pending_tokens_key, min_pending_tokens_default),
         ),
         min_pending_turns=max(
             1,
-            int(segmentation_config.get("min_pending_interaction_turns", 2)),
+            config_int(min_pending_turns_key, min_pending_turns_default),
         ),
         min_segment_override_probability=float(
             segmentation_config.get("min_segment_override_probability", 0.90),
         ),
         max_time_gap_seconds=float(-1.0 if max_gap in (None, "") else max_gap),
+        enforce_min_pending_tokens=bool(enforce_min_pending_tokens),
+    )
+
+
+def build_online_segmentation_config(
+    runtime_config: Dict[str, Any],
+) -> OnlineSegmentationConfig:
+    """Build the assistant-wakeup semantic segmentation configuration."""
+    segmentation_config = runtime_config.get("assistant_wakeup_segmentation")
+    if not isinstance(segmentation_config, dict):
+        segmentation_config = {}
+    return _build_online_segmentation_config(
+        segmentation_config,
+        max_pending_turns_key="max_pending_interaction_turns",
+        max_pending_turns_default=5,
+        max_pending_tokens_key="max_pending_interaction_tokens",
+        max_pending_tokens_default=500,
+        min_pending_tokens_key="min_pending_interaction_tokens",
+        min_pending_tokens_default=100,
+        min_pending_turns_key="min_pending_interaction_turns",
+        min_pending_turns_default=2,
+    )
+
+
+def build_transcript_segmentation_config(
+    runtime_config: Dict[str, Any],
+) -> OnlineSegmentationConfig:
+    """Build the all-day-recording semantic segmentation configuration."""
+    segmentation_config = runtime_config.get("allday_recording_segmentation")
+    if not isinstance(segmentation_config, dict):
+        segmentation_config = {}
+    return _build_online_segmentation_config(
+        segmentation_config,
+        max_pending_turns_key="max_pending_transcript_units",
+        max_pending_turns_default=80,
+        max_pending_tokens_key="max_pending_transcript_tokens",
+        max_pending_tokens_default=2000,
+        min_pending_tokens_key="min_pending_transcript_tokens",
+        min_pending_tokens_default=500,
+        min_pending_turns_key="min_pending_transcript_units",
+        min_pending_turns_default=4,
+        enforce_min_pending_tokens=True,
+    )
+
+
+def build_transcript_aggregation_config(
+    runtime_config: Dict[str, Any],
+) -> TranscriptAggregationConfig:
+    """Build VAD-fragment aggregation rules for all-day transcript input."""
+    segmentation_config = runtime_config.get("allday_recording_segmentation")
+    if not isinstance(segmentation_config, dict):
+        segmentation_config = {}
+    return TranscriptAggregationConfig(
+        max_gap_seconds=float(
+            segmentation_config.get("segment_merge_max_gap_seconds", 1.0)
+        ),
+        min_transcript_unit_tokens=max(
+            1,
+            int(segmentation_config.get("min_transcript_unit_tokens", 20)),
+        ),
+        max_transcript_unit_tokens=max(
+            1,
+            int(segmentation_config.get("max_transcript_unit_tokens", 120)),
+        ),
+        max_transcript_unit_duration_seconds=max(
+            0.0,
+            float(
+                segmentation_config.get(
+                    "max_transcript_unit_duration_seconds",
+                    20.0,
+                )
+            ),
+        ),
+        short_fragment_max_tokens=max(
+            1,
+            int(segmentation_config.get("short_fragment_max_tokens", 8)),
+        ),
     )
 
 
@@ -210,6 +325,191 @@ def convert_interaction_turn_to_online_exchange(
         timestamp=timestamp,
         raw=dict(turn),
     )
+
+
+def convert_transcript_unit_to_online_exchange(
+    unit: TranscriptSemanticUnit,
+) -> OnlineSegmentExchange:
+    """Convert one assembled transcript utterance into a semantic exchange."""
+    return OnlineSegmentExchange(
+        index=unit.index,
+        text=unit.text,
+        token_count=unit.token_count,
+        timestamp=unit.started_at,
+        ended_at=unit.ended_at,
+        raw={
+            "raw_segments": [dict(segment) for segment in unit.raw_segments],
+            "speaker_labels": list(unit.speaker_labels),
+        },
+    )
+
+
+class TranscriptUtteranceAssembler:
+    """Assemble adjacent VAD fragments into speaker-safe semantic utterances."""
+
+    def __init__(
+        self,
+        config: Optional[TranscriptAggregationConfig] = None,
+    ) -> None:
+        self.config = config or TranscriptAggregationConfig()
+        self._current_segments: List[Dict[str, Any]] = []
+        self._current_token_count = 0
+        self._next_unit_index = 1
+
+    def append(self, segment: Dict[str, Any]) -> Optional[TranscriptSemanticUnit]:
+        """Append one transcript span and return the prior completed utterance."""
+        normalized = dict(segment)
+        if not self._segment_text(normalized):
+            return None
+        if not self._current_segments:
+            self._start_unit(normalized)
+            return None
+        if self._can_append(normalized):
+            self._append_to_current(normalized)
+            return None
+        completed = self._take_current_unit()
+        self._start_unit(normalized)
+        return completed
+
+    def flush(self) -> Optional[TranscriptSemanticUnit]:
+        """Return the final incomplete utterance at an explicit input boundary."""
+        return self._take_current_unit()
+
+    def has_pending_segments(self) -> bool:
+        """Return whether a not-yet-finalized utterance is being assembled."""
+        return bool(self._current_segments)
+
+    def _start_unit(self, segment: Dict[str, Any]) -> None:
+        self._current_segments = [dict(segment)]
+        self._current_token_count = _estimate_interaction_token_count(
+            self._segment_text(segment),
+        )
+
+    def _append_to_current(self, segment: Dict[str, Any]) -> None:
+        self._current_segments.append(dict(segment))
+        self._current_token_count += _estimate_interaction_token_count(
+            self._segment_text(segment),
+        )
+
+    def _take_current_unit(self) -> Optional[TranscriptSemanticUnit]:
+        if not self._current_segments:
+            return None
+        raw_segments = [dict(segment) for segment in self._current_segments]
+        text = " ".join(
+            self._segment_text(segment)
+            for segment in raw_segments
+            if self._segment_text(segment)
+        )
+        speaker_labels = list(
+            dict.fromkeys(
+                self._speaker_label(segment)
+                for segment in raw_segments
+            )
+        )
+        unit = TranscriptSemanticUnit(
+            index=self._next_unit_index,
+            text=text,
+            token_count=max(1, self._current_token_count),
+            started_at=self._segment_started_at(raw_segments[0]),
+            ended_at=self._segment_ended_at(raw_segments[-1]),
+            raw_segments=raw_segments,
+            speaker_labels=speaker_labels,
+        )
+        self._next_unit_index += 1
+        self._current_segments = []
+        self._current_token_count = 0
+        return unit
+
+    def _can_append(self, incoming: Dict[str, Any]) -> bool:
+        if not self._current_segments:
+            return True
+        previous = self._current_segments[-1]
+        gap_seconds = OnlineSemanticSegmenter.timestamp_gap_seconds(
+            self._segment_ended_at(previous),
+            self._segment_started_at(incoming),
+        )
+        if gap_seconds is None:
+            return False
+        if (
+            self.config.max_gap_seconds >= 0
+            and gap_seconds > self.config.max_gap_seconds
+        ):
+            return False
+
+        incoming_tokens = _estimate_interaction_token_count(
+            self._segment_text(incoming),
+        )
+        if (
+            self._current_token_count + incoming_tokens
+            > self.config.max_transcript_unit_tokens
+        ):
+            return False
+        duration_seconds = OnlineSemanticSegmenter.timestamp_gap_seconds(
+            self._segment_started_at(self._current_segments[0]),
+            self._segment_ended_at(incoming),
+        )
+        if (
+            self.config.max_transcript_unit_duration_seconds > 0
+            and duration_seconds is not None
+            and duration_seconds > self.config.max_transcript_unit_duration_seconds
+        ):
+            return False
+
+        incoming_speaker = self._speaker_label(incoming)
+        known_current_speakers = {
+            self._speaker_label(segment)
+            for segment in self._current_segments
+            if not self._is_unknown_speaker(self._speaker_label(segment))
+        }
+        if not self._is_unknown_speaker(incoming_speaker):
+            if not known_current_speakers or incoming_speaker not in known_current_speakers:
+                return False
+        elif incoming_tokens > self.config.short_fragment_max_tokens:
+            return False
+
+        current_text = " ".join(
+            self._segment_text(segment)
+            for segment in self._current_segments
+        )
+        previous_tokens = _estimate_interaction_token_count(
+            self._segment_text(previous),
+        )
+        return bool(
+            self._current_token_count < self.config.min_transcript_unit_tokens
+            or previous_tokens <= self.config.short_fragment_max_tokens
+            or incoming_tokens <= self.config.short_fragment_max_tokens
+            or not self._ends_sentence(current_text)
+        )
+
+    @staticmethod
+    def _segment_text(segment: Dict[str, Any]) -> str:
+        return _compact_whitespace(segment.get("text") or "")
+
+    @staticmethod
+    def _speaker_label(segment: Dict[str, Any]) -> str:
+        return _compact_whitespace(segment.get("speaker") or "unknown_speaker")
+
+    @staticmethod
+    def _segment_started_at(segment: Dict[str, Any]) -> str:
+        return _to_timestamp_text(segment.get("started_at")) or ""
+
+    @classmethod
+    def _segment_ended_at(cls, segment: Dict[str, Any]) -> str:
+        return _to_timestamp_text(segment.get("ended_at")) or cls._segment_started_at(
+            segment,
+        )
+
+    @staticmethod
+    def _is_unknown_speaker(value: str) -> bool:
+        return str(value or "").strip().lower() in {
+            "",
+            "unknown",
+            "unknown_speaker",
+        }
+
+    @staticmethod
+    def _ends_sentence(text: str) -> bool:
+        return str(text or "").rstrip().endswith(("。", "！", "？", ".", "!", "?"))
 
 
 class OnlineSemanticSegmenter:
@@ -331,7 +631,7 @@ class OnlineSemanticSegmenter:
         self,
         exchanges: Sequence[Any],
     ) -> Optional[str]:
-        """Return the pending turn or character hard-limit reason."""
+        """Return the pending semantic-unit, token, or character limit reason."""
         if not exchanges:
             return None
         if (
@@ -345,6 +645,14 @@ class OnlineSemanticSegmenter:
             and token_count >= self.config.max_pending_tokens
         ):
             return "pending_token_limit"
+        char_count = sum(
+            len(self.exchange_text(exchange)) for exchange in exchanges
+        )
+        if (
+            self.config.max_pending_chars > 0
+            and char_count >= self.config.max_pending_chars
+        ):
+            return "pending_char_limit"
         return None
 
     def score_boundary(
@@ -410,7 +718,14 @@ class OnlineSemanticSegmenter:
         if (decision.cut_probability or 0.0) < self.config.threshold:
             return False
         min_exchanges = max(1, int(self.config.min_pending_turns))
-        if len(active) >= min_exchanges:
+        active_token_count = sum(
+            self.exchange_token_count(item.exchange) for item in active
+        )
+        meets_token_minimum = (
+            not self.config.enforce_min_pending_tokens
+            or active_token_count >= max(1, int(self.config.min_pending_tokens))
+        )
+        if len(active) >= min_exchanges and meets_token_minimum:
             return True
         return (decision.cut_probability or 0.0) >= float(
             self.config.min_segment_override_probability,
@@ -443,13 +758,20 @@ class OnlineSemanticSegmenter:
         return _to_timestamp_text(getattr(exchange, "timestamp", "")) or ""
 
     @classmethod
+    def exchange_end_timestamp(cls, exchange: Any) -> str:
+        return (
+            _to_timestamp_text(getattr(exchange, "ended_at", ""))
+            or cls.exchange_timestamp(exchange)
+        )
+
+    @classmethod
     def exchange_time_gap_seconds(
         cls,
         previous_exchange: Any,
         incoming_exchange: Any,
     ) -> Optional[float]:
         return cls.timestamp_gap_seconds(
-            cls.exchange_timestamp(previous_exchange),
+            cls.exchange_end_timestamp(previous_exchange),
             cls.exchange_timestamp(incoming_exchange),
         )
 

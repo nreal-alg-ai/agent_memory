@@ -64,8 +64,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--db-name", default="memory.db")
     parser.add_argument("--session-start", default="", help="ISO timestamp used as audio time zero.")
     parser.add_argument("--source-type", default="allday_recording")
-    parser.add_argument("--max-segments-per-episode", type=int, default=0)
-    parser.add_argument("--max-chars-per-episode", type=int, default=0)
+    parser.add_argument("--max-pending-transcript-units", type=int, default=0)
+    parser.add_argument("--max-pending-transcript-tokens", type=int, default=0)
+    parser.add_argument("--min-pending-transcript-units", type=int, default=0)
+    parser.add_argument("--min-pending-transcript-tokens", type=int, default=0)
     parser.add_argument("--max-gap-seconds", type=float, default=-1.0)
     parser.add_argument("--enable-reflect", action="store_true", help="Run memory reflection after storing episodes.")
     parser.add_argument("--disable-llm", action="store_true", help="Use heuristic fallback extraction only.")
@@ -87,14 +89,32 @@ def main() -> None:
     embedding_config = memory_manager_config["embedding"]
     if args.disable_llm:
         llm_config["llm_api_key"] = ""
-    if args.max_segments_per_episode:
-        memory_runtime_config["transcript_episode_max_segments"] = (
-            args.max_segments_per_episode
+    transcript_segmentation_config = memory_runtime_config.setdefault(
+        "allday_recording_segmentation",
+        {},
+    )
+    if not isinstance(transcript_segmentation_config, dict):
+        raise ValueError(
+            "memory_runtime.allday_recording_segmentation must be a mapping",
         )
-    if args.max_chars_per_episode:
-        memory_runtime_config["transcript_episode_max_chars"] = args.max_chars_per_episode
+    if args.max_pending_transcript_units:
+        transcript_segmentation_config["max_pending_transcript_units"] = (
+            args.max_pending_transcript_units
+        )
+    if args.max_pending_transcript_tokens:
+        transcript_segmentation_config["max_pending_transcript_tokens"] = (
+            args.max_pending_transcript_tokens
+        )
+    if args.min_pending_transcript_units:
+        transcript_segmentation_config["min_pending_transcript_units"] = (
+            args.min_pending_transcript_units
+        )
+    if args.min_pending_transcript_tokens:
+        transcript_segmentation_config["min_pending_transcript_tokens"] = (
+            args.min_pending_transcript_tokens
+        )
     if args.max_gap_seconds >= 0:
-        memory_runtime_config["transcript_episode_max_gap_seconds"] = args.max_gap_seconds
+        transcript_segmentation_config["max_time_gap_seconds"] = args.max_gap_seconds
 
     textgrid_path = args.textgrid.expanduser().resolve()
     if not textgrid_path.exists():
@@ -169,17 +189,21 @@ def main() -> None:
         )
         logging.info("Reflect result: %s", reflect_result)
     else:
-        pending_transcript_count = len(runtime._pending_transcript_segments)
+        pending_transcript_count = (
+            len(runtime._transcript_segmenter.pending_exchange_snapshot())
+            + int(runtime._transcript_utterance_assembler.has_pending_segments())
+        )
         runtime.flush_task_queue()
         queued_episode_count += int(
             pending_transcript_count > 0
-            and not runtime._pending_transcript_segments
+            and not runtime._transcript_segmenter.has_pending_exchanges()
+            and not runtime._transcript_utterance_assembler.has_pending_segments()
         )
     store_operation_report = operation_reporter.operation_report("memory_store")
     logging.info(
         "Transcript input complete segments=%s pending=%s queued_episodes=%s stored_episodes=%s",
         len(memory_segments),
-        len(runtime._pending_transcript_segments),
+        len(runtime._transcript_segmenter.pending_exchange_snapshot()),
         queued_episode_count,
         store_operation_report["succeeded"],
     )
