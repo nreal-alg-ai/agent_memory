@@ -122,6 +122,10 @@ def build_service(config_source: Any = None) -> tuple[MemoryMCPService, logging.
     log_override = _explicit_override(config_source, "log_path")
     if log_override is not None:
         log_path = _resolve_configured_path(log_override, config_path)
+    asr_result_dir = _resolve_configured_path(
+        server_config.get("asr_result_dir"),
+        config_path,
+    )
     log_level = str(
         _explicit_override(config_source, "log_level")
         or server_config.get("log_level")
@@ -138,11 +142,12 @@ def build_service(config_source: Any = None) -> tuple[MemoryMCPService, logging.
     )
     logger = build_logger(log_path, log_level)
     logger.info(
-        "Memory MCP service configured config_path=%s cwd=%s db_path=%s log_path=%s",
+        "Memory MCP service configured config_path=%s cwd=%s db_path=%s log_path=%s asr_result_dir=%s",
         config_path,
         Path.cwd(),
         db_path,
         log_path,
+        asr_result_dir,
     )
     try:
         memory_runtime = MemoryRuntime(
@@ -167,6 +172,7 @@ def build_service(config_source: Any = None) -> tuple[MemoryMCPService, logging.
             memory_runtime,
             voice_runtime_factory=build_voice_runtime,
             queue_timeout=queue_timeout,
+            asr_result_dir=asr_result_dir,
         ), logger
     except Exception:
         if "memory_runtime" in locals():

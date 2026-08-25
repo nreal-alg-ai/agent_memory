@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sys
 import threading
 from datetime import date, datetime
@@ -68,13 +69,20 @@ class MemoryMCPService:
         *,
         voice_runtime_factory: Optional[Callable[[], "VoiceRuntime"]] = None,
         queue_timeout: float = 30.0,
+        asr_result_dir: Optional[Path | str] = None,
     ) -> None:
         self.memory_runtime = memory_runtime
         self.voice_runtime = voice_runtime
         self._voice_runtime_factory = voice_runtime_factory
         self._voice_runtime_lock = threading.Lock()
+        self._asr_result_lock = threading.Lock()
         self._stdio_framing: Optional[str] = None
         self.queue_timeout = max(0.0, float(queue_timeout))
+        self.asr_result_dir = (
+            Path(asr_result_dir).expanduser().resolve()
+            if asr_result_dir is not None and str(asr_result_dir).strip()
+            else None
+        )
 
     def _get_voice_runtime(self) -> "VoiceRuntime":
         """Create the voice runtime only when audio processing is requested."""
@@ -105,6 +113,7 @@ class MemoryMCPService:
             session_start=session_start,
         )
         segments = list(voice_report.get("segments") or [])
+        asr_result_path = self._save_asr_result(voice_report)
         store_reports: List[Dict[str, Any]] = []
         for segment in segments:
             store_reports.append(
@@ -133,6 +142,7 @@ class MemoryMCPService:
                 for key, value in voice_report.items()
                 if key != "segments"
             },
+            "asr_result_path": str(asr_result_path) if asr_result_path else None,
             "transcript_segments": segments,
             "submitted_segment_count": len(store_reports),
             "store_queue_event_count": queued_count,
@@ -143,6 +153,32 @@ class MemoryMCPService:
             "reflect_queue_flushed": reflect_flushed,
         }
         return _json_compatible(report)
+
+    def _save_asr_result(self, voice_report: Dict[str, Any]) -> Optional[Path]:
+        """Persist one complete VoiceRuntime report after audio transcription."""
+        if self.asr_result_dir is None:
+            return None
+
+        audio_path = Path(str(voice_report.get("audio_path") or "audio"))
+        safe_stem = re.sub(r"[^A-Za-z0-9._-]+", "_", audio_path.stem).strip("._")
+        safe_stem = safe_stem or "audio"
+        timestamp = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S_%f")
+        with self._asr_result_lock:
+            self.asr_result_dir.mkdir(parents=True, exist_ok=True)
+            result_path = self.asr_result_dir / f"{timestamp}_{safe_stem}.json"
+            payload = {
+                "created_at": datetime.now().astimezone().isoformat(),
+                **voice_report,
+            }
+            serialized = json.dumps(
+                _json_compatible(payload),
+                ensure_ascii=False,
+                indent=2,
+            )
+            temp_path = result_path.with_suffix(result_path.suffix + ".tmp")
+            temp_path.write_text(serialized, encoding="utf-8")
+            temp_path.replace(result_path)
+        return result_path
 
     def process_audio_files(
         self,
