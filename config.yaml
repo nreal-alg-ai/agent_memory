@@ -18,11 +18,8 @@ voice_runtime:
   vad:
     frame_ms: 32.0
     threshold: 0.5
-    min_silence_ms: 100
+    min_silence_ms: 250
     speech_pad_ms: 30
-    window_frames: 5
-    activate_ratio: 0.6
-    deactivate_ratio: 0.4
   
   asr:
     backend: qwen3_asr

@@ -51,9 +51,6 @@ class VoiceRuntime:
                 self.vad_config.get("min_silence_ms", 100)
             ),
             speech_pad_ms=int(self.vad_config.get("speech_pad_ms", 30)),
-            window_frames=max(1, int(self.vad_config.get("window_frames", 5))),
-            activate_ratio=float(self.vad_config.get("activate_ratio", 0.6)),
-            deactivate_ratio=float(self.vad_config.get("deactivate_ratio", 0.4)),
         )
         self.asr = self._build_asr()
         self.speaker_identifier = self._build_speaker_identifier()
