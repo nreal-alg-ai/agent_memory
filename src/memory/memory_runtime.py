@@ -329,20 +329,18 @@ class MemoryRuntime:
         if not raw_segments:
             self._transcript_segmenter.clear_pending_exchanges()
             return {"queued": False, "reason": "invalid_pending_segments"}
-        self._logger.info(
-            "transcript episode batch detail %s",
-            json.dumps(
-                {
-                    "reason": reason,
-                    "source_type": context.get("source_type"),
-                    "tags": context.get("tags") or [],
-                    "raw_segment_count": len(segments),
-                    "semantic_unit_count": len(pending_exchanges),
-                    "prompt_language": prompt_language,
-                    "segments": raw_segments,
-                },
-                ensure_ascii=False,
-            ),
+        self._log_info(
+            "memory_runtime",
+            "transcript_episode_batch_detail",
+            {
+                "reason": reason,
+                "source_type": context.get("source_type"),
+                "tags": context.get("tags") or [],
+                "raw_segment_count": len(segments),
+                "semantic_unit_count": len(pending_exchanges),
+                "prompt_language": prompt_language,
+                "segments": raw_segments,
+            },
         )
         queue_report = self._process_transcript_segments(
             raw_segments,
@@ -440,6 +438,34 @@ class MemoryRuntime:
             getattr(decision, "time_gap_seconds", None),
             unit.text[:240],
         )
+
+    def _log_info(self, scope: str, event: str, payload: Dict[str, Any]) -> None:
+        """Emit a structured JSON log record for runtime diagnostics."""
+        record = {
+            "scope": scope,
+            "event": event,
+            "payload": payload,
+        }
+        try:
+            body = json.dumps(
+                record,
+                ensure_ascii=False,
+                sort_keys=False,
+                indent=2,
+                default=str,
+            )
+        except (TypeError, ValueError):
+            body = json.dumps(
+                {
+                    "scope": scope,
+                    "event": event,
+                    "payload": str(payload),
+                },
+                ensure_ascii=False,
+                sort_keys=False,
+                indent=2,
+            )
+        self._logger.info("\n%s", body)
 
     def trigger_memory_reflect(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
         """Queue reflection after pending interaction and transcript storage."""
