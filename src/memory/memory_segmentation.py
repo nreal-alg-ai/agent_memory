@@ -35,6 +35,9 @@ class SegmentDecision:
     prospective_tokens: Optional[int] = None
     prospective_exchanges: Optional[int] = None
     time_gap_seconds: Optional[float] = None
+    scoring_mode: str = "single_exchange"
+    rolling_window_tail_units: int = 0
+    rolling_window_tail_tokens: int = 0
 
 
 @dataclass
@@ -72,6 +75,8 @@ class OnlineSegmentationConfig:
     min_segment_override_probability: float = 0.90
     max_time_gap_seconds: float = -1.0
     enforce_min_pending_tokens: bool = False
+    rolling_window_enabled: bool = False
+    rolling_window_tail_units: int = 0
 
 
 @dataclass
@@ -232,6 +237,13 @@ def _build_online_segmentation_config(
         ),
         max_time_gap_seconds=float(-1.0 if max_gap in (None, "") else max_gap),
         enforce_min_pending_tokens=bool(enforce_min_pending_tokens),
+        rolling_window_enabled=bool(
+            segmentation_config.get("rolling_window_enabled", False),
+        ),
+        rolling_window_tail_units=max(
+            0,
+            config_int("rolling_window_tail_units", 0),
+        ),
     )
 
 
@@ -614,18 +626,87 @@ class OnlineSemanticSegmenter:
                 self._pending_online_exchanges_embedding,
             )
         ]
-        incoming = self.embed_exchange(incoming_exchange)
-        self._prepared_incoming_embedding = (
+        incoming, scoring_context = self._build_boundary_scoring_incoming(
+            active_exchanges,
             incoming_exchange,
-            incoming.embedding,
         )
         decision = self.score_boundary(active, incoming)
         decision.time_gap_seconds = time_gap_seconds
+        decision.scoring_mode = scoring_context["scoring_mode"]
+        decision.rolling_window_tail_units = scoring_context["tail_units"]
+        decision.rolling_window_tail_tokens = scoring_context["tail_tokens"]
         if self.semantic_boundary_allowed(active, decision):
             decision.reason = "semantic_boundary"
             return True, decision
         decision.reason = "append"
         return False, decision
+
+    def _build_boundary_scoring_incoming(
+        self,
+        active_exchanges: Sequence[Any],
+        incoming_exchange: Any,
+    ) -> Tuple[ActiveExchange, Dict[str, Any]]:
+        """Build the incoming embedding used only for boundary scoring."""
+        tail_limit = max(0, int(self.config.rolling_window_tail_units))
+        if not self.config.rolling_window_enabled or tail_limit <= 0:
+            incoming = self.embed_exchange(incoming_exchange)
+            self._prepared_incoming_embedding = (
+                incoming_exchange,
+                incoming.embedding,
+            )
+            return incoming, {
+                "scoring_mode": "single_exchange",
+                "tail_units": 0,
+                "tail_tokens": 0,
+            }
+
+        tail_exchanges = list(active_exchanges[-tail_limit:])
+        texts = [
+            self.exchange_text(exchange)
+            for exchange in tail_exchanges
+            if self.exchange_text(exchange)
+        ]
+        incoming_text = self.exchange_text(incoming_exchange)
+        if incoming_text:
+            texts.append(incoming_text)
+        if len(texts) <= 1:
+            incoming = self.embed_exchange(incoming_exchange)
+            self._prepared_incoming_embedding = (
+                incoming_exchange,
+                incoming.embedding,
+            )
+            return incoming, {
+                "scoring_mode": "single_exchange",
+                "tail_units": 0,
+                "tail_tokens": 0,
+            }
+
+        rolling_text = "\n".join(texts)
+        embedding = self.embedding_client.embed_text(rolling_text)
+        vector = _as_embedding_vector(embedding)
+        if vector is None:
+            incoming = self.embed_exchange(incoming_exchange)
+            self._prepared_incoming_embedding = (
+                incoming_exchange,
+                incoming.embedding,
+            )
+            return incoming, {
+                "scoring_mode": "single_exchange",
+                "tail_units": 0,
+                "tail_tokens": 0,
+            }
+        self._prepared_incoming_embedding = None
+        return ActiveExchange(
+            exchange=incoming_exchange,
+            embedding=vector,
+        ), {
+            "scoring_mode": "rolling_window",
+            "tail_units": len(tail_exchanges),
+            "tail_tokens": sum(
+                self.exchange_token_count(exchange)
+                for exchange in tail_exchanges
+            ),
+        }
 
     def _pending_capacity_reason(
         self,
@@ -727,6 +808,8 @@ class OnlineSemanticSegmenter:
         )
         if len(active) >= min_exchanges and meets_token_minimum:
             return True
+        if self.config.enforce_min_pending_tokens:
+            return False
         return (decision.cut_probability or 0.0) >= float(
             self.config.min_segment_override_probability,
         )

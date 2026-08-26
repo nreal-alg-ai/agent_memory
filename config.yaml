@@ -10,10 +10,7 @@ voice_runtime:
   sample_rate: 16000
   language: zh
   device: null
-  max_duration_s: 900
-  pace_file_realtime: false
-  mic_device: null
-  mic_channels: 1
+  max_duration_s: null
 
   vad:
     frame_ms: 32.0
@@ -155,6 +152,8 @@ memory_runtime:
     max_transcript_unit_tokens: 120
     max_transcript_unit_duration_seconds: 20.0
     short_fragment_max_tokens: 8
+    rolling_window_enabled: true
+    rolling_window_tail_units: 3
     
     threshold: 0.6
     bias: -1.1

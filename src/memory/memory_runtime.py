@@ -425,7 +425,8 @@ class MemoryRuntime:
         self._logger.info(
             "transcript segmentation decision unit=%s reason=%s raw_segment_count=%s "
             "token_count=%s speakers=%s cut_probability=%s score=%s "
-            "semantic_surprise=%s cohesion_drop=%s time_gap_seconds=%s text=%s",
+            "semantic_surprise=%s cohesion_drop=%s time_gap_seconds=%s "
+            "scoring_mode=%s rolling_tail_units=%s rolling_tail_tokens=%s text=%s",
             unit.index,
             resolved_reason,
             len(unit.raw_segments),
@@ -436,6 +437,9 @@ class MemoryRuntime:
             getattr(decision, "semantic_surprise", None),
             getattr(decision, "cohesion_drop", None),
             getattr(decision, "time_gap_seconds", None),
+            getattr(decision, "scoring_mode", None),
+            getattr(decision, "rolling_window_tail_units", None),
+            getattr(decision, "rolling_window_tail_tokens", None),
             unit.text[:240],
         )
 
