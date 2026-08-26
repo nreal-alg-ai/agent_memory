@@ -11,10 +11,12 @@ stdio transport. The server owns one `SessionDB`, `MemoryNodeManager`, and
   /Users/zhouboyu/Documents/agent_memory/scripts/memory_mcp_server.py
 ```
 
-The MCP protocol uses stdout. Memory logs go to stderr by default, or to
-`memory_mcp_server.log_path` when supplied. Database path, log level, queue
-timeout, runtime/model settings, and environment references such as
-`${GLM_API_KEY}` are all read from `config.yaml` during startup.
+The MCP protocol uses stdout. Memory logs, the database, ASR results, and test
+reports are resolved under `memory_mcp_server.result_dir` using
+`db_name`, `log_name`, `asr_result_dir`, and `report_name`. The server creates
+`result_dir` on startup. Log level, queue timeout, runtime/model settings, and
+environment references such as `${GLM_API_KEY}` are all read from
+`config.yaml`.
 
 Example client configuration:
 

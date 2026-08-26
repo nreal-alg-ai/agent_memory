@@ -19,9 +19,9 @@ if str(ROOT / "scripts") not in sys.path:
     sys.path.insert(0, str(ROOT / "scripts"))
 
 from memory_mcp_server import (  # noqa: E402
-    _resolve_configured_path,
     build_service,
     load_config,
+    resolve_mcp_server_paths,
 )
 
 
@@ -42,19 +42,19 @@ def parse_args() -> argparse.Namespace:
         "--db-path",
         type=Path,
         default=None,
-        help="Override memory_mcp_server.db_path from config.yaml.",
+        help="Override the resolved memory database path.",
     )
     parser.add_argument(
         "--log-path",
         type=Path,
         default=None,
-        help="Override memory_mcp_server.log_path from config.yaml.",
+        help="Override the resolved memory log path.",
     )
     parser.add_argument(
         "--report-path",
         type=Path,
         default=None,
-        help="Override memory_mcp_server.report_path from config.yaml.",
+        help="Override the resolved report path.",
     )
     parser.add_argument(
         "--override",
@@ -65,6 +65,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--queue-timeout", type=float, default=60.0)
     parser.add_argument("--job-poll-interval", type=float, default=5.0)
     parser.add_argument("--job-timeout", type=float)
+    parser.add_argument(
+        "--max-duration-s",
+        type=float,
+        help="Override voice_runtime.max_duration_s for this test run.",
+    )
     parser.add_argument("--source-type", default="allday_recording")
     parser.add_argument("--session-start")
     parser.add_argument("--tag", dest="tags", action="append", default=[])
@@ -102,6 +107,7 @@ def build_service_args(args: argparse.Namespace) -> Namespace:
         log_path=(args.log_path.expanduser().resolve() if args.log_path else None),
         log_level=args.log_level,
         queue_timeout=args.queue_timeout,
+        max_duration_s=args.max_duration_s,
     )
 
 
@@ -175,25 +181,26 @@ def main() -> int:
     server_config = config.get("memory_mcp_server") or {}
     if not isinstance(server_config, dict):
         raise ValueError("memory_mcp_server in config.yaml must be a mapping")
+    server_paths = resolve_mcp_server_paths(server_config, config_path)
     db_path = (
         args.db_path.expanduser().resolve()
         if args.db_path
-        else _resolve_configured_path(server_config.get("db_path"), config_path)
+        else server_paths["db_path"]
     )
     log_path = (
         args.log_path.expanduser().resolve()
         if args.log_path
-        else _resolve_configured_path(server_config.get("log_path"), config_path)
+        else server_paths["log_path"]
     )
     report_path = (
         args.report_path.expanduser().resolve()
         if args.report_path
-        else _resolve_configured_path(server_config.get("report_path"), config_path)
+        else server_paths["report_path"]
     )
     if db_path is None:
-        raise ValueError("memory_mcp_server.db_path must be configured")
+        raise ValueError("memory_mcp_server.db_name must be configured")
     if report_path is None:
-        raise ValueError("memory_mcp_server.report_path must be configured")
+        raise ValueError("memory_mcp_server.report_name must be configured")
     if args.override:
         remove_existing_outputs(db_path, log_path, report_path)
     audio_files = collect_audio_files(args.audio_dir, args.max_files)
@@ -227,6 +234,7 @@ def main() -> int:
             "audio_files": [str(path) for path in audio_files],
             "db_path": str(db_path),
             "override": bool(args.override),
+            "max_duration_s": args.max_duration_s,
             "processing": processing_report,
         }
         if args.query:

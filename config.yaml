@@ -113,10 +113,11 @@ chat:
   llm_api_key: ${DEEPSEEK_API_KEY}
 
 memory_mcp_server:
-  db_path: tmp/mcp/memory.db
-  log_path: tmp/mcp/memory.log
-  asr_result_dir: tmp/mcp/asr_result
-  report_path: tmp/mcp/voice_memory_runtime_report.json
+  result_dir: tmp/mcp
+  db_name: memory.db
+  log_name: memory.log
+  asr_result_dir: asr_result
+  report_name: voice_memory_runtime_report.json
   log_level: INFO
   queue_timeout: 30.0
 
