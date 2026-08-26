@@ -17,7 +17,7 @@ import json
 import re
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
@@ -110,8 +110,8 @@ def _lexical_index_text(identity_text: Any) -> str:
     return " ".join(tokens)
 
 
-def utc_now_text() -> str:
-    return datetime.now(timezone.utc).isoformat()
+def local_now_text() -> str:
+    return datetime.now().astimezone().isoformat()
 
 
 def _coerce_reference_datetime(value: Any) -> datetime:
@@ -619,7 +619,7 @@ class SessionDB:
         entity_ids: Optional[Sequence[int]] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> int:
-        now = utc_now_text()
+        now = local_now_text()
         episode_metadata = dict(metadata or {})
         normalized_topics = list(canonical_topics or [])
         cur = self._conn.execute(
@@ -674,7 +674,7 @@ class SessionDB:
         canonical_name_embedding: Optional[np.ndarray],
         identity_text: str,
     ) -> int:
-        now = utc_now_text()
+        now = local_now_text()
         normalized_scope = str(state_scope or "entity_state").strip()
         normalized_type = str(state_type or "profile").strip()
         normalized_source = str(source_type or "unified")
@@ -776,7 +776,7 @@ class SessionDB:
         identity_text_embedding: Optional[np.ndarray],
         identity_text: str,
     ) -> int:
-        now = utc_now_text()
+        now = local_now_text()
         self._conn.execute(
             """
             INSERT INTO memory_actionable_items (
@@ -875,14 +875,14 @@ class SessionDB:
         if restrict_to_today:
             local_now = _coerce_reference_datetime(reference_timestamp).astimezone()
             event_date = local_now.date().isoformat()
-            clauses.append("substr(dialogue_time_key, 1, 10) = ?")
+            clauses.append("substr(created_at, 1, 10) = ?")
             params.append(event_date)
         where = "WHERE " + " AND ".join(clauses) if clauses else ""
         rows = self._conn.execute(
             f"""
             SELECT * FROM memory_facts
             {where}
-            ORDER BY replace(substr(dialogue_time_key, 1, 19), 'T', ' ') ASC, created_at ASC, id ASC
+            ORDER BY replace(substr(created_at, 1, 19), 'T', ' ') ASC, id ASC
             LIMIT ?
             """,
             (*params, max(1, int(limit or 100))),
@@ -917,7 +917,7 @@ class SessionDB:
                 updated_at = ?
             WHERE id IN ({placeholders})
             """,
-            (utc_now_text(), *ids),
+            (local_now_text(), *ids),
         )
         self._commit_if_needed()
         return int(cur.rowcount or 0)
@@ -1009,7 +1009,7 @@ class SessionDB:
         identity_text_embedding: Optional[np.ndarray],
         identity_text: str,
     ) -> int:
-        now = utc_now_text()
+        now = local_now_text()
         cur = self._conn.execute(
             """
             INSERT INTO memory_facts (
@@ -1060,7 +1060,7 @@ class SessionDB:
         return fact_id
 
     def add_entity_names(self, names: Iterable[str]) -> Dict[str, int]:
-        now = utc_now_text()
+        now = local_now_text()
         normalized: List[str] = []
         for name in names:
             clean = str(name or "").strip()
@@ -1187,7 +1187,7 @@ class SessionDB:
         if not grouped:
             return 0
 
-        now = utc_now_text()
+        now = local_now_text()
         changed_count = 0
         for entity_id, mapping in grouped.items():
             existing = self._conn.execute(

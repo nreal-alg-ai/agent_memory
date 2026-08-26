@@ -21,6 +21,9 @@ from voice.voice_runtime import VoiceRuntime
 
 
 MCP_PROTOCOL_VERSION = "2024-11-05"
+AUDIO_SESSION_START_RE = re.compile(
+    r"(?P<date>\d{8})[_-](?P<time>\d{4}(?:\d{2})?)"
+)
 
 
 def _json_compatible(value: Any) -> Any:
@@ -57,6 +60,22 @@ def _string_list(value: Any, field_name: str) -> Optional[List[str]]:
     if not isinstance(value, list):
         raise ValueError(f"{field_name} must be an array of strings")
     return [str(item) for item in value if item is not None and str(item).strip()]
+
+
+def _session_start_from_audio_filename(audio_path: str) -> Optional[str]:
+    """Parse audio time zero from filenames like ``20260826_1421.wav``."""
+    stem = Path(str(audio_path or "")).stem
+    match = AUDIO_SESSION_START_RE.search(stem)
+    if match is None:
+        return None
+    date_text = match.group("date")
+    time_text = match.group("time")
+    format_text = "%Y%m%d%H%M%S" if len(time_text) == 6 else "%Y%m%d%H%M"
+    timestamp = datetime.strptime(date_text + time_text, format_text)
+    local_tz = datetime.now().astimezone().tzinfo
+    if local_tz is not None:
+        timestamp = timestamp.replace(tzinfo=local_tz)
+    return timestamp.isoformat()
 
 
 class MemoryMCPService:
@@ -108,9 +127,13 @@ class MemoryMCPService:
         if not str(audio_path or "").strip():
             raise ValueError("audio_path must be non-empty")
         source = str(source_type or "allday_recording").strip()
+        resolved_session_start = (
+            _optional_string(session_start)
+            or _session_start_from_audio_filename(audio_path)
+        )
         voice_report = self._get_voice_runtime().process_audio_file(
             audio_path,
-            session_start=session_start,
+            session_start=resolved_session_start,
         )
         segments = list(voice_report.get("segments") or [])
         asr_result_path = self._save_asr_result(voice_report)
@@ -137,6 +160,7 @@ class MemoryMCPService:
         report = {
             "status": "ok" if queue_flushed else "queue_flush_timeout",
             "source_type": source,
+            "session_start": resolved_session_start,
             "audio": {
                 key: value
                 for key, value in voice_report.items()
@@ -312,7 +336,13 @@ TOOLS: List[Dict[str, Any]] = [
                         "properties": {
                             "audio_path": {"type": "string"},
                             "source_type": {"type": "string"},
-                            "session_start": {"type": "string"},
+                            "session_start": {
+                                "type": "string",
+                                "description": (
+                                    "Optional ISO-8601 timestamp. When omitted, "
+                                    "the service parses YYYYMMDD_HHMM from the filename."
+                                ),
+                            },
                             "tags": {"type": "array", "items": {"type": "string"}},
                         },
                         "required": ["audio_path"],
@@ -322,7 +352,10 @@ TOOLS: List[Dict[str, Any]] = [
                 "source_type": {"type": "string", "default": "allday_recording"},
                 "session_start": {
                     "type": "string",
-                    "description": "Optional ISO-8601 timestamp for audio time zero.",
+                    "description": (
+                        "Optional ISO-8601 timestamp for audio time zero. When omitted, "
+                        "the service parses YYYYMMDD_HHMM from each filename."
+                    ),
                 },
                 "tags": {"type": "array", "items": {"type": "string"}},
             },

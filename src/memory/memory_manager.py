@@ -169,7 +169,7 @@ _ACTIONABLE_HARD_MARKERS = (
 
 
 def _now_text() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now().astimezone().isoformat()
 
 
 def _to_timestamp_text(value: Any) -> str:
@@ -5310,7 +5310,7 @@ class MemoryNodeManager:
                     recent_reference_time=(
                         parsed_time_end
                         if has_explicit_time_window
-                        else datetime.now(timezone.utc).isoformat()
+                        else datetime.now().astimezone().isoformat()
                     ),
                     prompt_language=prompt_language,
                     database=database,
@@ -5458,7 +5458,7 @@ class MemoryNodeManager:
                 database=database,
             )
         )
-        reference_time = recent_reference_time or datetime.now(timezone.utc).isoformat()
+        reference_time = recent_reference_time or datetime.now().astimezone().isoformat()
         (
             ranked_fact_candidates,
             ranked_state_candidates,
@@ -5920,7 +5920,7 @@ class MemoryNodeManager:
             score_components = dict(match.get("score_components") or {})
             index_level = str(candidate.get("index_level") or "")
             effective_reference_time = (
-                reference_time or datetime.now(timezone.utc).isoformat()
+                reference_time or datetime.now().astimezone().isoformat()
             )
 
             if index_level == "actionable_item":

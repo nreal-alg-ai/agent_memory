@@ -26,7 +26,7 @@ from memory_mcp_server import (  # noqa: E402
 
 DEFAULT_AUDIO_DIR = (
     ROOT
-    / "test_data/ambient_transcript/Eval_Ali/Eval_Ali_far/audio_dir"
+    / "test_data/ambient_transcript/Eval_Ali/Eval_Ali_far/filenames_formated_dir"
 )
 SUPPORTED_AUDIO_SUFFIXES = {".wav", ".flac", ".mp3", ".m4a", ".ogg"}
 

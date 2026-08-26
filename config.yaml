@@ -10,7 +10,7 @@ voice_runtime:
   sample_rate: 16000
   language: zh
   device: null
-  max_duration_s: null
+  max_duration_s: 600
 
   vad:
     frame_ms: 32.0
