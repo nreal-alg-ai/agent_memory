@@ -173,6 +173,7 @@ def build_service(config_source: Any = None) -> tuple[MemoryMCPService, logging.
             voice_runtime_factory=build_voice_runtime,
             queue_timeout=queue_timeout,
             asr_result_dir=asr_result_dir,
+            logger=logger,
         ), logger
     except Exception:
         if "memory_runtime" in locals():

@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from argparse import Namespace
 from datetime import datetime
 from pathlib import Path
@@ -62,6 +63,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--log-level", default="INFO")
     parser.add_argument("--queue-timeout", type=float, default=60.0)
+    parser.add_argument("--job-poll-interval", type=float, default=5.0)
+    parser.add_argument("--job-timeout", type=float)
     parser.add_argument("--source-type", default="allday_recording")
     parser.add_argument("--session-start")
     parser.add_argument("--tag", dest="tags", action="append", default=[])
@@ -100,6 +103,36 @@ def build_service_args(args: argparse.Namespace) -> Namespace:
         log_level=args.log_level,
         queue_timeout=args.queue_timeout,
     )
+
+
+def wait_for_audio_job(
+    service: Any,
+    job_id: str,
+    *,
+    poll_interval: float,
+    timeout: float | None,
+    logger: Any,
+) -> Dict[str, Any]:
+    """Poll an asynchronous MCP audio job until it reaches a terminal state."""
+    started_at = time.monotonic()
+    terminal_statuses = {"ok", "partial_failure", "failed", "queue_flush_timeout"}
+    while True:
+        report = service.get_audio_processing_job(job_id=job_id)
+        status = str(report.get("status") or "")
+        logger.info(
+            "Audio processing job status job_id=%s status=%s stage=%s file=%s/%s elapsed_ms=%s",
+            job_id,
+            status,
+            report.get("current_stage"),
+            report.get("current_file_index"),
+            report.get("file_count"),
+            report.get("elapsed_ms"),
+        )
+        if status in terminal_statuses:
+            return report
+        if timeout is not None and time.monotonic() - started_at > timeout:
+            raise TimeoutError(f"Audio processing job timed out: {job_id}")
+        time.sleep(max(0.1, float(poll_interval)))
 
 
 def _remove_existing_file(path: Path) -> None:
@@ -178,6 +211,15 @@ def main() -> int:
             session_start=args.session_start,
             tags=list(args.tags),
         )
+        job_id = str(processing_report.get("job_id") or "")
+        if job_id:
+            processing_report = wait_for_audio_job(
+                service,
+                job_id,
+                poll_interval=args.job_poll_interval,
+                timeout=args.job_timeout,
+                logger=logger,
+            )
         result: Dict[str, Any] = {
             "created_at": datetime.now().isoformat(timespec="seconds"),
             "config_path": str(config_path),
