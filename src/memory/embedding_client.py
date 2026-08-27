@@ -1,17 +1,14 @@
 #!/usr/bin/env python3
 """Small embedding client used by the unified memory prototype.
 
-The production voice_recording project can call remote embedding APIs. For this
-standalone memory prototype we keep the same class name but add a deterministic
-local fallback so benchmark memory construction can run even when the embedding
-provider is unavailable.
+The production voice_recording project can call remote embedding APIs. When the
+provider is unavailable, this client returns ``None`` so callers can skip
+semantic matching instead of treating a synthetic vector as real evidence.
 """
 
 from __future__ import annotations
 
-import hashlib
 import logging
-import math
 import os
 import re
 from pathlib import Path
@@ -68,7 +65,7 @@ def _build_openai_embedding_url(base_url: str) -> str:
 
 
 class EmbeddingClient:
-    """OpenAI-compatible embedding client with deterministic local fallback."""
+    """OpenAI-compatible embedding client without synthetic-vector fallback."""
 
     def __init__(self, config: Optional[Dict[str, Any]] = None) -> None:
         merged = dict(DEFAULT_CONFIG)
@@ -96,9 +93,9 @@ class EmbeddingClient:
             remote = self._embed_openai(text)
             if remote is not None:
                 return remote
-        return self._embed_local_hash(text)
+        return None
 
-    def embed_batch(self, texts: Iterable[str]) -> List[np.ndarray]:
+    def embed_batch(self, texts: Iterable[str]) -> List[Optional[np.ndarray]]:
         return [self.embed_text(text) for text in texts]
 
     def _embed_openai(self, text: str) -> Optional[np.ndarray]:
@@ -116,21 +113,8 @@ class EmbeddingClient:
                 return None
             return self._as_vector(vector)
         except Exception as exc:
-            logger.warning("Remote embedding failed; falling back to local hash: %s", exc)
+            logger.warning("Remote embedding failed; returning no embedding: %s", exc)
             return None
-
-    def _embed_local_hash(self, text: str) -> np.ndarray:
-        vector = np.zeros((self._dim,), dtype=np.float32)
-        terms = re.findall(r"[A-Za-z0-9_.$'-]+|[\u4e00-\u9fff]+", str(text or "").lower())
-        if not terms:
-            terms = ["empty"]
-        for term in terms:
-            digest = hashlib.blake2b(term.encode("utf-8"), digest_size=16).digest()
-            idx = int.from_bytes(digest[:4], "little") % self._dim
-            sign = 1.0 if digest[4] % 2 == 0 else -1.0
-            weight = 1.0 + min(2.0, math.log1p(len(term)) / 2.0)
-            vector[idx] += sign * weight
-        return self._as_vector(vector)
 
     def _as_vector(self, raw: Any) -> np.ndarray:
         vector = np.asarray(raw, dtype=np.float32).reshape(-1)

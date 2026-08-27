@@ -53,7 +53,7 @@ class OnlineSegmentExchange:
 @dataclass
 class ActiveExchange:
     exchange: Any
-    embedding: np.ndarray
+    embedding: Optional[np.ndarray]
 
 
 @dataclass
@@ -538,22 +538,24 @@ class OnlineSemanticSegmenter:
             maxlen=max(1, self.config.surprise_history_window),
         )
         self._pending_online_exchanges: List[OnlineSegmentExchange] = []
-        self._pending_online_exchanges_embedding: List[np.ndarray] = []
+        self._pending_online_exchanges_embedding: List[Optional[np.ndarray]] = []
         self._prepared_incoming_embedding: Optional[
-            Tuple[OnlineSegmentExchange, np.ndarray]
+            Tuple[OnlineSegmentExchange, Optional[np.ndarray]]
         ] = None
 
     def append_pending_exchange(self, exchange: OnlineSegmentExchange) -> None:
         """Append an exchange to the segmenter's pending online buffer."""
         embedding: Optional[np.ndarray] = None
+        prepared_embedding_used = False
         if (
             self._prepared_incoming_embedding is not None
             and self._prepared_incoming_embedding[0] is exchange
         ):
             embedding = self._prepared_incoming_embedding[1]
+            prepared_embedding_used = True
         elif self._prepared_incoming_embedding is not None:
             self._prepared_incoming_embedding = None
-        if embedding is None:
+        if not prepared_embedding_used:
             embedding = self.embed_exchange(exchange).embedding
         self._pending_online_exchanges.append(exchange)
         self._pending_online_exchanges_embedding.append(embedding)
@@ -575,8 +577,6 @@ class OnlineSemanticSegmenter:
     def embed_exchange(self, exchange: Any) -> ActiveExchange:
         embedding = self.embedding_client.embed_text(self.exchange_text(exchange))
         vector = _as_embedding_vector(embedding)
-        if vector is None:
-            raise ValueError("Embedding provider returned an invalid vector")
         return ActiveExchange(exchange=exchange, embedding=vector)
 
     def should_finalize_pending_exchanges(
@@ -619,6 +619,26 @@ class OnlineSemanticSegmenter:
                 prospective_exchanges=len(active_exchanges),
                 time_gap_seconds=time_gap_seconds,
             )
+        incoming, scoring_context = self._build_boundary_scoring_incoming(
+            active_exchanges,
+            incoming_exchange,
+        )
+        if incoming.embedding is None or any(
+            embedding is None
+            for embedding in self._pending_online_exchanges_embedding
+        ):
+            return False, SegmentDecision(
+                exchange_index=self.exchange_index(incoming_exchange),
+                reason="embedding_unavailable",
+                prospective_tokens=sum(
+                    self.exchange_token_count(item) for item in active_exchanges
+                ),
+                prospective_exchanges=len(active_exchanges),
+                time_gap_seconds=time_gap_seconds,
+                scoring_mode="embedding_unavailable",
+                rolling_window_tail_units=scoring_context["tail_units"],
+                rolling_window_tail_tokens=scoring_context["tail_tokens"],
+            )
         active = [
             ActiveExchange(exchange=exchange, embedding=embedding)
             for exchange, embedding in zip(
@@ -626,10 +646,6 @@ class OnlineSemanticSegmenter:
                 self._pending_online_exchanges_embedding,
             )
         ]
-        incoming, scoring_context = self._build_boundary_scoring_incoming(
-            active_exchanges,
-            incoming_exchange,
-        )
         decision = self.score_boundary(active, incoming)
         decision.time_gap_seconds = time_gap_seconds
         decision.scoring_mode = scoring_context["scoring_mode"]
