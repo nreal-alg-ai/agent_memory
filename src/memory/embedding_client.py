@@ -12,7 +12,7 @@ import logging
 import os
 import re
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 import numpy as np
 import requests
@@ -28,6 +28,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "dimensions": 384,
     "normalize": True,
     "timeout": 30,
+    "batch_size": 32,
 }
 
 
@@ -83,6 +84,7 @@ class EmbeddingClient:
         self._dim = max(8, int(merged.get("dimensions") or 384))
         self._normalize = bool(merged.get("normalize", True))
         self._timeout = int(merged.get("timeout") or 30)
+        self._batch_size = max(1, int(merged.get("batch_size") or 32))
 
     @property
     def dimension(self) -> int:
@@ -96,7 +98,17 @@ class EmbeddingClient:
         return None
 
     def embed_batch(self, texts: Iterable[str]) -> List[Optional[np.ndarray]]:
-        return [self.embed_text(text) for text in texts]
+        input_texts = list(texts)
+        if not input_texts:
+            return []
+        if self._provider != "openai" or not self._api_key:
+            return [None] * len(input_texts)
+
+        vectors: List[Optional[np.ndarray]] = []
+        for start in range(0, len(input_texts), self._batch_size):
+            batch = input_texts[start : start + self._batch_size]
+            vectors.extend(self._embed_openai_batch(batch))
+        return vectors
 
     def _embed_openai(self, text: str) -> Optional[np.ndarray]:
         url = _build_openai_embedding_url(self._base_url)
@@ -115,6 +127,63 @@ class EmbeddingClient:
         except Exception as exc:
             logger.warning("Remote embedding failed; returning no embedding: %s", exc)
             return None
+
+    def _embed_openai_batch(
+        self,
+        texts: Sequence[str],
+    ) -> List[Optional[np.ndarray]]:
+        """Request one provider-side embedding batch and preserve input order."""
+        if not texts:
+            return []
+        url = _build_openai_embedding_url(self._base_url)
+        headers = {"Content-Type": "application/json"}
+        if self._api_key:
+            headers["Authorization"] = f"Bearer {self._api_key}"
+        payload = {
+            "model": self._model,
+            "input": [text or " " for text in texts],
+        }
+        empty_result: List[Optional[np.ndarray]] = [None] * len(texts)
+        try:
+            resp = requests.post(
+                url,
+                json=payload,
+                headers=headers,
+                timeout=self._timeout,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            raw_items = data.get("data") if isinstance(data, dict) else None
+            if not isinstance(raw_items, list):
+                return empty_result
+
+            result: List[Optional[np.ndarray]] = [None] * len(texts)
+            used_indices: set[int] = set()
+            for fallback_index, item in enumerate(raw_items):
+                if not isinstance(item, dict):
+                    continue
+                raw_index = item.get("index", fallback_index)
+                try:
+                    index = int(raw_index)
+                except (TypeError, ValueError):
+                    continue
+                if index < 0 or index >= len(texts) or index in used_indices:
+                    continue
+                embedding = item.get("embedding")
+                if not embedding:
+                    continue
+                try:
+                    result[index] = self._as_vector(embedding)
+                except (TypeError, ValueError):
+                    result[index] = None
+                used_indices.add(index)
+            return result
+        except Exception as exc:
+            logger.warning(
+                "Remote batch embedding failed; returning no embeddings: %s",
+                exc,
+            )
+            return empty_result
 
     def _as_vector(self, raw: Any) -> np.ndarray:
         vector = np.asarray(raw, dtype=np.float32).reshape(-1)

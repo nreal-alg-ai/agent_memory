@@ -2633,6 +2633,26 @@ class MemoryNodeManager:
                     str(fact.get("summary") or "") for fact in matched_facts
                 )[:2400],
             })
+        if candidates:
+            self._ensure_embedding_client()
+            if self._embedding_client is not None:
+                identity_embeddings = self._embedding_client.embed_batch(
+                    [str(candidate.get("identity_text") or "") for candidate in candidates]
+                )
+                name_embeddings = self._embedding_client.embed_batch(
+                    [str(candidate.get("topic_name") or "") for candidate in candidates]
+                )
+                for index, candidate in enumerate(candidates):
+                    candidate["candidate_identity_embedding"] = (
+                        identity_embeddings[index]
+                        if index < len(identity_embeddings)
+                        else None
+                    )
+                    candidate["candidate_name_embedding"] = (
+                        name_embeddings[index]
+                        if index < len(name_embeddings)
+                        else None
+                    )
         return candidates
 
     @staticmethod
@@ -2746,28 +2766,10 @@ class MemoryNodeManager:
             for topic in candidate_aspect_topics
             if self._generate_topic_name_key(topic)
         }
-        candidate_identity_text = (
-            _compact_whitespace(candidate.get("identity_text") or "")
-            or self._generate_topic_candidate_identity_text(
-                canonical_name=candidate_root_name,
-                keywords=candidate.get("keywords") or [],
-                fact_summaries=candidate.get("fact_summaries") or candidate.get("summary_text"),
-            )
-        )
         best_state: Optional[Dict[str, Any]] = None
         best_info: Dict[str, Any] = {"score": 0.0}
-        candidate_identity_embedding: Optional[np.ndarray] = None
-        candidate_name_embedding: Optional[np.ndarray] = None
-        if any(
-            state.get("identity_text_embedding") is not None
-            for state in existing_topic_states
-        ):
-            candidate_identity_embedding = self._generate_embedding_vector(candidate_identity_text)
-        if any(
-            state.get("canonical_name_embedding") is not None
-            for state in existing_topic_states
-        ):
-            candidate_name_embedding = self._generate_embedding_vector(candidate_root_name)
+        candidate_identity_embedding = candidate.get("candidate_identity_embedding")
+        candidate_name_embedding = candidate.get("candidate_name_embedding")
         for state in existing_topic_states:
             state_metadata = state.get("metadata") if isinstance(state.get("metadata"), dict) else {}
             state_aspect_topics = self._normalize_unique_labels([
@@ -3705,6 +3707,26 @@ class MemoryNodeManager:
                 "\n".join(aspect_evidence),
             ])[:2800]
             candidates.append(item)
+        if candidates:
+            self._ensure_embedding_client()
+            if self._embedding_client is not None:
+                identity_embeddings = self._embedding_client.embed_batch(
+                    [str(candidate.get("identity_text") or "") for candidate in candidates]
+                )
+                name_embeddings = self._embedding_client.embed_batch(
+                    [str(candidate.get("attribute_name") or "") for candidate in candidates]
+                )
+                for index, candidate in enumerate(candidates):
+                    candidate["candidate_identity_embedding"] = (
+                        identity_embeddings[index]
+                        if index < len(identity_embeddings)
+                        else None
+                    )
+                    candidate["candidate_name_embedding"] = (
+                        name_embeddings[index]
+                        if index < len(name_embeddings)
+                        else None
+                    )
         return candidates
 
     def _state_aspects_from_fact(self, fact: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -3772,7 +3794,6 @@ class MemoryNodeManager:
         candidate: Dict[str, Any],
         existing_entity_states: List[Dict[str, Any]],
     ) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
-        candidate_name = str(candidate.get("attribute_name") or "")
         candidate_entity = str(candidate.get("entity") or "")
         candidate_type = str(candidate.get("state_type") or "")
         candidate_entity_key = self._generate_entity_name_key(candidate.get("entity_key") or candidate_entity)
@@ -3780,7 +3801,6 @@ class MemoryNodeManager:
             candidate.get("attribute_name"),
             *(candidate.get("attribute_name_aliases") or []),
         ], limit=12)
-        candidate_identity_text = str(candidate.get("identity_text") or candidate.get("summary_text") or "")
         best_state: Optional[Dict[str, Any]] = None
         best_score = 0.0
         best_info: Dict[str, Any] = {"matched": False, "score": 0.0}
@@ -3805,17 +3825,8 @@ class MemoryNodeManager:
         if not matching_states:
             return None, best_info
 
-        candidate_name_embedding: Optional[np.ndarray] = None
-        candidate_identity_embedding: Optional[np.ndarray] = None
-        if any(state.get("canonical_name_embedding") is not None for state in matching_states):
-            candidate_name_embedding = self._generate_embedding_vector(
-                candidate.get("attribute_name") or candidate_name
-            )
-        if any(
-            state.get("identity_text_embedding") is not None
-            for state in matching_states
-        ):
-            candidate_identity_embedding = self._generate_embedding_vector(candidate_identity_text[:1600])
+        candidate_name_embedding = candidate.get("candidate_name_embedding")
+        candidate_identity_embedding = candidate.get("candidate_identity_embedding")
 
         for state in matching_states:
             metadata = state.get("metadata") or {}
