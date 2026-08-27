@@ -104,6 +104,7 @@ voice_runtime:
     user_similarity_threshold: null
     user_reference_audio: []
     speaker_assignment_method: agglomerative
+    embedding_batch_size: 16
 
 chat:
   enabled: false
@@ -189,6 +190,7 @@ memory_manager:
     api_key_env: GLM_API_KEY
     dimensions: 2048
     normalize: true
+    batch_size: 32
 
   task_queue_maxsize: 100
 

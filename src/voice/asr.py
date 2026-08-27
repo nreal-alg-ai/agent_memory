@@ -3,7 +3,7 @@ from __future__ import annotations
 import tempfile
 import warnings
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Protocol, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Protocol, Sequence, Tuple
 
 import numpy as np
 import soundfile as sf
@@ -13,6 +13,9 @@ from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
 
 class ASRBackend(Protocol):
     def transcribe_segment(self, audio: np.ndarray) -> str:
+        ...
+
+    def transcribe_batch_segments(self, audios: Sequence[np.ndarray]) -> List[str]:
         ...
 
 
@@ -92,6 +95,10 @@ class BaseASR:
         if self.config.device:
             return self.config.device
         return "cuda:0" if torch.cuda.is_available() else "cpu"
+
+    def transcribe_batch_segments(self, audios: Sequence[np.ndarray]) -> List[str]:
+        """Transcribe a sequence, using the backend's single-item API by default."""
+        return [self.transcribe_segment(audio) for audio in audios]
 
 
 class WhisperASR(BaseASR):
@@ -282,6 +289,28 @@ class Qwen3ASR(BaseASR):
         if not results:
             return ""
         return _qwen_result_text(results[0])
+
+    def transcribe_batch_segments(self, audios: Sequence[np.ndarray]) -> List[str]:
+        """Transcribe multiple VAD segments with one Qwen batch request."""
+        audio_inputs: List[Tuple[np.ndarray, int]] = []
+        result_positions: List[int] = []
+        texts = [""] * len(audios)
+        sample_rate = int(self.config.sample_rate)
+        for index, audio in enumerate(audios):
+            if audio.size == 0:
+                continue
+            audio_inputs.append((_as_float32_mono(audio), sample_rate))
+            result_positions.append(index)
+        if not audio_inputs:
+            return texts
+
+        results = self.model.transcribe(
+            audio=audio_inputs,
+            language=_qwen_language(getattr(self.config, "language", None)),
+        )
+        for index, result in zip(result_positions, results or []):
+            texts[index] = _qwen_result_text(result)
+        return texts
 
 
 class ParakeetTDTASR(BaseASR):

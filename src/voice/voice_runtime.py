@@ -95,54 +95,78 @@ class VoiceRuntime:
         )
         chunks = [slice_audio(audio, sample_rate, start, end) for start, end in spans]
         assignments = self._identify_speakers(chunks)
-        segments: List[Dict[str, Any]] = []
-        for index, ((start, end), chunk, assignment) in enumerate(
-            zip(spans, chunks, assignments),
+        batch_size = max(
             1,
-        ):
-            text = normalize_text(
-                self.asr.transcribe_segment(chunk),
-                bool(
-                    self.asr_config.get(
-                        "simplify_chinese",
-                        self.config.get("output", {}).get("simplify_chinese", True),
-                    )
-                ),
+            int(self.asr_config.get("max_inference_batch_size", 1) or 1),
+        )
+        segments: List[Dict[str, Any]] = []
+        for batch_start in range(0, len(chunks), batch_size):
+            batch_index = batch_start // batch_size + 1
+            batch_chunks = chunks[batch_start : batch_start + batch_size]
+            batch_texts = self.asr.transcribe_batch_segments(batch_chunks)
+            if len(batch_texts) != len(batch_chunks):
+                raise RuntimeError(
+                    "ASR batch result count does not match speech segment count: "
+                    f"batch={batch_index} results={len(batch_texts)} "
+                    f"segments={len(batch_chunks)}"
+                )
+            self.logger.info(
+                "process_audio_file asr_batch path=%s batch=%s start_segment=%s "
+                "batch_size=%s returned=%s",
+                path,
+                batch_index,
+                batch_start + 1,
+                len(batch_chunks),
+                len(batch_texts),
             )
-            if not text:
+            for offset, transcript_text in enumerate(batch_texts):
+                chunk_index = batch_start + offset
+                start, end = spans[chunk_index]
+                assignment = assignments[chunk_index]
+                index = chunk_index + 1
+                text = normalize_text(
+                    transcript_text,
+                    bool(
+                        self.asr_config.get(
+                            "simplify_chinese",
+                            self.config.get("output", {}).get("simplify_chinese", True),
+                        )
+                    ),
+                )
+                if not text:
+                    self.logger.info(
+                        "process_audio_file asr_empty path=%s segment=%s start=%.3f end=%.3f",
+                        path,
+                        index,
+                        start,
+                        end,
+                    )
+                    continue
+                speaker, speaker_metadata = self._speaker_label(assignment)
                 self.logger.info(
-                    "process_audio_file asr_empty path=%s segment=%s start=%.3f end=%.3f",
+                    "process_audio_file asr_segment path=%s segment=%s start=%.3f end=%.3f speaker=%s text=%s",
                     path,
                     index,
                     start,
                     end,
+                    speaker,
+                    text,
                 )
-                continue
-            speaker, speaker_metadata = self._speaker_label(assignment)
-            self.logger.info(
-                "process_audio_file asr_segment path=%s segment=%s start=%.3f end=%.3f speaker=%s text=%s",
-                path,
-                index,
-                start,
-                end,
-                speaker,
-                text,
-            )
-            segments.append(
-                {
-                    "speaker": speaker,
-                    "text": text,
-                    "started_at": (recording_start + timedelta(seconds=start)).isoformat(),
-                    "ended_at": (recording_start + timedelta(seconds=end)).isoformat(),
-                    "segment_index": index,
-                    "metadata": {
-                        "audio_start_s": round(start, 3),
-                        "audio_end_s": round(end, 3),
-                        "sample_rate": sample_rate,
-                        **speaker_metadata,
-                    },
-                }
-            )
+                segments.append(
+                    {
+                        "speaker": speaker,
+                        "text": text,
+                        "started_at": (recording_start + timedelta(seconds=start)).isoformat(),
+                        "ended_at": (recording_start + timedelta(seconds=end)).isoformat(),
+                        "chunk_index": index,
+                        "metadata": {
+                            "audio_start_s": round(start, 3),
+                            "audio_end_s": round(end, 3),
+                            "sample_rate": sample_rate,
+                            **speaker_metadata,
+                        },
+                    }
+                )
 
         report = {
             "status": "ok",
@@ -340,6 +364,10 @@ class VoiceRuntime:
             ),
             speaker_assignment_method=str(
                 self.speaker_config.get("speaker_assignment_method", "reference")
+            ),
+            embedding_batch_size=max(
+                1,
+                int(self.speaker_config.get("embedding_batch_size", 16)),
             ),
         )
         reference_audio = self.speaker_config.get("user_reference_audio")

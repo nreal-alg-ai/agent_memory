@@ -46,7 +46,7 @@ The MCP server exposes three tools:
   once processing has finished.
 - `trigger_memory_recall`: searches the latest committed memory snapshot using
   a `query`, with optional `tags` and `time_end`. The response contains the
-  assembled `memory_context`, recall-path metadata, and timing information.
+  assembled `memory_context`, recall-mode metadata, and timing information.
 
 `process_audio_file`, transcript ingestion, reflection, and pending-queue
 operations are internal implementation steps of the `process_audio_files` job;

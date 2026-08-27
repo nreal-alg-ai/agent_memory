@@ -106,6 +106,7 @@ class SpeakerReferenceDetector:
         user_reference_audio_dir: Optional[Path] = None,
         reference_embeddings_path: Optional[Path] = None,
         speaker_assignment_method: str = "reference",
+        embedding_batch_size: int = 16,
     ) -> None:
         try:
             from funasr import AutoModel
@@ -132,6 +133,7 @@ class SpeakerReferenceDetector:
         if speaker_assignment_method not in {"reference", "agglomerative"}:
             raise ValueError("speaker_assignment_method must be reference or agglomerative.")
         self.speaker_assignment_method = speaker_assignment_method
+        self.embedding_batch_size = max(1, int(embedding_batch_size))
         self.user_similarity_threshold = (
             similarity_threshold
             if user_similarity_threshold is None
@@ -629,19 +631,66 @@ class SpeakerReferenceDetector:
     def _reference_embedding(reference: SpeakerReference) -> np.ndarray:
         return _l2_normalize(np.mean(reference.embeddings, axis=0))
 
-    def _encode_audio(self, audio: np.ndarray) -> np.ndarray:
-        if audio.size == 0:
-            return np.zeros(192, dtype=np.float32)
-        with tempfile.NamedTemporaryFile(suffix=".wav") as temp_file:
-            sf.write(temp_file.name, np.asarray(audio, dtype=np.float32), self.sample_rate)
-            output = self.model.generate(input=temp_file.name)
-        embedding = _find_embedding_array(output)
-        if embedding is None:
-            raise RuntimeError(
-                "Could not find a speaker embedding in CAMPPlus output. "
-                f"Output type={type(output)!r}, value={output!r}"
+    def _encode_audio_batch(self, audios: List[np.ndarray]) -> List[np.ndarray]:
+        """Encode multiple audio arrays in one CAM++ inference call."""
+        if not audios:
+            return []
+
+        normalized_audios = [
+            np.asarray(audio, dtype=np.float32).reshape(-1) for audio in audios
+        ]
+        valid_indexes = [
+            index for index, audio in enumerate(normalized_audios) if audio.size
+        ]
+        embeddings: List[Optional[np.ndarray]] = [None] * len(normalized_audios)
+        if valid_indexes:
+            valid_audios = [normalized_audios[index] for index in valid_indexes]
+            outputs = self.model.generate(
+                input=valid_audios,
+                batch_size=len(valid_audios),
             )
-        return _l2_normalize(embedding)
+            if not isinstance(outputs, (list, tuple)):
+                outputs = [outputs]
+            batch_embeddings: List[np.ndarray] = []
+            if len(outputs) == 1 and len(valid_audios) > 1:
+                embedding = _find_embedding_array(outputs[0])
+                if embedding is not None:
+                    embedding_array = np.asarray(embedding, dtype=np.float32)
+                    if embedding_array.ndim >= 2 and embedding_array.shape[0] == len(
+                        valid_audios
+                    ):
+                        batch_embeddings = [
+                            embedding_array[index] for index in range(len(valid_audios))
+                        ]
+            if not batch_embeddings:
+                if len(outputs) != len(valid_audios):
+                    raise RuntimeError(
+                        "CAMPPlus batch embedding count does not match audio count: "
+                        f"outputs={len(outputs)} audios={len(valid_audios)}"
+                    )
+                for output in outputs:
+                    embedding = _find_embedding_array(output)
+                    if embedding is None:
+                        raise RuntimeError(
+                            "Could not find a speaker embedding in CAMPPlus output. "
+                            f"Output type={type(output)!r}, value={output!r}"
+                        )
+                    embedding_array = np.asarray(embedding, dtype=np.float32)
+                    if embedding_array.ndim >= 2 and embedding_array.shape[0] == 1:
+                        embedding_array = embedding_array[0]
+                    batch_embeddings.append(embedding_array)
+            for index, embedding in zip(valid_indexes, batch_embeddings):
+                embeddings[index] = _l2_normalize(embedding)
+
+        return [
+            embedding
+            if embedding is not None
+            else np.zeros(192, dtype=np.float32)
+            for embedding in embeddings
+        ]
+
+    def _encode_audio(self, audio: np.ndarray) -> np.ndarray:
+        return self._encode_audio_batch([audio])[0]
 
     def _load_reference_audio(self, path: Path) -> np.ndarray:
         audio, sample_rate = sf.read(str(path), dtype="float32", always_2d=False)
