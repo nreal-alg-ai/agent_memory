@@ -135,7 +135,6 @@ class MemoryMCPService:
         source_type: str = "allday_recording",
         session_start: Optional[str] = None,
         tags: Optional[List[str]] = None,
-        run_reflect: bool = True,
     ) -> Dict[str, Any]:
         """Transcribe an audio file and submit its segments to memory."""
         if not str(audio_path or "").strip():
@@ -164,7 +163,7 @@ class MemoryMCPService:
         queue_flushed = self.memory_runtime.flush_task_queue(timeout=self.queue_timeout)
         reflect_report: Optional[Dict[str, Any]] = None
         reflect_flushed: Optional[bool] = None
-        if run_reflect and queue_flushed and segments:
+        if queue_flushed and segments:
             reflect_report = self.memory_runtime.trigger_memory_reflect()
             reflect_flushed = self.memory_runtime.flush_task_queue(
                 timeout=self.queue_timeout,
@@ -186,7 +185,6 @@ class MemoryMCPService:
             "store_queue_event_count": queued_count,
             "store_reports": store_reports,
             "store_queue_flushed": queue_flushed,
-            "run_reflect": bool(run_reflect),
             "reflect_report": reflect_report,
             "reflect_queue_flushed": reflect_flushed,
         }
@@ -321,7 +319,6 @@ class MemoryMCPService:
                         or session_start
                     ),
                     tags=file_tags,
-                    run_reflect=True,
                 )
                 report["file_index"] = index
                 file_reports.append(report)

@@ -197,7 +197,7 @@ memory_manager:
   recall_top_k: 8
   recall_budget: mid
   recall_mode: normal
-  retrievel_source_override:
+  retrieval_source_override:
 
   recall_detailed_logging: true
   recall_stage1_candidate_min_score: 0.30

@@ -496,7 +496,7 @@ class MemoryNodeManager:
             or "mid"
         )
         configured_source_override = self._memory_cfg.get(
-            "retrievel_source_override"
+            "retrieval_source_override"
         )
         if isinstance(configured_source_override, str):
             configured_source_override = [
@@ -513,7 +513,7 @@ class MemoryNodeManager:
             self._memory_cfg.get("recall_mode", "normal") or "normal"
         ).strip().lower()
         self._recall_stage2_fact_min_embedding_similarity = self._clamp_float(
-            self._memory_cfg.get("recall_fact_min_embedding_similarity"),
+            self._memory_cfg.get("recall_stage2_fact_min_embedding_similarity"),
             0.0,
             1.0,
             0.35,
