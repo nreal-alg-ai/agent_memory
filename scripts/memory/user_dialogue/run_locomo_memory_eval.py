@@ -115,7 +115,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--recall-top-k", type=int, default=8)
     parser.add_argument("--recall-budget", choices=("low", "mid", "high"), default=None)
     parser.add_argument(
-        "--recall-path", choices=("stage1", "stage2", "normal"), default="normal"
+        "--recall-mode", choices=("stage1", "stage2", "normal"), default="normal"
     )
     parser.add_argument(
         "--recall-gate-mode", choices=("auto", "force"), default=None

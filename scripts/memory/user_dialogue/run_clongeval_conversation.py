@@ -134,7 +134,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--recall-top-k", type=int)
     parser.add_argument("--recall-budget")
     parser.add_argument(
-        "--recall-path",
+        "--recall-mode",
         choices=("stage1", "stage2", "normal"),
         default="normal",
         help="Recall path passed to the memory runtime.",
@@ -355,14 +355,12 @@ def replay_context_into_memory(
         return False
 
     for day_index, day in enumerate(days, 1):
-        last_timestamp: Optional[datetime] = None
         for pair_index, (user, assistant) in enumerate(day["pairs"]):
             pair_count += 1
             turn_timestamp = normalize_unique_timestamp(
                 day["date"] + timedelta(seconds=pair_index),
                 seen_timestamps,
             )
-            last_timestamp = turn_timestamp
             store_report = runtime.accept_single_interaction_turn(
                 user,
                 assistant,
@@ -381,7 +379,9 @@ def replay_context_into_memory(
             day_index % every_days == 0 or day_index == len(days)
         )
         if should_reflect:
-            reflect_timestamp = last_timestamp or day["date"]
+            # Facts are filtered by their local DB created_at date. Keep this
+            # wall-clock timestamp separate from the benchmark dialogue time.
+            reflect_timestamp = datetime.now().astimezone().isoformat()
             reflect_submit = runtime.trigger_memory_reflect(
                 limit=max(1, int(reflect_limit or 100)),
                 reflect_timestamp=reflect_timestamp,

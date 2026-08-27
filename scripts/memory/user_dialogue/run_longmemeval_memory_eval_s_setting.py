@@ -177,7 +177,7 @@ def parse_args() -> argparse.Namespace:
         help="Recall traversal budget passed to the memory runtime.",
     )
     parser.add_argument(
-        "--recall-path",
+        "--recall-mode",
         default="normal",
         choices=["stage1", "stage2", "normal"],
         help="Recall path passed to the memory runtime.",
