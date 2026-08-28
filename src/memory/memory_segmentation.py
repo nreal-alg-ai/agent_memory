@@ -539,27 +539,17 @@ class OnlineSemanticSegmenter:
         )
         self._pending_online_exchanges: List[OnlineSegmentExchange] = []
         self._pending_online_exchanges_embedding: List[Optional[np.ndarray]] = []
-        self._prepared_incoming_embedding: Optional[
-            Tuple[OnlineSegmentExchange, Optional[np.ndarray]]
-        ] = None
 
-    def append_pending_exchange(self, exchange: OnlineSegmentExchange) -> None:
+    def append_pending_exchange(
+        self,
+        exchange: OnlineSegmentExchange,
+        embedding: Optional[np.ndarray],
+    ) -> None:
         """Append an exchange to the segmenter's pending online buffer."""
-        embedding: Optional[np.ndarray] = None
-        prepared_embedding_used = False
-        if (
-            self._prepared_incoming_embedding is not None
-            and self._prepared_incoming_embedding[0] is exchange
-        ):
-            embedding = self._prepared_incoming_embedding[1]
-            prepared_embedding_used = True
-        elif self._prepared_incoming_embedding is not None:
-            self._prepared_incoming_embedding = None
-        if not prepared_embedding_used:
-            embedding = self.embed_exchange(exchange).embedding
         self._pending_online_exchanges.append(exchange)
-        self._pending_online_exchanges_embedding.append(embedding)
-        self._prepared_incoming_embedding = None
+        self._pending_online_exchanges_embedding.append(
+            _as_embedding_vector(embedding),
+        )
 
     def pending_exchange_snapshot(self) -> List[OnlineSegmentExchange]:
         """Return a shallow copy of the current pending online exchanges."""
@@ -582,6 +572,7 @@ class OnlineSemanticSegmenter:
     def should_finalize_pending_exchanges(
         self,
         incoming_exchange: Any,
+        incoming_embedding: Optional[np.ndarray],
     ) -> Tuple[bool, SegmentDecision]:
         active_exchanges = self._pending_online_exchanges
         time_gap_seconds = (
@@ -622,6 +613,7 @@ class OnlineSemanticSegmenter:
         incoming, scoring_context = self._build_boundary_scoring_incoming(
             active_exchanges,
             incoming_exchange,
+            incoming_embedding,
         )
         if incoming.embedding is None or any(
             embedding is None
@@ -661,16 +653,15 @@ class OnlineSemanticSegmenter:
         self,
         active_exchanges: Sequence[Any],
         incoming_exchange: Any,
+        incoming_embedding: Optional[np.ndarray],
     ) -> Tuple[ActiveExchange, Dict[str, Any]]:
         """Build the incoming embedding used only for boundary scoring."""
         tail_limit = max(0, int(self.config.rolling_window_tail_units))
         if not self.config.rolling_window_enabled or tail_limit <= 0:
-            incoming = self.embed_exchange(incoming_exchange)
-            self._prepared_incoming_embedding = (
-                incoming_exchange,
-                incoming.embedding,
-            )
-            return incoming, {
+            return ActiveExchange(
+                exchange=incoming_exchange,
+                embedding=_as_embedding_vector(incoming_embedding),
+            ), {
                 "scoring_mode": "single_exchange",
                 "tail_units": 0,
                 "tail_tokens": 0,
@@ -686,12 +677,10 @@ class OnlineSemanticSegmenter:
         if incoming_text:
             texts.append(incoming_text)
         if len(texts) <= 1:
-            incoming = self.embed_exchange(incoming_exchange)
-            self._prepared_incoming_embedding = (
-                incoming_exchange,
-                incoming.embedding,
-            )
-            return incoming, {
+            return ActiveExchange(
+                exchange=incoming_exchange,
+                embedding=_as_embedding_vector(incoming_embedding),
+            ), {
                 "scoring_mode": "single_exchange",
                 "tail_units": 0,
                 "tail_tokens": 0,
@@ -701,17 +690,14 @@ class OnlineSemanticSegmenter:
         embedding = self.embedding_client.embed_text(rolling_text)
         vector = _as_embedding_vector(embedding)
         if vector is None:
-            incoming = self.embed_exchange(incoming_exchange)
-            self._prepared_incoming_embedding = (
-                incoming_exchange,
-                incoming.embedding,
-            )
-            return incoming, {
+            return ActiveExchange(
+                exchange=incoming_exchange,
+                embedding=_as_embedding_vector(incoming_embedding),
+            ), {
                 "scoring_mode": "single_exchange",
                 "tail_units": 0,
                 "tail_tokens": 0,
             }
-        self._prepared_incoming_embedding = None
         return ActiveExchange(
             exchange=incoming_exchange,
             embedding=vector,

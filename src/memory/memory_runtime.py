@@ -167,9 +167,13 @@ class MemoryRuntime:
             turn,
             len(pending_exchanges) + 1,
         )
+        incoming_embedding = self._interaction_segmenter.embed_exchange(
+            incoming_exchange,
+        ).embedding
         if pending_exchanges:
             should_finalize, boundary_decision = self._interaction_segmenter.should_finalize_pending_exchanges(
                 incoming_exchange,
+                incoming_embedding,
             )
             if should_finalize:
                 flush_report = self._flush_pending_interaction_turns()
@@ -178,7 +182,10 @@ class MemoryRuntime:
                 if self._interaction_segmenter.has_pending_exchanges():
                     return {"queued": queued, "reason": reason}
 
-        self._interaction_segmenter.append_pending_exchange(incoming_exchange)
+        self._interaction_segmenter.append_pending_exchange(
+            incoming_exchange,
+            incoming_embedding,
+        )
         return {"queued": queued, "reason": "" if queued else reason}
 
     def _flush_pending_interaction_turns(self) -> Dict[str, Any]:
@@ -254,12 +261,16 @@ class MemoryRuntime:
     ) -> Dict[str, Any]:
         """Use one assembled utterance to decide whether the prior episode ends."""
         queued = False
-        exchange = convert_transcript_unit_to_online_exchange(unit)
+        incoming_exchange = convert_transcript_unit_to_online_exchange(unit)
+        incoming_embedding = self._transcript_segmenter.embed_exchange(
+            incoming_exchange,
+        ).embedding
         pending_exchanges = self._transcript_segmenter.pending_exchange_snapshot()
         if pending_exchanges:
             should_finalize, decision = (
                 self._transcript_segmenter.should_finalize_pending_exchanges(
-                    exchange,
+                    incoming_exchange,
+                    incoming_embedding,
                 )
             )
             self._log_transcript_segmentation_decision(
@@ -283,11 +294,15 @@ class MemoryRuntime:
                     }
         else:
             _, decision = self._transcript_segmenter.should_finalize_pending_exchanges(
-                exchange,
+                incoming_exchange,
+                incoming_embedding,
             )
             self._log_transcript_segmentation_decision(unit, decision=decision)
 
-        self._transcript_segmenter.append_pending_exchange(exchange)
+        self._transcript_segmenter.append_pending_exchange(
+            incoming_exchange,
+            incoming_embedding,
+        )
         return {"accepted": True, "queued": queued, "reason": ""}
 
     def _flush_pending_transcript_segments(

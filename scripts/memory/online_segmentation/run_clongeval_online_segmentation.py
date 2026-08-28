@@ -530,15 +530,17 @@ def segment_context_group(
                 "date": exchange.date_text,
             },
         )
+        incoming_embedding = segmenter.embed_exchange(incoming).embedding
         if segmenter.has_pending_exchanges():
             should_finalize, decision = segmenter.should_finalize_pending_exchanges(
                 incoming,
+                incoming_embedding,
             )
             if decision.cut_probability is not None:
                 last_scoring_decision = decision
             if should_finalize:
                 finalize_pending(decision, last_scoring_decision)
-        segmenter.append_pending_exchange(incoming)
+        segmenter.append_pending_exchange(incoming, incoming_embedding)
 
     pending = segmenter.pending_exchange_snapshot()
     if pending:
