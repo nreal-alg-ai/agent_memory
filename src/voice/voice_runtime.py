@@ -93,94 +93,128 @@ class VoiceRuntime:
             path,
             len(spans),
         )
-        chunks = [slice_audio(audio, sample_rate, start, end) for start, end in spans]
-        assignments = self._identify_speakers(chunks)
-        batch_size = max(
-            1,
-            int(self.asr_config.get("max_inference_batch_size", 1) or 1),
+        raw_chunks = [
+            slice_audio(audio, sample_rate, start, end) for start, end in spans
+        ]
+        raw_assignments = self._identify_speakers(raw_chunks)
+        spans, assignments, source_span_indexes = self._merge_speech_spans_by_speaker(
+            spans,
+            raw_assignments,
+        )
+        chunks = [
+            slice_audio(audio, sample_rate, start, end) for start, end in spans
+        ]
+        merged_span_count = sum(
+            1 for source_indexes in source_span_indexes if len(source_indexes) > 1
+        )
+        self.logger.info(
+            "process_audio_file speech_span_merge path=%s input_spans=%s output_spans=%s "
+            "merged_groups=%s enabled=%s max_gap_s=%.3f max_duration_s=%.3f",
+            path,
+            len(raw_chunks),
+            len(chunks),
+            merged_span_count,
+            bool(self.vad_config.get("span_merge_enabled", True)),
+            float(self.vad_config.get("span_merge_max_gap_seconds", 0.6)),
+            float(self.vad_config.get("span_merge_max_duration_seconds", 20.0)),
         )
         segments: List[Dict[str, Any]] = []
-        for batch_start in range(0, len(chunks), batch_size):
-            batch_index = batch_start // batch_size + 1
-            batch_chunks = chunks[batch_start : batch_start + batch_size]
+        asr_texts = [""] * len(chunks)
+        asr_batches = self._build_asr_batches(chunks, sample_rate)
+        for batch_index, batch_indexes in enumerate(asr_batches, 1):
+            batch_chunks = [chunks[index] for index in batch_indexes]
             batch_texts = self.asr.transcribe_batch_segments(batch_chunks)
             if len(batch_texts) != len(batch_chunks):
                 raise RuntimeError(
                     "ASR batch result count does not match speech segment count: "
                     f"batch={batch_index} results={len(batch_texts)} "
-                    f"segments={len(batch_chunks)}"
+                    f"segments={len(batch_chunks)} indexes={batch_indexes}"
                 )
+            for chunk_index, transcript_text in zip(batch_indexes, batch_texts):
+                asr_texts[chunk_index] = transcript_text
+            batch_durations = [
+                len(chunks[index]) / sample_rate
+                for index in batch_indexes
+            ]
             self.logger.info(
-                "process_audio_file asr_batch path=%s batch=%s start_segment=%s "
-                "batch_size=%s returned=%s",
+                "process_audio_file asr_batch path=%s batch=%s segment_indexes=%s "
+                "batch_size=%s duration_min_s=%.3f duration_max_s=%.3f returned=%s",
                 path,
                 batch_index,
-                batch_start + 1,
+                [index + 1 for index in batch_indexes],
                 len(batch_chunks),
+                min(batch_durations) if batch_durations else 0.0,
+                max(batch_durations) if batch_durations else 0.0,
                 len(batch_texts),
             )
-            for offset, transcript_text in enumerate(batch_texts):
-                chunk_index = batch_start + offset
-                start, end = spans[chunk_index]
-                assignment = assignments[chunk_index]
-                index = chunk_index + 1
-                text = normalize_text(
-                    transcript_text,
-                    bool(
-                        self.asr_config.get(
-                            "simplify_chinese",
-                            self.config.get("output", {}).get("simplify_chinese", True),
-                        )
-                    ),
-                )
-                if not text:
-                    self.logger.info(
-                        "process_audio_file asr_empty path=%s segment=%s start=%.3f end=%.3f",
-                        path,
-                        index,
-                        start,
-                        end,
+        for chunk_index, transcript_text in enumerate(asr_texts):
+            start, end = spans[chunk_index]
+            assignment = assignments[chunk_index]
+            index = chunk_index + 1
+            text = normalize_text(
+                transcript_text,
+                bool(
+                    self.asr_config.get(
+                        "simplify_chinese",
+                        self.config.get("output", {}).get("simplify_chinese", True),
                     )
-                    continue
-                speaker, speaker_metadata = self._speaker_label(assignment)
+                ),
+            )
+            if not text:
                 self.logger.info(
-                    "process_audio_file asr_segment path=%s segment=%s start=%.3f end=%.3f speaker=%s text=%s",
+                    "process_audio_file asr_empty path=%s segment=%s start=%.3f end=%.3f",
                     path,
                     index,
                     start,
                     end,
-                    speaker,
-                    text,
                 )
-                segments.append(
-                    {
-                        "speaker": speaker,
-                        "text": text,
-                        "started_at": (recording_start + timedelta(seconds=start)).isoformat(),
-                        "ended_at": (recording_start + timedelta(seconds=end)).isoformat(),
-                        "chunk_index": index,
-                        "metadata": {
-                            "audio_start_s": round(start, 3),
-                            "audio_end_s": round(end, 3),
-                            "sample_rate": sample_rate,
-                            **speaker_metadata,
-                        },
-                    }
-                )
+                continue
+            speaker, speaker_metadata = self._speaker_label(assignment)
+            self.logger.info(
+                "process_audio_file asr_segment path=%s segment=%s start=%.3f end=%.3f speaker=%s text=%s",
+                path,
+                index,
+                start,
+                end,
+                speaker,
+                text,
+            )
+            segments.append(
+                {
+                    "speaker": speaker,
+                    "text": text,
+                    "started_at": (recording_start + timedelta(seconds=start)).isoformat(),
+                    "ended_at": (recording_start + timedelta(seconds=end)).isoformat(),
+                    "chunk_index": index,
+                    "metadata": {
+                        "audio_start_s": round(start, 3),
+                        "audio_end_s": round(end, 3),
+                        "source_vad_span_indexes": source_span_indexes[chunk_index],
+                        "merged_vad_span_count": len(
+                            source_span_indexes[chunk_index]
+                        ),
+                        "sample_rate": sample_rate,
+                        **speaker_metadata,
+                    },
+                }
+            )
 
         report = {
             "status": "ok",
             "audio_path": str(path),
             "sample_rate": sample_rate,
             "audio_duration_s": round(len(audio) / sample_rate, 3),
-            "speech_segment_count": len(spans),
+            "speech_segment_count": len(raw_chunks),
+            "merged_speech_segment_count": len(spans),
+            "speech_span_merge_group_count": merged_span_count,
+            "asr_batch_count": len(asr_batches),
             "transcript_segment_count": len(segments),
             "segments": segments,
         }
         self.logger.info(
             "process_audio_file finish path=%s speech_segments=%s transcript_segments=%s elapsed_ms=%.2f",
             path,
-            len(spans),
+            len(raw_chunks),
             len(segments),
             (time.monotonic() - started_at) * 1000.0,
         )
@@ -454,6 +488,140 @@ class VoiceRuntime:
         except Exception:
             self.logger.exception("Speaker identification failed; using unknown labels")
         return [None] * len(chunks)
+
+    def _build_asr_batches(
+        self,
+        chunks: Sequence[np.ndarray],
+        sample_rate: int,
+    ) -> List[List[int]]:
+        """Group similarly sized chunks while retaining their original indexes."""
+        max_batch_size = max(
+            1,
+            int(self.asr_config.get("max_inference_batch_size", 1) or 1),
+        )
+        if not bool(self.asr_config.get("dynamic_batching_enabled", True)):
+            return [
+                list(range(start, min(start + max_batch_size, len(chunks))))
+                for start in range(0, len(chunks), max_batch_size)
+            ]
+
+        max_duration_diff_seconds = max(
+            0.0,
+            float(
+                self.asr_config.get(
+                    "max_batch_duration_diff_seconds",
+                    2.0,
+                )
+            ),
+        )
+        indexed_durations = sorted(
+            [
+                (
+                    index,
+                    len(audio) / sample_rate if sample_rate else 0.0,
+                )
+                for index, audio in enumerate(chunks)
+            ],
+            key=lambda item: item[1],
+        )
+        batches: List[List[int]] = []
+        current_batch: List[int] = []
+        current_min_duration = 0.0
+        for index, duration_seconds in indexed_durations:
+            if not current_batch:
+                current_batch = [index]
+                current_min_duration = duration_seconds
+                continue
+            duration_within_range = (
+                duration_seconds - current_min_duration
+                <= max_duration_diff_seconds
+            )
+            if len(current_batch) >= max_batch_size or not duration_within_range:
+                batches.append(current_batch)
+                current_batch = [index]
+                current_min_duration = duration_seconds
+            else:
+                current_batch.append(index)
+        if current_batch:
+            batches.append(current_batch)
+        return batches
+
+    def _merge_speech_spans_by_speaker(
+        self,
+        spans: Sequence[Tuple[float, float]],
+        assignments: Sequence[Any],
+    ) -> Tuple[List[Tuple[float, float]], List[Any], List[List[int]]]:
+        """Merge nearby VAD spans only when their identified speaker is the same."""
+        normalized_spans = [
+            (float(start), float(end)) for start, end in spans if float(end) > float(start)
+        ]
+        if len(normalized_spans) != len(assignments):
+            self.logger.warning(
+                "Cannot merge speech spans: spans=%s assignments=%s",
+                len(normalized_spans),
+                len(assignments),
+            )
+            return normalized_spans, list(assignments), [
+                [index] for index in range(len(normalized_spans))
+            ]
+
+        if not bool(self.vad_config.get("span_merge_enabled", True)):
+            return normalized_spans, list(assignments), [
+                [index] for index in range(len(normalized_spans))
+            ]
+
+        max_gap_seconds = max(
+            0.0,
+            float(self.vad_config.get("span_merge_max_gap_seconds", 0.6)),
+        )
+        max_duration_seconds = max(
+            0.0,
+            float(self.vad_config.get("span_merge_max_duration_seconds", 20.0)),
+        )
+        merged_spans: List[Tuple[float, float]] = []
+        merged_assignments: List[Any] = []
+        source_span_indexes: List[List[int]] = []
+
+        for index, (span, assignment) in enumerate(zip(normalized_spans, assignments)):
+            if not merged_spans:
+                merged_spans.append(span)
+                merged_assignments.append(assignment)
+                source_span_indexes.append([index])
+                continue
+
+            previous_start, previous_end = merged_spans[-1]
+            previous_assignment = merged_assignments[-1]
+            gap_seconds = max(0.0, span[0] - previous_end)
+            merged_duration_seconds = span[1] - previous_start
+            previous_speaker_id = self._known_speaker_id(previous_assignment)
+            current_speaker_id = self._known_speaker_id(assignment)
+            can_merge = (
+                previous_speaker_id is not None
+                and previous_speaker_id == current_speaker_id
+                and gap_seconds <= max_gap_seconds
+                and merged_duration_seconds <= max_duration_seconds
+            )
+            if can_merge:
+                merged_spans[-1] = (previous_start, span[1])
+                source_span_indexes[-1].append(index)
+                continue
+
+            merged_spans.append(span)
+            merged_assignments.append(assignment)
+            source_span_indexes.append([index])
+
+        return merged_spans, merged_assignments, source_span_indexes
+
+    @staticmethod
+    def _known_speaker_id(assignment: Any) -> Optional[int]:
+        """Return a stable speaker id, excluding unknown or failed assignments."""
+        if assignment is None:
+            return None
+        try:
+            speaker_id = int(getattr(assignment, "speaker_id"))
+        except (TypeError, ValueError, AttributeError):
+            return None
+        return speaker_id if speaker_id >= 0 else None
 
     @staticmethod
     def _speaker_label(assignment: Any) -> Tuple[str, Dict[str, Any]]:

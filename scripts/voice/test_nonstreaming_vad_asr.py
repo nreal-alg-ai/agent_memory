@@ -24,7 +24,7 @@ DEFAULT_AUDIO = (
     ROOT
     / "test_data/ambient_transcript/Eval_Ali/Eval_Ali_far/audio_dir/R8001_M8004_MS801.wav"
 )
-DEFAULT_RESULT_ROOT = ROOT / "tmp_result/nonstreaming_vad_asr"
+DEFAULT_RESULT_ROOT = ROOT / "tmp/nonstreaming_vad_asr"
 
 
 @dataclass
@@ -101,6 +101,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional audio override for quick tests. Defaults to config.yaml.",
     )
+    parser.add_argument(
+        "--max-duration-s",
+        type=float,
+        default=None,
+        help="Override voice_runtime.max_duration_s for this test run.",
+    )
     return parser.parse_args()
 
 
@@ -120,6 +126,8 @@ def main() -> None:
         config,
         include_voice_runtime=True,
     )
+    if args.max_duration_s is not None:
+        voice_runtime_config["max_duration_s"] = args.max_duration_s
 
     runtime_config = voice_runtime_config
     vad_config = voice_runtime_config.get("vad") or {}
