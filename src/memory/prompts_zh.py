@@ -176,7 +176,8 @@ actionable_aspects 输出规则：
 - 每条 fact 最多输出 2 个 actionable_aspects，只保留最具体、最可追踪的事项线索。
 - item_type 只能是 task、commitment、decision、follow_up、open_question、risk、reminder、recommendation、constraint。
 - 不要把“愿意试试/可以考虑/听起来不错”提取为 actionable_aspect，除非同时有明确提醒、截止时间、具体后续检查、强承诺或可验证执行计划。
-- action_summary 必须说明需要被跟进/执行/追踪的事项，不能只复述整条 fact。
+- action_summary 必须是自包含的行动描述，明确写出“谁负责 + 在什么时间/截止条件前（证据有才写）+ 做什么/针对什么对象”。例如“团队需在下周二前确定促销方案”；没有明确时间时至少写清责任主体和动作，不要只写“确定方案”，也不要编造日期。
+- owner 表示实际负责执行、跟进或作出决定的责任主体，可以是用户、助手、具体 speaker、团队、部门或其他证据中明确出现的主体。它不等于被讨论的对象，也不因为某个 speaker 发言就自动归属于该 speaker；如果只明确了提出要求的人而没有明确执行者，使用“未知”。
 - trigger_basis 必须引用当前 fact 中支持该 actionable 线索的具体证据。
 - due_at 只在证据明确包含时间、截止或提醒时间时填写，否则为空字符串。
 
@@ -211,8 +212,8 @@ actionable_aspects 输出规则：
       "actionable_aspects": [
         {
           "item_type": "task|commitment|decision|follow_up|open_question|risk|reminder|recommendation|constraint",
-          "action_summary": "需要后续提醒、跟进、执行、复盘或决策追踪的具体事项",
-          "owner": "用户|助手|other|unknown",
+          "action_summary": "自包含行动描述，包含责任主体、时间/截止条件（如有）和具体动作",
+          "owner": "实际责任主体名称；可以是用户、助手、具体 speaker、团队或部门；无法判断时：未知",
           "status": "open|in_progress|done|blocked|decided|noted|unknown",
           "due_at": "",
           "trigger_basis": "当前 fact 中支持该 actionable 线索的具体证据",
@@ -356,7 +357,7 @@ entity_state_target 字段说明与使用方式：
 
 UNIFIED_ACTIONABLE_ITEM_EXTRACTION_PROMPT_ZH = """你是 AI 眼镜长期记忆系统中的 actionable item 提取模块。
 
-输入包含新存储的候选 narrative facts，部分 fact 会带有 actionable_aspects 作为前置筛选出的行动线索。请从中提取未来真正需要跟进、提醒、执行、复盘或决策追踪的具体可执行事项。actionable item 和 evolving state 分开：state 描述持续变化的长期状态、偏好、约束和背景；actionable item 必须是可以被检查、完成、追踪，或明确作为决定/承诺/风险/开放问题被召回的事项。
+输入包含一个 topic candidate 及其新存储的 narrative facts，部分 fact 会带有 actionable_aspects 作为前置筛选出的行动线索。请在这个 topic 范围内提取未来真正需要跟进、提醒、执行、复盘或决策追踪的具体可执行事项。actionable item 和 evolving state 分开：state 描述持续变化的长期状态、偏好、约束和背景；actionable item 必须是可以被检查、完成、追踪，或明确作为决定/承诺/风险/开放问题被召回的事项。
 
 优先参考 actionable_aspects，但最终只能提取 fact summary 和 actionable_aspects 直接支持的内容。
 
@@ -367,26 +368,32 @@ UNIFIED_ACTIONABLE_ITEM_EXTRACTION_PROMPT_ZH = """你是 AI 眼镜长期记忆�
 4. 不要把助手的普通建议单独提取为 actionable item。只有当用户明确采纳、要求后续提醒/跟进，或该建议已经变成用户的任务/承诺/决定时才提取。
 5. 普通约束、偏好、背景信息应留给 state，不要作为 constraint item；只有当约束正在阻塞一个明确行动或决策时才提取。
 6. 不要复制每条 fact。若多条 facts 指向同一件事，只保留一条最具体、最可追踪的 item。
-7. 每个 item 必须可独立理解：包含执行人/owner、目标对象、上下文、原因、截止时间或时间锚点（如果存在）、当前状态。
-8. evidence_fact_ids 必须引用输入中的 fact ID。
-9. item_type 只能是：task、commitment、decision、follow_up、open_question、risk、reminder、recommendation、constraint、other。
-10. status 只能是：open、in_progress、done、blocked、decided、noted、unknown。
-11. importance 和 confidence 都是 0-1。弱尝试意愿的 confidence 不应提高来绕过规则。
-12. 只返回 JSON，不要 markdown。
+7. 每个 item 必须可独立理解：`summary` 必须明确写出“谁负责 + 在什么时间/截止条件前（证据有才写）+ 做什么/针对什么对象”，并包含必要上下文、原因和当前状态。没有明确时间时不要编造日期；责任主体无法判断时可以使用“责任主体未明确”，但仍需写清待执行的动作。
+8. `canonical_name` 是用于识别、检索和合并同一待办的稳定短标题，不是完整句子或详细 summary。应包含最核心的动作/事项和目标对象，例如“提交报销材料”“跟进直播平台选择”；不要加入 owner、状态、截止日期、原因、多个无关事实或泛化标题。更新已有 item 时，如果仍是同一件事，必须复用已有的 `canonical_name`，只有事项本身发生变化时才修改。
+9. `owner` 表示这条待办属于谁、由谁负责完成、跟进或作出决定，不是待办涉及的对象，也不是所有被提及的实体。优先使用 supporting facts 中 `actionable_aspects.owner` 的明确责任主体，其次依据事实中的明确指派关系判断；`primary_entity` 只能在它同时明确表示执行或决策责任时作为辅助依据。更新已有 item 时优先保持已有 item 的 owner，只有新 fact 明确显示责任归属发生变化时才修改。无法判断时使用“未知”。
+10. owner 必须是证据支持的实际责任主体名称，可以是“用户”“助手”“N_SPK8013”“小王”“团队”或“市场部”等；不要因为某人发言、被提及或提出要求就自动把待办归给该人，也不要输出固定类别“其他”。
+11. evidence_fact_ids 必须引用输入中的 fact ID。
+12. item_type 只能是：task、commitment、decision、follow_up、open_question、risk、reminder、recommendation、constraint、other。
+13. status 只能是：open、in_progress、done、blocked、decided、noted、unknown。
+14. importance 和 confidence 都是 0-1。弱尝试意愿的 confidence 不应提高来绕过规则。
+15. 如果已有 actionable_items 与当前 topic 相关，优先判断新 facts 是否明确改变其状态、截止时间、责任人或当前描述。只有新 facts 明确支持变化时才输出 `operation="update"`；没有新证据表明完成时，不要擅自标记为 done。
+16. 更新已有 item 时必须使用已有 item 的 `id`，并保持其 `canonical_name` 和 `item_type` 稳定；新 item 使用 `operation="create"` 和 `existing_item_id=0`。
+17. 只返回 JSON，不要 markdown。
 
 输出格式：
 {
   "actionable_items": [
     {
+      "operation": "create|update",
+      "existing_item_id": 0,
       "item_type": "task|commitment|decision|follow_up|open_question|risk|reminder|recommendation|constraint|other",
-      "canonical_name": "稳定短名称",
-      "summary": "可独立理解的可执行事项",
-      "owner": "用户|助手|other|unknown",
+      "canonical_name": "用于识别和合并待办的稳定短标题，例如：提交报销材料",
+      "summary": "自包含可执行事项，明确责任主体、时间/截止条件（如有）和具体动作",
+      "owner": "具体责任主体名称，例如：用户、小王、项目经理；无法判断时：未知",
       "status": "open|in_progress|done|blocked|decided|noted|unknown",
       "due_at": "",
       "evidence_fact_ids": [1, 2],
       "keywords": ["关键词1", "关键词2"],
-      "entities": ["实体1", "实体2"],
       "canonical_topics": ["主题1"],
       "importance": 0.8,
       "confidence": 0.85
@@ -394,8 +401,15 @@ UNIFIED_ACTIONABLE_ITEM_EXTRACTION_PROMPT_ZH = """你是 AI 眼镜长期记忆�
   ]
 }
 
-候选 facts：
-{facts}
+topic_candidate（包含 topic 元信息和详细 supporting facts）：
+{topic_candidate}
+
+已有 topic_state（如果存在）：
+{existing_topic_state}
+
+当前 topic 已有的 actionable_items：
+{existing_actionable_items}
+
 """
 
 

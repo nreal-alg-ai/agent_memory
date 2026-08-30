@@ -575,11 +575,6 @@ class MemoryNodeManager:
         self._topic_identity_grounding_similarity_threshold = float(
             self._memory_cfg.get("topic_identity_grounding_similarity_threshold", 0.64) or 0.64
         )
-        self._pending_unresolved_topic_max = max(
-            1,
-            int(self._memory_cfg.get("pending_unresolved_topic_max", 200) or 200),
-        )
-        self._pending_unresolved_topics: List[Dict[str, Any]] = []
         self._task_queue_maxsize = max(
             1,
             int(self._memory_cfg.get("task_queue_maxsize", 100) or 100),
@@ -2056,11 +2051,7 @@ class MemoryNodeManager:
             )
             topic_report = state_report["topic_report"]
             entity_report = state_report["entity_report"]
-
-            actionable_report = self._update_memory_actionable_items_using_facts(
-                limit=limit,
-                reference_timestamp=reflect_timestamp,
-            )
+            actionable_report = topic_report.get("actionable_report") or {}
         report = {
             "status": (
                 "ok"
@@ -2080,7 +2071,6 @@ class MemoryNodeManager:
             ),
             "topic_states_updated": int(topic_report.get("updated", 0) or 0),
             "topic_candidates_unresolved": int(topic_report.get("unresolved", 0) or 0),
-            "pending_unresolved_topics": int(topic_report.get("pending_unresolved", 0) or 0),
             "entity_states_updated": int(entity_report.get("updated", 0) or 0),
             "actionable_facts_considered": int(
                 actionable_report.get("candidate_fact_count", 0) or 0
@@ -2112,7 +2102,7 @@ class MemoryNodeManager:
         """Update topic and entity state projections from the current facts."""
 
         started_at = time.monotonic()
-        if not self._enable_memory_state_update:
+        if not self._enable_memory_state_update and not self._enable_memory_actionable_item_update:
             report = {
                 "enabled": 0,
                 "fact_count": 0,
@@ -2121,7 +2111,6 @@ class MemoryNodeManager:
                     "enabled": 0,
                     "updated": 0,
                     "unresolved": 0,
-                    "pending_unresolved": len(self._pending_unresolved_topics),
                 },
                 "entity_report": {
                     "enabled": 0,
@@ -2132,6 +2121,14 @@ class MemoryNodeManager:
                 "evidence_only_facts": 0,
                 "states_updated": 0,
                 "facts_marked_processed": 0,
+                "actionable_report": {
+                    "enabled": 0,
+                    "fact_count": 0,
+                    "candidate_fact_count": 0,
+                    "stored_count": 0,
+                    "item_ids": [],
+                    "facts_marked_processed": 0,
+                },
                 "total_elapsed_ms": round(
                     (time.monotonic() - started_at) * 1000,
                     2,
@@ -2139,14 +2136,26 @@ class MemoryNodeManager:
             }
             self._log_info("memory_reflect", "state_update_skipped", report)
             return report
+        processing_target = (
+            "state" if self._enable_memory_state_update else "actionable_item"
+        )
         facts = self._db.get_unprocessed_facts(
-            processing_target="state",
+            processing_target=processing_target,
             limit=limit,
             reference_timestamp=reference_timestamp,
         )
-        self._log_reflect_facts_loaded("state", facts, limit, reference_timestamp)
+        self._log_reflect_facts_loaded(
+            processing_target,
+            facts,
+            limit,
+            reference_timestamp,
+        )
         topic_facts = [fact for fact in facts if self._fact_can_seed_topic_state(fact)]
-        entity_facts = [fact for fact in facts if self._fact_can_seed_entity_state(fact)]
+        entity_facts = [
+            fact for fact in facts
+            if self._enable_memory_state_update
+            and self._fact_can_seed_entity_state(fact)
+        ]
         self._log_info("memory_reflect", "state_fact_candidates", {
             "topic_fact_count": len(topic_facts),
             "topic_fact_ids": [
@@ -2160,14 +2169,34 @@ class MemoryNodeManager:
 
         topic_report = self._resolve_and_update_topic_states_from_facts(
             facts=topic_facts,
+            update_topic_state=self._enable_memory_state_update,
         )
-        entity_report = self._resolve_and_update_entity_scoped_states_from_facts(
-            facts=entity_facts,
+        entity_report = (
+            self._resolve_and_update_entity_scoped_states_from_facts(
+                facts=entity_facts,
+            )
+            if self._enable_memory_state_update
+            else {"enabled": 0, "updated": 0}
         )
-        facts_marked_processed = self._db.mark_facts_processed(
-            processing_target="state",
-            fact_ids=[fact.get("id") for fact in facts],
+        facts_marked_processed = (
+            self._db.mark_facts_processed(
+                processing_target="state",
+                fact_ids=[fact.get("id") for fact in facts],
+            )
+            if self._enable_memory_state_update
+            else 0
         )
+        actionable_report = topic_report.get("actionable_report") or {}
+        actionable_facts_marked_processed = (
+            self._db.mark_facts_processed(
+                processing_target="actionable_item",
+                fact_ids=[fact.get("id") for fact in facts],
+            )
+            if self._enable_memory_actionable_item_update
+            else 0
+        )
+        actionable_report["facts_marked_processed"] = actionable_facts_marked_processed
+        topic_report["actionable_report"] = actionable_report
         report = {
             "fact_count": len(facts),
             "fact_ids": [fact.get("id") for fact in facts],
@@ -2191,108 +2220,6 @@ class MemoryNodeManager:
             ),
         }
         self._log_info("memory_reflect", "state_update_finish", report)
-        return report
-
-    def _update_memory_actionable_items_using_facts(
-        self,
-        *,
-        limit: int,
-        reference_timestamp: Any,
-    ) -> Dict[str, Any]:
-        """Extract and persist actionable items from the current reflect facts."""
-        started_at = time.monotonic()
-        if not self._enable_memory_actionable_item_update:
-            report = {
-                "enabled": 0,
-                "fact_count": 0,
-                "fact_ids": [],
-                "candidate_fact_count": 0,
-                "candidate_fact_ids": [],
-                "actionable_update_count": 0,
-                "requested_store_count": 0,
-                "stored_count": 0,
-                "item_ids": [],
-                "facts_marked_processed": 0,
-                "total_elapsed_ms": round(
-                    (time.monotonic() - started_at) * 1000,
-                    2,
-                ),
-            }
-            self._log_info(
-                "memory_reflect",
-                "actionable_item_update_skipped",
-                report,
-            )
-            return report
-        facts = self._db.get_unprocessed_facts(
-            processing_target="actionable_item",
-            limit=limit,
-            reference_timestamp=reference_timestamp,
-        )
-        self._log_reflect_facts_loaded(
-            "actionable_item", facts, limit, reference_timestamp
-        )
-        actionable_facts = self._filter_facts_for_actionable_item_extraction(facts)
-        self._log_info("memory_reflect", "actionable_item_extraction_start", {
-            "candidate_fact_count": len(actionable_facts),
-            "candidate_fact_ids": [
-                fact.get("id") for fact in actionable_facts if fact.get("id") is not None
-            ],
-        })
-        actionable_updates = self._extract_actionable_items_with_llm(facts=actionable_facts)
-        self._log_info("memory_reflect", "actionable_item_extraction_finish", {
-            "candidate_fact_count": len(actionable_facts),
-            "actionable_update_count": len(actionable_updates),
-            "actionable_updates": [
-                {
-                    "item_type": item.get("item_type"),
-                    "canonical_name": item.get("canonical_name"),
-                    "owner": item.get("owner"),
-                    "status": item.get("status"),
-                    "due_at": item.get("due_at"),
-                    "evidence_fact_ids": item.get("evidence_fact_ids") or [],
-                    "confidence": item.get("confidence"),
-                    "importance": item.get("importance"),
-                }
-                for item in actionable_updates
-            ],
-        })
-        actionable_items_updated = 0
-        actionable_item_ids: List[int] = []
-        for item in actionable_updates:
-            item_id = self._store_actionable_item(item)
-            if item_id:
-                actionable_items_updated += 1
-                actionable_item_ids.append(item_id)
-
-        facts_marked_processed = self._db.mark_facts_processed(
-            processing_target="actionable_item",
-            fact_ids=[fact.get("id") for fact in facts],
-        )
-        
-        report = {
-            "fact_count": len(facts),
-            "fact_ids": [fact.get("id") for fact in facts],
-            "candidate_fact_count": len(actionable_facts),
-            "candidate_fact_ids": [
-                fact.get("id") for fact in actionable_facts
-                if fact.get("id") is not None
-            ],
-            "actionable_update_count": len(actionable_updates),
-            "requested_store_count": len(actionable_updates),
-            "stored_count": actionable_items_updated,
-            "item_ids": actionable_item_ids,
-            "facts_marked_processed": facts_marked_processed,
-            "total_elapsed_ms": round(
-                (time.monotonic() - started_at) * 1000,
-                2,
-            ),
-        }
-        self._log_info(
-            "memory_reflect",
-            "actionable_item_update_finish",
-            report,
-        )
         return report
 
     def _log_reflect_facts_loaded(
@@ -2368,12 +2295,24 @@ class MemoryNodeManager:
         self,
         *,
         facts: List[Dict[str, Any]],
-    ) -> Dict[str, int]:
+        update_topic_state: bool = True,
+    ) -> Dict[str, Any]:
         update_started_at = time.monotonic()
 
         candidates = self._build_topic_state_candidates_from_facts(facts)
         updated = 0
         unresolved = 0
+        actionable_report: Dict[str, Any] = {
+            "enabled": int(self._enable_memory_actionable_item_update),
+            "fact_count": len(facts),
+            "candidate_fact_count": 0,
+            "candidate_fact_ids": [],
+            "actionable_update_count": 0,
+            "stored_count": 0,
+            "item_ids": [],
+            "mapping_count": 0,
+            "facts_marked_processed": 0,
+        }
         for candidate in candidates:
             candidate_existing_topic_states = (
                 self._retrieve_existing_topic_states_for_candidate(
@@ -2406,42 +2345,109 @@ class MemoryNodeManager:
                 match_info=match_info,
                 existing_topic_states=candidate_existing_topic_states,
             )
-            if not grounded:
-                unresolved += 1
-                self._remember_pending_unresolved_topic(candidate, grounding_info)
-                continue
             if chosen_state:
                 candidate["topic_name"] = str(
                     chosen_state.get("canonical_name")
                     or candidate.get("topic_name")
                     or "general"
                 )
-            state_update = self._extract_topic_state_update_with_llm(
-                candidate=candidate,
-                existing_state=chosen_state,
+            state_id = (
+                int(chosen_state["id"])
+                if chosen_state and str(chosen_state.get("id") or "").strip().isdigit()
+                else 0
             )
-            if not state_update or not state_update.get("summary"):
-                continue
-            state_update.setdefault("source_type", candidate.get("source_type"))
-            state_id = self._store_state(state_update)
-            if state_id:
+            # Resolve and persist the topic state before creating or updating
+            # actionable items, so every relationship uses a real state ID.
+            if grounded and update_topic_state:
+                state_update = self._extract_topic_state_update_with_llm(
+                    candidate=candidate,
+                    existing_state=chosen_state,
+                )
+                if state_update and state_update.get("summary"):
+                    state_update.setdefault("source_type", candidate.get("source_type"))
+                    stored_state_id = self._store_state(state_update)
+                    if stored_state_id:
+                        state_id = int(stored_state_id)
+                        stored_topic_state = self._db.get_memory_state_by_id(state_id)
+                        candidate["topic_name"] = str(
+                            (stored_topic_state or state_update).get("canonical_name")
+                            or candidate.get("topic_name")
+                            or "general"
+                        )
+                        self._log_info(
+                            "memory_reflect",
+                            "topic_state_updated",
+                            self._state_update_log_payload(
+                                state_id=state_id,
+                                state_update=state_update,
+                                candidate=candidate,
+                                existing_state=chosen_state,
+                            ),
+                        )
+                        updated += 1
+
+            candidate_has_actionable_aspects = any(
+                self._actionable_aspects_from_fact(fact)
+                for fact in (candidate.get("facts") or [])
+            )
+            if self._enable_memory_actionable_item_update and candidate_has_actionable_aspects:
+                existing_actionable_items = (
+                    self._retrieve_existing_actionable_items_for_topic_state(
+                        topic_state_id=state_id,
+                        limit=32,
+                    )
+                    if state_id
+                    else []
+                )
+                candidate_actionable_report = self._update_actionable_items_for_topic_candidate(
+                    candidate=candidate,
+                    topic_state_id=state_id,
+                    existing_actionable_items=existing_actionable_items,
+                )
+                actionable_report["candidate_fact_count"] += int(
+                    candidate_actionable_report.get("candidate_fact_count", 0) or 0
+                )
+                actionable_report["candidate_fact_ids"] = list(dict.fromkeys([
+                    *actionable_report["candidate_fact_ids"],
+                    *(candidate_actionable_report.get("candidate_fact_ids") or []),
+                ]))
+                actionable_report["actionable_update_count"] += int(
+                    candidate_actionable_report.get("actionable_update_count", 0) or 0
+                )
+                actionable_report["stored_count"] += int(
+                    candidate_actionable_report.get("stored_count", 0) or 0
+                )
+                actionable_report["item_ids"] = list(dict.fromkeys([
+                    *actionable_report["item_ids"],
+                    *(candidate_actionable_report.get("item_ids") or []),
+                ]))
+                actionable_report["mapping_count"] += int(
+                    candidate_actionable_report.get("mapping_count", 0) or 0
+                )
+            elif self._enable_memory_actionable_item_update:
                 self._log_info(
                     "memory_reflect",
-                    "topic_state_updated",
-                    self._state_update_log_payload(
-                        state_id=state_id,
-                        state_update=state_update,
-                        candidate=candidate,
-                        existing_state=chosen_state,
-                    ),
+                    "actionable_item_candidate_skipped",
+                    {
+                        "reason": "no_actionable_aspects",
+                        "candidate_root_topic": candidate.get("topic_name"),
+                        "candidate_fact_ids": [
+                            fact.get("id")
+                            for fact in (candidate.get("facts") or [])
+                            if fact.get("id") is not None
+                        ],
+                    },
                 )
-                updated += 1
+
+            if not grounded:
+                unresolved += 1
+                continue
         report = {
-            "enabled": 1,
+            "enabled": int(update_topic_state),
             "candidate_count": len(candidates),
             "updated": updated,
             "unresolved": unresolved,
-            "pending_unresolved": len(self._pending_unresolved_topics),
+            "actionable_report": actionable_report,
         }
         self._log_info("memory_reflect", "topic_state_update_finish", {
             **report,
@@ -2449,6 +2455,99 @@ class MemoryNodeManager:
                 (time.monotonic() - update_started_at) * 1000,
                 2,
             ),
+        })
+        return report
+
+    def _retrieve_existing_actionable_items_for_topic_state(
+        self,
+        *,
+        topic_state_id: int,
+        limit: int = 32,
+    ) -> List[Dict[str, Any]]:
+        """Find existing actionable items through the stable mapping table."""
+        return self._db.memory_actionable_items_by_topic_state_id(
+            topic_state_id,
+            limit=limit,
+        )
+
+    def _update_actionable_items_for_topic_candidate(
+        self,
+        *,
+        candidate: Dict[str, Any],
+        topic_state_id: int,
+        existing_actionable_items: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Extract actionable items for one topic candidate and persist them."""
+        # Topic state and actionable extraction intentionally share the same
+        # topic candidate facts. The LLM prompt, rather than a second global
+        # fact filter, decides whether any of them form a real action.
+        actionable_facts = list(candidate.get("facts") or [])
+        report: Dict[str, Any] = {
+            "candidate_fact_count": len(actionable_facts),
+            "candidate_fact_ids": [
+                fact.get("id")
+                for fact in actionable_facts
+                if fact.get("id") is not None
+            ],
+            "actionable_update_count": 0,
+            "stored_count": 0,
+            "item_ids": [],
+            "mapping_count": 0,
+        }
+        if not actionable_facts:
+            return report
+        topic_state = (
+            self._db.get_memory_state_by_id(topic_state_id)
+            if topic_state_id
+            else None
+        )
+        self._log_info("memory_reflect", "actionable_item_candidate_start", {
+            "candidate_root_topic": candidate.get("topic_name"),
+            "candidate_fact_ids": report["candidate_fact_ids"],
+            "existing_actionable_item_ids": [
+                item.get("id")
+                for item in existing_actionable_items
+                if item.get("id") is not None
+            ],
+        })
+        actionable_updates = self._extract_actionable_items_with_llm(
+            topic_candidate=candidate,
+            existing_topic_state=topic_state,
+            existing_actionable_items=existing_actionable_items,
+        )
+        report["actionable_update_count"] = len(actionable_updates)
+        topic_names = [
+            candidate.get("topic_name"),
+            *(candidate.get("aspect_topics") or []),
+        ]
+        if topic_state:
+            topic_names.append(topic_state.get("canonical_name"))
+            metadata = topic_state.get("metadata")
+            metadata = metadata if isinstance(metadata, dict) else {}
+            topic_names.extend(metadata.get("aspect_topic_names") or [])
+        topic_actionable_mappings: List[Dict[str, Any]] = []
+        for item in actionable_updates:
+            item["canonical_topics"] = self._normalize_unique_labels([
+                *(item.get("canonical_topics") or []),
+                *topic_names,
+            ], limit=12)
+            item_id = self._store_actionable_item(item)
+            if item_id:
+                report["stored_count"] += 1
+                report["item_ids"].append(item_id)
+                if topic_state_id:
+                    topic_actionable_mappings.append({
+                        "topic_state_id": topic_state_id,
+                        "actionable_item_id": item_id,
+                        "evidence_fact_ids": item.get("evidence_fact_ids") or report["candidate_fact_ids"],
+                    })
+        if topic_actionable_mappings:
+            report["mapping_count"] = self._db.insert_topic_actionable_item_mappings(
+                topic_actionable_mappings
+            )
+        self._log_info("memory_reflect", "actionable_item_candidate_finish", {
+            "candidate_root_topic": candidate.get("topic_name"),
+            **report,
         })
         return report
 
@@ -2985,24 +3084,6 @@ class MemoryNodeManager:
             "candidate_has_anchor": False,
             "match": match_info,
         }
-
-    def _remember_pending_unresolved_topic(
-        self,
-        candidate: Dict[str, Any],
-        grounding_info: Dict[str, Any],
-    ) -> None:
-        record = {
-            "created_at": _now_text(),
-            "topic_name": candidate.get("topic_name"),
-            "topic_key": candidate.get("topic_key"),
-            "fact_ids": candidate.get("fact_ids", []),
-            "source_type": candidate.get("source_type"),
-            "grounding": grounding_info,
-        }
-        self._pending_unresolved_topics.append(record)
-        if len(self._pending_unresolved_topics) > self._pending_unresolved_topic_max:
-            overflow = len(self._pending_unresolved_topics) - self._pending_unresolved_topic_max
-            del self._pending_unresolved_topics[:overflow]
 
     def _extract_topic_state_update_with_llm(
         self,
@@ -4209,8 +4290,11 @@ class MemoryNodeManager:
     def _extract_actionable_items_with_llm(
         self,
         *,
-        facts: List[Dict[str, Any]],
+        topic_candidate: Dict[str, Any],
+        existing_topic_state: Optional[Dict[str, Any]] = None,
+        existing_actionable_items: Optional[List[Dict[str, Any]]] = None,
     ) -> List[Dict[str, Any]]:
+        facts = list(topic_candidate.get("facts") or [])
         if not facts:
             self._log_info("memory_reflect", "actionable_llm_skipped", {
                 "reason": "no_candidate_facts",
@@ -4224,7 +4308,36 @@ class MemoryNodeManager:
             if prompt_language == "en"
             else UNIFIED_ACTIONABLE_ITEM_EXTRACTION_PROMPT_ZH
         )
-        prompt = prompt_template.replace("{facts}", self._format_facts_for_actionable_prompt(facts))
+        prompt = (
+            prompt_template
+            .replace(
+                "{topic_candidate}",
+                json.dumps(
+                    self._format_topic_candidate_for_actionable_prompt(topic_candidate),
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+            )
+            .replace(
+                "{existing_topic_state}",
+                json.dumps(
+                    self._format_existing_topic_state_for_prompt(existing_topic_state),
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+            )
+            .replace(
+                "{existing_actionable_items}",
+                json.dumps(
+                    [
+                        self._format_existing_actionable_item_for_prompt(item)
+                        for item in (existing_actionable_items or [])
+                    ],
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+            )
+        )
         self._log_info("memory_reflect", "actionable_llm_call_start", {
             "candidate_fact_count": len(facts),
             "candidate_fact_ids": [
@@ -4252,14 +4365,34 @@ class MemoryNodeManager:
         normalized: List[Dict[str, Any]] = []
         valid_fact_ids = {int(item["id"]) for item in facts if item.get("id") is not None}
         facts_by_id = {int(item["id"]): item for item in facts if item.get("id") is not None}
+        existing_items_by_id = {
+            int(item["id"]): item
+            for item in (existing_actionable_items or [])
+            if str(item.get("id") or "").strip().isdigit()
+        }
         seen_keys: set[str] = set()
         rejected_counts: Counter[str] = Counter()
         for raw in raw_items:
             if not isinstance(raw, dict):
                 rejected_counts["non_object"] += 1
                 continue
+            operation = _compact_whitespace(raw.get("operation") or "create").lower()
+            if operation not in {"create", "update"}:
+                operation = "create"
+            existing_item_id = (
+                int(raw.get("existing_item_id"))
+                if str(raw.get("existing_item_id") or "").strip().isdigit()
+                else 0
+            )
+            existing_item = existing_items_by_id.get(existing_item_id)
             summary = _compact_whitespace(raw.get("summary") or "")
             canonical_name = _compact_whitespace(raw.get("canonical_name") or "")
+            if operation == "update" and existing_item:
+                canonical_name = _compact_whitespace(
+                    existing_item.get("canonical_name") or canonical_name
+                )
+                if not summary:
+                    summary = _compact_whitespace(existing_item.get("summary") or "")
             if not summary or not canonical_name:
                 rejected_counts["missing_summary_or_name"] += 1
                 continue
@@ -4271,26 +4404,107 @@ class MemoryNodeManager:
             if not evidence_ids:
                 rejected_counts["missing_valid_evidence"] += 1
                 continue
+            aspect_owner_candidates: List[str] = []
+            for fact_id in evidence_ids:
+                fact = facts_by_id.get(fact_id)
+                if not fact:
+                    continue
+                for aspect in self._actionable_aspects_from_fact(fact):
+                    aspect_owner = self._normalize_actionable_owner(aspect.get("owner"))
+                    if aspect_owner != "unknown" and aspect_owner not in aspect_owner_candidates:
+                        aspect_owner_candidates.append(aspect_owner)
+            aspect_owner = (
+                aspect_owner_candidates[0]
+                if len(aspect_owner_candidates) == 1
+                else "unknown"
+            )
             source_type = self._state_source_type_for_facts(facts, evidence_ids)
+            item_type = self._normalize_actionable_item_type(raw.get("item_type"))
+            owner = self._normalize_actionable_owner(raw.get("owner"))
+            status = self._normalize_actionable_status(raw.get("status"))
+            due_at = _compact_whitespace(raw.get("due_at") or "")
+            if operation == "update" and existing_item:
+                source_type = str(existing_item.get("source_type") or source_type)
+                item_type = self._normalize_actionable_item_type(
+                    existing_item.get("item_type") or item_type
+                )
+                raw_owner = self._normalize_actionable_owner(raw.get("owner"))
+                existing_owner = self._normalize_actionable_owner(existing_item.get("owner"))
+                owner = raw_owner
+                if owner == "unknown":
+                    owner = (
+                        existing_owner
+                        if existing_owner != "unknown"
+                        else aspect_owner
+                    )
+                status = self._normalize_actionable_status(
+                    raw.get("status") or existing_item.get("status")
+                )
+                due_at = _compact_whitespace(
+                    raw.get("due_at") or existing_item.get("due_at") or ""
+                )
+            elif owner == "unknown":
+                owner = aspect_owner
+            existing_metadata = (
+                existing_item.get("metadata")
+                if isinstance(existing_item, dict)
+                and isinstance(existing_item.get("metadata"), dict)
+                else {}
+            )
+            canonical_topics = self._normalize_string_list(
+                raw.get("canonical_topics"),
+                limit=8,
+            )
+            if not canonical_topics and existing_item:
+                canonical_topics = self._normalize_string_list(
+                    existing_metadata.get("canonical_topics"),
+                    limit=8,
+                )
+            elif existing_item:
+                canonical_topics = self._normalize_unique_labels([
+                    *self._normalize_string_list(
+                        existing_metadata.get("canonical_topics"),
+                        limit=8,
+                    ),
+                    *canonical_topics,
+                ], limit=8)
             item = {
-                "item_type": self._normalize_actionable_item_type(raw.get("item_type")),
+                "operation": operation,
+                "existing_item_id": existing_item_id if existing_item else 0,
+                "item_type": item_type,
                 "source_type": source_type,
                 "canonical_name": canonical_name,
                 "summary": summary,
-                "owner": self._normalize_actionable_owner(raw.get("owner")),
-                "status": self._normalize_actionable_status(raw.get("status")),
-                "due_at": _compact_whitespace(raw.get("due_at") or ""),
+                "owner": owner,
+                "status": status,
+                "due_at": due_at,
                 "evidence_fact_ids": evidence_ids[:24],
                 "keywords": self._normalize_string_list(raw.get("keywords"), limit=18),
-                "entities": self._normalize_string_list(raw.get("entities"), limit=18),
-                "canonical_topics": self._normalize_string_list(raw.get("canonical_topics"), limit=8),
+                "canonical_topics": canonical_topics,
                 "importance": self._clamp_float(raw.get("importance"), 0.0, 1.0, 0.7),
                 "confidence": self._clamp_float(raw.get("confidence"), 0.0, 1.0, 0.75),
             }
-            if not self._is_high_value_actionable_item(item, facts_by_id=facts_by_id):
+            is_supported_existing_update = bool(
+                operation == "update"
+                and existing_item
+                and item["confidence"] >= 0.55
+                and (
+                    item["status"] != existing_item.get("status")
+                    or item["summary"] != existing_item.get("summary")
+                    or item["due_at"] != (existing_item.get("due_at") or "")
+                )
+            )
+            if not is_supported_existing_update and not self._is_high_value_actionable_item(
+                item,
+                facts_by_id=facts_by_id,
+            ):
                 rejected_counts["low_value"] += 1
                 continue
-            dedupe_key = self._actionable_dedupe_key(item)
+            dedupe_key = (
+                f"existing:{existing_item_id}"
+                if is_supported_existing_update
+                else self._actionable_dedupe_key(item)
+            )
             if dedupe_key in seen_keys:
                 rejected_counts["duplicate"] += 1
                 continue
@@ -4304,82 +4518,46 @@ class MemoryNodeManager:
         })
         return normalized
 
-    def _filter_facts_for_actionable_item_extraction(
+    def _format_topic_candidate_for_actionable_prompt(
         self,
-        facts: List[Dict[str, Any]],
-    ) -> List[Dict[str, Any]]:
-        selected: List[Dict[str, Any]] = []
-        seen_ids: set[int] = set()
-        for fact in facts:
-            fact_id = fact.get("id")
-            numeric_id = int(fact_id) if str(fact_id or "").strip().isdigit() else 0
-            if numeric_id and numeric_id in seen_ids:
-                continue
-            if self._actionable_aspects_from_fact(fact) or self._fact_can_seed_actionable_item(fact):
-                selected.append(fact)
-                if numeric_id:
-                    seen_ids.add(numeric_id)
-        limit = max(
-            1,
-            int(self._memory_cfg.get("actionable_fact_candidate_limit", 40) or 40),
+        candidate: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Format one topic candidate and its supporting facts as one payload."""
+        payload = self._format_topic_state_candidate_for_prompt(candidate)
+        payload.pop("fact_summaries", None)
+        # The candidate identity text already embeds fact summaries. Keep the
+        # structured candidate fields and detailed facts as the single source
+        # of prompt evidence instead of repeating that text.
+        payload.pop("identity_text", None)
+        payload["facts"] = self._format_facts_for_actionable_prompt(
+            list(candidate.get("facts") or [])
         )
-        selected = selected[:limit]
-        aspect_seed_count = sum(
-            1 for fact in selected
-            if self._actionable_aspects_from_fact(fact)
-        )
-        self._log_info("memory_reflect", "actionable_fact_candidates", {
-            "candidate_count": len(selected),
-            "input_fact_count": len(facts),
-            "candidate_limit": limit,
-            "candidate_fact_ids": [
-                fact.get("id")
-                for fact in selected
-                if fact.get("id") is not None
-            ],
-            "aspect_seed_count": aspect_seed_count,
-            "heuristic_seed_count": max(0, len(selected) - aspect_seed_count),
-        })
-        return selected
+        return payload
+
+    @staticmethod
+    def _format_existing_actionable_item_for_prompt(
+        item: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Keep actionable context compact and exclude embeddings/internal blobs."""
+        metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+        return {
+            "id": item.get("id"),
+            "item_type": item.get("item_type"),
+            "canonical_name": item.get("canonical_name"),
+            "summary": item.get("summary"),
+            "owner": item.get("owner"),
+            "status": item.get("status"),
+            "due_at": item.get("due_at"),
+            "evidence_fact_ids": item.get("evidence_fact_ids") or [],
+            "canonical_topics": metadata.get("canonical_topics") or [],
+            "importance": item.get("importance"),
+            "confidence": item.get("confidence"),
+        }
 
     def _actionable_aspects_from_fact(self, fact: Dict[str, Any]) -> List[Dict[str, Any]]:
         metadata = fact.get("metadata") if isinstance(fact.get("metadata"), dict) else {}
         raw = fact.get("actionable_aspects") or metadata.get("actionable_aspects")
         return self._normalize_actionable_aspects(raw)
-
-    def _fact_can_seed_actionable_item(self, fact: Dict[str, Any]) -> bool:
-        kind = str(fact.get("fact_kind") or "").strip().lower()
-        fact_type = str(fact.get("fact_type") or "").strip().lower()
-        summary = str(fact.get("summary") or "")
-        all_text = f"{summary}".lower()
-        if not summary:
-            return False
-        if any(pattern in all_text for pattern in _WEAK_TRY_PATTERNS):
-            if not self._has_explicit_followup_or_commitment(all_text, item_type="task"):
-                return False
-        if self._has_actionable_hard_marker(all_text):
-            return True
-        if kind in {"commitment", "open_question", "request"}:
-            return True
-        if kind == "decision":
-            return self._has_strong_decision_marker(all_text)
-        if kind == "risk":
-            return self._has_blocking_marker(all_text)
-        primary_entity = fact.get("primary_entity")
-        primary_entity_name = (
-            primary_entity.get("name")
-            if isinstance(primary_entity, dict)
-            else primary_entity
-        )
-        if kind == "instruction" and str(primary_entity_name or "").strip().lower() in {
-            "user", "the user", "用户", "assistant", "the assistant", "助手", "system", "系统",
-        }:
-            return True
-        if kind == "action" and fact_type == "episodic":
-            return self._has_explicit_followup_or_commitment(all_text, item_type="task")
-        if kind == "recommendation":
-            return self._has_explicit_followup_or_commitment(all_text, item_type="recommendation")
-        return False
 
     def _is_high_value_actionable_item(
         self,
@@ -4521,13 +4699,13 @@ class MemoryNodeManager:
 
     def _store_actionable_item(self, item: Dict[str, Any]) -> int:
         keywords = item.get("keywords") or self._keywords(item["summary"], limit=18)
-        entities = item.get("entities") or self._entities(item["summary"])
         canonical_topics = item.get("canonical_topics") or [item["canonical_name"]]
         evidence_fact_ids = [int(value) for value in item.get("evidence_fact_ids") or []]
-        evidence_facts = self._db.memory_facts_by_ids(evidence_fact_ids)
-        entity_ids = self._entity_ids_from_names_and_facts(
-            names=[*entities, item.get("owner") or ""],
-            facts=evidence_facts,
+        owner = _compact_whitespace(item.get("owner") or "")
+        entity_ids = (
+            self._entity_ids_for_names([owner])
+            if owner and owner.lower() != "unknown"
+            else []
         )
         identity_text = "\n".join([
             item["canonical_name"],
@@ -4537,7 +4715,6 @@ class MemoryNodeManager:
             f"status: {item['status']}",
             f"due_at: {item['due_at']}",
             f"keywords: {' '.join(keywords)}",
-            f"entities: {', '.join(entities)}",
         ])
         identity_text_embedding = self._generate_embedding_vector(identity_text)
         item_id = self._db.upsert_actionable_item(
@@ -4554,7 +4731,6 @@ class MemoryNodeManager:
             importance=item["importance"],
             metadata={
                 "keywords": keywords,
-                "entities": entities,
                 "canonical_topics": canonical_topics,
             },
             identity_text_embedding=identity_text_embedding,
@@ -4563,7 +4739,10 @@ class MemoryNodeManager:
 
         return item_id
     
-    def _format_facts_for_actionable_prompt(self, facts: List[Dict[str, Any]]) -> str:
+    def _format_facts_for_actionable_prompt(
+        self,
+        facts: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
         rows: List[Dict[str, Any]] = []
         for fact in facts[:80]:
             metadata = fact.get("metadata") if isinstance(fact.get("metadata"), dict) else {}
@@ -4583,7 +4762,7 @@ class MemoryNodeManager:
                 "fact_aspect_topic": fact.get("fact_aspect_topic") or "",
                 "actionable_aspects": actionable_aspects,
             })
-        return json.dumps(rows, ensure_ascii=False, indent=2)
+        return rows
 
     @staticmethod
     def _normalize_state_scope(value: Any, state_type: Any = None) -> str:
@@ -4630,13 +4809,19 @@ class MemoryNodeManager:
 
     @staticmethod
     def _normalize_actionable_owner(value: Any) -> str:
-        text = str(value or "unknown").strip().lower()
-        if text in {"用户", "user", "the user"}:
+        text = _compact_whitespace(value).strip("'\".,:;!?，。！？、；：（）()[]{}")
+        if not text:
+            return "unknown"
+        normalized = text.lower()
+        if normalized in {"用户", "user", "the user"}:
             return "user"
-        if text in {"助手", "assistant", "agent", "the assistant"}:
+        if normalized in {"助手", "assistant", "agent", "the assistant"}:
             return "assistant"
-        allowed = {"user", "assistant", "other", "unknown"}
-        return text if text in allowed else "unknown"
+        if normalized in {"未知", "unknown"}:
+            return "unknown"
+        if normalized in {"其他", "other"}:
+            return "unknown"
+        return text
 
     @staticmethod
     def _clamp_float(value: Any, low: float, high: float, default: float) -> float:

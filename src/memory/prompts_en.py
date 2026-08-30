@@ -178,7 +178,8 @@ actionable_aspects rules:
 - Return at most 2 actionable_aspects per fact, keeping only the most concrete and trackable action signals.
 - item_type must be one of: task, commitment, decision, follow_up, open_question, risk, reminder, recommendation, constraint.
 - Do not extract weak willingness such as "might try", "sounds good", or "may consider" as an actionable_aspect unless it also includes an explicit reminder, deadline, follow-up check, strong commitment, or verifiable execution plan.
-- action_summary must describe the specific item to follow up, execute, remind, review, or track. Do not restate the whole fact.
+- action_summary must be a self-contained action description stating "who is responsible + by what time or deadline (only when supported by evidence) + what action or target is involved". For example: "The team must finalize the promotion plan by next Tuesday." Without time evidence, at least state the responsible party and action; do not write only "finalize the plan" or invent a date.
+- owner identifies the actual party responsible for executing, following up, or deciding the action. It may be the user, assistant, a named speaker, a team, a department, or another entity explicitly supported by the evidence. It is not the target object, and a speaker is not automatically the owner merely because they spoke; when the evidence identifies only the requester but not the executor, use "unknown".
 - trigger_basis must cite the specific evidence in the current fact that supports this actionable signal.
 - due_at should be filled only when the evidence contains an explicit time, deadline, or reminder time; otherwise use an empty string.
 
@@ -213,8 +214,8 @@ Output schema:
       "actionable_aspects": [
         {
           "item_type": "task|commitment|decision|follow_up|open_question|risk|reminder|recommendation|constraint",
-          "action_summary": "specific item that needs future reminder, follow-up, execution, review, or decision tracking",
-          "owner": "user|assistant|other|unknown",
+          "action_summary": "self-contained action description with responsible party, time/deadline when supported, and concrete action",
+          "owner": "the actual responsible entity name, such as user, assistant, a named speaker, a team, or a department; use unknown when unclear",
           "status": "open|in_progress|done|blocked|decided|noted|unknown",
           "due_at": "",
           "trigger_basis": "specific evidence from this fact supporting the actionable signal",
@@ -365,7 +366,7 @@ existing_entity_state:
 
 UNIFIED_ACTIONABLE_ITEM_EXTRACTION_PROMPT_EN = """You are the actionable-item extraction module for a unified AI-glasses long-term memory system inspired by MemPalace.
 
-The input contains newly stored candidate narrative facts. Some facts include actionable_aspects as pre-filtered action signals. Extract only concrete actionable items that truly require future follow-up, reminder, execution, review, or decision tracking. Actionable items are separate from evolving states: states summarize durable situations, preferences, constraints, and background; actionable items must be checkable, completable, trackable, or explicitly recalled as decisions, commitments, risks, or open questions.
+The input contains one topic candidate and its newly stored narrative facts. Some facts include actionable_aspects as pre-filtered action signals. Within this topic, extract only concrete actionable items that truly require future follow-up, reminder, execution, review, or decision tracking. Actionable items are separate from evolving states: states summarize durable situations, preferences, constraints, and background; actionable items must be checkable, completable, trackable, or explicitly recalled as decisions, commitments, risks, or open questions.
 
 Prefer actionable_aspects when present, but extract only items directly supported by the fact summary and actionable_aspects.
 
@@ -376,26 +377,31 @@ Rules:
 4. Do not extract ordinary assistant recommendations as actionable items. Extract them only when the user explicitly accepts them, asks for follow-up/reminders, or the recommendation becomes the user's task, commitment, or decision.
 5. Ordinary constraints, preferences, and background belong in states, not constraint items. Extract a constraint item only when the constraint is actively blocking a concrete action or decision.
 6. Do not copy every fact. If multiple facts point to the same matter, keep only the most specific and trackable item.
-7. Keep each item self-contained: include actor/owner, target object, context, reason, deadline/time if known, and current status.
-8. evidence_fact_ids must cite supporting fact IDs from the input.
-9. item_type must be one of: task, commitment, decision, follow_up, open_question, risk, reminder, recommendation, constraint, other.
-10. status must be one of: open, in_progress, done, blocked, decided, noted, unknown.
-11. importance and confidence are 0-1. Do not inflate confidence to bypass the weak-willingness rule.
-12. Return JSON only. No markdown.
+7. Keep each item self-contained: `summary` must state "who is responsible + by what time or deadline (only when supported by evidence) + what action or target is involved", with the necessary context, reason, and current status. Do not invent a date when no time is supported; when the responsible party is unclear, you may say "responsible party not established" while still stating the action.
+8. `owner` identifies who the item belongs to and who is responsible for completing, following up, or deciding it. It is not the target object and not a list of mentioned entities. Prefer an explicit non-unknown `actionable_aspects.owner` from the supporting facts, then use explicit assignment language in the facts; use `primary_entity` only when it also clearly represents execution or decision responsibility. When updating an existing item, preserve its owner unless new facts clearly show that responsibility changed. Use `unknown` when the evidence is insufficient.
+9. owner must be the name of an evidence-supported responsible entity, such as "user", "assistant", "N_SPK8013", "Xiao Wang", "the team", or "the marketing department". Do not assign ownership merely because someone spoke or was mentioned, and do not output the generic category "other". Use `unknown` only when the responsible party is not established.
+10. evidence_fact_ids must cite supporting fact IDs from the input.
+11. item_type must be one of: task, commitment, decision, follow_up, open_question, risk, reminder, recommendation, constraint, other.
+12. status must be one of: open, in_progress, done, blocked, decided, noted, unknown.
+13. importance and confidence are 0-1. Do not inflate confidence to bypass the weak-willingness rule.
+14. When existing actionable_items are provided for this topic, first check whether the new facts explicitly change their status, deadline, owner, or current description. Emit `operation="update"` only when new evidence supports a change; do not mark an item done without evidence of completion.
+15. For an existing item, use its `id` in `existing_item_id` and preserve its `canonical_name` and `item_type`; for a new item use `operation="create"` and `existing_item_id=0`.
+16. Return JSON only. No markdown.
 
 Output schema:
 {
   "actionable_items": [
     {
+      "operation": "create|update",
+      "existing_item_id": 0,
       "item_type": "task|commitment|decision|follow_up|open_question|risk|reminder|recommendation|constraint|other",
       "canonical_name": "stable short name",
-      "summary": "self-contained actionable item",
-      "owner": "user|assistant|other|unknown",
+      "summary": "self-contained actionable item stating the responsible party, time/deadline when supported, and concrete action",
+      "owner": "concrete responsible entity name, such as user, Xiao Wang, or the project manager; use unknown when unclear",
       "status": "open|in_progress|done|blocked|decided|noted|unknown",
       "due_at": "",
       "evidence_fact_ids": [1, 2],
       "keywords": ["keyword1", "keyword2"],
-      "entities": ["entity1", "entity2"],
       "canonical_topics": ["topic1"],
       "importance": 0.8,
       "confidence": 0.85
@@ -403,8 +409,15 @@ Output schema:
   ]
 }
 
-Candidate facts:
-{facts}
+Topic candidate, including topic metadata and detailed supporting facts:
+{topic_candidate}
+
+Existing topic_state, if any:
+{existing_topic_state}
+
+Existing actionable_items for this topic:
+{existing_actionable_items}
+
 """
 
 

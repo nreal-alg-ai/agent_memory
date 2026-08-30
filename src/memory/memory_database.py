@@ -340,6 +340,18 @@ class SessionDB:
                 FOREIGN KEY(entity_id) REFERENCES memory_entity_nodes(id) ON DELETE CASCADE
             );
 
+            CREATE TABLE IF NOT EXISTS memory_topic_actionable_item_mapping (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                topic_state_id INTEGER NOT NULL,
+                actionable_item_id INTEGER NOT NULL,
+                evidence_fact_ids TEXT NOT NULL DEFAULT '[]',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(topic_state_id, actionable_item_id),
+                FOREIGN KEY(topic_state_id) REFERENCES memory_states(id) ON DELETE CASCADE,
+                FOREIGN KEY(actionable_item_id) REFERENCES memory_actionable_items(id) ON DELETE CASCADE
+            );
+
             CREATE INDEX IF NOT EXISTS idx_memory_facts_event_time ON memory_facts(event_time_key);
             CREATE INDEX IF NOT EXISTS idx_memory_facts_dialogue_time ON memory_facts(dialogue_time_key);
             CREATE INDEX IF NOT EXISTS idx_memory_facts_source ON memory_facts(source_type);
@@ -350,6 +362,8 @@ class SessionDB:
             ON memory_states(source_type, state_scope, state_type);
             CREATE INDEX IF NOT EXISTS idx_memory_actionable_source
             ON memory_actionable_items(source_type, item_type, status);
+            CREATE INDEX IF NOT EXISTS idx_memory_topic_actionable_state
+            ON memory_topic_actionable_item_mapping(topic_state_id, updated_at);
             """
         )
         self._ensure_entity_ids_schema()
@@ -1590,6 +1604,74 @@ class SessionDB:
         ).fetchall()
         by_id = {int(row["id"]): self._row_to_dict(row) for row in rows}
         return [by_id[item] for item in ids if item in by_id]
+
+    def memory_actionable_items_by_topic_state_id(
+        self,
+        topic_state_id: int,
+        *,
+        limit: int = 32,
+    ) -> List[Dict[str, Any]]:
+        """Load actionable items linked to one topic state by stable IDs."""
+        rows = self._conn.execute(
+            """
+            SELECT item.*
+            FROM memory_actionable_items AS item
+            INNER JOIN memory_topic_actionable_item_mapping AS mapping
+                ON mapping.actionable_item_id = item.id
+            WHERE mapping.topic_state_id = ?
+            ORDER BY item.updated_at DESC, item.id DESC
+            LIMIT ?
+            """,
+            (int(topic_state_id), max(1, int(limit or 32))),
+        ).fetchall()
+        return [self._row_to_dict(row) for row in rows]
+
+    def insert_topic_actionable_item_mappings(
+        self,
+        mappings: Sequence[Dict[str, Any]],
+    ) -> int:
+        """Persist stable topic-state to actionable-item relationships."""
+        if not mappings:
+            return 0
+        now = local_now_text()
+        changed_count = 0
+        for mapping in mappings:
+            try:
+                topic_state_id = int(mapping["topic_state_id"])
+                actionable_item_id = int(mapping["actionable_item_id"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if topic_state_id <= 0 or actionable_item_id <= 0:
+                continue
+            evidence_fact_ids = []
+            for value in mapping.get("evidence_fact_ids") or []:
+                try:
+                    fact_id = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if fact_id > 0 and fact_id not in evidence_fact_ids:
+                    evidence_fact_ids.append(fact_id)
+            self._conn.execute(
+                """
+                INSERT INTO memory_topic_actionable_item_mapping (
+                    topic_state_id, actionable_item_id, evidence_fact_ids,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(topic_state_id, actionable_item_id) DO UPDATE SET
+                    evidence_fact_ids = excluded.evidence_fact_ids,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    topic_state_id,
+                    actionable_item_id,
+                    _json_dumps(evidence_fact_ids),
+                    now,
+                    now,
+                ),
+            )
+            changed_count += 1
+        self._commit_if_needed()
+        return changed_count
 
     def _row_to_dict(self, row: sqlite3.Row) -> Dict[str, Any]:
         item = dict(row)
