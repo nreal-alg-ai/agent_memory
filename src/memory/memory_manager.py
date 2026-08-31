@@ -1006,7 +1006,7 @@ class MemoryNodeManager:
             return
         self._log_info(
             "memory_store",
-            "extract_fact_state_aspects",
+            "extract_fact_signals",
             {
                 "source_type": source_type,
                 "episode_type": episode_type,
@@ -1021,7 +1021,7 @@ class MemoryNodeManager:
             metadata = fact.get("metadata") if isinstance(fact.get("metadata"), dict) else {}
             self._log_info(
                 "memory_store",
-                "extract_fact_state_aspects",
+                "extract_fact_signals",
                 {
                     "fact_index": index,
                     "fact_count": len(facts),
@@ -1035,8 +1035,8 @@ class MemoryNodeManager:
                     "primary_entity": fact.get("primary_entity"),
                     "fact_root_topic": fact.get("fact_root_topic") or "",
                     "fact_aspect_topic": fact.get("fact_aspect_topic") or "",
-                    "state_aspects": fact.get("state_aspects") or [],
-                    "actionable_aspects": fact.get("actionable_aspects") or [],
+                    "entity_state_signal": fact.get("entity_state_signal") or [],
+                    "action_signal": fact.get("action_signal") or [],
                     "importance": fact.get("importance"),
                     "confidence": fact.get("confidence"),
                     "time_confidence": metadata.get("time_confidence") or "",
@@ -1317,12 +1317,12 @@ class MemoryNodeManager:
                 fallback_root_topic=(episode_topics[0] if episode_topics else fact_topic_fallback),
                 fallback_aspect_topic=fact_topic_fallback,
             )
-            state_aspects = self._normalize_state_aspects(
-                raw_fact.get("state_aspects"),
+            entity_state_signal = self._normalize_entity_state_signal(
+                raw_fact.get("entity_state_signal"),
                 fallback_entity=primary_entity,
             )
-            actionable_aspects = self._normalize_actionable_aspects(
-                raw_fact.get("actionable_aspects"),
+            action_signal = self._normalize_action_signal(
+                raw_fact.get("action_signal"),
             )
             event_time_key = _compact_whitespace(raw_fact.get("event_time_key") or "")
             facts.append({
@@ -1334,8 +1334,8 @@ class MemoryNodeManager:
                 "keywords": " ".join(keywords),
                 "entities": entities,
                 "primary_entity": primary_entity,
-                "state_aspects": state_aspects,
-                "actionable_aspects": actionable_aspects,
+                "entity_state_signal": entity_state_signal,
+                "action_signal": action_signal,
                 "fact_root_topic": fact_root_topic,
                 "fact_aspect_topic": fact_aspect_topic,
                 "importance": max(0.6, min(1.0, priority / 100.0)),
@@ -1378,7 +1378,7 @@ class MemoryNodeManager:
         )
         return normalized_root, normalized_aspect
 
-    def _normalize_state_aspects(
+    def _normalize_entity_state_signal(
         self,
         value: Any,
         *,
@@ -1392,7 +1392,7 @@ class MemoryNodeManager:
             int(
                 limit
                 if limit is not None
-                else self._memory_cfg.get("state_aspect_max_per_fact", 3) or 3
+                else self._memory_cfg.get("entity_state_signal_max_per_fact", 3) or 3
             ),
         )
         if max_items <= 0:
@@ -1412,19 +1412,13 @@ class MemoryNodeManager:
                 or raw.get("attribute")
                 or ""
             )
-            aspect_summary = _compact_whitespace(
-                raw.get("aspect_summary")
-                or raw.get("summary")
-                or raw.get("text")
-                or ""
-            )
             evidence_basis = _compact_whitespace(
                 raw.get("evidence_basis")
                 or raw.get("evidence")
                 or raw.get("reason")
                 or ""
             )
-            if not attribute_name or not aspect_summary:
+            if not attribute_name or not evidence_basis:
                 continue
             confidence = self._clamp_float(raw.get("confidence"), 0.0, 1.0, 0.75)
             entity = raw.get("entity") or raw.get("primary_entity") or fallback_entity
@@ -1442,7 +1436,7 @@ class MemoryNodeManager:
             key = (
                 state_type,
                 attribute_name.lower(),
-                aspect_summary.lower(),
+                evidence_basis.lower(),
             )
             if key in seen:
                 continue
@@ -1450,7 +1444,6 @@ class MemoryNodeManager:
             item: Dict[str, Any] = {
                 "state_type": state_type,
                 "attribute_name": attribute_name,
-                "aspect_summary": aspect_summary,
                 "evidence_basis": evidence_basis,
                 "confidence": confidence,
             }
@@ -1461,7 +1454,7 @@ class MemoryNodeManager:
                 break
         return normalized
 
-    def _normalize_actionable_aspects(
+    def _normalize_action_signal(
         self,
         value: Any,
         *,
@@ -1474,7 +1467,7 @@ class MemoryNodeManager:
             int(
                 limit
                 if limit is not None
-                else self._memory_cfg.get("actionable_aspect_max_per_fact", 2) or 2
+                else self._memory_cfg.get("action_signal_max_per_fact", 2) or 2
             ),
         )
         if max_items <= 0:
@@ -1482,6 +1475,9 @@ class MemoryNodeManager:
         allowed_types = {
             "task", "commitment", "decision", "follow_up", "open_question",
             "risk", "reminder", "recommendation", "constraint",
+        }
+        allowed_strengths = {
+            "assigned", "committed", "pending_decision", "follow_up",
         }
         normalized: List[Dict[str, Any]] = []
         seen: set[Tuple[str, str]] = set()
@@ -1491,36 +1487,34 @@ class MemoryNodeManager:
             item_type = self._normalize_actionable_item_type(raw.get("item_type"))
             if item_type not in allowed_types:
                 continue
-            action_summary = _compact_whitespace(
-                raw.get("action_summary")
-                or raw.get("summary")
-                or raw.get("text")
-                or ""
-            )
-            trigger_basis = _compact_whitespace(
-                raw.get("trigger_basis")
-                or raw.get("evidence_basis")
+            action_strength = _compact_whitespace(
+                raw.get("action_strength") or ""
+            ).lower()
+            if action_strength not in allowed_strengths:
+                continue
+            evidence_basis = _compact_whitespace(
+                raw.get("evidence_basis")
                 or raw.get("evidence")
                 or raw.get("reason")
                 or ""
             )
-            if not action_summary or not trigger_basis:
+            if not evidence_basis:
                 continue
-            owner = self._normalize_actionable_owner(raw.get("owner"))
-            status = self._normalize_actionable_status(raw.get("status"))
             due_at = _compact_whitespace(raw.get("due_at") or "")
             confidence = self._clamp_float(raw.get("confidence"), 0.0, 1.0, 0.75)
-            key = (item_type, action_summary.lower())
+            if confidence < 0.7:
+                continue
+            if item_type == "decision" and action_strength != "pending_decision":
+                continue
+            key = (item_type, evidence_basis.lower())
             if key in seen:
                 continue
             seen.add(key)
             normalized.append({
                 "item_type": item_type,
-                "action_summary": action_summary,
-                "owner": owner,
-                "status": status,
+                "action_strength": action_strength,
                 "due_at": due_at,
-                "trigger_basis": trigger_basis,
+                "evidence_basis": evidence_basis,
                 "confidence": confidence,
             })
             if len(normalized) >= max_items:
@@ -1981,8 +1975,8 @@ class MemoryNodeManager:
             fact_metadata = {
                 **metadata,
                 "tags": tags,
-                "state_aspects": fact.get("state_aspects") or [],
-                "actionable_aspects": fact.get("actionable_aspects") or [],
+                "entity_state_signal": fact.get("entity_state_signal") or [],
+                "action_signal": fact.get("action_signal") or [],
                 "episode_context_topics": list(episode_context_topics or []),
                 "episode_context_entities": list(episode_context_entities or []),
             }
@@ -2283,12 +2277,12 @@ class MemoryNodeManager:
 
     def _fact_can_seed_entity_state(self, fact: Dict[str, Any]) -> bool:
         """Entity states require an explicit projected aspect."""
-        state_aspects = self._state_aspects_from_fact(fact)
+        state_signals = self._entity_state_signals_from_fact(fact)
         return any(
             str(aspect.get("state_type") or "").strip().lower()
             in self._entity_scoped_state_types()
-            and bool(self._entities_for_state_aspect(aspect, fact))
-            for aspect in state_aspects
+            and bool(self._entities_for_state_signal(aspect, fact))
+            for aspect in state_signals
         )
 
     def _resolve_and_update_topic_states_from_facts(
@@ -2386,11 +2380,11 @@ class MemoryNodeManager:
                         )
                         updated += 1
 
-            candidate_has_actionable_aspects = any(
-                self._actionable_aspects_from_fact(fact)
+            candidate_has_action_signals = any(
+                self._action_signals_from_fact(fact)
                 for fact in (candidate.get("facts") or [])
             )
-            if self._enable_memory_actionable_item_update and candidate_has_actionable_aspects:
+            if self._enable_memory_actionable_item_update and candidate_has_action_signals:
                 existing_actionable_items = (
                     self._retrieve_existing_actionable_items_for_topic_state(
                         topic_state_id=state_id,
@@ -2429,7 +2423,7 @@ class MemoryNodeManager:
                     "memory_reflect",
                     "actionable_item_candidate_skipped",
                     {
-                        "reason": "no_actionable_aspects",
+                        "reason": "no_action_signal",
                         "candidate_root_topic": candidate.get("topic_name"),
                         "candidate_fact_ids": [
                             fact.get("id")
@@ -3280,7 +3274,7 @@ class MemoryNodeManager:
         candidate: Dict[str, Any],
     ) -> List[Dict[str, Any]]:
         aspect_items = [
-            aspect for aspect in candidate.get("state_aspects") or []
+            aspect for aspect in candidate.get("state_signals") or []
             if isinstance(aspect, dict)
             and _compact_whitespace(aspect.get("aspect_summary") or "")
         ]
@@ -3682,8 +3676,8 @@ class MemoryNodeManager:
             "primary_entity": fact.get("primary_entity"),
             "fact_root_topic": fact.get("fact_root_topic") or "",
             "fact_aspect_topic": fact.get("fact_aspect_topic") or "",
-            "state_aspects": fact.get("state_aspects") or metadata.get("state_aspects") or [],
-            "actionable_aspects": fact.get("actionable_aspects") or metadata.get("actionable_aspects") or [],
+            "entity_state_signal": fact.get("entity_state_signal") or metadata.get("entity_state_signal") or [],
+            "action_signal": fact.get("action_signal") or metadata.get("action_signal") or [],
             "confidence": fact.get("confidence"),
             "importance": fact.get("importance"),
         }
@@ -3721,13 +3715,13 @@ class MemoryNodeManager:
         grouped: Dict[Tuple[str, str, str, str], Dict[str, Any]] = {}
         for fact in facts:
             source_type = fact.get("source_type")
-            state_aspects = self._state_aspects_from_fact(fact)
-            if state_aspects:
-                for aspect in state_aspects:
+            state_signals = self._entity_state_signals_from_fact(fact)
+            if state_signals:
+                for aspect in state_signals:
                     state_type = str(aspect.get("state_type") or "").strip().lower()
                     if state_type not in self._entity_scoped_state_types():
                         continue
-                    entities = self._entities_for_state_aspect(aspect, fact)
+                    entities = self._entities_for_state_signal(aspect, fact)
                     if not entities:
                         continue
                     attribute_name = _compact_whitespace(aspect.get("attribute_name") or "")
@@ -3748,15 +3742,19 @@ class MemoryNodeManager:
                             "attribute_name_aliases": [attribute_name],
                             "facts": [],
                             "fact_ids": [],
-                            "state_aspects": [],
+                            "state_signals": [],
                         })
                         item["facts"].append(fact)
                         fact_id = None
                         if str(fact.get("id") or "").strip().isdigit():
                             fact_id = int(fact["id"])
                             item["fact_ids"].append(fact_id)
-                        item["state_aspects"].append({
+                        item["state_signals"].append({
                             **aspect,
+                            # Reflection, rather than fact extraction, owns
+                            # the final state summary. Keep fact text only as
+                            # internal fallback/evidence context.
+                            "aspect_summary": fact.get("summary") or "",
                             "fact_id": fact_id,
                             "fact_summary": fact.get("summary") or "",
                             "fact_event_time_key": fact.get("event_time_key") or "",
@@ -3769,12 +3767,12 @@ class MemoryNodeManager:
                 continue
             aspect_summaries = [
                 _compact_whitespace(aspect.get("aspect_summary") or "")
-                for aspect in item.get("state_aspects") or []
+                for aspect in item.get("state_signals") or []
                 if _compact_whitespace(aspect.get("aspect_summary") or "")
             ]
             aspect_evidence = [
                 _compact_whitespace(aspect.get("evidence_basis") or "")
-                for aspect in item.get("state_aspects") or []
+                for aspect in item.get("state_signals") or []
                 if _compact_whitespace(aspect.get("evidence_basis") or "")
             ]
             item["summary_text"] = "\n".join(
@@ -3810,13 +3808,14 @@ class MemoryNodeManager:
                     )
         return candidates
 
-    def _state_aspects_from_fact(self, fact: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def _entity_state_signals_from_fact(self, fact: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Build internal state candidates from lightweight extraction signals."""
         metadata = fact.get("metadata") if isinstance(fact.get("metadata"), dict) else {}
-        raw = fact.get("state_aspects") or metadata.get("state_aspects")
+        raw = fact.get("entity_state_signal") or metadata.get("entity_state_signal")
         fallback_entity = fact.get("primary_entity")
-        return self._normalize_state_aspects(raw, fallback_entity=fallback_entity)
+        return self._normalize_entity_state_signal(raw, fallback_entity=fallback_entity)
 
-    def _entities_for_state_aspect(
+    def _entities_for_state_signal(
         self,
         aspect: Dict[str, Any],
         fact: Dict[str, Any],
@@ -4011,14 +4010,13 @@ class MemoryNodeManager:
                 "attribute_name": candidate.get("attribute_name"),
                 "attribute_key": candidate.get("attribute_key"),
                 "attribute_name_aliases": candidate.get("attribute_name_aliases", []),
-                "state_aspect_summaries": [
+                "state_signal_evidence": [
                     {
                         "fact_id": aspect.get("fact_id"),
-                        "aspect_summary": aspect.get("aspect_summary") or "",
                         "evidence_basis": aspect.get("evidence_basis") or "",
                         "confidence": aspect.get("confidence"),
                     }
-                    for aspect in candidate.get("state_aspects") or []
+                    for aspect in candidate.get("state_signals") or []
                     if isinstance(aspect, dict)
                 ],
             }, ensure_ascii=False, indent=2))
@@ -4150,8 +4148,12 @@ class MemoryNodeManager:
         existing_state: Optional[Dict[str, Any]],
     ) -> Dict[str, Any]:
         summaries = [
-            _compact_whitespace(aspect.get("aspect_summary") or "")
-            for aspect in candidate.get("state_aspects") or []
+            _compact_whitespace(
+                aspect.get("aspect_summary")
+                or aspect.get("evidence_basis")
+                or ""
+            )
+            for aspect in candidate.get("state_signals") or []
             if isinstance(aspect, dict)
             and _compact_whitespace(aspect.get("aspect_summary") or "")
         ][:5]
@@ -4404,20 +4406,6 @@ class MemoryNodeManager:
             if not evidence_ids:
                 rejected_counts["missing_valid_evidence"] += 1
                 continue
-            aspect_owner_candidates: List[str] = []
-            for fact_id in evidence_ids:
-                fact = facts_by_id.get(fact_id)
-                if not fact:
-                    continue
-                for aspect in self._actionable_aspects_from_fact(fact):
-                    aspect_owner = self._normalize_actionable_owner(aspect.get("owner"))
-                    if aspect_owner != "unknown" and aspect_owner not in aspect_owner_candidates:
-                        aspect_owner_candidates.append(aspect_owner)
-            aspect_owner = (
-                aspect_owner_candidates[0]
-                if len(aspect_owner_candidates) == 1
-                else "unknown"
-            )
             source_type = self._state_source_type_for_facts(facts, evidence_ids)
             item_type = self._normalize_actionable_item_type(raw.get("item_type"))
             owner = self._normalize_actionable_owner(raw.get("owner"))
@@ -4435,7 +4423,7 @@ class MemoryNodeManager:
                     owner = (
                         existing_owner
                         if existing_owner != "unknown"
-                        else aspect_owner
+                        else "unknown"
                     )
                 status = self._normalize_actionable_status(
                     raw.get("status") or existing_item.get("status")
@@ -4443,8 +4431,6 @@ class MemoryNodeManager:
                 due_at = _compact_whitespace(
                     raw.get("due_at") or existing_item.get("due_at") or ""
                 )
-            elif owner == "unknown":
-                owner = aspect_owner
             existing_metadata = (
                 existing_item.get("metadata")
                 if isinstance(existing_item, dict)
@@ -4554,10 +4540,11 @@ class MemoryNodeManager:
             "confidence": item.get("confidence"),
         }
 
-    def _actionable_aspects_from_fact(self, fact: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def _action_signals_from_fact(self, fact: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Return lightweight action signals for reflection gating."""
         metadata = fact.get("metadata") if isinstance(fact.get("metadata"), dict) else {}
-        raw = fact.get("actionable_aspects") or metadata.get("actionable_aspects")
-        return self._normalize_actionable_aspects(raw)
+        raw = fact.get("action_signal") or metadata.get("action_signal")
+        return self._normalize_action_signal(raw)
 
     def _is_high_value_actionable_item(
         self,
@@ -4591,7 +4578,9 @@ class MemoryNodeManager:
 
         if item_type == "decision":
             if status == "decided":
-                return True
+                # A completed decision is durable context, not an open
+                # actionable item. It remains available through facts/state.
+                return False
             return self._has_strong_decision_marker(all_text) and not has_weak_try
 
         if item_type in {"follow_up", "open_question"}:
@@ -4745,8 +4734,7 @@ class MemoryNodeManager:
     ) -> List[Dict[str, Any]]:
         rows: List[Dict[str, Any]] = []
         for fact in facts[:80]:
-            metadata = fact.get("metadata") if isinstance(fact.get("metadata"), dict) else {}
-            actionable_aspects = self._actionable_aspects_from_fact(fact)
+            action_signals = self._action_signals_from_fact(fact)
             rows.append({
                 "id": fact.get("id"),
                 "source_type": fact.get("source_type"),
@@ -4760,7 +4748,7 @@ class MemoryNodeManager:
                 "primary_entity": fact.get("primary_entity"),
                 "fact_root_topic": fact.get("fact_root_topic") or "",
                 "fact_aspect_topic": fact.get("fact_aspect_topic") or "",
-                "actionable_aspects": actionable_aspects,
+                "action_signal": action_signals,
             })
         return rows
 

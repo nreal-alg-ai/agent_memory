@@ -163,25 +163,21 @@ Rules:
 13. keywords must be short retrieval terms: entities, topics, symptoms, plans, constraints, decisions, and important time/order anchors. For time-sensitive facts, include the original or resolved time phrase such as "March 15 2023", "first service", "3/22", "last Saturday", or "two months ago". Do not put full sentences, pleasantries, filler, generic encouragement, or phrases like "hope this method helps you" into keywords.
 14. Return JSON only. No markdown.
 
-state_aspects rules:
-- `fact_kind` remains the primary semantic type of the fact. `state_aspects` are projection slices showing how this fact can contribute to multiple entity_state types.
-- Output state_aspects only when the fact has durable long-term value for the user or another key entity. For one-off events, temporary suggestions, pleasantries, or low-value background, use an empty array.
-- Return at most 3 state_aspects per fact, keeping only the clearest and most useful aspects.
+entity_state_signal rules:
+- `entity_state_signal` only flags that the fact may contribute to a durable state of the user or another key entity; it is not the final entity_state update.
+- Output it only when the evidence explicitly expresses a reusable preference, profile, routine, relationship, constraint, or risk. Use an empty array for one-off events, temporary suggestions, pleasantries, and low-value background.
+- Return at most 3 signals per fact. Each signal contains only `state_type`, `attribute_name`, `evidence_basis`, and `confidence`, plus an evidence-supported `entity` when needed; do not generate an aspect summary or use prior state. Later reflection decides whether to create, update, or ignore it.
 - state_type must be one of: preference, profile, routine, relationship, constraint, risk.
-- aspect_summary must describe only the contribution for the current state_type, not restate the whole fact. For example, risk must say what may be affected or what negative outcome may happen; constraint states the limiting condition; routine states repeated behavior or cadence; preference states likes, dislikes, refusal, or selection tendency.
-- attribute_name must be more specific than the episode topic, such as "flexible workout preference", "health management execution constraint", or "weight-loss plan continuity risk". Avoid broad names like "health management" unless the evidence supports only a broad attribute.
-- evidence_basis must cite the specific evidence in the current fact that supports this aspect. Do not import prior state or outside inference.
+- attribute_name should name the specific potentially affected attribute, and evidence_basis must cite evidence from the current fact.
 
-actionable_aspects rules:
-- `actionable_aspects` are candidate projections showing how this fact may later become an actionable_item, used to reduce downstream LLM cost and noise.
-- Output actionable_aspects only when the fact explicitly contains something that needs future reminder, follow-up, execution, review, decision tracking, open-question resolution, or a high-value risk that blocks action.
-- Return at most 2 actionable_aspects per fact, keeping only the most concrete and trackable action signals.
+action_signal rules:
+- `action_signal` only flags that the fact may contain a follow-up action, decision, commitment, risk, or open question; it is not the final actionable_item.
+- Output it only for one of these cases: an explicitly assigned responsibility and action (assigned), an explicit commitment to execute (committed), an unresolved decision that explicitly requires a later choice or confirmation (pending_decision), or an explicit request for reminder, follow-up, or review (follow_up).
+- Mere suggestions, proposals, considerations, tendencies, discussions, vague "discuss further" language, missing executor or completion criteria, and completed decisions with no remaining action must use an empty array.
+- Return at most 2 signals per fact. Each signal contains only `item_type`, `action_strength`, `evidence_basis`, and `confidence`, with optional evidence-supported `due_at`; do not generate action_summary, owner, or status.
+- `action_strength` must be one of `assigned`, `committed`, `pending_decision`, or `follow_up`; do not output informational signals. `item_type=decision` is allowed only with `pending_decision`; completed decisions belong in facts/states.
 - item_type must be one of: task, commitment, decision, follow_up, open_question, risk, reminder, recommendation, constraint.
-- Do not extract weak willingness such as "might try", "sounds good", or "may consider" as an actionable_aspect unless it also includes an explicit reminder, deadline, follow-up check, strong commitment, or verifiable execution plan.
-- action_summary must be a self-contained action description stating "who is responsible + by what time or deadline (only when supported by evidence) + what action or target is involved". For example: "The team must finalize the promotion plan by next Tuesday." Without time evidence, at least state the responsible party and action; do not write only "finalize the plan" or invent a date.
-- owner identifies the actual party responsible for executing, following up, or deciding the action. It may be the user, assistant, a named speaker, a team, a department, or another entity explicitly supported by the evidence. It is not the target object, and a speaker is not automatically the owner merely because they spoke; when the evidence identifies only the requester but not the executor, use "unknown".
-- trigger_basis must cite the specific evidence in the current fact that supports this actionable signal.
-- due_at should be filled only when the evidence contains an explicit time, deadline, or reminder time; otherwise use an empty string.
+- Do not treat "might try", "sounds good", or "may consider" as an action signal unless there is also an explicit reminder, deadline, follow-up check, strong commitment, or verifiable execution plan.
 
 Output schema:
 {
@@ -202,23 +198,21 @@ Output schema:
       "event_time_key": "real-world event occurrence time or representative temporal anchor derived from the dialogue time anchor and fact content; empty when it cannot be determined",
       "time_confidence": "explicit|inferred_from_turn|unknown; explicit evidence, resolved from the segment Time and a relative expression, or undetermined",
       "where": "",
-      "state_aspects": [
+      "entity_state_signal": [
         {
           "state_type": "preference|profile|routine|relationship|constraint|risk",
           "attribute_name": "specific attribute name",
-          "aspect_summary": "durable contribution for this state_type only",
-          "evidence_basis": "specific evidence from this fact supporting the aspect",
+          "entity": {"name": "explicitly affected entity", "type": "PERSON|ORGANIZATION|LOCATION|PRODUCT|PROJECT|TECHNOLOGY|CONCEPT|TOPIC|PREFERENCE|OTHER"},
+          "evidence_basis": "specific evidence from this fact supporting the signal",
           "confidence": 0.8
         }
       ],
-      "actionable_aspects": [
+      "action_signal": [
         {
           "item_type": "task|commitment|decision|follow_up|open_question|risk|reminder|recommendation|constraint",
-          "action_summary": "self-contained action description with responsible party, time/deadline when supported, and concrete action",
-          "owner": "the actual responsible entity name, such as user, assistant, a named speaker, a team, or a department; use unknown when unclear",
-          "status": "open|in_progress|done|blocked|decided|noted|unknown",
+          "action_strength": "assigned|committed|pending_decision|follow_up",
           "due_at": "",
-          "trigger_basis": "specific evidence from this fact supporting the actionable signal",
+          "evidence_basis": "specific evidence from this fact supporting the signal",
           "confidence": 0.8
         }
       ]
@@ -353,11 +347,11 @@ entity_state_target field descriptions and usage:
 - `attribute_name`: the specific attribute represented by this candidate and the main semantic boundary of the update. The summary must explain what this attribute means long-term for the entity, rather than summarizing the whole dialogue or a topic_state.
 - `attribute_key`: the stable internal key for the attribute. Use it to help confirm attribute identity, but do not copy it into summary or canonical_name.
 - `attribute_name_aliases`: alternative or historical names for the same attribute. Use them when deciding whether existing_entity_state describes the same attribute, but do not mechanically concatenate all aliases into the output. If the existing state describes a different attribute, return `update_needed=false`.
-- `state_aspect_summaries`: aspects already extracted from the candidate facts that contribute to this entity_state type. Each `aspect_summary` describes only the contribution to this attribute, while `evidence_basis` explains why the current fact supports it. Prefer these fields when generating the summary and timeline; do not expand them into an unrelated topic summary.
-- `state_aspect_summaries[].fact_id`: the fact identifier supporting the aspect. Use it only to cite evidence in `evidence_fact_ids` and `time_line_updates[].fact_ids`; it is not semantic content and must not be used to infer facts from the number.
-- `state_aspect_summaries[].confidence`: the extraction confidence for the aspect. Use it to stay conservative; low-confidence or weakly supported aspects must not be expanded into new long-term conclusions.
+- `state_signal_evidence`: evidence in the candidate facts supporting this entity_state signal. The signal is not a final state conclusion; use the full fact summaries and existing_entity_state to decide whether an update is warranted.
+- `state_signal_evidence[].fact_id`: the fact identifier supporting the signal. Use it only to cite evidence in `evidence_fact_ids` and `time_line_updates[].fact_ids`.
+- `state_signal_evidence[].confidence`: the extraction confidence for the signal. Use it to stay conservative; low-confidence or weakly supported signals must not be expanded into new long-term conclusions.
 
-Processing principle: first use `entity` and `entity_key` to confirm the state owner, then use `state_type`, `attribute_name`, and the attribute aliases to establish the update boundary, and finally use `aspect_summary` and `evidence_basis` from `state_aspect_summaries` to produce the current state. Update only when the candidate aspect has durable value for this entity attribute. For one-off events, single recommendations, temporary requests, or topic-only progress, return `update_needed=false`. When existing_entity_state refers to the same entity and attribute, merge the candidate incrementally while preserving the existing long-term conclusion. If the attribute is different, do not force a merge.
+Processing principle: first use `entity` and `entity_key` to confirm the state owner, then use `state_type`, `attribute_name`, and the attribute aliases to establish the update boundary, and finally use the current facts, `state_signal_evidence`, and existing_entity_state to produce the current state. Update only when the evidence has durable value for this entity attribute. For one-off events, single recommendations, temporary requests, or topic-only progress, return `update_needed=false`. When existing_entity_state refers to the same entity and attribute, merge the candidate incrementally while preserving the existing long-term conclusion. If the attribute is different, do not force a merge.
 
 existing_entity_state:
 {existing_entity_state}
@@ -366,27 +360,28 @@ existing_entity_state:
 
 UNIFIED_ACTIONABLE_ITEM_EXTRACTION_PROMPT_EN = """You are the actionable-item extraction module for a unified AI-glasses long-term memory system inspired by MemPalace.
 
-The input contains one topic candidate and its newly stored narrative facts. Some facts include actionable_aspects as pre-filtered action signals. Within this topic, extract only concrete actionable items that truly require future follow-up, reminder, execution, review, or decision tracking. Actionable items are separate from evolving states: states summarize durable situations, preferences, constraints, and background; actionable items must be checkable, completable, trackable, or explicitly recalled as decisions, commitments, risks, or open questions.
+The input contains one topic candidate and its newly stored narrative facts. Some facts include action_signal as pre-filtered action signals. Within this topic, extract only concrete actionable items that truly require future follow-up, reminder, execution, review, or decision tracking. Actionable items are separate from evolving states: states summarize durable situations, preferences, constraints, and background; actionable items must be checkable, completable, trackable, or explicitly recalled as decisions, commitments, risks, or open questions.
 
-Prefer actionable_aspects when present, but extract only items directly supported by the fact summary and actionable_aspects.
+Prefer action_signal when present, but extract only items directly supported by the fact summary and action_signal.
 
 Rules:
 1. Extract 0-4 actionable items. Many ordinary dialogue batches should return an empty list. Do not force coverage of facts.
-2. Extract only strong actionable items: the user explicitly asks for a reminder/follow-up/record/arrangement/execution, the user or assistant clearly commits to future action, the user makes a trackable decision, a specific open issue must be resolved later, or a high-value risk is blocking an action.
-3. Do not extract weak willingness such as "the user is willing to try", "might try", "sounds good", or "may consider" as standalone actionable items. These belong in facts or states. Extract them only when they include an explicit reminder request, deadline, follow-up check, strong commitment, or verifiable execution plan.
-4. Do not extract ordinary assistant recommendations as actionable items. Extract them only when the user explicitly accepts them, asks for follow-up/reminders, or the recommendation becomes the user's task, commitment, or decision.
-5. Ordinary constraints, preferences, and background belong in states, not constraint items. Extract a constraint item only when the constraint is actively blocking a concrete action or decision.
-6. Do not copy every fact. If multiple facts point to the same matter, keep only the most specific and trackable item.
-7. Keep each item self-contained: `summary` must state "who is responsible + by what time or deadline (only when supported by evidence) + what action or target is involved", with the necessary context, reason, and current status. Do not invent a date when no time is supported; when the responsible party is unclear, you may say "responsible party not established" while still stating the action.
-8. `owner` identifies who the item belongs to and who is responsible for completing, following up, or deciding it. It is not the target object and not a list of mentioned entities. Prefer an explicit non-unknown `actionable_aspects.owner` from the supporting facts, then use explicit assignment language in the facts; use `primary_entity` only when it also clearly represents execution or decision responsibility. When updating an existing item, preserve its owner unless new facts clearly show that responsibility changed. Use `unknown` when the evidence is insufficient.
-9. owner must be the name of an evidence-supported responsible entity, such as "user", "assistant", "N_SPK8013", "Xiao Wang", "the team", or "the marketing department". Do not assign ownership merely because someone spoke or was mentioned, and do not output the generic category "other". Use `unknown` only when the responsible party is not established.
-10. evidence_fact_ids must cite supporting fact IDs from the input.
-11. item_type must be one of: task, commitment, decision, follow_up, open_question, risk, reminder, recommendation, constraint, other.
-12. status must be one of: open, in_progress, done, blocked, decided, noted, unknown.
-13. importance and confidence are 0-1. Do not inflate confidence to bypass the weak-willingness rule.
-14. When existing actionable_items are provided for this topic, first check whether the new facts explicitly change their status, deadline, owner, or current description. Emit `operation="update"` only when new evidence supports a change; do not mark an item done without evidence of completion.
-15. For an existing item, use its `id` in `existing_item_id` and preserve its `canonical_name` and `item_type`; for a new item use `operation="create"` and `existing_item_id=0`.
-16. Return JSON only. No markdown.
+2. Extract only strong actionable items: the input fact's action_signal must be assigned, committed, pending_decision, or follow_up, and the evidence must also contain an explicit executor or a verifiable outcome. This includes an explicit reminder/follow-up/record/arrangement/execution request, a clear future commitment, an unresolved decision requiring later choice or confirmation, a concrete open issue that must be resolved, or a high-value risk blocking a specific action.
+3. Completed decisions with no remaining action belong in facts/states, not actionable items; only decisions still awaiting choice, confirmation, or execution may be extracted.
+4. Do not extract weak willingness such as "the user is willing to try", "might try", "sounds good", or "may consider" as standalone actionable items. These belong in facts or states. Extract them only when they include an explicit reminder request, deadline, follow-up check, strong commitment, or verifiable execution plan.
+5. Do not extract ordinary assistant recommendations as actionable items. Extract them only when the user explicitly accepts them, asks for follow-up/reminders, or the recommendation becomes the user's task, commitment, or decision.
+6. Ordinary constraints, preferences, and background belong in states, not constraint items. Extract a constraint item only when the constraint is actively blocking a concrete action or decision.
+7. Do not copy every fact. If multiple facts point to the same matter, keep only the most specific and trackable item.
+8. Keep each item self-contained: `summary` must state "who is responsible + by what time or deadline (only when supported by evidence) + what action or target is involved", with the necessary context, reason, and current status. Do not invent a date when no time is supported; when the responsible party is unclear, you may say "responsible party not established" while still stating the action.
+9. `owner` identifies who the item belongs to and who is responsible for completing, following up, or deciding it. It is not the target object and not a list of mentioned entities. Use explicit assignment language in the facts; use `primary_entity` only when it also clearly represents execution or decision responsibility. When updating an existing item, preserve its owner unless new facts clearly show that responsibility changed. Use `unknown` when the evidence is insufficient.
+10. owner must be the name of an evidence-supported responsible entity, such as "user", "assistant", "N_SPK8013", "Xiao Wang", "the team", or "the marketing department". Do not assign ownership merely because someone spoke or was mentioned, and do not output the generic category "other". Use `unknown` only when the responsible party is not established.
+11. evidence_fact_ids must cite supporting fact IDs from the input.
+12. item_type must be one of: task, commitment, decision, follow_up, open_question, risk, reminder, recommendation, constraint, other.
+13. status must be one of: open, in_progress, done, blocked, decided, noted, unknown.
+14. importance and confidence are 0-1. Do not inflate confidence to bypass the weak-willingness rule.
+15. When existing actionable_items are provided for this topic, first check whether the new facts explicitly change their status, deadline, owner, or current description. Emit `operation="update"` only when new evidence supports a change; do not mark an item done without evidence of completion.
+16. For an existing item, use its `id` in `existing_item_id` and preserve its `canonical_name` and `item_type`; for a new item use `operation="create"` and `existing_item_id=0`.
+17. Return JSON only. No markdown.
 
 Output schema:
 {

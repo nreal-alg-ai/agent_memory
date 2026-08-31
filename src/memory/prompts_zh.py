@@ -161,25 +161,21 @@ fact_type 判别规则：
 14. keywords 只能包含用于检索的短实体、主题、症状、方案、约束、决定和关键时间/顺序锚，通常每个关键词 2-8 个汉字或一个短英文短语；对带时间锚的事件，必须加入原始或补全后的时间词，例如“March 15 2023”“first service”“3/22”“last Saturday”“two months ago”“上周六”“两个月前”。不要把完整句子、寒暄、礼貌话、语气词、泛化表达或“希望这个方法能帮到您”这类文本放入 keywords。
 15. 只返回 JSON，不要 markdown。
 
-state_aspects 输出规则：
-- `fact_kind` 仍然是这条 fact 的主语义类型；`state_aspects` 是这条 fact 对 entity_state 的多个长期状态投影切片。
-- 只有当该 fact 对用户或关键实体的长期状态确实有复用价值时才输出 state_aspects；普通一次性事件、临时建议、寒暄、低价值背景输出空数组。
-- 每条 fact 最多输出 3 个 state_aspects，只保留最明确、最有价值的侧面。
-- state_type 只能是 preference、profile、routine、relationship、constraint、risk。
-- aspect_summary 必须只描述当前 state_type 的贡献点，不能复述整条 fact。比如 risk 必须说明可能影响什么或造成什么后果；constraint 说明限制条件；routine 说明反复行为/节奏；preference 说明偏好/拒绝/选择倾向。
-- attribute_name 必须比 episode topic 更具体，例如“碎片化健身方式偏好”“健康管理执行限制”“减重计划持续性风险”，不要直接使用“健康管理”这类宽泛主题，除非证据只能支持宽泛属性。
-- evidence_basis 必须引用当前 fact 中支持该 aspect 的具体证据，不要引入历史 state 或外部推断。
+entity_state_signal 输出规则：
+- `entity_state_signal` 只是提示当前 fact 可能对用户或关键实体的长期状态有贡献，不是最终的 entity_state 更新。
+- 只有证据明确表达偏好、画像、习惯、关系、约束或风险，且具有跨场景复用价值时才输出；普通一次性事件、临时建议、寒暄和低价值背景输出空数组。
+- 每条 fact 最多输出 3 个 signal。每个 signal 只保留 `state_type`、`attribute_name`、`evidence_basis`、`confidence`，以及证据明确时的 `entity`；不要生成 aspect_summary，不要引用历史 state。
+- `state_type` 只能是 preference、profile、routine、relationship、constraint、risk。
+- `attribute_name` 应具体描述可能受影响的属性；`evidence_basis` 必须引用当前 fact 中的证据。后续 reflection 会结合已有 entity_state 决定是否创建、更新或忽略该信号。
 
-actionable_aspects 输出规则：
-- `actionable_aspects` 是这条 fact 对后续 actionable_item 提取的候选投影，用于降低后续 LLM 成本和噪声。
-- 只有当该 fact 明确包含未来需要提醒、跟进、执行、复盘、决策追踪、开放问题处理，或阻塞行动的高价值风险时才输出；普通偏好、背景、一次性建议、弱尝试意愿输出空数组。
-- 每条 fact 最多输出 2 个 actionable_aspects，只保留最具体、最可追踪的事项线索。
-- item_type 只能是 task、commitment、decision、follow_up、open_question、risk、reminder、recommendation、constraint。
-- 不要把“愿意试试/可以考虑/听起来不错”提取为 actionable_aspect，除非同时有明确提醒、截止时间、具体后续检查、强承诺或可验证执行计划。
-- action_summary 必须是自包含的行动描述，明确写出“谁负责 + 在什么时间/截止条件前（证据有才写）+ 做什么/针对什么对象”。例如“团队需在下周二前确定促销方案”；没有明确时间时至少写清责任主体和动作，不要只写“确定方案”，也不要编造日期。
-- owner 表示实际负责执行、跟进或作出决定的责任主体，可以是用户、助手、具体 speaker、团队、部门或其他证据中明确出现的主体。它不等于被讨论的对象，也不因为某个 speaker 发言就自动归属于该 speaker；如果只明确了提出要求的人而没有明确执行者，使用“未知”。
-- trigger_basis 必须引用当前 fact 中支持该 actionable 线索的具体证据。
-- due_at 只在证据明确包含时间、截止或提醒时间时填写，否则为空字符串。
+action_signal 输出规则：
+- `action_signal` 只是提示当前 fact 可能包含需要后续跟进的行动、决定、承诺、风险或开放问题，不是最终的 actionable_item。
+- 只有以下情况才输出：明确分配了责任和动作（assigned）、明确承诺执行（committed）、尚未完成且明确需要后续选择/确认的决策（pending_decision），或明确要求提醒/跟进/复盘的事项（follow_up）。
+- 仅仅“建议/提出/考虑/倾向/讨论/需要进一步探讨”、没有执行主体或完成标准的泛化表达，以及已经完成且无需后续动作的决定，都必须输出空数组。
+- 每条 fact 最多输出 2 个 signal。每个 signal 只保留 `item_type`、`action_strength`、`evidence_basis` 和 `confidence`，可选填写证据明确的 `due_at`；不要生成 action_summary、owner 或 status。
+- `action_strength` 只能是 `assigned`、`committed`、`pending_decision` 或 `follow_up`；不要输出 informational signal。`item_type=decision` 只有在 `pending_decision` 时才允许输出，已确定的决定属于 fact/state。
+- `item_type` 只能是 task、commitment、decision、follow_up、open_question、risk、reminder、recommendation、constraint。
+- 不要把“愿意试试/可以考虑/听起来不错”作为 action signal，除非同时有明确提醒、截止时间、后续检查、强承诺或可验证执行计划。后续 reflection 会结合已有 topic_state 和 actionable_item 决定最终关系。
 
 输出格式：
 {
@@ -200,23 +196,21 @@ actionable_aspects 输出规则：
       "event_time_key": "根据对话时间锚点和 fact 内容推导出的事件实际发生时间或代表性时间锚点；无法判断时为空字符串",
       "time_confidence": "explicit|inferred_from_turn|unknown；分别表示原文明确给出、结合当前片段 Time 和相对表达推断、无法判断",
       "where": "明确出现的地点、场景、平台或项目范围；没有明确证据时保持为空字符串，不要填写‘未提及’或类似说明",
-      "state_aspects": [
+      "entity_state_signal": [
         {
           "state_type": "preference|profile|routine|relationship|constraint|risk",
           "attribute_name": "具体属性名",
-          "aspect_summary": "只描述该 state_type 侧面的长期状态贡献点",
-          "evidence_basis": "当前 fact 中支持该 aspect 的具体证据",
+          "entity": {"name": "明确受影响的实体", "type": "PERSON|ORGANIZATION|LOCATION|PRODUCT|PROJECT|TECHNOLOGY|CONCEPT|TOPIC|PREFERENCE|OTHER"},
+          "evidence_basis": "当前 fact 中支持该 signal 的具体证据",
           "confidence": 0.8
         }
       ],
-      "actionable_aspects": [
+      "action_signal": [
         {
           "item_type": "task|commitment|decision|follow_up|open_question|risk|reminder|recommendation|constraint",
-          "action_summary": "自包含行动描述，包含责任主体、时间/截止条件（如有）和具体动作",
-          "owner": "实际责任主体名称；可以是用户、助手、具体 speaker、团队或部门；无法判断时：未知",
-          "status": "open|in_progress|done|blocked|decided|noted|unknown",
+          "action_strength": "assigned|committed|pending_decision|follow_up",
           "due_at": "",
-          "trigger_basis": "当前 fact 中支持该 actionable 线索的具体证据",
+          "evidence_basis": "当前 fact 中支持该 signal 的具体证据",
           "confidence": 0.8
         }
       ]
@@ -344,11 +338,11 @@ entity_state_target 字段说明与使用方式：
 - `attribute_name`：本次候选状态的具体属性名称，是更新的主要语义边界。summary 应该说明这个属性对该实体的长期含义，而不是泛泛总结整段对话或 topic_state 的进展。
 - `attribute_key`：属性的稳定内部键，用于辅助确认属性身份。它不是需要展示给用户的内容，不要直接复制到 summary 或 canonical_name。
 - `attribute_name_aliases`：该属性可能出现的同义名称或历史名称。判断已有 entity_state 是否描述同一属性时可以参考这些别名，但不要把所有别名机械拼接进输出；如果已有状态表达的是不同属性，应返回 `update_needed=false`。
-- `state_aspect_summaries`：当前候选 facts 已经提炼出的、对这个 entity_state 类型有贡献的 aspect。每一项中的 `aspect_summary` 只描述该属性的状态贡献，`evidence_basis` 说明当前 fact 为什么支持这个贡献。优先依据这些内容生成 summary 和 timeline，不要重新扩展成无关的 topic 总结。
-- `state_aspect_summaries[].fact_id`：支持该 aspect 的 fact 标识。它只用于在输出的 `evidence_fact_ids` 和 `time_line_updates[].fact_ids` 中准确引用证据，不代表可以写入自然语言内容，也不能根据编号推断事实。
-- `state_aspect_summaries[].confidence`：该 aspect 的提炼置信度，用于判断是否应该保守更新；低置信度或证据不足时不要扩展出新的长期结论。
+- `state_signal_evidence`：当前候选 facts 中支持该 entity_state 信号的证据。信号不是最终状态结论；请结合完整 fact summary 和 existing_entity_state 判断是否真的需要更新。
+- `state_signal_evidence[].fact_id`：支持该信号的 fact 标识，只用于在输出的 `evidence_fact_ids` 和 `time_line_updates[].fact_ids` 中引用。
+- `state_signal_evidence[].confidence`：信号提炼置信度，用于保守判断；低置信度或证据不足时不要扩展出新的长期结论。
 
-处理原则：先使用 `entity` 和 `entity_key` 确认状态归属，再使用 `state_type`、`attribute_name` 和属性别名确认更新边界，最后综合 `state_aspect_summaries` 中的 aspect_summary 与 evidence_basis 生成当前状态。只有当候选 aspect 对该实体属性确实具有长期价值时才更新；一次性事件、单次建议、临时请求或仅属于 topic_state 的进展都应返回 `update_needed=false`。如果 existing_entity_state 与 candidate 是同一实体和同一属性，则在保留已有长期结论的基础上增量融合；如果属性不同，不要强行合并。
+处理原则：先使用 `entity` 和 `entity_key` 确认状态归属，再使用 `state_type`、`attribute_name` 和属性别名确认更新边界，最后综合当前 facts、`state_signal_evidence` 与 existing_entity_state 生成当前状态。只有当证据对该实体属性确实具有长期价值时才更新；一次性事件、单次建议、临时请求或仅属于 topic_state 的进展都应返回 `update_needed=false`。如果 existing_entity_state 与 candidate 是同一实体和同一属性，则在保留已有长期结论的基础上增量融合；如果属性不同，不要强行合并。
 
 已有 entity_state：
 {existing_entity_state}
@@ -357,28 +351,29 @@ entity_state_target 字段说明与使用方式：
 
 UNIFIED_ACTIONABLE_ITEM_EXTRACTION_PROMPT_ZH = """你是 AI 眼镜长期记忆系统中的 actionable item 提取模块。
 
-输入包含一个 topic candidate 及其新存储的 narrative facts，部分 fact 会带有 actionable_aspects 作为前置筛选出的行动线索。请在这个 topic 范围内提取未来真正需要跟进、提醒、执行、复盘或决策追踪的具体可执行事项。actionable item 和 evolving state 分开：state 描述持续变化的长期状态、偏好、约束和背景；actionable item 必须是可以被检查、完成、追踪，或明确作为决定/承诺/风险/开放问题被召回的事项。
+输入包含一个 topic candidate 及其新存储的 narrative facts，部分 fact 会带有 action_signal 作为前置筛选出的行动线索。请在这个 topic 范围内提取未来真正需要跟进、提醒、执行、复盘或决策追踪的具体可执行事项。actionable item 和 evolving state 分开：state 描述持续变化的长期状态、偏好、约束和背景；actionable item 必须是可以被检查、完成、追踪，或明确作为决定/承诺/风险/开放问题被召回的事项。
 
-优先参考 actionable_aspects，但最终只能提取 fact summary 和 actionable_aspects 直接支持的内容。
+优先参考 action_signal，但最终只能提取 fact summary 和 action_signal 直接支持的内容。
 
 规则：
 1. 提取 0-4 条 actionable items。多数普通对话可以输出空列表，不要为了覆盖 facts 强行生成。
-2. 只提取强 actionable：用户明确要求提醒/跟进/记录/安排/执行，用户或助手明确承诺未来会做，用户做出可追踪的决定，存在必须后续解决的开放问题，或存在会阻塞行动的高价值风险。
-3. 不要把“用户愿意试试/可以试一试/听起来不错/可能会考虑”单独提取为 actionable item；这类弱尝试意愿默认只属于 fact 或 state。只有当它同时包含明确提醒需求、截止时间、具体后续检查、强承诺或可验证执行计划时才提取。
-4. 不要把助手的普通建议单独提取为 actionable item。只有当用户明确采纳、要求后续提醒/跟进，或该建议已经变成用户的任务/承诺/决定时才提取。
-5. 普通约束、偏好、背景信息应留给 state，不要作为 constraint item；只有当约束正在阻塞一个明确行动或决策时才提取。
-6. 不要复制每条 fact。若多条 facts 指向同一件事，只保留一条最具体、最可追踪的 item。
-7. 每个 item 必须可独立理解：`summary` 必须明确写出“谁负责 + 在什么时间/截止条件前（证据有才写）+ 做什么/针对什么对象”，并包含必要上下文、原因和当前状态。没有明确时间时不要编造日期；责任主体无法判断时可以使用“责任主体未明确”，但仍需写清待执行的动作。
-8. `canonical_name` 是用于识别、检索和合并同一待办的稳定短标题，不是完整句子或详细 summary。应包含最核心的动作/事项和目标对象，例如“提交报销材料”“跟进直播平台选择”；不要加入 owner、状态、截止日期、原因、多个无关事实或泛化标题。更新已有 item 时，如果仍是同一件事，必须复用已有的 `canonical_name`，只有事项本身发生变化时才修改。
-9. `owner` 表示这条待办属于谁、由谁负责完成、跟进或作出决定，不是待办涉及的对象，也不是所有被提及的实体。优先使用 supporting facts 中 `actionable_aspects.owner` 的明确责任主体，其次依据事实中的明确指派关系判断；`primary_entity` 只能在它同时明确表示执行或决策责任时作为辅助依据。更新已有 item 时优先保持已有 item 的 owner，只有新 fact 明确显示责任归属发生变化时才修改。无法判断时使用“未知”。
-10. owner 必须是证据支持的实际责任主体名称，可以是“用户”“助手”“N_SPK8013”“小王”“团队”或“市场部”等；不要因为某人发言、被提及或提出要求就自动把待办归给该人，也不要输出固定类别“其他”。
-11. evidence_fact_ids 必须引用输入中的 fact ID。
-12. item_type 只能是：task、commitment、decision、follow_up、open_question、risk、reminder、recommendation、constraint、other。
-13. status 只能是：open、in_progress、done、blocked、decided、noted、unknown。
-14. importance 和 confidence 都是 0-1。弱尝试意愿的 confidence 不应提高来绕过规则。
-15. 如果已有 actionable_items 与当前 topic 相关，优先判断新 facts 是否明确改变其状态、截止时间、责任人或当前描述。只有新 facts 明确支持变化时才输出 `operation="update"`；没有新证据表明完成时，不要擅自标记为 done。
-16. 更新已有 item 时必须使用已有 item 的 `id`，并保持其 `canonical_name` 和 `item_type` 稳定；新 item 使用 `operation="create"` 和 `existing_item_id=0`。
-17. 只返回 JSON，不要 markdown。
+2. 只提取强 actionable：输入 fact 的 action_signal 必须是 assigned、committed、pending_decision 或 follow_up；同时还要有明确的执行/跟进对象或可验证结果。用户明确要求提醒/跟进/记录/安排/执行、明确承诺未来会做、尚未完成且需要后续确认的决定、必须后续解决的具体开放问题，或阻塞具体行动的高价值风险才符合条件。
+3. 已经确定且没有剩余动作的决定属于 fact/state，不要作为 actionable item；只有仍待选择、确认或执行的决定才可以提取。
+4. 不要把“用户愿意试试/可以试一试/听起来不错/可能会考虑”单独提取为 actionable item；这类弱尝试意愿默认只属于 fact 或 state。只有当它同时包含明确提醒需求、截止时间、具体后续检查、强承诺或可验证执行计划时才提取。
+5. 不要把助手的普通建议单独提取为 actionable item。只有当用户明确采纳、要求后续提醒/跟进，或该建议已经变成用户的任务/承诺/决定时才提取。
+6. 普通约束、偏好、背景信息应留给 state，不要作为 constraint item；只有当约束正在阻塞一个明确行动或决策时才提取。
+7. 不要复制每条 fact。若多条 facts 指向同一件事，只保留一条最具体、最可追踪的 item。
+8. 每个 item 必须可独立理解：`summary` 必须明确写出“谁负责 + 在什么时间/截止条件前（证据有才写）+ 做什么/针对什么对象”，并包含必要上下文、原因和当前状态。没有明确时间时不要编造日期；责任主体无法判断时可以使用“责任主体未明确”，但仍需写清待执行的动作。
+9. `canonical_name` 是用于识别、检索和合并同一待办的稳定短标题，不是完整句子或详细 summary。应包含最核心的动作/事项和目标对象，例如“提交报销材料”“跟进直播平台选择”；不要加入 owner、状态、截止日期、原因、多个无关事实或泛化标题。更新已有 item 时，如果仍是同一件事，必须复用已有的 `canonical_name`，只有事项本身发生变化时才修改。
+10. `owner` 表示这条待办属于谁、由谁负责完成、跟进或作出决定，不是待办涉及的对象，也不是所有被提及的实体。依据 supporting facts 中的明确指派关系判断；`primary_entity` 只能在它同时明确表示执行或决策责任时作为辅助依据。更新已有 item 时优先保持已有 item 的 owner，只有新 fact 明确显示责任归属发生变化时才修改。无法判断时使用“未知”。
+11. owner 必须是证据支持的实际责任主体名称，可以是“用户”“助手”“N_SPK8013”“小王”“团队”或“市场部”等；不要因为某人发言、被提及或提出要求就自动把待办归给该人，也不要输出固定类别“其他”。
+12. evidence_fact_ids 必须引用输入中的 fact ID。
+13. item_type 只能是：task、commitment、decision、follow_up、open_question、risk、reminder、recommendation、constraint、other。
+14. status 只能是：open、in_progress、done、blocked、decided、noted、unknown。
+15. importance 和 confidence 都是 0-1。弱尝试意愿的 confidence 不应提高来绕过规则。
+16. 如果已有 actionable_items 与当前 topic 相关，优先判断新 facts 是否明确改变其状态、截止时间、责任人或当前描述。只有新 facts 明确支持变化时才输出 `operation="update"`；没有新证据表明完成时，不要擅自标记为 done。
+17. 更新已有 item 时必须使用已有 item 的 `id`，并保持其 `canonical_name` 和 `item_type` 稳定；新 item 使用 `operation="create"` 和 `existing_item_id=0`。
+18. 只返回 JSON，不要 markdown。
 
 输出格式：
 {
