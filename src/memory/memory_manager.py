@@ -5614,7 +5614,7 @@ class MemoryNodeManager:
             "lexical_candidate_limits": lexical_candidate_limits,
         })
 
-        lexical_fact_candidates, lexical_state_candidates, lexical_actionable_candidates = (
+        lexical_fact_candidates, lexical_state_candidates = (
             self._retrieve_recall_raw_candidates_lexical_search(
                 terms=terms,
                 candidate_source_prefix="stage1",
@@ -5625,7 +5625,7 @@ class MemoryNodeManager:
                 database=database,
             )
         )
-        entity_fact_candidates, entity_state_candidates, entity_actionable_candidates = (
+        entity_fact_candidates, entity_state_candidates = (
             self._retrieve_recall_entity_mapping_candidates(
                 query=query,
                 candidate_source_prefix="stage1",
@@ -5641,12 +5641,10 @@ class MemoryNodeManager:
                 entity_candidates=[
                     *entity_fact_candidates,
                     *entity_state_candidates,
-                    *entity_actionable_candidates,
                 ],
                 lexical_candidates=[
                     *lexical_fact_candidates,
                     *lexical_state_candidates,
-                    *lexical_actionable_candidates,
                 ],
                 source_types=source_types,
                 temporal_bounds=temporal_bounds,
@@ -5669,7 +5667,6 @@ class MemoryNodeManager:
         filtered_candidates: List[Dict[str, Any]] = [
             *ranked_fact_candidates,
             *ranked_state_candidates,
-            *ranked_actionable_items,
         ]
         semantic_query = self._recall_stage1_requires_semantic_search(query)
 
@@ -5677,25 +5674,27 @@ class MemoryNodeManager:
             self._recall_get_selected_candidates_by_layer(
                 ranked_fact_candidates=ranked_fact_candidates,
                 ranked_state_candidates=ranked_state_candidates,
-                ranked_actionable_items=ranked_actionable_items,
+                ranked_actionable_items=[],
                 layer_limits=layer_limits,
             )
         )
+        selected_actionable_items = self._retrieve_recall_actionable_candidates_for_states(
+            states=selected_candidates,
+            candidate_source_prefix="stage1",
+            limit=layer_limits.get("actionable_item", 0),
+            reference_time=reference_time,
+            database=database,
+        )
+        selected_candidates.extend(selected_actionable_items)
+        filtered_candidates.extend(selected_actionable_items)
+        selected_by_layer["actionable_item"] = len(selected_actionable_items)
 
         evidence_profile = self._recall_stage1_build_evidence_profile(
             selected_candidates,
         )
         evidence_gate = bool(evidence_profile.get("trusted"))
 
-        actionable_hit = any(
-            self._recall_stage1_candidate_match_type(item)
-            in {"high_priority_actionable", "exact_actionable"}
-            for item in selected_candidates
-        )
-        trusted = bool(selected_candidates) and (
-            evidence_gate
-            or actionable_hit
-        )
+        trusted = bool(selected_candidates) and evidence_gate
         memory_text = self._build_memory_retrieved_format_text(
             entries=selected_candidates,
             prompt_language=prompt_language,
@@ -5714,10 +5713,11 @@ class MemoryNodeManager:
             "lexical_candidate_limits": lexical_candidate_limits,
             "entity_mapping_fact_candidate_count": len(entity_fact_candidates),
             "entity_mapping_state_candidate_count": len(entity_state_candidates),
-            "entity_mapping_actionable_candidate_count": len(entity_actionable_candidates),
+            "entity_mapping_actionable_candidate_count": 0,
             "lexical_fact_candidate_count": len(lexical_fact_candidates),
             "lexical_state_candidate_count": len(lexical_state_candidates),
-            "lexical_actionable_candidate_count": len(lexical_actionable_candidates),
+            "lexical_actionable_candidate_count": 0,
+            "state_actionable_candidate_count": len(selected_actionable_items),
             "evidence_expansion_candidate_count": sum(
                 1
                 for candidate in raw_candidates
@@ -5950,20 +5950,14 @@ class MemoryNodeManager:
         raw_candidate_limits = {
             "fact": base_raw_limit,
             "state": base_raw_limit,
-            "actionable_item": base_raw_limit,
         }
 
         # Contextual recall needs a wider recent-fact and active-topic pool;
-        # actionable recall needs more actionable candidates for the
-        # high-priority pass. These are raw retrieval budgets, not additional
-        # final output slots.
+        # these are raw retrieval budgets, not additional final output slots.
         contextual_extra = max(4, min(16, k * 2))
-        actionable_extra = max(4, min(16, k * 2))
         if contextual:
             raw_candidate_limits["fact"] += contextual_extra
             raw_candidate_limits["state"] += contextual_extra
-        if actionable:
-            raw_candidate_limits["actionable_item"] += actionable_extra
         raw_candidate_limits = {
             key: min(48, value)
             for key, value in raw_candidate_limits.items()
@@ -5981,6 +5975,9 @@ class MemoryNodeManager:
             limits["fact"] += contextual_layer_extra
             limits["state"] += contextual_layer_extra
         if actionable:
+            # Actionable items are loaded from recalled topic states, so an
+            # actionable query widens the derived-item quota rather than a
+            # direct actionable search quota.
             limits["actionable_item"] += actionable_layer_extra
         return raw_candidate_limits, limits
 
@@ -7149,7 +7146,7 @@ class MemoryNodeManager:
             "temporal_mode": temporal_mode,
         })
         if supplement_terms:
-            lexical_fact_candidates, lexical_state_candidates, lexical_actionable_candidates = (
+            lexical_fact_candidates, lexical_state_candidates = (
                 self._retrieve_recall_raw_candidates_lexical_search(
                     terms=supplement_terms,
                     candidate_source_prefix="stage2",
@@ -7161,8 +7158,8 @@ class MemoryNodeManager:
                 )
             )
         else:
-            lexical_fact_candidates, lexical_state_candidates, lexical_actionable_candidates = (
-                [], [], []
+            lexical_fact_candidates, lexical_state_candidates = (
+                [], []
             )
         stage1_raw_candidates = list(
             (stage1_report or {}).get("raw_candidates") or []
@@ -7177,7 +7174,7 @@ class MemoryNodeManager:
             entity for entity in llm_entities
             if self._recall_stage1_normalize_match_text(entity) not in stage1_entity_names
         ]
-        stage2_entity_fact_candidates, stage2_entity_state_candidates, stage2_entity_actionable_candidates = (
+        stage2_entity_fact_candidates, stage2_entity_state_candidates = (
             self._retrieve_recall_entity_mapping_candidates(
                 query=" ".join(new_llm_entities),
                 candidate_source_prefix="stage2",
@@ -7193,12 +7190,10 @@ class MemoryNodeManager:
             stage2_lexical_candidates=[
                 *lexical_fact_candidates,
                 *lexical_state_candidates,
-                *lexical_actionable_candidates,
             ],
             stage2_entity_candidates=[
                 *stage2_entity_fact_candidates,
                 *stage2_entity_state_candidates,
-                *stage2_entity_actionable_candidates,
             ],
             source_types=forced_source_types,
             temporal_bounds=temporal_bounds,
@@ -7250,12 +7245,20 @@ class MemoryNodeManager:
         ranked = self._rank_recall_raw_candidates(
             facts=fact_candidates,
             states=state_candidates,
-            actionable_items=actionable_candidates,
+            actionable_items=[],
             query=query,
             terms=ranking_terms,
             query_embedding=query_identity_embedding,
             final_candidate_limits=final_candidate_limits,
         )
+        state_actionable_candidates = self._retrieve_recall_actionable_candidates_for_states(
+            states=ranked,
+            candidate_source_prefix="stage2",
+            limit=final_candidate_limits.get("actionable_item", 0),
+            reference_time=(temporal_bounds or (None, None))[1],
+            database=database,
+        )
+        ranked = [*ranked, *state_actionable_candidates]
         
         ranked_payload = {
             "facts": self._recall_log_candidate_items([
@@ -7267,6 +7270,7 @@ class MemoryNodeManager:
             "actionable_items": self._recall_log_candidate_items([
                 item for item in ranked if item.get("index_level") == "actionable_item"
             ]),
+            "state_actionable_candidate_count": len(state_actionable_candidates),
             "all_ranked": self._recall_log_candidate_items(ranked, limit=20),
         }
         if self._recall_detailed_logging:
@@ -7425,6 +7429,124 @@ class MemoryNodeManager:
             candidate["canonical_topics"] = topics
         return candidate
 
+    def _retrieve_recall_actionable_candidates_for_states(
+        self,
+        *,
+        states: Sequence[Dict[str, Any]],
+        candidate_source_prefix: str,
+        limit: int,
+        reference_time: Optional[str] = None,
+        database: Optional[SessionDB] = None,
+    ) -> List[Dict[str, Any]]:
+        """Load actionable items only through recalled topic-state mappings."""
+        max_items = max(0, int(limit or 0))
+        if max_items <= 0:
+            return []
+        db = database or self._db
+        reference = reference_time or datetime.now().astimezone().isoformat()
+        candidates: List[Dict[str, Any]] = []
+        seen_item_ids: set[int] = set()
+        for state in states or []:
+            if str(state.get("index_level") or "") != "state":
+                continue
+            raw_state = (
+                state.get("_hydrated")
+                if isinstance(state.get("_hydrated"), dict)
+                else {}
+            )
+            state_scope = str(raw_state.get("state_scope") or "").strip().lower()
+            if state_scope and state_scope != "topic_state":
+                continue
+            try:
+                state_id = int(state.get("target_id"))
+            except (TypeError, ValueError):
+                continue
+            state_score = self._clamp_float(
+                state.get("_recall_score") or state.get("_recall_type_score"),
+                0.0,
+                1.0,
+                0.0,
+            )
+            actionable_rows = db.memory_actionable_items_by_topic_state_id(
+                state_id,
+                limit=max_items,
+            )
+            for row in actionable_rows:
+                try:
+                    item_id = int(row.get("id"))
+                except (TypeError, ValueError):
+                    continue
+                if item_id in seen_item_ids:
+                    continue
+                candidate = self._make_recall_memory_candidate(
+                    table="memory_actionable_items",
+                    level="actionable_item",
+                    row=row,
+                    candidate_source=(
+                        f"{str(candidate_source_prefix).strip()}"
+                        "_state_actionable_expansion"
+                    ),
+                    temporal_bounds=None,
+                    temporal_mode="dialogue_time",
+                )
+                if not candidate:
+                    continue
+                seen_item_ids.add(item_id)
+                high_priority = self._recall_stage1_is_high_priority_actionable(
+                    candidate,
+                    reference_time=reference,
+                )
+                priority_bonus = (
+                    self._clamp_float(
+                        self._memory_cfg.get(
+                            "recall_fast_high_priority_actionable_score",
+                            0.20,
+                        ),
+                        0.0,
+                        1.0,
+                        0.20,
+                    )
+                    if high_priority
+                    else 0.0
+                )
+                candidate_score = min(1.0, state_score + priority_bonus)
+                candidate["_recall_parent_state_id"] = state_id
+                candidate["_recall_parent_state_score"] = round(state_score, 4)
+                candidate["_recall_score"] = round(candidate_score, 4)
+                candidate["_recall_type_score"] = round(candidate_score, 4)
+                candidate["_recall_fast_match_evidence"] = [
+                    "state_actionable_expansion",
+                    *(["high_priority_actionable"] if high_priority else []),
+                ]
+                candidate["_recall_fast_match_details"] = {
+                    "match_type": "state_actionable_expansion",
+                    "strong_anchor": False,
+                    "rank_score": round(candidate_score, 4),
+                    "candidate_score_passed": True,
+                    "matched": True,
+                    "candidate_score_threshold": 0.0,
+                }
+                candidate["_recall_decision"] = {
+                    "accepted": True,
+                    "decision_reason": "attached_to_recalled_topic_state",
+                }
+                candidate["_recall_score_components"] = {
+                    "parent_state_score": round(state_score, 4),
+                    "high_priority_actionable": round(priority_bonus, 4),
+                    "final_type_score": round(candidate_score, 4),
+                }
+                candidates.append(candidate)
+
+        candidates.sort(
+            key=lambda item: (
+                float(item.get("_recall_score") or 0.0),
+                str(item.get("time_start") or ""),
+                int(item.get("target_id") or 0),
+            ),
+            reverse=True,
+        )
+        return candidates[:max_items]
+
     def _retrieve_recall_entity_mapping_candidates(
         self,
         *,
@@ -7435,8 +7557,8 @@ class MemoryNodeManager:
         temporal_mode: str,
         candidate_limits: Dict[str, int],
         database: Optional[SessionDB] = None,
-    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
-        """Retrieve direct memory candidates through query-matched entities."""
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """Retrieve fact and topic-state candidates through matched entities."""
         db = database or self._db
         entity_lookup_aliases = self._recall_entity_lookup_aliases(query)
         entity_lookup_text = " ".join(
@@ -7450,21 +7572,19 @@ class MemoryNodeManager:
             if str(row.get("name") or "").strip()
         ]
         if not entity_ids:
-            return [], [], []
+            return [], []
         mappings = db.memory_entity_mappings_by_entity_ids(entity_ids)
         if not mappings:
-            return [], [], []
+            return [], []
         allowed_sources = set(source_types or [])
         ids_by_level: Dict[str, List[int]] = {
             "fact": [],
             "state": [],
-            "actionable_item": [],
         }
         for mapping in mappings:
             for field, level in (
                 ("fact_id", "fact"),
                 ("state_id", "state"),
-                ("actionable_item_id", "actionable_item"),
             ):
                 level_limit = max(
                     0,
@@ -7484,21 +7604,17 @@ class MemoryNodeManager:
 
         facts = db.memory_facts_by_ids(ids_by_level["fact"])
         states = db.memory_states_by_ids(ids_by_level["state"])
-        actionable_items = db.memory_actionable_items_by_ids(ids_by_level["actionable_item"])
         candidates_by_level: Dict[str, List[Dict[str, Any]]] = {
             "fact": [],
             "state": [],
-            "actionable_item": [],
         }
         rows_by_level = {
             "fact": facts,
             "state": states,
-            "actionable_item": actionable_items,
         }
         table_by_level = {
             "fact": "memory_facts",
             "state": "memory_states",
-            "actionable_item": "memory_actionable_items",
         }
         for level, rows in rows_by_level.items():
             for row in rows:
@@ -7520,7 +7636,6 @@ class MemoryNodeManager:
         return (
             candidates_by_level["fact"],
             candidates_by_level["state"],
-            candidates_by_level["actionable_item"],
         )
 
     def _retrieve_recall_raw_candidates_lexical_search(
@@ -7533,7 +7648,7 @@ class MemoryNodeManager:
         temporal_mode: str,
         candidate_limits: Dict[str, int],
         database: Optional[SessionDB] = None,
-    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         """Build separate raw candidate groups before type-specific ranking.
 
         This intentionally bypasses `memory_index_entries` for the default
@@ -7545,14 +7660,8 @@ class MemoryNodeManager:
         table_specs = (
             ("memory_facts", "fact", db.search_memory_facts),
             ("memory_states", "state", db.search_memory_states),
-            ("memory_actionable_items", "actionable_item", db.search_memory_actionable_items),
         )
         rows_by_table: Dict[str, List[Dict[str, Any]]] = {}
-        raw_limit_keys = {
-            "memory_facts": "fact",
-            "memory_states": "state",
-            "memory_actionable_items": "actionable_item",
-        }
         for table, _level, loader in table_specs:
             loader_kwargs = {
                 "terms": terms,
@@ -7561,7 +7670,7 @@ class MemoryNodeManager:
                 # column, so their own update/due time is used below.
                 "time_start": time_start if table == "memory_facts" else None,
                 "time_end": time_end if table == "memory_facts" else None,
-                "limit": max(1, int(candidate_limits.get(raw_limit_keys[table], 1) or 1)),
+                "limit": max(1, int(candidate_limits.get(_level, 1) or 1)),
             }
             if table == "memory_facts":
                 loader_kwargs["temporal_mode"] = temporal_mode
@@ -7570,7 +7679,6 @@ class MemoryNodeManager:
         candidates_by_level: Dict[str, List[Dict[str, Any]]] = {
             "fact": [],
             "state": [],
-            "actionable_item": [],
         }
         for table, level, _loader in table_specs:
             for row in rows_by_table[table]:
@@ -7700,16 +7808,14 @@ class MemoryNodeManager:
                 candidate["_recall_bm25_score"] = round(normalized_bm25_score, 4)
                 candidate["_recall_bm25_rank"] = position + 1
         self._logger.debug(
-            "Direct recall candidates: facts=%d states=%d actionable_items=%d total=%d",
+            "Direct recall candidates: facts=%d states=%d total=%d",
             len(rows_by_table["memory_facts"]),
             len(rows_by_table["memory_states"]),
-            len(rows_by_table["memory_actionable_items"]),
             sum(len(items) for items in candidates_by_level.values()),
         )
         return (
             candidates_by_level["fact"],
             candidates_by_level["state"],
-            candidates_by_level["actionable_item"],
         )
 
     def _make_recall_fact_candidate(
@@ -9014,7 +9120,6 @@ class MemoryNodeManager:
         supplement_limits = {
             "fact": base_raw_limit,
             "state": base_raw_limit,
-            "actionable_item": base_raw_limit,
         }
 
         supplement_limits = {
