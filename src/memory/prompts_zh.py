@@ -169,13 +169,12 @@ entity_state_signal 输出规则：
 - `attribute_name` 应具体描述可能受影响的属性；`evidence_basis` 必须引用当前 fact 中的证据。后续 reflection 会结合已有 entity_state 决定是否创建、更新或忽略该信号。
 
 action_signal 输出规则：
-- `action_signal` 只是提示当前 fact 可能包含需要后续跟进的行动、决定、承诺、风险或开放问题，不是最终的 actionable_item。
-- 只有以下情况才输出：明确分配了责任和动作（assigned）、明确承诺执行（committed）、尚未完成且明确需要后续选择/确认的决策（pending_decision），或明确要求提醒/跟进/复盘的事项（follow_up）。
-- 仅仅“建议/提出/考虑/倾向/讨论/需要进一步探讨”、没有执行主体或完成标准的泛化表达，以及已经完成且无需后续动作的决定，都必须输出空数组。
-- 每条 fact 最多输出 2 个 signal。每个 signal 只保留 `item_type`、`action_strength`、`evidence_basis` 和 `confidence`，可选填写证据明确的 `due_at`；不要生成 action_summary、owner 或 status。
-- `action_strength` 只能是 `assigned`、`committed`、`pending_decision` 或 `follow_up`；不要输出 informational signal。`item_type=decision` 只有在 `pending_decision` 时才允许输出，已确定的决定属于 fact/state。
+- `action_signal` 只是候选线索，不是最终的 actionable_item。它允许有少量误报，后续 actionable 提取模块会重新核验。
+- 只有当前 fact 明显涉及未来行动、执行承诺、未完成决定或明确提醒/跟进时才输出；没有未来导向时输出空数组。不要根据上下文推断责任人、截止时间、完成状态或最终结论。
+- `action_strength` 只能是 `assigned`、`committed`、`pending_decision` 或 `follow_up`，表示粗粒度候选类型，不代表最终判断；`item_type=decision` 仅可搭配 `pending_decision`。
+- 每条 fact 最多输出 1 个 signal。每个 signal 只保留 `item_type`、`action_strength`、`evidence_basis` 和 `confidence`，可选填写证据明确的 `due_at`；不要生成 action_summary、owner 或 status。
+- `evidence_basis` 必须来自当前 fact 的直接证据，不要拼接多个事实或补充未出现的责任人、时间和结论。
 - `item_type` 只能是 task、commitment、decision、follow_up、open_question、risk、reminder、recommendation、constraint。
-- 不要把“愿意试试/可以考虑/听起来不错”作为 action signal，除非同时有明确提醒、截止时间、后续检查、强承诺或可验证执行计划。后续 reflection 会结合已有 topic_state 和 actionable_item 决定最终关系。
 
 输出格式：
 {
@@ -353,27 +352,35 @@ UNIFIED_ACTIONABLE_ITEM_EXTRACTION_PROMPT_ZH = """你是 AI 眼镜长期记忆�
 
 输入包含一个 topic candidate 及其新存储的 narrative facts，部分 fact 会带有 action_signal 作为前置筛选出的行动线索。请在这个 topic 范围内提取未来真正需要跟进、提醒、执行、复盘或决策追踪的具体可执行事项。actionable item 和 evolving state 分开：state 描述持续变化的长期状态、偏好、约束和背景；actionable item 必须是可以被检查、完成、追踪，或明确作为决定/承诺/风险/开放问题被召回的事项。
 
-优先参考 action_signal，但最终只能提取 fact summary 和 action_signal 直接支持的内容。
+`action_signal` 只是候选线索，可能包含误报，不能直接转换为 actionable_item。必须重新核验完整 fact summary 和 signal 的直接证据；无法确认时输出空列表。
 
 规则：
 1. 提取 0-4 条 actionable items。多数普通对话可以输出空列表，不要为了覆盖 facts 强行生成。
-2. 只提取强 actionable：输入 fact 的 action_signal 必须是 assigned、committed、pending_decision 或 follow_up；同时还要有明确的执行/跟进对象或可验证结果。用户明确要求提醒/跟进/记录/安排/执行、明确承诺未来会做、尚未完成且需要后续确认的决定、必须后续解决的具体开放问题，或阻塞具体行动的高价值风险才符合条件。
-3. 已经确定且没有剩余动作的决定属于 fact/state，不要作为 actionable item；只有仍待选择、确认或执行的决定才可以提取。
-4. 不要把“用户愿意试试/可以试一试/听起来不错/可能会考虑”单独提取为 actionable item；这类弱尝试意愿默认只属于 fact 或 state。只有当它同时包含明确提醒需求、截止时间、具体后续检查、强承诺或可验证执行计划时才提取。
-5. 不要把助手的普通建议单独提取为 actionable item。只有当用户明确采纳、要求后续提醒/跟进，或该建议已经变成用户的任务/承诺/决定时才提取。
-6. 普通约束、偏好、背景信息应留给 state，不要作为 constraint item；只有当约束正在阻塞一个明确行动或决策时才提取。
+2. 每个 item 都必须有明确的 fact 证据和可核验结果；action_signal 是必要的候选线索，但不是充分条件。建议、计划、考虑、倾向、讨论或泛化的“后续探讨”不能单独生成 item。
+3. `pending_decision` 必须同时满足：决策对象明确；当前仍未决；存在具体选项、确认/商定动作或截止时间。缺少任意一项则不要生成 decision/open_question。
+4. “已经决定 X，但执行细节/落实进度尚未确定”不属于 `pending_decision`；只有明确责任人、动作和交付物时，才可生成 task/commitment。
+5. `assigned` 必须有明确责任主体、具体动作和交付物或完成标准；`committed` 必须是明确承诺执行；`follow_up` 必须是明确提醒、跟进、复盘、下次确认或汇报。仅“有人提出/建议/需要/各部门回去落实”不够。
+6. 已经确定且没有剩余动作的决定、普通约束、偏好和背景信息属于 fact/state，不要作为 actionable item。弱尝试意愿和助手普通建议也默认输出空列表。
 7. 不要复制每条 fact。若多条 facts 指向同一件事，只保留一条最具体、最可追踪的 item。
-8. 每个 item 必须可独立理解：`summary` 必须明确写出“谁负责 + 在什么时间/截止条件前（证据有才写）+ 做什么/针对什么对象”，并包含必要上下文、原因和当前状态。没有明确时间时不要编造日期；责任主体无法判断时可以使用“责任主体未明确”，但仍需写清待执行的动作。
-9. `canonical_name` 是用于识别、检索和合并同一待办的稳定短标题，不是完整句子或详细 summary。应包含最核心的动作/事项和目标对象，例如“提交报销材料”“跟进直播平台选择”；不要加入 owner、状态、截止日期、原因、多个无关事实或泛化标题。更新已有 item 时，如果仍是同一件事，必须复用已有的 `canonical_name`，只有事项本身发生变化时才修改。
-10. `owner` 表示这条待办属于谁、由谁负责完成、跟进或作出决定，不是待办涉及的对象，也不是所有被提及的实体。依据 supporting facts 中的明确指派关系判断；`primary_entity` 只能在它同时明确表示执行或决策责任时作为辅助依据。更新已有 item 时优先保持已有 item 的 owner，只有新 fact 明确显示责任归属发生变化时才修改。无法判断时使用“未知”。
-11. owner 必须是证据支持的实际责任主体名称，可以是“用户”“助手”“N_SPK8013”“小王”“团队”或“市场部”等；不要因为某人发言、被提及或提出要求就自动把待办归给该人，也不要输出固定类别“其他”。
-12. evidence_fact_ids 必须引用输入中的 fact ID。
-13. item_type 只能是：task、commitment、decision、follow_up、open_question、risk、reminder、recommendation、constraint、other。
-14. status 只能是：open、in_progress、done、blocked、decided、noted、unknown。
-15. importance 和 confidence 都是 0-1。弱尝试意愿的 confidence 不应提高来绕过规则。
-16. 如果已有 actionable_items 与当前 topic 相关，优先判断新 facts 是否明确改变其状态、截止时间、责任人或当前描述。只有新 facts 明确支持变化时才输出 `operation="update"`；没有新证据表明完成时，不要擅自标记为 done。
-17. 更新已有 item 时必须使用已有 item 的 `id`，并保持其 `canonical_name` 和 `item_type` 稳定；新 item 使用 `operation="create"` 和 `existing_item_id=0`。
-18. 只返回 JSON，不要 markdown。
+8. 以下情况必须输出空列表：
+   - “团队决定同时上线多种赠品形式，但执行细节尚未确定。”
+   - “建议多方面了解后进一步探讨。”
+   - “有人提出需要与银行谈判争取较低利率。”
+   以下情况可以生成 `pending_decision`：
+   - “尚未决定选择抖音还是小红书作为主促销平台。”
+   - “团队存在分歧，需要在下周二前确认产品颜色。”
+9. `evidence_fact_ids` 必须引用输入中的 fact ID；每个 item 应能对应到一个直接支持它的 fact signal。
+10. 每个 item 必须可独立理解：`summary` 必须明确写出“谁负责 + 在什么时间/截止条件前（证据有才写）+ 做什么/针对什么对象”，并包含必要上下文、原因和当前状态。没有明确时间时不要编造日期；责任主体无法判断时可以使用“责任主体未明确”，但仍需写清待执行的动作。
+11. `canonical_name` 是用于识别、检索和合并同一待办的稳定短标题，不是完整句子或详细 summary。应包含最核心的动作/事项和目标对象，例如“提交报销材料”“跟进直播平台选择”；不要加入 owner、状态、截止日期、原因、多个无关事实或泛化标题。更新已有 item 时，如果仍是同一件事，必须复用已有的 `canonical_name`，只有事项本身发生变化时才修改。
+12. `owner` 表示这条待办属于谁、由谁负责完成、跟进或作出决定，不是待办涉及的对象，也不是所有被提及的实体。依据 supporting facts 中的明确指派关系判断；`primary_entity` 只能在它同时明确表示执行或决策责任时作为辅助依据。更新已有 item 时优先保持已有 item 的 owner，只有新 fact 明确显示责任归属发生变化时才修改。无法判断时使用“未知”。
+13. owner 必须是证据支持的实际责任主体名称，可以是“用户”“助手”“N_SPK8013”“小王”“团队”或“市场部”等；不要因为某人发言、被提及或提出要求就自动把待办归给该人，也不要输出固定类别“其他”。
+14. evidence_fact_ids 必须引用输入中的 fact ID。
+15. item_type 只能是：task、commitment、decision、follow_up、open_question、risk、reminder、recommendation、constraint、other。
+16. status 只能是：open、in_progress、done、blocked、decided、noted、unknown。
+17. importance 和 confidence 都是 0-1。弱尝试意愿的 confidence 不应提高来绕过规则。
+18. 如果已有 actionable_items 与当前 topic 相关，优先判断新 facts 是否明确改变其状态、截止时间、责任人或当前描述。只有新 facts 明确支持变化时才输出 `operation="update"`；没有新证据表明完成时，不要擅自标记为 done。
+19. 更新已有 item 时必须使用已有 item 的 `id`，并保持其 `canonical_name` 和 `item_type` 稳定；新 item 使用 `operation="create"` 和 `existing_item_id=0`。
+20. 只返回 JSON，不要 markdown。
 
 输出格式：
 {

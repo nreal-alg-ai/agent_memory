@@ -171,13 +171,12 @@ entity_state_signal rules:
 - attribute_name should name the specific potentially affected attribute, and evidence_basis must cite evidence from the current fact.
 
 action_signal rules:
-- `action_signal` only flags that the fact may contain a follow-up action, decision, commitment, risk, or open question; it is not the final actionable_item.
-- Output it only for one of these cases: an explicitly assigned responsibility and action (assigned), an explicit commitment to execute (committed), an unresolved decision that explicitly requires a later choice or confirmation (pending_decision), or an explicit request for reminder, follow-up, or review (follow_up).
-- Mere suggestions, proposals, considerations, tendencies, discussions, vague "discuss further" language, missing executor or completion criteria, and completed decisions with no remaining action must use an empty array.
-- Return at most 2 signals per fact. Each signal contains only `item_type`, `action_strength`, `evidence_basis`, and `confidence`, with optional evidence-supported `due_at`; do not generate action_summary, owner, or status.
-- `action_strength` must be one of `assigned`, `committed`, `pending_decision`, or `follow_up`; do not output informational signals. `item_type=decision` is allowed only with `pending_decision`; completed decisions belong in facts/states.
+- `action_signal` is only a candidate hint, not the final actionable_item. It may contain a small number of false positives and will be re-checked by the actionable extraction module.
+- Output it only when the fact clearly involves a future action, execution commitment, unresolved decision, or explicit reminder/follow-up. Otherwise output an empty array. Do not infer an owner, deadline, completion state, or final conclusion from context.
+- `action_strength` must be one of `assigned`, `committed`, `pending_decision`, or `follow_up`; it is a coarse candidate type, not a final judgment. `item_type=decision` is allowed only with `pending_decision`.
+- Return at most 1 signal per fact. Each signal contains only `item_type`, `action_strength`, `evidence_basis`, and `confidence`, with optional evidence-supported `due_at`; do not generate action_summary, owner, or status.
+- `evidence_basis` must come from direct evidence in the current fact; do not combine facts or invent an owner, time, or conclusion.
 - item_type must be one of: task, commitment, decision, follow_up, open_question, risk, reminder, recommendation, constraint.
-- Do not treat "might try", "sounds good", or "may consider" as an action signal unless there is also an explicit reminder, deadline, follow-up check, strong commitment, or verifiable execution plan.
 
 Output schema:
 {
@@ -362,26 +361,28 @@ UNIFIED_ACTIONABLE_ITEM_EXTRACTION_PROMPT_EN = """You are the actionable-item ex
 
 The input contains one topic candidate and its newly stored narrative facts. Some facts include action_signal as pre-filtered action signals. Within this topic, extract only concrete actionable items that truly require future follow-up, reminder, execution, review, or decision tracking. Actionable items are separate from evolving states: states summarize durable situations, preferences, constraints, and background; actionable items must be checkable, completable, trackable, or explicitly recalled as decisions, commitments, risks, or open questions.
 
-Prefer action_signal when present, but extract only items directly supported by the fact summary and action_signal.
+`action_signal` is only a candidate hint and may contain false positives. Do not convert it directly into an actionable item. Re-check the complete fact summary and direct signal evidence; when uncertain, return an empty list.
 
 Rules:
 1. Extract 0-4 actionable items. Many ordinary dialogue batches should return an empty list. Do not force coverage of facts.
-2. Extract only strong actionable items: the input fact's action_signal must be assigned, committed, pending_decision, or follow_up, and the evidence must also contain an explicit executor or a verifiable outcome. This includes an explicit reminder/follow-up/record/arrangement/execution request, a clear future commitment, an unresolved decision requiring later choice or confirmation, a concrete open issue that must be resolved, or a high-value risk blocking a specific action.
-3. Completed decisions with no remaining action belong in facts/states, not actionable items; only decisions still awaiting choice, confirmation, or execution may be extracted.
-4. Do not extract weak willingness such as "the user is willing to try", "might try", "sounds good", or "may consider" as standalone actionable items. These belong in facts or states. Extract them only when they include an explicit reminder request, deadline, follow-up check, strong commitment, or verifiable execution plan.
-5. Do not extract ordinary assistant recommendations as actionable items. Extract them only when the user explicitly accepts them, asks for follow-up/reminders, or the recommendation becomes the user's task, commitment, or decision.
-6. Ordinary constraints, preferences, and background belong in states, not constraint items. Extract a constraint item only when the constraint is actively blocking a concrete action or decision.
+2. Every item must have direct fact evidence and a verifiable outcome. action_signal is necessary candidate evidence but not sufficient; suggestions, plans, considerations, discussions, or vague "discuss further" language do not create an item by themselves.
+3. `pending_decision` requires all three: a concrete decision object, an explicitly unresolved state, and a concrete option, confirmation/selection action, or deadline. If any condition is missing, do not create a decision/open_question.
+4. "Decision X is complete but implementation details/progress remain" is not `pending_decision`; create a task/commitment only when an owner, action, and deliverable are explicit.
+5. `assigned` requires an explicit responsible party, concrete action, and deliverable or completion criterion; `committed` requires an explicit commitment to execute; `follow_up` requires an explicit reminder, follow-up, review, next confirmation, or report request. "Someone proposed", "suggested", "needs", or "departments should follow up" is insufficient.
+6. Completed decisions without remaining action, ordinary constraints, preferences, and background belong in facts/states. Weak willingness and ordinary assistant recommendations also default to an empty list.
 7. Do not copy every fact. If multiple facts point to the same matter, keep only the most specific and trackable item.
-8. Keep each item self-contained: `summary` must state "who is responsible + by what time or deadline (only when supported by evidence) + what action or target is involved", with the necessary context, reason, and current status. Do not invent a date when no time is supported; when the responsible party is unclear, you may say "responsible party not established" while still stating the action.
-9. `owner` identifies who the item belongs to and who is responsible for completing, following up, or deciding it. It is not the target object and not a list of mentioned entities. Use explicit assignment language in the facts; use `primary_entity` only when it also clearly represents execution or decision responsibility. When updating an existing item, preserve its owner unless new facts clearly show that responsibility changed. Use `unknown` when the evidence is insufficient.
-10. owner must be the name of an evidence-supported responsible entity, such as "user", "assistant", "N_SPK8013", "Xiao Wang", "the team", or "the marketing department". Do not assign ownership merely because someone spoke or was mentioned, and do not output the generic category "other". Use `unknown` only when the responsible party is not established.
-11. evidence_fact_ids must cite supporting fact IDs from the input.
-12. item_type must be one of: task, commitment, decision, follow_up, open_question, risk, reminder, recommendation, constraint, other.
-13. status must be one of: open, in_progress, done, blocked, decided, noted, unknown.
-14. importance and confidence are 0-1. Do not inflate confidence to bypass the weak-willingness rule.
-15. When existing actionable_items are provided for this topic, first check whether the new facts explicitly change their status, deadline, owner, or current description. Emit `operation="update"` only when new evidence supports a change; do not mark an item done without evidence of completion.
-16. For an existing item, use its `id` in `existing_item_id` and preserve its `canonical_name` and `item_type`; for a new item use `operation="create"` and `existing_item_id=0`.
-17. Return JSON only. No markdown.
+8. Always return an empty list for: "The team decided to launch several gift forms, but implementation details are not settled"; "Suggest learning more and discussing later"; "Someone proposed negotiating with the bank." These may be `pending_decision`: "It is not yet decided whether to use TikTok or Xiaohongshu as the main platform"; "The team disagrees and must confirm the product color by next Tuesday".
+9. `evidence_fact_ids` must cite fact IDs from the input; each item should map to a directly supporting fact signal.
+10. Keep each item self-contained: `summary` must state "who is responsible + by what time or deadline (only when supported by evidence) + what action or target is involved", with the necessary context, reason, and current status. Do not invent a date when no time is supported; when the responsible party is unclear, you may say "responsible party not established" while still stating the action.
+11. `owner` identifies who the item belongs to and who is responsible for completing, following up, or deciding it. It is not the target object and not a list of mentioned entities. Use explicit assignment language in the facts; use `primary_entity` only when it also clearly represents execution or decision responsibility. When updating an existing item, preserve its owner unless new facts clearly show that responsibility changed. Use `unknown` when the evidence is insufficient.
+12. owner must be the name of an evidence-supported responsible entity, such as "user", "assistant", "N_SPK8013", "Xiao Wang", "the team", or "the marketing department". Do not assign ownership merely because someone spoke or was mentioned, and do not output the generic category "other". Use `unknown` only when the responsible party is not established.
+13. evidence_fact_ids must cite supporting fact IDs from the input.
+14. item_type must be one of: task, commitment, decision, follow_up, open_question, risk, reminder, recommendation, constraint, other.
+15. status must be one of: open, in_progress, done, blocked, decided, noted, unknown.
+16. importance and confidence are 0-1. Do not inflate confidence to bypass the weak-willingness rule.
+17. When existing actionable_items are provided for this topic, first check whether the new facts explicitly change their status, deadline, owner, or current description. Emit `operation="update"` only when new evidence supports a change; do not mark an item done without evidence of completion.
+18. For an existing item, use its `id` in `existing_item_id` and preserve its `canonical_name` and `item_type`; for a new item use `operation="create"` and `existing_item_id=0`.
+19. Return JSON only. No markdown.
 
 Output schema:
 {
