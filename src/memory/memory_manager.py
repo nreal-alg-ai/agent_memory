@@ -426,7 +426,7 @@ class MemoryOperationReporter:
             ),
             "total_elapsed_ms": elapsed_ms,
         })
-        if operation_type == "memory_store":
+        if operation_type in {"memory_store", "memory_episode_summary"}:
             report["stored"] = bool(succeeded and error is None)
         if error is not None:
             report["error_type"] = type(error).__name__
@@ -670,6 +670,8 @@ class MemoryNodeManager:
                 with self._memory_operation_lock:
                     if task_kind == "memory_store":
                         result = self._process_memory_store_task(**task["payload"])
+                    elif task_kind == "memory_episode_summary":
+                        result = self._process_memory_episode_summary_task(**task["payload"])
                     elif task_kind == "memory_reflect":
                         result = self._process_memory_reflect_task(**task["payload"])
                     else:
@@ -784,15 +786,32 @@ class MemoryNodeManager:
         self,
         *,
         wait: bool = True,
-        timeout: Optional[float] = 5.0,
+        timeout: Optional[float] = None,
     ) -> bool:
-        """Stop accepting tasks and optionally drain the memory worker."""
+        """Stop accepting tasks and optionally drain the memory worker.
+
+        When ``wait`` is true, do not report shutdown as successful until every
+        queued task has called ``task_done`` and the worker thread has exited.
+        This is important because callers close the database immediately after
+        shutdown; closing it while a reflection transaction is still running
+        rolls back all state updates made by that transaction.
+        """
         with self._task_worker_lock:
             self._task_shutdown_event.set()
             worker = self._task_worker_thread
         if not wait or worker is None:
             return not self._task_queue.unfinished_tasks
-        worker.join(timeout=None if timeout is None else max(0.0, timeout))
+
+        deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
+        while self._task_queue.unfinished_tasks:
+            if not worker.is_alive():
+                return False
+            if deadline is not None and time.monotonic() >= deadline:
+                return False
+            time.sleep(0.01)
+
+        remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+        worker.join(timeout=remaining)
         return not worker.is_alive() and not self._task_queue.unfinished_tasks
 
     def submit_memory_store_task(
@@ -822,6 +841,86 @@ class MemoryNodeManager:
             },
         )
 
+    def submit_memory_episode_summary_task(
+        self,
+        *,
+        fact_id_after: int,
+        source_type: str,
+        tags: List[str],
+        started_at: Optional[str],
+        ended_at: Optional[str],
+        prompt_language: str,
+    ) -> Dict[str, Any]:
+        """Queue episode summarization after preceding fact-store tasks."""
+        if not self._memory_enabled:
+            task_id = self._operation_reporter.next_task_id("memory_episode_summary")
+            return self._reject_memory_task(
+                task_kind="memory_episode_summary", task_id=task_id, reason="memory_disabled"
+            )
+        return self._submit_memory_task(
+            task_kind="memory_episode_summary",
+            payload={
+                "fact_id_after": int(fact_id_after or 0),
+                "source_type": source_type,
+                "tags": list(tags or []),
+                "started_at": started_at,
+                "ended_at": ended_at,
+                "prompt_language": prompt_language,
+            },
+        )
+
+    def _process_memory_episode_summary_task(
+        self,
+        *,
+        fact_id_after: int,
+        source_type: str,
+        tags: List[str],
+        started_at: Optional[str],
+        ended_at: Optional[str],
+        prompt_language: str,
+    ) -> Dict[str, Any]:
+        facts = self._db.get_memory_facts_after_id(
+            fact_id=fact_id_after,
+            source_type=source_type,
+            only_unassigned=True,
+            limit=80,
+        )
+        episode_info = self.generate_episode_from_facts(
+            facts=facts,
+            started_at=started_at,
+            ended_at=ended_at,
+            prompt_language=prompt_language,
+        )
+        if episode_info.get("status") != "ok":
+            return episode_info
+        episode_id = self._db.insert_episode(
+            source_type=source_type,
+            episode_type=self._episode_type_for_source_type(source_type),
+            title=episode_info["title"],
+            summary=episode_info["summary"],
+            participants=episode_info.get("participants") or [],
+            started_at=episode_info.get("started_at") or _now_text(),
+            ended_at=episode_info.get("ended_at") or episode_info.get("started_at") or _now_text(),
+            canonical_topics=episode_info.get("canonical_topics") or [],
+            entity_ids=episode_info.get("entity_ids") or [],
+            metadata={"tags": list(tags or []), "fact_count": len(facts), "generated_from_facts": True},
+        )
+        attached = self._db.update_facts_episode_id(
+            fact_ids=episode_info.get("fact_ids") or [], episode_id=episode_id,
+        )
+        episode_info.update({
+            "episode_id": episode_id,
+            "fact_count": attached,
+            "new_episode_count": 1,
+        })
+        self._log_info("memory_store", "episode_summary_generated", {
+            "episode_id": episode_id,
+            "fact_count": attached,
+            "source_type": source_type,
+            "title": episode_info.get("title") or "",
+        })
+        return episode_info
+
     def _process_memory_store_task(
         self,
         *,
@@ -831,10 +930,8 @@ class MemoryNodeManager:
         prompt_language: str,
     ) -> Dict[str, Any]:
         store_started_at = time.monotonic()
-        episode_type = self._episode_type_for_source_type(source_type)
         self._log_info("memory_store", "start", {
             "source_type": source_type,
-            "episode_type": episode_type,
             "source_segment_count": len(raw_segments),
         })
         if not raw_segments:
@@ -851,125 +948,41 @@ class MemoryNodeManager:
                 "new_fact_count": 0,
                 "total_elapsed_ms": elapsed_ms,
             }
-        episode_participants = self._parse_participants_from_raw_segments(raw_segments)
-        episode_started_at = raw_segments[0].get("started_at") or _now_text()
-        episode_ended_at = raw_segments[-1].get("ended_at") or episode_started_at
         extracted_info = self._extract_memory_fact_from_raw_segments(
             raw_segments,
             prompt_language=prompt_language,
         )
-        episode_title = (
-            _compact_whitespace(extracted_info.get("episode_title") or "")
-            or self._fallback_generate_episode_title_from_raw_segments(raw_segments)
-        )
-        episode_summary = (
-            _compact_whitespace(extracted_info.get("episode_summary") or "")
-            or self._fallback_generate_episode_summary_from_raw_segments(raw_segments)
-        )
-        episode_canonical_topics = (
-            extracted_info.get("canonical_topics")
-            or self._topic_candidates(episode_summary)
-            or ["general"]
-        )
         facts = list(extracted_info.get("facts") or [])
-
         self._log_extracted_fact_info(
             raw_segments=raw_segments,
             facts=facts,
             source_type=source_type,
-            episode_type=episode_type,
             prompt_language=prompt_language,
         )
-
         save_entity_info = self._store_extracted_memory_entities_into_db(
-            participants=episode_participants,
-            raw_segments=raw_segments,
-            facts=facts,
-            episode_summary=episode_summary,
-        )
-        save_episode_info = self._store_extracted_memory_episode_into_db(
-            participants=episode_participants,
-            raw_segments=raw_segments,
-            entity_info=save_entity_info,
-            source_type=source_type,
-            episode_type=episode_type,
-            tags=tags,
-            episode_title=episode_title,
-            episode_summary=episode_summary,
-            canonical_topics=episode_canonical_topics,
-            started_at=episode_started_at,
-            ended_at=episode_ended_at,
+            participants=[], raw_segments=raw_segments, facts=facts, episode_summary="",
         )
         save_fact_info = self._store_extracted_memory_facts_into_db(
-            episode_id=int(save_episode_info["episode_id"]),
+            episode_id=None,
             facts=facts,
             tags=tags,
             source_type=source_type,
-            episode_context_topics=episode_canonical_topics,
+            episode_context_topics=None,
             entity_info=save_entity_info,
         )
         report = {
             "status": "ok",
-            "new_episode_count": 1,
+            "new_episode_count": 0,
             "new_fact_count": len(list(save_fact_info.get("fact_ids") or [])),
+            "fact_ids": list(save_fact_info.get("fact_ids") or []),
             "total_elapsed_ms": round((time.monotonic() - store_started_at) * 1000, 2),
         }
         self._log_info("memory_store", "finish", {
             **report,
             "source_type": source_type,
-            "episode_type": episode_type,
             "source_segment_count": len(raw_segments),
         })
         return report
-
-    def _store_extracted_memory_episode_into_db(
-        self,
-        *,
-        participants: List[str],
-        raw_segments: List[Dict[str, Any]],
-        entity_info: Dict[str, int],
-        source_type: str,
-        episode_type: str,
-        tags: List[str],
-        episode_title: str,
-        episode_summary: str,
-        canonical_topics: List[str],
-        started_at: str,
-        ended_at: str,
-    ) -> Dict[str, Any]:
-        episode_entity_names = list(entity_info.keys())
-        episode_entity_ids = [
-            int(entity_id)
-            for entity_id in entity_info.values()
-            if str(entity_id).strip().isdigit()
-        ]
-        episode_id = self._db.insert_episode(
-            source_type=source_type,
-            episode_type=episode_type,
-            title=episode_title,
-            summary=episode_summary,
-            participants=participants,
-            started_at=started_at,
-            ended_at=ended_at,
-            entity_ids=episode_entity_ids,
-            canonical_topics=canonical_topics,
-            metadata={
-                "tags": tags,
-                "segment_count": len(raw_segments),
-                "entities": episode_entity_names,
-            },
-        )
-
-        return {
-            "episode_id": episode_id,
-            "participants": participants,
-            "entity_names": episode_entity_names,
-            "entity_ids": episode_entity_ids,
-            "entity_info": entity_info,
-            "title": episode_title,
-            "summary": episode_summary,
-            "canonical_topics": canonical_topics,
-        }
 
     def _store_extracted_memory_entities_into_db(
         self,
@@ -999,7 +1012,6 @@ class MemoryNodeManager:
         raw_segments: List[Dict[str, Any]],
         facts: List[Dict[str, Any]],
         source_type: str,
-        episode_type: str,
         prompt_language: str,
     ) -> None:
         if not facts:
@@ -1009,7 +1021,6 @@ class MemoryNodeManager:
             "extract_fact_signals",
             {
                 "source_type": source_type,
-                "episode_type": episode_type,
                 "raw_segments": self._build_memory_segments_for_prompt(
                     raw_segments,
                     prompt_language=prompt_language,
@@ -1053,76 +1064,84 @@ class MemoryNodeManager:
         *,
         prompt_language: str,
     ) -> Dict[str, Any]:
-        """Extract episode metadata and facts with LLM, falling back to heuristics."""
+        """Extract narrative facts with the unified fact prompt."""
         data = self._extract_memory_fact_with_llm(
             raw_segments,
             prompt_language=prompt_language,
         )
         if data and data.get("facts"):
             return data
-        llm_episode_summary = self._generate_episode_summary_directly_with_llm(
-            raw_segments,
-            prompt_language=prompt_language,
-        ) or {}
-        summary = (
-            llm_episode_summary.get("summary")
-            or self._fallback_generate_episode_summary_from_raw_segments(raw_segments)
-        )
-        title = (llm_episode_summary.get("title")
-                or self._fallback_generate_episode_title_from_raw_segments(raw_segments)
-        )
-        return {
-            "episode_title": title,
-            "episode_summary": summary,
-            "canonical_topics": self._topic_candidates(summary),
-            "facts": [],
-        }
+        return {"facts": []}
 
-    def _generate_episode_summary_directly_with_llm(
+    def generate_episode_from_facts(
         self,
-        segments: List[Dict[str, Any]],
         *,
-        prompt_language: str,
-    ) -> Optional[Dict[str, str]]:
-        if not segments:
-            return None
-        prompt_template = (
-            EPISODE_SUMMARY_PROMPT_EN
-            if prompt_language == "en"
-            else EPISODE_SUMMARY_PROMPT_ZH
+        facts: Sequence[Dict[str, Any]],
+        started_at: Optional[str] = None,
+        ended_at: Optional[str] = None,
+        prompt_language: str = "zh",
+    ) -> Dict[str, Any]:
+        """Summarize a logical episode from facts already persisted by extraction."""
+        fact_list = [item for item in facts if isinstance(item, dict) and _compact_whitespace(item.get("summary") or item.get("text") or "")]
+        if not fact_list:
+            return {"status": "empty", "new_episode_count": 0, "fact_count": 0}
+        payload = [
+            {
+                "summary": _compact_whitespace(item.get("summary") or item.get("text") or ""),
+                "fact_kind": item.get("fact_kind") or "",
+                "fact_root_topic": item.get("fact_root_topic") or "",
+                "fact_aspect_topic": item.get("fact_aspect_topic") or "",
+                "dialogue_time_key": item.get("dialogue_time_key") or "",
+                "event_time_key": item.get("event_time_key") or "",
+            }
+            for item in fact_list
+        ]
+        prompt_template = EPISODE_SUMMARY_PROMPT_EN if prompt_language == "en" else EPISODE_SUMMARY_PROMPT_ZH
+        prompt = prompt_template.replace("{facts}", json.dumps(payload, ensure_ascii=False))
+        parsed: Dict[str, Any] = {}
+        for _ in range(2):
+            parsed = self._parse_json_object_from_llm_text(self._call_llm(prompt) or "") or {}
+            if _compact_whitespace(parsed.get("summary") or ""):
+                break
+        summary = _compact_whitespace(parsed.get("summary") or "")
+        if not summary:
+            summary = "；".join(item["summary"] for item in payload)[:2000]
+        title = _compact_whitespace(parsed.get("title") or "")
+        if not title:
+            title = _compact_whitespace(payload[0].get("fact_root_topic") or "本次对话")[:80]
+        topics = self._normalize_episode_canonical_topics(
+            parsed.get("canonical_topics"), fallback_text=" ".join(item["summary"] for item in payload), limit=3,
         )
-        prompt = prompt_template.replace(
-            "{dialogue_batch}",
-            self._build_memory_segments_for_prompt(
-                segments,
-                prompt_language=prompt_language,
-            ),
-        )
-        for attempt in range(2):
-            result = self._call_llm(prompt)
-            parsed = self._parse_json_object_from_llm_text(result or "")
-            if parsed is not None:
-                title = _compact_whitespace(
-                    parsed.get("title")
-                    or parsed.get("episode_title")
-                    or ""
-                )
-                summary = _compact_whitespace(
-                    parsed.get("summary")
-                    or parsed.get("episode_summary")
-                    or ""
-                )
-                if summary:
-                    self._log_info("memory_store", "episode_summary_fallback", {
-                        "title": title,
-                        "summary": summary,
-                        "summary_chars": len(summary),
-                        "source_segment_count": len(segments),
-                    })
-                    return {"title": title, "summary": summary}
-            if attempt == 0:
-                self._logger.debug("Episode summary LLM fallback failed, retrying")
-        return None
+        if not topics:
+            topics = self._normalize_unique_labels([item.get("fact_root_topic") for item in payload if item.get("fact_root_topic")])[:3] or self._topic_candidates(summary)[:3]
+        participants = self._normalize_unique_labels([
+            entity
+            for item in fact_list
+            for entity in (item.get("entities") or [])
+            if isinstance(entity, str)
+            and entity.strip().lower() in {"user", "assistant", "用户", "助手", "speaker_1", "speaker_2"}
+        ])[:20]
+        episode_entity_ids = sorted({
+            int(entity_id)
+            for item in fact_list
+            for entity_id in (item.get("entity_ids") or [])
+            if str(entity_id).strip().isdigit()
+        })
+        start = started_at or next((item.get("dialogue_time_key") for item in fact_list if item.get("dialogue_time_key")), _now_text())
+        end = ended_at or next((item.get("dialogue_time_key") for item in reversed(fact_list) if item.get("dialogue_time_key")), start)
+        fact_ids = [int(item["id"]) for item in fact_list if str(item.get("id", "")).isdigit()]
+        return {
+            "status": "ok",
+            "new_episode_count": 0,
+            "title": title,
+            "summary": summary,
+            "canonical_topics": topics,
+            "participants": participants,
+            "entity_ids": episode_entity_ids,
+            "fact_ids": fact_ids,
+            "started_at": start,
+            "ended_at": end,
+        }
 
     def _extract_memory_fact_with_llm(
         self,
@@ -1256,24 +1275,6 @@ class MemoryNodeManager:
         raw_facts = data.get("facts")
         if not isinstance(raw_facts, list):
             return None
-        raw_episode_title = _compact_whitespace(data.get("episode_title") or "")
-        raw_episode_summary = _compact_whitespace(data.get("episode_summary") or "")
-        llm_episode_summary: Dict[str, str] = {}
-        if not raw_episode_title or not raw_episode_summary:
-            llm_episode_summary = self._generate_episode_summary_directly_with_llm(
-                raw_segments,
-                prompt_language=prompt_language,
-            ) or {}
-        episode_summary = (
-            raw_episode_summary
-            or llm_episode_summary.get("summary")
-            or self._fallback_generate_episode_summary_from_raw_segments(raw_segments)
-        )
-        episode_topics = self._normalize_episode_canonical_topics(
-            data.get("canonical_topics") or data.get("episode_canonical_topics"),
-            fallback_text=episode_summary,
-            limit=5,
-        )
         facts: List[Dict[str, Any]] = []
         dialogue_time_key = _to_timestamp_text(
             raw_segments[0].get("started_at") if raw_segments else ""
@@ -1314,7 +1315,7 @@ class MemoryNodeManager:
             fact_root_topic, fact_aspect_topic = self._normalize_fact_topic_fields(
                 raw_fact.get("fact_root_topic"),
                 raw_fact.get("fact_aspect_topic"),
-                fallback_root_topic=(episode_topics[0] if episode_topics else fact_topic_fallback),
+                fallback_root_topic=fact_topic_fallback,
                 fallback_aspect_topic=fact_topic_fallback,
             )
             entity_state_signal = self._normalize_entity_state_signal(
@@ -1347,16 +1348,7 @@ class MemoryNodeManager:
                     "where": _compact_whitespace(raw_fact.get("where") or ""),
                 },
             })
-        return {
-            "episode_title": (
-                raw_episode_title
-                or llm_episode_summary.get("title")
-                or self._fallback_generate_episode_title_from_raw_segments(raw_segments)
-            ),
-            "episode_summary": episode_summary,
-            "canonical_topics": episode_topics or self._topic_candidates(episode_summary),
-            "facts": facts,
-        }
+        return {"facts": facts}
 
     def _normalize_fact_topic_fields(
         self,
@@ -1923,7 +1915,7 @@ class MemoryNodeManager:
     def _store_extracted_memory_facts_into_db(
         self,
         *,
-        episode_id: int,
+        episode_id: Optional[int],
         facts: List[Dict[str, Any]],
         tags: List[str],
         source_type: str,
@@ -4946,7 +4938,6 @@ class MemoryNodeManager:
                         "stage2_provenance",
                         "direct_index",
                         "evidence_expansion",
-                        "episode_expansion",
                         "provenance_bonus",
                         "expansion_penalty",
                     }
@@ -5002,8 +4993,6 @@ class MemoryNodeManager:
                     reasons.append(value)
             if source.endswith("_evidence_expansion") and "evidence_expansion" not in reasons:
                 reasons.append("evidence_expansion")
-            if source.endswith("_episode_expansion") and "episode_expansion" not in reasons:
-                reasons.append("episode_expansion")
             for value in provenance:
                 if value not in reasons:
                     reasons.append(value)
@@ -6781,70 +6770,6 @@ class MemoryNodeManager:
         )
         return any(marker in lower for marker in markers)
 
-    def _expand_recall_episode_facts_from_candidates(
-        self,
-        *,
-        candidates: Sequence[Dict[str, Any]],
-        candidate_source_prefix: str,
-        source_types: Optional[Sequence[str]],
-        temporal_bounds: RecallTimeBounds,
-        temporal_mode: str,
-        limit: int,
-        database: Optional[SessionDB] = None,
-    ) -> List[Dict[str, Any]]:
-        """Expand only indexed fact candidates to their sibling episode facts."""
-        db = database or self._db
-        episode_ids: List[int] = []
-        seed_targets: Dict[int, List[str]] = {}
-        for candidate in candidates or []:
-            if str(candidate.get("index_level") or "").strip().lower() != "fact":
-                continue
-            raw = candidate.get("_hydrated") if isinstance(candidate.get("_hydrated"), dict) else {}
-            value = raw.get("episode_id")
-            if not str(value or "").strip().isdigit():
-                continue
-            episode_id = int(value)
-            if episode_id not in episode_ids:
-                episode_ids.append(episode_id)
-            seed_targets.setdefault(episode_id, []).append(
-                f"{candidate.get('target_table')}#{candidate.get('target_id')}"
-            )
-            if len(episode_ids) >= 8:
-                break
-        if not episode_ids:
-            return []
-
-        allowed_sources = set(source_types or [])
-        facts = db.memory_facts_by_episode_ids(
-            episode_ids,
-            limit=max(1, int(limit or 24)),
-        )
-        expanded: List[Dict[str, Any]] = []
-        for fact in facts:
-            if allowed_sources and fact.get("source_type") not in allowed_sources:
-                continue
-            candidate = self._make_recall_fact_candidate(
-                fact,
-                candidate_source=(
-                    f"{str(candidate_source_prefix).strip()}_episode_expansion"
-                ),
-                temporal_mode=temporal_mode,
-            )
-            if not candidate:
-                continue
-            if not self._fact_matches_time_bounds(
-                fact,
-                temporal_mode=temporal_mode,
-                temporal_bounds=temporal_bounds,
-            ):
-                continue
-            episode_id = fact.get("episode_id")
-            candidate["_stage2_episode_seed_targets"] = list(
-                dict.fromkeys(seed_targets.get(int(episode_id), []))
-            ) if str(episode_id or "").strip().isdigit() else []
-            expanded.append(candidate)
-        return expanded
-
     def _expand_recall_evidence_facts_from_candidates(
         self,
         *,
@@ -6918,21 +6843,12 @@ class MemoryNodeManager:
         top_k: int,
         database: Optional[SessionDB] = None,
     ) -> Dict[str, Any]:
-        """Merge Stage 1/2 seeds and expand episode and evidence relations."""
+        """Merge Stage 1/2 seeds and expand only explicitly cited evidence facts."""
         seed_candidates = [
             *list(stage2_lexical_candidates or []),
             *list(stage2_entity_candidates or []),
         ]
         expansion_limit = max(12, min(64, max(1, int(top_k or 1)) * 6))
-        episode_candidates = self._expand_recall_episode_facts_from_candidates(
-            candidates=seed_candidates,
-            candidate_source_prefix="stage2",
-            source_types=source_types,
-            temporal_bounds=temporal_bounds,
-            temporal_mode=temporal_mode,
-            limit=expansion_limit,
-            database=database,
-        )
         evidence_candidates = self._expand_recall_evidence_facts_from_candidates(
             candidates=seed_candidates,
             candidate_source_prefix="stage2",
@@ -6989,10 +6905,6 @@ class MemoryNodeManager:
             evidence_candidates,
             "evidence_expansion",
         )
-        merge_candidate_group(
-            episode_candidates,
-            "episode_expansion",
-        )
 
         merged_by_level: Dict[str, List[Dict[str, Any]]] = {
             "fact": [],
@@ -7009,12 +6921,10 @@ class MemoryNodeManager:
             "stage1_seed_candidates": list(stage1_raw_candidates or []),
             "stage2_lexical_candidates": list(stage2_lexical_candidates or []),
             "stage2_entity_candidates": list(stage2_entity_candidates or []),
-            "episode_candidates": episode_candidates,
             "evidence_candidates": evidence_candidates,
             "merged_candidates": list(merged_candidates.values()),
             "merged_count": len(merged_candidates),
             "seed_count": len(seed_candidates),
-            "episode_expansion_count": len(episode_candidates),
             "evidence_expansion_count": len(evidence_candidates),
         }
 
@@ -7171,7 +7081,7 @@ class MemoryNodeManager:
                 temporal_mode=temporal_mode,
                 candidate_limits=supplement_entity_mapping_limits,
                 database=database,
-            ) if new_llm_entities else ([], [], [])
+            ) if new_llm_entities else ([], [])
         )
         stage2_candidate_report = self._merge_and_expand_recall_stage2_candidates(
             stage1_raw_candidates=stage1_raw_candidates,
@@ -7199,7 +7109,6 @@ class MemoryNodeManager:
             "actionable_items": self._recall_log_candidate_items(actionable_candidates),
             "stage1_seed_count": len(stage1_raw_candidates),
             "merged_count": stage2_candidate_report["merged_count"],
-            "episode_expansion_count": stage2_candidate_report["episode_expansion_count"],
             "evidence_expansion_count": stage2_candidate_report["evidence_expansion_count"],
         }
         if self._recall_detailed_logging:
@@ -7219,10 +7128,6 @@ class MemoryNodeManager:
                 "evidence_expansions": self._recall_detailed_candidate_items(
                     stage2_candidate_report.get("evidence_candidates") or [],
                     stage="stage2_evidence_expansion",
-                ),
-                "episode_expansions": self._recall_detailed_candidate_items(
-                    stage2_candidate_report.get("episode_candidates") or [],
-                    stage="stage2_episode_expansion",
                 ),
                 "merged_candidates": self._recall_detailed_candidate_items(
                     stage2_candidate_report.get("merged_candidates") or [],
@@ -7385,6 +7290,8 @@ class MemoryNodeManager:
                 return None
 
         hydrated = dict(row)
+        if table == "memory_facts":
+            hydrated.pop("episode_id", None)
         hydrated.pop("embedding", None)
         hydrated.pop("identity_text_embedding", None)
         hydrated.pop("canonical_name_embedding", None)
@@ -7824,6 +7731,7 @@ class MemoryNodeManager:
         time_value = fact_times[0] if fact_times else ""
         time_end_value = fact_times[-1] if fact_times else ""
         hydrated = dict(fact)
+        hydrated.pop("episode_id", None)
         hydrated.pop("identity_text_embedding", None)
         metadata = dict(fact.get("metadata") or {})
         metadata["_matched_via"] = [candidate_source]
@@ -7890,10 +7798,6 @@ class MemoryNodeManager:
             "evidence_expansion" in provenance
             or candidate_source.endswith("_evidence_expansion")
         )
-        episode_expansion = bool(
-            "episode_expansion" in provenance
-            or candidate_source.endswith("_episode_expansion")
-        )
         fast_match = candidate.get("_recall_fast_match_details")
         fast_match = fast_match if isinstance(fast_match, dict) else {}
         strong_anchor = bool(fast_match.get("strong_anchor"))
@@ -7921,18 +7825,13 @@ class MemoryNodeManager:
         if strong_anchor:
             provenance_bonus += 0.04
 
-        hop = 0 if direct_index else 1 if (
-            evidence_expansion or episode_expansion
-        ) else 0
+        hop = 0 if direct_index else 1 if evidence_expansion else 0
         if direct_index:
             expansion_penalty = 0.0
         elif evidence_expansion:
             # Evidence facts are explicitly cited by a state/actionable item,
-            # so they are weaker than direct hits but stronger than same-episode
-            # expansion facts.
+            # so they are weaker than direct hits.
             expansion_penalty = min(0.08, 0.03 * max(1, hop))
-        elif episode_expansion:
-            expansion_penalty = min(0.18, 0.08 * max(1, hop))
         else:
             expansion_penalty = 0.0
 
@@ -7948,7 +7847,6 @@ class MemoryNodeManager:
             "stage2_lexical": stage2_lexical,
             "direct_index": direct_index,
             "evidence_expansion": evidence_expansion,
-            "episode_expansion": episode_expansion,
             "hop": hop,
             "strong_anchor": strong_anchor,
             "provenance_bonus": round(min(0.22, provenance_bonus), 4),

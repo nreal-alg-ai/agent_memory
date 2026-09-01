@@ -61,53 +61,50 @@ ENTITY_EXTRACTION_GUIDANCE_ZH = """实体提取规则:
 每条长期记忆 fact 通常至少包含主体实体（如 用户/助手/speaker）和 1-4 个核心语义锚点。"""
 
 
-EPISODE_SUMMARY_PROMPT_ZH = """你是长期记忆系统的 episode 摘要模块。请根据以下按时间顺序排列的对话/转写片段，只生成一个忠实、可追溯、自包含的 episode title 和 episode summary。
+EPISODE_SUMMARY_PROMPT_ZH = """你是长期记忆系统的 episode 聚合模块。输入是同一个连续时间区间内，已经由 fact extraction 模块提炼完成、按时间顺序排列的 narrative facts。你的任务不是重新提炼 facts，而是把这些 facts 组织成一个更高层的、可独立理解的事件摘要。
 
-摘要要求：
-1. title 必须简短具体，能区分同主题下的不同 episode，不要只写“健康管理”“家庭沟通”等宽泛主题。
-2. summary 必须保留当前 episode 中明确出现的关键对象、参与者、动作、建议、拒绝/接受、约束、原因、结论或未解决问题。
-3. summary 是 episode 级别的忠实压缩，不要提前归纳成长期偏好、画像、风险或跨 episode 观察。
-4. 只使用输入证据，不要补充历史 state、外部知识或未明说的完成状态。
-5. 如果对话包含多个相关信息点，用一段完整复句表达；不要写成空泛的“讨论了某主题”。
-6. 忽略寒暄、礼貌收尾和无复用价值的重复内容。
-7. 只返回 JSON，不要 markdown。
+概念边界：
+- fact 是可独立召回的证据单元，保留一个具体议题或事件的细节。
+- episode 是一段连续交互/转写中多个相关 facts 的上层叙事，应体现这段经历整体发生了什么。
+- episode 不是长期 state、用户画像、长期偏好、风险评估或 actionable item；不要把一次 episode 推广成跨 episode 结论。
+
+聚合步骤：
+1. 先判断 facts 是否属于同一个连续事件或共同议题。对同一对象、同一目标、前后回应或因果链上的 facts 进行合并；不要按 fact 数量机械拼接。
+2. 按时间恢复事件进展：背景/问题 → 讨论或方案 → 用户态度（接受、拒绝、犹豫）→ 约束与理由 → 决定、结果或未解决事项。输入没有支持的环节直接省略。
+3. 对互不相关但确实处于同一连续 episode 的 facts，使用一段有层次的概括串联它们；不要制造事实之间不存在的因果关系，也不要为了追求单一主题而删除高价值事实。
+4. 保留能改变未来回答的具体信息：对象、人、地点/场景、时间锚、数量、方案、选择、拒绝、限制、承诺、结果和开放问题。普通寒暄、重复表达、泛化解释和礼貌收尾应忽略。
+5. 保留事实之间的先后、转折和条件关系。不能把“建议但未接受”写成“已决定”，不能把“计划/可能”写成“已完成”，不能把“待确认”写成“已确认”。
+6. 如果 facts 之间存在观点冲突或状态变化，明确写出变化过程或当前结论；不要擅自裁决冲突，也不要用较新的 fact 覆盖仍有价值的早期背景。
+7. summary 必须是 1 段自包含叙事，读者不看 facts 也能理解 episode 的核心对象、发生过程和结论/未决点；不要只写“讨论了某主题”。
+8. title 是该 episode 的检索标题：简短、具体、可区分同主题的其他 episode，优先使用“对象 + 核心事件/决定/问题”，不要只写“健康管理”“家庭沟通”“项目讨论”等泛主题。
+9. canonical_topics 只输出 1-3 个稳定主题。优先从 facts 的 `fact_root_topic` 中归并复用；可以合并同义方面，但不要把 `fact_aspect_topic`、动作、结论或零散关键词当作主题。没有充分证据时宁可少输出，不要编造上位主题。
+10. 只使用输入 facts 作为证据，不要补充原始对话、历史 state、外部知识、推测的责任人/截止时间或未明说的完成状态。
+11. 只返回符合格式的 JSON，不要 markdown、解释文字或额外字段。
 
 输出格式：
 {
   "title": "简短具体标题",
-  "summary": "可独立理解的 episode 摘要"
+  "summary": "一段自包含、按时间和因果组织的 episode 摘要",
+  "canonical_topics": ["稳定主题1", "稳定主题2"]
 }
 
-对话/转写片段：
-{dialogue_batch}
+已提炼 facts：
+{facts}
 """
 
 
 UNIFIED_MEMORY_EXTRACTION_PROMPT_ZH = """你是 AI 眼镜长期记忆系统的记忆提炼模块。
 
-系统不再把 assistant_wakeup 和 allday_recording 当作两套彼此独立的记忆产品。两类来源都会进入同一条记忆线：
-- episode：一次连续的交互或语音转写语义片段。
-- fact：从 episode 中提炼出的可追溯、自包含、可独立召回的叙事事实。
-- state：后续由 facts 更新出的长期主题/偏好/约束/风险等演化状态。
+当前记忆结构：
+- fact：从一批连续证据中提炼出的可追溯、自包含、可独立召回的 narrative fact，是记忆提炼的基本证据单元。
+- episode：由独立模块根据一段连续时间内新增的、已经生成的 facts 汇总出的更高层事件；它不是每个输入批次或每条 fact 的简单副本。
+- state：reflection 根据 facts 形成的演化投影，包括 `topic_state`（长期主题进展）和 `entity_state`（实体的偏好、画像、习惯、关系、约束或风险）。state 不是当前对话的直接证据。
+- actionable_item：从 facts 中筛选出的可能需要后续跟进的任务、承诺、决定、开放问题或风险。
 
-你现在需要从下面按时间顺序排列的对话/转写证据批次中提取 episode summary、episode canonical_topics 和 Hindsight 风格的高质量 narrative facts。证据可能来自用户与助手的主动对话，也可能来自多人环境语音转写；请根据 speaker、role 和 time 判断参与者与语义流动。
-
-canonical_topics 生成规则：
-- canonical_topics 是 episode 级别的稳定主题名称，按相关性从高到低排序，输出 1-5 个。
-- 如果本次 episode 与已有长期 topic 候选中的某个主题属于同一稳定对象或同一长期议题，必须复用候选里的 canonical_topic 原文，不要改写同义词。
-- 只有当输入证据明确出现了新的稳定对象、项目、产品、人物关系或长期议题，才创建新 canonical topic。
-- 不要输出过泛的 topic，例如“方案确定”“产品设计讨论”“部门协作”“问题讨论”“用户咨询”。topic 应尽量包含具体对象或稳定领域，例如“AI眼镜语音记忆系统”“手机推广策略”。
-- 如果证据不足以确定具体对象，不要仅凭领域相关性强行复用已有长期 topic；只有严格确认是同一对象或议题时才复用，否则输出基于当前证据的保守上位主题，但不要生成碎片化短词。
-- 复用已有 topic 需要严格判断：当前 episode/fact 的核心对象或具体议题、讨论目标和语义范围，必须与该 topic 的 canonical_name 基本一致。仅仅属于同一大领域、共享某个实体、使用相似词，或前后 episode 时间接近，都不足以复用。
-- 如果一个 fact 只是涉及已有 topic 的背景，但它实际讨论的是另一个对象或议题，必须在 `fact_root_topic` 中选择更准确的根主题，不能为了保持 topic 数量而强行归入已有 topic。
-- 每条 fact 还要并列输出 `fact_root_topic` 和 `fact_aspect_topic`，把细粒度议题放入一个更稳定的根主题下。`fact_root_topic` 应是产品、项目或长期议题，`fact_aspect_topic` 应是当前 fact 讨论的具体方面；如果无法确认根主题，使用当前证据支持的保守根主题；如果无法进一步区分具体方面，可以让 `fact_aspect_topic` 与 `fact_root_topic` 相同，不要猜测无证据的上层主题。
-- `fact_root_topic` 必须参考已有 `memory_states` 中 `state_scope=topic_state` 的 `canonical_name`；如果当前 fact 与某个已有 topic_state 的核心对象、讨论目标和语义范围一致，优先原样复用该 `canonical_name`。仅共享实体、领域或相近关键词时不要强行复用；无法严格匹配时使用当前证据支持的保守根主题。
-
-已有长期 memory_states 参考：
-{existing_memory_states}
+你现在需要从下面按时间顺序排列的对话/转写证据批次中提取 Hindsight 风格的高质量 narrative facts。episode summary、episode canonical_topics 将由独立模块根据已生成 facts 负责，不要在本 prompt 中输出 episode 级字段。
 
 memory_states 使用规则：
-- state_scope=topic_state 且 state_type=topic 的状态，是 episode canonical_topics 和 fact `fact_root_topic` 的命名参考；如果当前证据表达的是同一长期对象或议题，优先原样复用 canonical_name。
+- state_scope=topic_state 且 state_type=topic 的状态，只作为 fact `fact_root_topic` 的命名参考；如果当前证据表达的是同一长期对象或议题，优先原样复用 canonical_name。
 - state_scope=entity_state 的状态，只用于理解实体的长期属性、偏好、约束、风险或关系，不能直接把 entity_state 的 canonical_name 当作 episode topic 或 fact 的 fact_root_topic。
 - 这些 states 只是历史背景，不是当前 episode 的事实证据。当前对话没有明确支持的内容不能写入 fact；当前对话与历史 state 冲突时，以当前对话为准。
 - fact 的 `fact_root_topic` 必须描述该 fact 的主要稳定议题；它可以复用 topic_state 的 canonical_name，但不能因为 entity_state 的名称而改变为实体属性标题。
@@ -178,9 +175,6 @@ action_signal 输出规则：
 
 输出格式：
 {
-  "episode_title": "简短具体标题",
-  "episode_summary": "可独立理解的 episode 总结",
-  "canonical_topics": ["按相关性排序的稳定主题1", "稳定主题2"],
   "facts": [
     {
       "text": "覆盖完整 exchange 的自包含 narrative fact；优先写清 what，when/where/who/why 仅在证据明确且有助于理解时写入，缺失信息直接省略",
@@ -216,6 +210,9 @@ action_signal 输出规则：
     }
   ]
 }
+
+已有长期 memory_states 参考：
+{existing_memory_states}
 
 对话/转写证据批次：
 {dialogue_batch}

@@ -903,6 +903,95 @@ class SessionDB:
         ).fetchall()
         return [self._row_to_dict(row) for row in rows]
 
+    def get_memory_facts_after_id(
+        self,
+        *,
+        fact_id: int = 0,
+        source_type: Optional[str] = None,
+        only_unassigned: bool = False,
+        limit: int = 500,
+    ) -> List[Dict[str, Any]]:
+        """Return facts newer than a runtime cursor in insertion order."""
+        clauses = ["id > ?"]
+        params: List[Any] = [int(fact_id or 0)]
+        if source_type:
+            clauses.append("source_type = ?")
+            params.append(str(source_type))
+        if only_unassigned:
+            clauses.append("episode_id IS NULL")
+        rows = self._conn.execute(
+            f"SELECT * FROM memory_facts WHERE {' AND '.join(clauses)} "
+            "ORDER BY id ASC LIMIT ?",
+            (*params, max(1, int(limit or 500))),
+        ).fetchall()
+        return [self._row_to_dict(row) for row in rows]
+
+    def update_facts_episode_id(
+        self,
+        *,
+        fact_ids: Sequence[int],
+        episode_id: int,
+    ) -> int:
+        """Attach existing facts to an episode and mirror entity mappings."""
+        normalized_ids = [int(value) for value in fact_ids if str(value).strip().isdigit()]
+        if not normalized_ids:
+            return 0
+        placeholders = ",".join("?" for _ in normalized_ids)
+        rows = self._conn.execute(
+            f"SELECT id, entity_ids FROM memory_facts WHERE id IN ({placeholders})",
+            normalized_ids,
+        ).fetchall()
+        now = local_now_text()
+        cur = self._conn.execute(
+            f"UPDATE memory_facts SET episode_id = ?, updated_at = ? WHERE id IN ({placeholders})",
+            (int(episode_id), now, *normalized_ids),
+        )
+        mappings = []
+        for row in rows:
+            for entity_id in _json_loads(row["entity_ids"], default=[]):
+                if str(entity_id).strip().isdigit():
+                    mappings.append({"entity_id": int(entity_id), "episode_id": [int(episode_id)]})
+        if mappings:
+            self.insert_entity_memory_mappings(mappings)
+        self._commit_if_needed()
+        return int(cur.rowcount or 0)
+
+    def update_episode(
+        self,
+        *,
+        episode_id: int,
+        title: Optional[str] = None,
+        summary: Optional[str] = None,
+        canonical_topics: Optional[Sequence[str]] = None,
+        started_at: Optional[str] = None,
+        ended_at: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Update generated episode-level fields after fact aggregation."""
+        assignments: List[str] = []
+        params: List[Any] = []
+        for column, value in (
+            ("title", title),
+            ("summary", summary),
+            ("canonical_topics", _json_dumps(list(canonical_topics or [])) if canonical_topics is not None else None),
+            ("started_at", started_at),
+            ("ended_at", ended_at),
+            ("metadata", _json_dumps(dict(metadata or {})) if metadata is not None else None),
+        ):
+            if value is not None:
+                assignments.append(f"{column} = ?")
+                params.append(value)
+        if not assignments:
+            return False
+        assignments.append("updated_at = ?")
+        params.extend([local_now_text(), int(episode_id)])
+        cur = self._conn.execute(
+            f"UPDATE memory_episodes SET {', '.join(assignments)} WHERE id = ?",
+            params,
+        )
+        self._commit_if_needed()
+        return bool(cur.rowcount)
+
     def mark_facts_processed(
         self,
         *,

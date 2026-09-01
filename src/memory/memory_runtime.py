@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import json
 import re
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -110,6 +111,18 @@ class MemoryRuntime:
         self._transcript_segmentation_log_decisions = bool(
             allday_segmentation_config.get("log_decisions", False),
         )
+        self._episode_summary_trigger_gap_seconds = float(
+            allday_segmentation_config.get("episode_summary_trigger_gap_seconds")
+            or allday_segmentation_config.get("max_time_gap_seconds")
+            or 60.0
+        )
+        self._transcript_previous_segment_end: Optional[datetime] = None
+        self._transcript_episode_started_at: Optional[str] = None
+        self._transcript_episode_last_fact_id = 0
+        self._transcript_episode_source_type = "allday_recording"
+        self._transcript_episode_tags: List[str] = []
+        self._transcript_episode_prompt_language = "zh"
+        self._transcript_has_pending_episode_facts = False
 
     def close(self, timeout: Optional[float] = 30.0) -> None:
         """Drain owned tasks and release resources created by this runtime."""
@@ -117,10 +130,28 @@ class MemoryRuntime:
             self.flush_task_queue(timeout=timeout)
         finally:
             try:
-                self._memory_manager.shutdown_task_worker(
+                shutdown_ok = self._memory_manager.shutdown_task_worker(
                     wait=True,
                     timeout=timeout,
                 )
+                if not shutdown_ok:
+                    # A bounded shutdown timeout must not allow the database
+                    # to close while a reflection transaction is still in
+                    # flight. Continue draining without a deadline so all
+                    # queued writes are committed before the connection closes.
+                    self._logger.warning(
+                        "Memory worker did not stop within timeout=%s; "
+                        "continuing to drain queued tasks before closing database",
+                        timeout,
+                    )
+                    shutdown_ok = self._memory_manager.shutdown_task_worker(
+                        wait=True,
+                        timeout=None,
+                    )
+                if not shutdown_ok:
+                    raise RuntimeError(
+                        "Memory worker stopped before completing all queued tasks"
+                    )
             finally:
                 if self._memory_database is not None:
                     self._memory_database.close()
@@ -212,6 +243,7 @@ class MemoryRuntime:
         *,
         source_type: str = "allday_recording",
         tags: Optional[List[str]] = None,
+        is_last_segment: bool = False,
     ) -> Dict[str, Any]:
         """Buffer one transcript segment and queue completed transcript episodes."""
         if not self._memory_manager.enabled:
@@ -221,6 +253,17 @@ class MemoryRuntime:
         normalized_segment = self._normalize_single_transcript_segment(segment)
         if normalized_segment is None:
             return {"queued": False, "reason": "empty_segment"}
+
+        current_start = self._parse_runtime_timestamp(normalized_segment.get("started_at"))
+        gap_trigger = self.should_trigger_episode_summary(normalized_segment)
+        if gap_trigger and (
+            self._transcript_segmenter.has_pending_exchanges()
+            or self._transcript_utterance_assembler.has_pending_segments()
+            or self._transcript_has_pending_episode_facts
+        ):
+            gap_summary_report = self._finalize_transcript_episode_summary(reason="time_gap")
+        else:
+            gap_summary_report = None
 
         context = {
             "source_type": str(source_type or "allday_recording"),
@@ -233,15 +276,24 @@ class MemoryRuntime:
             ),
         }
         normalized_segment["_memory_context"] = dict(context)
+        if self._transcript_episode_started_at is None:
+            self._transcript_episode_started_at = normalized_segment.get("started_at")
+        self._transcript_episode_source_type = context["source_type"]
+        self._transcript_episode_tags = sorted(set(self._transcript_episode_tags).union(context["tags"]))
+        self._transcript_previous_segment_end = self._parse_runtime_timestamp(normalized_segment.get("ended_at")) or current_start
 
-        queued = False
+        queued = bool((gap_summary_report or {}).get("queued"))
         completed_unit = self._transcript_utterance_assembler.append(
             normalized_segment,
         )
         if completed_unit is None:
+            final_summary_report = None
+            if is_last_segment:
+                final_summary_report = self._finalize_transcript_episode_summary(reason="last_segment")
             return {
-                "queued": False,
+                "queued": queued or bool((final_summary_report or {}).get("queued")),
                 "reason": "threshold_not_reached",
+                "episode_summary": final_summary_report,
             }
         append_report = self._append_transcript_semantic_unit(completed_unit)
         queued = bool(append_report.get("queued")) or queued
@@ -250,10 +302,69 @@ class MemoryRuntime:
                 "queued": queued,
                 "reason": str(append_report.get("reason") or "queue_rejected"),
             }
+        if is_last_segment:
+            final_summary_report = self._finalize_transcript_episode_summary(reason="last_segment")
+            queued = queued or bool(final_summary_report.get("queued"))
+        else:
+            final_summary_report = None
         return {
             "queued": queued,
             "reason": "" if queued else "threshold_not_reached",
+            "episode_summary": final_summary_report or gap_summary_report,
         }
+
+    def should_trigger_episode_summary(
+        self,
+        current_segment: Dict[str, Any],
+        previous_segment: Optional[Dict[str, Any]] = None,
+        *,
+        is_last_segment: bool = False,
+    ) -> bool:
+        """Return whether a logical transcript episode boundary was reached."""
+        if is_last_segment:
+            return True
+        previous_end = self._transcript_previous_segment_end
+        if previous_segment is not None:
+            previous_end = self._parse_runtime_timestamp(
+                previous_segment.get("ended_at") or previous_segment.get("end_time")
+            )
+        if previous_end is None:
+            return False
+        current_start = self._parse_runtime_timestamp(
+            current_segment.get("started_at") or current_segment.get("start_time")
+        )
+        if current_start is None:
+            return False
+        return (current_start - previous_end).total_seconds() > self._episode_summary_trigger_gap_seconds
+
+    def _parse_runtime_timestamp(self, value: Any) -> Optional[datetime]:
+        text = _to_timestamp_text(value)
+        if not text:
+            return None
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=datetime.now().astimezone().tzinfo)
+            return parsed
+        except (TypeError, ValueError):
+            return None
+
+    def _finalize_transcript_episode_summary(self, *, reason: str) -> Dict[str, Any]:
+        flush_report = self._flush_pending_transcript_segments(reason=reason)
+        report = self._memory_manager.submit_memory_episode_summary_task(
+            fact_id_after=self._transcript_episode_last_fact_id,
+            source_type=self._transcript_episode_source_type,
+            tags=self._transcript_episode_tags,
+            started_at=self._transcript_episode_started_at,
+            ended_at=(self._transcript_previous_segment_end.isoformat() if self._transcript_previous_segment_end else None),
+            prompt_language=self._transcript_episode_prompt_language,
+        )
+        self._transcript_has_pending_episode_facts = False
+        self._transcript_episode_tags = []
+        self._transcript_episode_started_at = None
+        report["trigger_reason"] = reason
+        report["transcript_flush"] = flush_report
+        return report
 
     def _append_transcript_semantic_unit(
         self,
@@ -362,8 +473,10 @@ class MemoryRuntime:
             context,
             prompt_language=prompt_language,
         )
+        self._transcript_episode_prompt_language = prompt_language
         queued = bool(queue_report.get("queued"))
         if queued:
+            self._transcript_has_pending_episode_facts = True
             self._logger.info(
                 "transcript episode queued reason=%s raw_segment_count=%s semantic_unit_count=%s",
                 reason,
@@ -492,6 +605,18 @@ class MemoryRuntime:
         transcript_flush_report = self._flush_pending_transcript_segments(
             reason="reflect",
         )
+        if transcript_flush_report.get("queued") or self._transcript_has_pending_episode_facts:
+            transcript_flush_report["episode_summary"] = self._memory_manager.submit_memory_episode_summary_task(
+                fact_id_after=self._transcript_episode_last_fact_id,
+                source_type=self._transcript_episode_source_type,
+                tags=self._transcript_episode_tags,
+                started_at=self._transcript_episode_started_at,
+                ended_at=(self._transcript_previous_segment_end.isoformat() if self._transcript_previous_segment_end else None),
+                prompt_language=self._transcript_episode_prompt_language,
+            )
+            self._transcript_has_pending_episode_facts = False
+            self._transcript_episode_tags = []
+            self._transcript_episode_started_at = None
 
         report = self._memory_manager.submit_memory_reflect_task(*args, **kwargs) or {}
         report["pending_interaction_flush"] = interaction_flush_report
@@ -521,11 +646,16 @@ class MemoryRuntime:
         )
 
     def flush_task_queue(self, timeout: Optional[float] = None) -> bool:
-        """Wait for queued store and reflection tasks at an explicit boundary."""
+        """Submit buffered work; the manager worker drains tasks in FIFO order."""
         if self._interaction_segmenter.has_pending_exchanges():
-            self._flush_pending_interaction_turns()
-        self._flush_pending_transcript_segments(reason="explicit_input_boundary")
-        return self._memory_manager.flush_task_queue(timeout=timeout)
+            interaction_report = self._flush_pending_interaction_turns()
+            if not interaction_report.get("queued") and interaction_report.get("reason") not in {"", "no_pending_segments"}:
+                return False
+        transcript_flush_report = self._flush_pending_transcript_segments(reason="explicit_input_boundary")
+        return not (
+            not transcript_flush_report.get("queued")
+            and transcript_flush_report.get("reason") not in {"", "no_pending_segments"}
+        )
 
     def get_pending_interaction_turns(self) -> List[Dict[str, Any]]:
         """Return raw turns currently held by the interaction segmenter."""

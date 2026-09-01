@@ -61,55 +61,50 @@ Entities must come from explicit conversation content or be directly determined 
 Each retained memory fact should usually include a subject entity, such as user/assistant/speaker, plus 1-4 core semantic anchors."""
 
 
-EPISODE_SUMMARY_PROMPT_EN = """You are the episode summarization module for a long-term memory system. Generate exactly one faithful, traceable, self-contained episode title and episode summary from the chronological dialogue/transcript segments below.
+EPISODE_SUMMARY_PROMPT_EN = """You are the episode aggregation module for a long-term memory system. The input contains narrative facts already extracted by the fact-extraction module, ordered by time and belonging to one continuous interval. Do not re-extract facts; organize them into one higher-level, faithful, self-contained event summary.
 
-Summary requirements:
-1. title must be short and specific enough to distinguish this episode from other episodes on the same broad topic. Avoid vague titles such as "health management" or "family communication".
-2. summary must preserve explicit key objects, participants, actions, recommendations, acceptance/refusal, constraints, reasons, conclusions, or unresolved issues from this episode.
-3. This is an episode-level faithful compression. Do not turn it into a long-term preference, profile, risk, or cross-episode observation.
-4. Use only input evidence. Do not import prior state, outside knowledge, or unsupported completion status.
-5. If the episode contains several related high-value points, express them in one complete summary rather than a vague topic statement.
-6. Ignore greetings, courtesy closings, and repeated low-value content.
-7. Return JSON only. No markdown.
+Conceptual boundaries:
+- A fact is an independently retrievable evidence unit containing details about one event or issue.
+- An episode is the higher-level narrative of what happened across related facts in one continuous interaction/transcript interval.
+- An episode is not a long-term state, user profile, durable preference, risk assessment, or actionable item. Never generalize one episode into a cross-episode conclusion.
+
+Aggregation procedure:
+1. Determine whether facts belong to one event or shared issue. Merge facts about the same object, goal, response chain, or causal chain; do not mechanically concatenate one sentence per fact.
+2. Reconstruct progression in time: context/problem -> discussion or proposal -> user stance (accepted, rejected, hesitant) -> constraints/reasons -> decision, result, or unresolved point. Omit unsupported stages.
+3. If unrelated but co-located facts genuinely belong to the same episode, connect them in one structured paragraph without inventing causal links or dropping high-value facts merely to force one topic.
+4. Preserve future-answerable details: objects, people, setting, time anchors, quantities, plans, choices, refusals, constraints, commitments, outcomes, and open questions. Ignore greetings, repetition, generic explanations, and courtesy closings.
+5. Preserve ordering, contrast, and conditionality. Do not turn a suggestion not accepted into a decision, a plan or possibility into completion, or a pending confirmation into confirmation.
+6. When facts contain a conflict or state change, describe the change or current conclusion explicitly. Do not silently resolve a conflict or erase valuable earlier context.
+7. summary must be one self-contained narrative paragraph understandable without reading the facts; do not write only "discussed a topic".
+8. title is a retrieval-oriented episode title: short, concrete, and distinguishable from other episodes on the same topic. Prefer "object + core event/decision/problem" over broad labels such as "health management" or "project discussion".
+9. canonical_topics must contain only 1-3 stable topics. Prefer consolidating and reusing the facts' `fact_root_topic`; merge synonymous aspects, but never use an aspect, action, conclusion, or isolated keyword as a topic. When evidence is weak, output fewer topics rather than inventing a parent topic.
+10. Use only the supplied facts. Do not import raw dialogue, historical state, outside knowledge, inferred owners/deadlines, or unsupported completion status.
+11. Return JSON matching the schema exactly. No markdown, explanation, or extra fields.
 
 Output schema:
 {
   "title": "short specific title",
-  "summary": "self-contained episode summary"
+  "summary": "self-contained episode summary",
+  "canonical_topics": ["stable topic 1", "stable topic 2"]
 }
 
-Dialogue/transcript segments:
-{dialogue_batch}
+Extracted facts:
+{facts}
 """
 
 
 UNIFIED_MEMORY_EXTRACTION_PROMPT_EN = """You are the memory extraction module for a unified AI-glasses memory system inspired by MemPalace.
 
-The system no longer treats assistant_wakeup and allday_recording as two separate memory products. Both sources enter one memory line:
-- episode: one coherent interaction or transcript episode.
-- fact: traceable, self-contained narrative evidence extracted from the episode.
-- state: evolving long-term topic/preference/constraint/risk state derived later from facts.
-- index entry: a MemPalace-style directory card used for unified recall.
+Current memory structure:
+- fact: a traceable, self-contained, independently retrievable narrative evidence unit extracted from a continuous evidence batch. Facts are persisted first and may be assigned to an episode later.
+- episode: a higher-level event summary generated by a separate module from newly generated facts in one continuous time interval; it is not a copy of each input batch or fact.
+- state: an evolving projection produced by reflection from facts, including `topic_state` (long-term topic progress) and `entity_state` (an entity's preference, profile, routine, relationship, constraint, or risk). A state is not direct evidence from the current dialogue.
+- actionable_item: a separately screened task, commitment, decision, open question, or risk that may require follow-up.
 
-Your task now is to extract the episode summary, episode canonical_topics, and Hindsight-style high-quality narrative facts from the chronological dialogue/transcript evidence batch below. The evidence may come from an active user-assistant exchange or a multi-speaker ambient transcript; use speaker, role, and time to infer participants and pragmatic flow.
-
-Existing long-term memory states for context:
-{existing_memory_states}
-
-canonical_topics rules:
-- canonical_topics are stable episode-level topic names, ordered from most relevant to least relevant. Return 1-5 topics.
-- If this episode belongs to the same stable object or long-running topic as an existing candidate, reuse the candidate's canonical_topic exactly instead of rewriting it.
-- Create a new canonical topic only when the evidence clearly introduces a new stable object, project, product, relationship, or long-running issue.
-- Avoid over-generic topics such as "solution finalized", "product design discussion", "team collaboration", "problem discussion", or "user consultation". Prefer a concrete object or stable domain, e.g. "AI glasses voice memory system" or "phone promotion strategy".
-- If the evidence is too thin to identify the concrete object, do not reuse an existing topic merely because it is broadly related. Reuse it only when the same object or issue is still clear; otherwise output a conservative topic grounded in the current evidence rather than a fragmented short phrase.
-- Reuse an existing topic only after a strict semantic check: the current episode/fact must have substantially the same core object or concrete issue, discussion goal, and semantic scope as that topic's canonical_name. Sharing a broad domain, one entity, similar words, or nearby timestamps is not sufficient.
-- If a fact mentions an existing topic only as background but actually discusses a different object or issue, choose a more accurate `fact_root_topic` for that fact instead of forcing it into the existing topic to reduce the topic count.
-- Every fact must also output `fact_root_topic` and `fact_aspect_topic` as sibling fields to place the fine-grained issue under a stable root topic. `fact_root_topic` should be a product, project, or long-running issue; `fact_aspect_topic` should be the specific aspect discussed by the fact. If the root cannot be supported, use a conservative root topic grounded in the current evidence; if no finer aspect is supported, set fact_aspect_topic equal to fact_root_topic rather than inventing an unsupported parent.
-- `fact_root_topic` must reference the existing `memory_states` entries with `state_scope=topic_state` and their `canonical_name` values. When the fact has the same core object, discussion goal, and semantic scope as an existing topic state, reuse that `canonical_name` exactly. Do not force reuse based only on a shared entity, broad domain, or similar keywords; otherwise use a conservative root topic supported by the current evidence.
-- The system reuses this fact's `entities` as the root-topic context entities; do not generate a separate context-entity field.
+Your task now is to extract Hindsight-style high-quality narrative facts from the chronological dialogue/transcript evidence batch below. Episode summary and episode canonical_topics are generated by a separate module from the extracted facts; do not output episode-level fields in this prompt.
 
 memory_states usage rules:
-- A state with state_scope=topic_state and state_type=topic is a naming reference for episode canonical_topics and the fact's `fact_root_topic`. If the current evidence refers to the same durable object or issue, reuse its canonical_name exactly.
+- A state with state_scope=topic_state and state_type=topic is only a naming reference for the fact's `fact_root_topic`. If the current evidence refers to the same durable object or issue, reuse its canonical_name exactly.
 - A state with state_scope=entity_state is only background for understanding durable entity attributes, preferences, constraints, risks, or relationships. Do not directly use an entity_state canonical_name as an episode topic or the fact's fact_root_topic.
 - These states are historical context, not evidence for the current episode. Do not write unsupported historical details into a fact; when current dialogue conflicts with a prior state, current dialogue wins.
 - fact's `fact_root_topic` must describe the main durable topic of that fact. It may reuse a relevant topic_state canonical_name, but must not become an entity-attribute title merely because an entity_state was provided.
@@ -180,9 +175,6 @@ action_signal rules:
 
 Output schema:
 {
-  "episode_title": "short concrete title",
-  "episode_summary": "self-contained summary of the interaction episode",
-  "canonical_topics": ["stable topic 1 ordered by relevance", "stable topic 2"],
   "facts": [
     {
       "text": "self-contained narrative fact covering a complete exchange and expressing what/when/where/who/why, with background, user/assistant view or action flow, and reason/disagreement/constraint/conclusion/next step",
@@ -218,6 +210,9 @@ Output schema:
     }
   ]
 }
+
+Existing long-term memory states for context:
+{existing_memory_states}
 
 Dialogue/transcript evidence batch:
 {dialogue_batch}
