@@ -586,6 +586,9 @@ class MemoryNodeManager:
         self._task_worker_lock = threading.Lock()
         self._task_shutdown_event = threading.Event()
         self._memory_operation_lock = threading.RLock()
+        # Kept by the serialized task worker: advance only after an episode and
+        # its fact links have both been persisted successfully.
+        self._episode_summary_last_fact_id_by_source: Dict[str, int] = {}
         self._entity_state_max_entities_per_fact = max(
             1,
             int(self._memory_cfg.get("entity_state_max_entities_per_fact", 4) or 4),
@@ -844,11 +847,8 @@ class MemoryNodeManager:
     def submit_memory_episode_summary_task(
         self,
         *,
-        fact_id_after: int,
         source_type: str,
         tags: List[str],
-        started_at: Optional[str],
-        ended_at: Optional[str],
         prompt_language: str,
     ) -> Dict[str, Any]:
         """Queue episode summarization after preceding fact-store tasks."""
@@ -860,11 +860,8 @@ class MemoryNodeManager:
         return self._submit_memory_task(
             task_kind="memory_episode_summary",
             payload={
-                "fact_id_after": int(fact_id_after or 0),
                 "source_type": source_type,
                 "tags": list(tags or []),
-                "started_at": started_at,
-                "ended_at": ended_at,
                 "prompt_language": prompt_language,
             },
         )
@@ -872,13 +869,12 @@ class MemoryNodeManager:
     def _process_memory_episode_summary_task(
         self,
         *,
-        fact_id_after: int,
         source_type: str,
         tags: List[str],
-        started_at: Optional[str],
-        ended_at: Optional[str],
         prompt_language: str,
     ) -> Dict[str, Any]:
+        cursor_key = str(source_type or "")
+        fact_id_after = self._episode_summary_last_fact_id_by_source.get(cursor_key, 0)
         facts = self._db.get_memory_facts_after_id(
             fact_id=fact_id_after,
             source_type=source_type,
@@ -887,8 +883,6 @@ class MemoryNodeManager:
         )
         episode_info = self.generate_episode_from_facts(
             facts=facts,
-            started_at=started_at,
-            ended_at=ended_at,
             prompt_language=prompt_language,
         )
         if episode_info.get("status") != "ok":
@@ -908,14 +902,23 @@ class MemoryNodeManager:
         attached = self._db.update_facts_episode_id(
             fact_ids=episode_info.get("fact_ids") or [], episode_id=episode_id,
         )
+        fact_ids = [int(fact_id) for fact_id in (episode_info.get("fact_ids") or [])]
+        last_fact_id = fact_id_after
+        if attached and fact_ids:
+            last_fact_id = max(fact_ids)
+            self._episode_summary_last_fact_id_by_source[cursor_key] = last_fact_id
         episode_info.update({
             "episode_id": episode_id,
             "fact_count": attached,
             "new_episode_count": 1,
+            "fact_id_after": fact_id_after,
+            "last_fact_id": last_fact_id,
         })
         self._log_info("memory_store", "episode_summary_generated", {
             "episode_id": episode_id,
             "fact_count": attached,
+            "fact_id_after": fact_id_after,
+            "last_fact_id": last_fact_id,
             "source_type": source_type,
             "title": episode_info.get("title") or "",
         })
@@ -1077,8 +1080,6 @@ class MemoryNodeManager:
         self,
         *,
         facts: Sequence[Dict[str, Any]],
-        started_at: Optional[str] = None,
-        ended_at: Optional[str] = None,
         prompt_language: str = "zh",
     ) -> Dict[str, Any]:
         """Summarize a logical episode from facts already persisted by extraction."""
@@ -1127,8 +1128,13 @@ class MemoryNodeManager:
             for entity_id in (item.get("entity_ids") or [])
             if str(entity_id).strip().isdigit()
         })
-        start = started_at or next((item.get("dialogue_time_key") for item in fact_list if item.get("dialogue_time_key")), _now_text())
-        end = ended_at or next((item.get("dialogue_time_key") for item in reversed(fact_list) if item.get("dialogue_time_key")), start)
+        dialogue_times = [
+            _compact_whitespace(item.get("dialogue_time_key") or "")
+            for item in fact_list
+            if _compact_whitespace(item.get("dialogue_time_key") or "")
+        ]
+        start = dialogue_times[0] if dialogue_times else _now_text()
+        end = dialogue_times[-1] if dialogue_times else start
         fact_ids = [int(item["id"]) for item in fact_list if str(item.get("id", "")).isdigit()]
         return {
             "status": "ok",

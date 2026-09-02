@@ -77,6 +77,7 @@ class OnlineSegmentationConfig:
     enforce_min_pending_tokens: bool = False
     rolling_window_enabled: bool = False
     rolling_window_tail_units: int = 0
+    min_boundary_scoring_incoming_tokens: int = 0
 
 
 @dataclass
@@ -243,6 +244,10 @@ def _build_online_segmentation_config(
         rolling_window_tail_units=max(
             0,
             config_int("rolling_window_tail_units", 0),
+        ),
+        min_boundary_scoring_incoming_tokens=max(
+            0,
+            config_int("min_boundary_scoring_incoming_tokens", 0),
         ),
     )
 
@@ -609,6 +614,26 @@ class OnlineSemanticSegmenter:
                 ),
                 prospective_exchanges=len(active_exchanges),
                 time_gap_seconds=time_gap_seconds,
+            )
+        incoming_token_count = self.exchange_token_count(incoming_exchange)
+        minimum_scoring_tokens = max(
+            0,
+            int(self.config.min_boundary_scoring_incoming_tokens),
+        )
+        if (
+            minimum_scoring_tokens > 0
+            and incoming_token_count < minimum_scoring_tokens
+        ):
+            return False, SegmentDecision(
+                exchange_index=self.exchange_index(incoming_exchange),
+                reason="short_incoming_append",
+                prospective_tokens=(
+                    sum(self.exchange_token_count(item) for item in active_exchanges)
+                    + incoming_token_count
+                ),
+                prospective_exchanges=len(active_exchanges) + 1,
+                time_gap_seconds=time_gap_seconds,
+                scoring_mode="short_incoming_skipped",
             )
         incoming, scoring_context = self._build_boundary_scoring_incoming(
             active_exchanges,

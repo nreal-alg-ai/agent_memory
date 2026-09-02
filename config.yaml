@@ -161,6 +161,7 @@ memory_runtime:
     max_transcript_unit_tokens: 120
     max_transcript_unit_duration_seconds: 20.0
     short_fragment_max_tokens: 8
+    min_boundary_scoring_incoming_tokens: 5
     rolling_window_enabled: true
     rolling_window_tail_units: 3
     

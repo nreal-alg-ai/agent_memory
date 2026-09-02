@@ -117,8 +117,6 @@ class MemoryRuntime:
             or 60.0
         )
         self._transcript_previous_segment_end: Optional[datetime] = None
-        self._transcript_episode_started_at: Optional[str] = None
-        self._transcript_episode_last_fact_id = 0
         self._transcript_episode_source_type = "allday_recording"
         self._transcript_episode_tags: List[str] = []
         self._transcript_episode_prompt_language = "zh"
@@ -276,8 +274,6 @@ class MemoryRuntime:
             ),
         }
         normalized_segment["_memory_context"] = dict(context)
-        if self._transcript_episode_started_at is None:
-            self._transcript_episode_started_at = normalized_segment.get("started_at")
         self._transcript_episode_source_type = context["source_type"]
         self._transcript_episode_tags = sorted(set(self._transcript_episode_tags).union(context["tags"]))
         self._transcript_previous_segment_end = self._parse_runtime_timestamp(normalized_segment.get("ended_at")) or current_start
@@ -352,16 +348,12 @@ class MemoryRuntime:
     def _finalize_transcript_episode_summary(self, *, reason: str) -> Dict[str, Any]:
         flush_report = self._flush_pending_transcript_segments(reason=reason)
         report = self._memory_manager.submit_memory_episode_summary_task(
-            fact_id_after=self._transcript_episode_last_fact_id,
             source_type=self._transcript_episode_source_type,
             tags=self._transcript_episode_tags,
-            started_at=self._transcript_episode_started_at,
-            ended_at=(self._transcript_previous_segment_end.isoformat() if self._transcript_previous_segment_end else None),
             prompt_language=self._transcript_episode_prompt_language,
         )
         self._transcript_has_pending_episode_facts = False
         self._transcript_episode_tags = []
-        self._transcript_episode_started_at = None
         report["trigger_reason"] = reason
         report["transcript_flush"] = flush_report
         return report
@@ -389,7 +381,7 @@ class MemoryRuntime:
                 decision=decision,
             )
             flush_report = (
-                self._store_pending_transcript_exchanges(
+                self._process_pending_transcript_exchanges(
                     reason=decision.reason,
                 )
                 if should_finalize
@@ -432,13 +424,13 @@ class MemoryRuntime:
                     "queued": queued,
                     "reason": str(append_report.get("reason") or "queue_rejected"),
                 }
-        store_report = self._store_pending_transcript_exchanges(reason=reason)
+        store_report = self._process_pending_transcript_exchanges(reason=reason)
         return {
             "queued": bool(store_report.get("queued")) or queued,
             "reason": str(store_report.get("reason") or ""),
         }
 
-    def _store_pending_transcript_exchanges(
+    def _process_pending_transcript_exchanges(
         self,
         *,
         reason: str,
@@ -607,16 +599,12 @@ class MemoryRuntime:
         )
         if transcript_flush_report.get("queued") or self._transcript_has_pending_episode_facts:
             transcript_flush_report["episode_summary"] = self._memory_manager.submit_memory_episode_summary_task(
-                fact_id_after=self._transcript_episode_last_fact_id,
                 source_type=self._transcript_episode_source_type,
                 tags=self._transcript_episode_tags,
-                started_at=self._transcript_episode_started_at,
-                ended_at=(self._transcript_previous_segment_end.isoformat() if self._transcript_previous_segment_end else None),
                 prompt_language=self._transcript_episode_prompt_language,
             )
             self._transcript_has_pending_episode_facts = False
             self._transcript_episode_tags = []
-            self._transcript_episode_started_at = None
 
         report = self._memory_manager.submit_memory_reflect_task(*args, **kwargs) or {}
         report["pending_interaction_flush"] = interaction_flush_report
