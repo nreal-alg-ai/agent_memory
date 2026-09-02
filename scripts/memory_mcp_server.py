@@ -133,6 +133,37 @@ def resolve_mcp_server_paths(
     }
 
 
+def resolve_voice_runtime_paths(
+    voice_runtime_config: Dict[str, Any],
+    config_path: Path,
+) -> Dict[str, Any]:
+    """Resolve speaker reference paths relative to the configuration file."""
+    resolved_config = dict(voice_runtime_config or {})
+    speaker_config = resolved_config.get("speaker_identification")
+    if not isinstance(speaker_config, dict):
+        return resolved_config
+
+    resolved_speaker_config = dict(speaker_config)
+    for field in ("user_reference_audio_dir", "reference_embeddings_path"):
+        resolved_path = _resolve_configured_path(
+            resolved_speaker_config.get(field),
+            config_path,
+        )
+        if resolved_path is not None:
+            resolved_speaker_config[field] = str(resolved_path)
+
+    reference_audios = resolved_speaker_config.get("user_reference_audio")
+    if isinstance(reference_audios, list):
+        resolved_speaker_config["user_reference_audio"] = [
+            str(path)
+            for value in reference_audios
+            if (path := _resolve_configured_path(value, config_path)) is not None
+        ]
+
+    resolved_config["speaker_identification"] = resolved_speaker_config
+    return resolved_config
+
+
 def _explicit_override(config_source: Any, key: str) -> Any:
     if isinstance(config_source, (str, Path)) or config_source is None:
         return None
@@ -172,6 +203,10 @@ def build_service(config_source: Any = None) -> tuple[MemoryMCPService, logging.
     memory_runtime_config, memory_manager_config, voice_runtime_config = split_memory_config(
         config,
         include_voice_runtime=True,
+    )
+    voice_runtime_config = resolve_voice_runtime_paths(
+        voice_runtime_config,
+        config_path,
     )
     max_duration_override = _explicit_override(config_source, "max_duration_s")
     if max_duration_override is not None:
