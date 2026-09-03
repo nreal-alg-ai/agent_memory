@@ -106,11 +106,12 @@ def _path_under_result_dir(result_dir: Path, value: Any) -> Path | None:
 def resolve_mcp_server_paths(
     server_config: Dict[str, Any],
     config_path: Path,
+    *,
+    result_dir: Path | None = None,
 ) -> Dict[str, Path | None]:
     """Resolve MCP output paths from result_dir and configured file names."""
-    result_dir = _resolve_configured_path(
-        server_config.get("result_dir"),
-        config_path,
+    result_dir = result_dir or _resolve_configured_path(
+        server_config.get("result_dir"), config_path
     )
     if result_dir is None:
         raise ValueError("memory_mcp_server.result_dir must be configured")
@@ -223,13 +224,14 @@ def build_service(config_source: Any = None) -> tuple[MemoryMCPService, logging.
         asr_result_dir,
     )
     try:
+        memory_runtime_logger = logger.getChild("memory_runtime")
         memory_runtime = MemoryRuntime(
             db_path=db_path,
             memory_runtime_config=memory_runtime_config,
             memory_manager_config=memory_manager_config,
-            logger=logger,
+            logger=memory_runtime_logger,
         )
-        voice_logger = logger.getChild("voice")
+        voice_logger = logger.getChild("voice_runtime")
 
         def build_voice_runtime() -> VoiceRuntime:
             """Load VAD/ASR/speaker models on the first audio request."""

@@ -190,20 +190,20 @@ def main() -> None:
         logging.info("Reflect result: %s", reflect_result)
     else:
         pending_transcript_count = (
-            len(runtime._transcript_segmenter.pending_exchange_snapshot())
+            len(runtime._transcript_segmenter.pending_unit_snapshot())
             + int(runtime._transcript_utterance_assembler.has_pending_segments())
         )
         runtime.flush_task_queue()
         queued_episode_count += int(
             pending_transcript_count > 0
-            and not runtime._transcript_segmenter.has_pending_exchanges()
+            and not runtime._transcript_segmenter.has_pending_units()
             and not runtime._transcript_utterance_assembler.has_pending_segments()
         )
     store_operation_report = operation_reporter.operation_report("memory_store")
     logging.info(
         "Transcript input complete segments=%s pending=%s queued_episodes=%s stored_episodes=%s",
         len(memory_segments),
-        len(runtime._transcript_segmenter.pending_exchange_snapshot()),
+        len(runtime._transcript_segmenter.pending_unit_snapshot()),
         queued_episode_count,
         store_operation_report["succeeded"],
     )

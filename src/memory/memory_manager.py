@@ -936,6 +936,10 @@ class MemoryNodeManager:
         self._log_info("memory_store", "start", {
             "source_type": source_type,
             "source_segment_count": len(raw_segments),
+            "raw_segments": self._build_memory_segments_for_prompt(
+                raw_segments,
+                prompt_language=prompt_language,
+            ),
         })
         if not raw_segments:
             elapsed_ms = round((time.monotonic() - store_started_at) * 1000, 2)
@@ -956,12 +960,7 @@ class MemoryNodeManager:
             prompt_language=prompt_language,
         )
         facts = list(extracted_info.get("facts") or [])
-        self._log_extracted_fact_info(
-            raw_segments=raw_segments,
-            facts=facts,
-            source_type=source_type,
-            prompt_language=prompt_language,
-        )
+        self._log_extracted_fact_info(facts=facts)
         save_entity_info = self._store_extracted_memory_entities_into_db(
             participants=[], raw_segments=raw_segments, facts=facts, episode_summary="",
         )
@@ -1012,25 +1011,10 @@ class MemoryNodeManager:
     def _log_extracted_fact_info(
         self,
         *,
-        raw_segments: List[Dict[str, Any]],
         facts: List[Dict[str, Any]],
-        source_type: str,
-        prompt_language: str,
     ) -> None:
         if not facts:
             return
-        self._log_info(
-            "memory_store",
-            "extract_fact_signals",
-            {
-                "source_type": source_type,
-                "raw_segments": self._build_memory_segments_for_prompt(
-                    raw_segments,
-                    prompt_language=prompt_language,
-                ),
-                "source_segment_count": len(raw_segments),
-            },
-        )
         for index, fact in enumerate(facts, 1):
             metadata = fact.get("metadata") if isinstance(fact.get("metadata"), dict) else {}
             self._log_info(

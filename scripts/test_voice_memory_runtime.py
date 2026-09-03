@@ -39,22 +39,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", type=Path, default=ROOT / "config.yaml")
     parser.add_argument("--audio-dir", type=Path, default=DEFAULT_AUDIO_DIR)
     parser.add_argument(
-        "--db-path",
+        "--result-dir",
         type=Path,
         default=None,
-        help="Override the resolved memory database path.",
-    )
-    parser.add_argument(
-        "--log-path",
-        type=Path,
-        default=None,
-        help="Override the resolved memory log path.",
-    )
-    parser.add_argument(
-        "--report-path",
-        type=Path,
-        default=None,
-        help="Override the resolved report path.",
+        help="Override memory_mcp_server.result_dir; database, logs, and report use its configured file names.",
     )
     parser.add_argument(
         "--override",
@@ -99,12 +87,17 @@ def collect_audio_files(audio_dir: Path, max_files: int | None) -> List[Path]:
     return files
 
 
-def build_service_args(args: argparse.Namespace) -> Namespace:
+def build_service_args(
+    args: argparse.Namespace,
+    *,
+    db_path: Path,
+    log_path: Path | None,
+) -> Namespace:
     """Build the small Namespace expected by memory_mcp_server.build_service."""
     return Namespace(
         config=args.config.expanduser().resolve(),
-        db_path=(args.db_path.expanduser().resolve() if args.db_path else None),
-        log_path=(args.log_path.expanduser().resolve() if args.log_path else None),
+        db_path=db_path,
+        log_path=log_path,
         log_level=args.log_level,
         queue_timeout=args.queue_timeout,
         max_duration_s=args.max_duration_s,
@@ -181,22 +174,21 @@ def main() -> int:
     server_config = config.get("memory_mcp_server") or {}
     if not isinstance(server_config, dict):
         raise ValueError("memory_mcp_server in config.yaml must be a mapping")
-    server_paths = resolve_mcp_server_paths(server_config, config_path)
-    db_path = (
-        args.db_path.expanduser().resolve()
-        if args.db_path
-        else server_paths["db_path"]
+    result_dir = (
+        args.result_dir.expanduser().resolve()
+        if args.result_dir
+        else None
     )
-    log_path = (
-        args.log_path.expanduser().resolve()
-        if args.log_path
-        else server_paths["log_path"]
+    server_paths = resolve_mcp_server_paths(
+        server_config,
+        config_path,
+        result_dir=result_dir,
     )
-    report_path = (
-        args.report_path.expanduser().resolve()
-        if args.report_path
-        else server_paths["report_path"]
-    )
+    result_dir = server_paths["result_dir"]
+    db_path = server_paths["db_path"]
+    log_path = server_paths["log_path"]
+    report_path = server_paths["report_path"]
+    asr_result_dir = server_paths["asr_result_dir"]
     if db_path is None:
         raise ValueError("memory_mcp_server.db_name must be configured")
     if report_path is None:
@@ -204,7 +196,12 @@ def main() -> int:
     if args.override:
         remove_existing_outputs(db_path, log_path, report_path)
     audio_files = collect_audio_files(args.audio_dir, args.max_files)
-    service, logger = build_service(build_service_args(args))
+    service, logger = build_service(
+        build_service_args(args, db_path=db_path, log_path=log_path)
+    )
+    # ``build_service`` intentionally remains config-driven. This test-only
+    # override keeps every generated artifact under ``--result-dir``.
+    service.asr_result_dir = asr_result_dir
     try:
         logger.info(
             "Voice/memory runtime test started audio_dir=%s file_count=%s db_path=%s",
@@ -232,10 +229,11 @@ def main() -> int:
             "config_path": str(config_path),
             "audio_dir": str(args.audio_dir.expanduser().resolve()),
             "audio_files": [str(path) for path in audio_files],
+            "result_dir": str(result_dir),
             "db_path": str(db_path),
+            "asr_result_dir": str(asr_result_dir) if asr_result_dir else None,
             "override": bool(args.override),
             "max_duration_s": args.max_duration_s,
-            "processing": processing_report,
         }
         if args.query:
             result["recall"] = service.trigger_memory_recall(query=args.query)
