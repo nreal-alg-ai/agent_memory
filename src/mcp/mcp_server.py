@@ -160,14 +160,12 @@ class MemoryMCPService:
                 )
             )
 
-        queue_flushed = self.memory_runtime.flush_task_queue(timeout=self.queue_timeout)
+        queue_flushed = self.memory_runtime.flush_pending_memory_inputs(
+            timeout=self.queue_timeout,
+        )
         reflect_report: Optional[Dict[str, Any]] = None
-        reflect_flushed: Optional[bool] = None
         if queue_flushed and segments:
             reflect_report = self.memory_runtime.trigger_memory_reflect()
-            reflect_flushed = self.memory_runtime.flush_task_queue(
-                timeout=self.queue_timeout,
-            )
 
         queued_count = sum(bool(report.get("queued")) for report in store_reports)
         report = {
@@ -186,7 +184,6 @@ class MemoryMCPService:
             "store_reports": store_reports,
             "store_queue_flushed": queue_flushed,
             "reflect_report": reflect_report,
-            "reflect_queue_flushed": reflect_flushed,
         }
         return _json_compatible(report)
 

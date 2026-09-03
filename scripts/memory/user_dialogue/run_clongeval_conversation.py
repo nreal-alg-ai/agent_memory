@@ -348,7 +348,7 @@ def replay_context_into_memory(
     def flush_pending_store_turns() -> bool:
         nonlocal store_batches
         pending_before_flush = len(runtime.get_pending_interaction_turns())
-        stored = bool(pending_before_flush and runtime.flush_task_queue())
+        stored = bool(pending_before_flush and runtime.flush_pending_memory_inputs())
         if stored and not runtime.has_pending_interaction_turns():
             store_batches += 1
             return True
@@ -388,7 +388,7 @@ def replay_context_into_memory(
             )
             if (reflect_submit.get("pending_interaction_flush") or {}).get("queued"):
                 store_batches += 1
-            if reflect_submit.get("queued") and not runtime.flush_task_queue():
+            if reflect_submit.get("queued") and not runtime.wait_for_memory_tasks():
                 raise RuntimeError("Timed out while draining queued memory reflect")
             reflect_runs += 1
             last_reflected_day = day_index
@@ -673,8 +673,12 @@ def process_context_group(
                 reflect_every_days=args.reflect_every_days,
                 reflect_limit=args.reflect_limit,
             )
-            if not runtime.flush_task_queue():
+            if not runtime.flush_pending_memory_inputs():
                 raise RuntimeError("Timed out while draining queued memory stores")
+            if not runtime.wait_for_memory_tasks():
+                raise RuntimeError(
+                    "Timed out while draining queued memory store and reflect tasks"
+                )
         log_memory_index_state(db, f"after_context:{group_id}")
         counts = db_counts(db)
         memory_operation_report = operation_reporter.snapshot()

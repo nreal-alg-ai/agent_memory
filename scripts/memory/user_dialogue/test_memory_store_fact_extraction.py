@@ -731,7 +731,7 @@ def main() -> int:
                     tags=["store_fact_test", f"sample:{sample_id}", f"turn:{turn_index}"],
                     turn_timestamp=turn_timestamp,
                 )
-                if ok.get("queued") and not runtime.flush_task_queue():
+                if ok.get("queued") and not runtime.flush_pending_memory_inputs():
                     raise RuntimeError("Timed out while draining queued memory stores")
                 nodes = list(iter_stored_nodes(db, before_id))
                 store_operation_report = operation_reporter.latest_report("memory_store")
@@ -779,7 +779,7 @@ def main() -> int:
                     reflect_submit = runtime.trigger_memory_reflect(
                         reflect_timestamp=turn_timestamp,
                     )
-                    if reflect_submit.get("queued") and not runtime.flush_task_queue():
+                    if reflect_submit.get("queued") and not runtime.flush_pending_memory_inputs():
                         raise RuntimeError("Timed out while draining queued memory reflect")
                     reflect_report = (
                         operation_reporter.latest_report("memory_reflect")
@@ -801,7 +801,7 @@ def main() -> int:
                         reflect_report.get("actionable_items_updated"),
                     )
         pending_before_final_flush = len(runtime.get_pending_interaction_turns())
-        if not runtime.flush_task_queue():
+        if not runtime.flush_pending_memory_inputs():
             raise RuntimeError("Timed out while draining final pending memory stores")
         logging.info(
             "Final memory runtime flush completed pending_before=%s pending_after=%s",

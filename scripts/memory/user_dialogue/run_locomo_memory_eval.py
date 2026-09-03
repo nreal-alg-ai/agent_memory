@@ -436,11 +436,11 @@ def replay_sample_into_memory(
                     seen_timestamps,
                 ),
             )
-            if reflect_submit.get("queued") and not runtime.flush_task_queue():
+            if reflect_submit.get("queued") and not runtime.flush_pending_memory_inputs():
                 raise RuntimeError("Timed out while draining queued memory reflect")
             reflect_runs += 1
 
-    if runtime.has_pending_interaction_turns() and not runtime.flush_task_queue():
+    if runtime.has_pending_interaction_turns() and not runtime.flush_pending_memory_inputs():
         raise RuntimeError("Timed out while draining queued memory stores")
     if args.enable_reflect and sessions:
         reflect_submit = runtime.trigger_memory_reflect(
@@ -450,7 +450,7 @@ def replay_sample_into_memory(
                 seen_timestamps,
             ),
         )
-        if reflect_submit.get("queued") and not runtime.flush_task_queue():
+        if reflect_submit.get("queued") and not runtime.flush_pending_memory_inputs():
             raise RuntimeError("Timed out while draining queued memory reflect")
         reflect_runs += 1
     if runtime.has_pending_interaction_turns():
@@ -503,7 +503,7 @@ def build_sample_memory_context(
             validate_runtime(manager)
             sessions = sorted_locomo_sessions(sample, int(args.max_sessions))
             replay_stats, _ = replay_sample_into_memory(runtime, sample, sessions, args)
-            if not runtime.flush_task_queue():
+            if not runtime.flush_pending_memory_inputs():
                 raise RuntimeError("Timed out while draining queued memory stores")
             memory_operation_report = operation_reporter.snapshot()
             operation_counts = memory_operation_report.get("counts") or {}

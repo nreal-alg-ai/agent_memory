@@ -181,7 +181,7 @@ def main() -> None:
         reflect_submit = runtime.trigger_memory_reflect(
             reflect_timestamp=reflect_timestamp,
         )
-        if reflect_submit.get("queued") and not runtime.flush_task_queue():
+        if reflect_submit.get("queued") and not runtime.flush_pending_memory_inputs():
             raise RuntimeError("Timed out while draining queued memory reflect")
         reflect_result = operation_reporter.latest_report("memory_reflect") or reflect_submit
         queued_episode_count += int(
@@ -193,7 +193,7 @@ def main() -> None:
             len(runtime._transcript_segmenter.pending_unit_snapshot())
             + int(runtime._transcript_utterance_assembler.has_pending_segments())
         )
-        runtime.flush_task_queue()
+        runtime.flush_pending_memory_inputs()
         queued_episode_count += int(
             pending_transcript_count > 0
             and not runtime._transcript_segmenter.has_pending_units()

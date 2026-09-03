@@ -1102,7 +1102,7 @@ def replay_sessions_into_memory(
                 limit=reflect_limit,
                 reflect_timestamp=reflect_ts,
             )
-            if reflect_submit.get("queued") and not runtime.flush_task_queue():
+            if reflect_submit.get("queued") and not runtime.flush_pending_memory_inputs():
                 raise RuntimeError("Timed out while draining queued memory reflect")
     
     if enable_reflect and sessions:
@@ -1114,12 +1114,12 @@ def replay_sessions_into_memory(
             limit=reflect_limit,
             reflect_timestamp=final_ts,
         )
-        if reflect_submit.get("queued") and not runtime.flush_task_queue():
+        if reflect_submit.get("queued") and not runtime.flush_pending_memory_inputs():
             raise RuntimeError("Timed out while draining queued memory reflect")
     
     if runtime.has_pending_interaction_turns():
         pending_before_flush = len(runtime.get_pending_interaction_turns())
-        if not runtime.flush_task_queue():
+        if not runtime.flush_pending_memory_inputs():
             raise RuntimeError("Timed out while draining queued memory stores")
         if runtime.has_pending_interaction_turns():
             logging.warning(
@@ -1185,7 +1185,7 @@ def build_instance_memory_context(
             reflect_every_sessions=max(1, int(args.reflect_every_sessions)),
             reflect_limit=int(args.reflect_limit),
         )
-        if not runtime.flush_task_queue():
+        if not runtime.flush_pending_memory_inputs():
             raise RuntimeError("Timed out while draining queued memory stores")
         memory_operation_report = operation_reporter.snapshot()
         operation_counts = memory_operation_report.get("counts") or {}

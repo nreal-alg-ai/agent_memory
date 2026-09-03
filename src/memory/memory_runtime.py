@@ -123,7 +123,7 @@ class MemoryRuntime:
     def close(self, timeout: Optional[float] = 30.0) -> None:
         """Drain owned tasks and release resources created by this runtime."""
         try:
-            self.flush_task_queue(timeout=timeout)
+            self.flush_pending_memory_inputs(timeout=timeout)
         finally:
             try:
                 shutdown_ok = self._memory_manager.shutdown_task_worker(
@@ -219,8 +219,7 @@ class MemoryRuntime:
         """Submit the buffered interaction turns and clear them when queued."""
         if not self._interaction_segmenter.has_pending_units():
             return {"queued": False, "reason": "no_pending_turns"}
-        turns = self.get_pending_interaction_turns()
-        queue_report = self._process_interaction_turns(turns)
+        queue_report = self._trigger_memory_store_task_for_pending_interaction()
         queued = bool(queue_report.get("queued"))
         if queued:
             self._interaction_segmenter.clear_pending_units()
@@ -446,7 +445,7 @@ class MemoryRuntime:
             return {"queued": False, "reason": "invalid_pending_segments"}
         self._log_info(
             "memory_runtime",
-            "transcript_episode_batch_detail",
+            "transcript_batch_detail",
             {
                 "reason": reason,
                 "source_type": context.get("source_type"),
@@ -645,8 +644,8 @@ class MemoryRuntime:
             prompt_language=resolved_prompt_language,
         )
 
-    def flush_task_queue(self, timeout: Optional[float] = None) -> bool:
-        """Submit buffered work; the manager worker drains tasks in FIFO order."""
+    def flush_pending_memory_inputs(self, timeout: Optional[float] = None) -> bool:
+        """Submit runtime-buffered inputs without waiting for manager tasks."""
         if self._interaction_segmenter.has_pending_units():
             interaction_report = self._flush_pending_interaction_turns()
             if not interaction_report.get("queued") and interaction_report.get("reason") not in {"", "no_pending_segments"}:
@@ -656,6 +655,10 @@ class MemoryRuntime:
             not transcript_flush_report.get("queued")
             and transcript_flush_report.get("reason") not in {"", "no_pending_segments"}
         )
+
+    def wait_for_memory_tasks(self, timeout: Optional[float] = None) -> bool:
+        """Wait until all tasks already submitted to the memory manager complete."""
+        return self._memory_manager.flush_task_queue(timeout=timeout)
 
     def get_pending_interaction_turns(self) -> List[Dict[str, Any]]:
         """Return raw turns currently held by the interaction segmenter."""
@@ -669,13 +672,28 @@ class MemoryRuntime:
         """Return whether interaction turns are waiting for storage."""
         return self._interaction_segmenter.has_pending_units()
 
-    def _process_interaction_turns(self, turns: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Convert interaction turns and submit them as an assistant episode."""
+    def _trigger_memory_store_task_for_pending_interaction(self) -> Dict[str, Any]:
+        """Read pending turns, then submit their memory-store task."""
+        turns = self.get_pending_interaction_turns()
         (
             raw_segments,
             prompt_language,
         ) = self._normalize_interaction_turns_to_memory_raw_segments(turns)
         tags = sorted({tag for turn in turns for tag in turn.get("tags", [])})
+        self._log_info(
+            "memory_runtime",
+            "interaction_batch_detail",
+            {
+                "source_type": "assistant_wakeup",
+                "tags": tags,
+                "raw_segment_count": len(raw_segments),
+                "semantic_unit_count": len(
+                    self._interaction_segmenter.pending_unit_snapshot()
+                ),
+                "prompt_language": prompt_language,
+                "segments": raw_segments,
+            },
+        )
         return self._memory_manager.submit_memory_store_task(
             raw_segments=raw_segments,
             source_type="assistant_wakeup",
