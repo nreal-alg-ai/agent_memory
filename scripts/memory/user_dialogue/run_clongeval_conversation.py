@@ -136,8 +136,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--recall-mode",
         choices=("stage1", "stage2", "normal"),
-        default="normal",
-        help="Recall path passed to the memory runtime.",
+        default=None,
+        help=(
+            "Override config.yaml recall_mode; when omitted, use the configured "
+            "recall path."
+        ),
     )
     parser.add_argument("--skip-embedding-validation", action="store_true")
     parser.add_argument(
@@ -471,6 +474,11 @@ def prepare_runtime(
     args.reflect_limit = max(1, int(args.reflect_limit or memory_manager_config.get("reflect_limit", 100) or 100))
     args.recall_top_k = max(1, int(args.recall_top_k or memory_manager_config.get("recall_top_k", 8) or 8))
     args.recall_budget = str(args.recall_budget or memory_manager_config.get("recall_budget", "mid") or "mid")
+    if args.recall_mode is not None:
+        memory_manager_config["recall_mode"] = args.recall_mode
+    args.recall_mode = str(
+        memory_manager_config.get("recall_mode", "normal") or "normal"
+    ).strip().lower()
     segmentation_config = memory_runtime_config.setdefault(
         "assistant_wakeup_segmentation",
         {},

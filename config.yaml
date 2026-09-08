@@ -204,15 +204,32 @@ memory_manager:
 
   reflect_limit: 100
   
-  recall_top_k: 8
-  recall_budget: mid
-  recall_mode: normal
-  retrieval_source_override:
+  recall:  
+    recall_top_k: 8
+    recall_budget: mid
+    recall_mode: normal
+    retrieval_source_override:
 
-  recall_detailed_logging: true
-  recall_stage1_candidate_min_score: 0.30
-  recall_stage1_candidate_trusted_score_threshold: 0.65
-
-  recall_stage2_fact_min_embedding_similarity: 0.30
-  recall_stage2_state_min_embedding_similarity: 0.25
-  recall_stage2_actionable_item_min_embedding_similarity: 0.25
+    recall_detailed_logging: true
+    recall_stage1:
+      recall_stage1_entity_matched_score: 0.30
+      recall_stage1_topic_overlap_score_weight: 0.54
+      recall_stage1_keyword_overlap_score_weight: 0.12
+      recall_stage1_time_score_weight: 0.12
+      recall_stage1_contextual_time_score_multiplier: 2.0
+      recall_stage1_actionable_min_importance: 0.75
+      recall_stage1_evidence_profile_min_term_coverage: 0.5
+    recall_stage2:
+      recall_stage2_fact_min_embedding_similarity: 0.30
+      recall_stage2_state_min_embedding_similarity: 0.25
+      recall_stage2_fact_strong_embedding_similarity: 0.45
+      recall_stage2_state_strong_embedding_similarity: 0.40
+      recall_stage2_strong_topic_pair_score: 0.90
+      recall_stage2_keyword_match_score_weight: 0.12
+      recall_stage2_bm25_score_weight: 0.2
+      recall_stage2_entity_matched_score: 0.20
+      recall_stage2_time_score_weight: 0.12
+      recall_stage2_contextual_time_score_multiplier: 2.0
+    recall_fact_time_score_half_life_seconds: 604800
+    recall_topic_state_time_score_half_life_seconds: 1209600
+    recall_persistent_state_time_score_half_life_seconds: 7776000

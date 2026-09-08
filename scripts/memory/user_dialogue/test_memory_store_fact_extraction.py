@@ -19,6 +19,7 @@ import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple
+import numpy as np
 
 import requests
 
@@ -312,13 +313,17 @@ def iter_stored_nodes(db: Any, start_id: int) -> Iterable[Dict[str, Any]]:
     for row in rows:
         item = dict(row)
         for key, default in (
+            ("keywords", []),
             ("entities", []),
             ("metadata", {}),
         ):
             try:
                 item[key] = json.loads(item.get(key) or json.dumps(default))
             except json.JSONDecodeError:
-                item[key] = default
+                if key == "keywords":
+                    item[key] = str(item.get(key) or "").split()
+                else:
+                    item[key] = default
         yield item
 
 
@@ -625,7 +630,7 @@ def validate_embedding_runtime(
     logging.info(
         "Embedding probe succeeded: dimensions=%s normalized_norm=%.6f",
         probe_vector.size,
-        float((probe_vector @ probe_vector) ** 0.5),
+        float(np.dot(probe_vector, probe_vector) ** 0.5),
     )
 
 

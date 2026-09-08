@@ -261,7 +261,7 @@ class SessionDB:
                 fact_type TEXT NOT NULL DEFAULT 'episodic',
                 fact_kind TEXT NOT NULL DEFAULT 'context',
                 summary TEXT NOT NULL,
-                keywords TEXT NOT NULL DEFAULT '',
+                keywords TEXT NOT NULL DEFAULT '[]',
                 entities TEXT NOT NULL DEFAULT '[]',
                 entity_ids TEXT NOT NULL DEFAULT '[]',
                 fact_root_topic TEXT NOT NULL DEFAULT '',
@@ -340,6 +340,26 @@ class SessionDB:
                 FOREIGN KEY(entity_id) REFERENCES memory_entity_nodes(id) ON DELETE CASCADE
             );
 
+            CREATE TABLE IF NOT EXISTS memory_fact_state_mapping (
+                fact_id INTEGER NOT NULL,
+                state_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(fact_id, state_id),
+                FOREIGN KEY(fact_id) REFERENCES memory_facts(id) ON DELETE CASCADE,
+                FOREIGN KEY(state_id) REFERENCES memory_states(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS memory_fact_episode_mapping (
+                fact_id INTEGER NOT NULL,
+                episode_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(fact_id, episode_id),
+                FOREIGN KEY(fact_id) REFERENCES memory_facts(id) ON DELETE CASCADE,
+                FOREIGN KEY(episode_id) REFERENCES memory_episodes(id) ON DELETE CASCADE
+            );
+
             CREATE TABLE IF NOT EXISTS memory_topic_actionable_item_mapping (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 topic_state_id INTEGER NOT NULL,
@@ -362,6 +382,10 @@ class SessionDB:
             ON memory_states(source_type, state_scope, state_type);
             CREATE INDEX IF NOT EXISTS idx_memory_actionable_source
             ON memory_actionable_items(source_type, item_type, status);
+            CREATE INDEX IF NOT EXISTS idx_memory_fact_state_state
+            ON memory_fact_state_mapping(state_id, updated_at);
+            CREATE INDEX IF NOT EXISTS idx_memory_fact_episode_episode
+            ON memory_fact_episode_mapping(episode_id, updated_at);
             CREATE INDEX IF NOT EXISTS idx_memory_topic_actionable_state
             ON memory_topic_actionable_item_mapping(topic_state_id, updated_at);
             """
@@ -372,6 +396,7 @@ class SessionDB:
         self._ensure_memory_states_time_line_schema()
         self._ensure_memory_states_entity_key_schema()
         self._ensure_memory_states_canonical_name_embedding_schema()
+        self._backfill_fact_relation_mappings()
         self._init_identity_fts()
         self._commit_if_needed()
 
@@ -589,6 +614,32 @@ class SessionDB:
                 "ALTER TABLE memory_states ADD COLUMN canonical_name_embedding BLOB"
             )
 
+    def _backfill_fact_relation_mappings(self) -> None:
+        """Mirror legacy fact episode/state references into relation tables."""
+        episode_rows = self._conn.execute(
+            "SELECT id, episode_id FROM memory_facts WHERE episode_id IS NOT NULL"
+        ).fetchall()
+        self.insert_fact_episode_mappings([
+            {
+                "fact_id": int(row["id"]),
+                "episode_id": int(row["episode_id"]),
+            }
+            for row in episode_rows
+            if row["episode_id"] is not None
+        ])
+
+        state_rows = self._conn.execute(
+            "SELECT id, evidence_fact_ids FROM memory_states"
+        ).fetchall()
+        self.insert_fact_state_mappings([
+            {
+                "fact_id": fact_id,
+                "state_id": int(row["id"]),
+            }
+            for row in state_rows
+            for fact_id in _json_loads(row["evidence_fact_ids"], [])
+        ])
+
     @staticmethod
     def _terms_to_fts_query(terms: Sequence[str]) -> str:
         quoted: List[str] = []
@@ -761,6 +812,10 @@ class SessionDB:
                 source_table="memory_states",
                 row_id=state_id,
                 identity_text=str(identity_text or ""),
+            )
+            self.replace_fact_state_mappings_for_state(
+                state_id=state_id,
+                fact_ids=evidence_fact_ids,
             )
             self.insert_entity_memory_mappings([
                 {
@@ -946,6 +1001,18 @@ class SessionDB:
             f"UPDATE memory_facts SET episode_id = ?, updated_at = ? WHERE id IN ({placeholders})",
             (int(episode_id), now, *normalized_ids),
         )
+        self._conn.execute(
+            f"DELETE FROM memory_fact_episode_mapping "
+            f"WHERE fact_id IN ({placeholders}) AND episode_id != ?",
+            (*normalized_ids, int(episode_id)),
+        )
+        self.insert_fact_episode_mappings([
+            {
+                "fact_id": fact_id,
+                "episode_id": int(episode_id),
+            }
+            for fact_id in normalized_ids
+        ])
         mappings = []
         for row in rows:
             for entity_id in _json_loads(row["entity_ids"], default=[]):
@@ -955,6 +1022,132 @@ class SessionDB:
             self.insert_entity_memory_mappings(mappings)
         self._commit_if_needed()
         return int(cur.rowcount or 0)
+
+    def insert_fact_state_mappings(
+        self,
+        mappings: Sequence[Dict[str, Any]],
+    ) -> int:
+        """Persist stable evidence links from facts to memory states."""
+        normalized_pairs = {
+            (int(mapping["fact_id"]), int(mapping["state_id"]))
+            for mapping in mappings or []
+            if str(mapping.get("fact_id") or "").strip().isdigit()
+            and str(mapping.get("state_id") or "").strip().isdigit()
+            and int(mapping["fact_id"]) > 0
+            and int(mapping["state_id"]) > 0
+        }
+        if not normalized_pairs:
+            return 0
+        fact_ids = sorted({fact_id for fact_id, _state_id in normalized_pairs})
+        state_ids = sorted({state_id for _fact_id, state_id in normalized_pairs})
+        fact_placeholders = ",".join("?" for _ in fact_ids)
+        state_placeholders = ",".join("?" for _ in state_ids)
+        existing_fact_ids = {
+            int(row["id"])
+            for row in self._conn.execute(
+                f"SELECT id FROM memory_facts WHERE id IN ({fact_placeholders})",
+                fact_ids,
+            ).fetchall()
+        }
+        existing_state_ids = {
+            int(row["id"])
+            for row in self._conn.execute(
+                f"SELECT id FROM memory_states WHERE id IN ({state_placeholders})",
+                state_ids,
+            ).fetchall()
+        }
+        now = local_now_text()
+        changed_count = 0
+        for fact_id, state_id in normalized_pairs:
+            if fact_id not in existing_fact_ids or state_id not in existing_state_ids:
+                continue
+            self._conn.execute(
+                """
+                INSERT INTO memory_fact_state_mapping (
+                    fact_id, state_id, created_at, updated_at
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(fact_id, state_id) DO NOTHING
+                """,
+                (fact_id, state_id, now, now),
+            )
+            changed_count += 1
+        self._commit_if_needed()
+        return changed_count
+
+    def replace_fact_state_mappings_for_state(
+        self,
+        *,
+        state_id: int,
+        fact_ids: Sequence[int],
+    ) -> int:
+        """Synchronize one state's fact evidence links with its current input."""
+        normalized_state_id = int(state_id or 0)
+        if normalized_state_id <= 0:
+            return 0
+        self._conn.execute(
+            "DELETE FROM memory_fact_state_mapping WHERE state_id = ?",
+            (normalized_state_id,),
+        )
+        return self.insert_fact_state_mappings([
+            {
+                "fact_id": fact_id,
+                "state_id": normalized_state_id,
+            }
+            for fact_id in fact_ids or []
+        ])
+
+    def insert_fact_episode_mappings(
+        self,
+        mappings: Sequence[Dict[str, Any]],
+    ) -> int:
+        """Persist stable membership links from facts to memory episodes."""
+        normalized_pairs = {
+            (int(mapping["fact_id"]), int(mapping["episode_id"]))
+            for mapping in mappings or []
+            if str(mapping.get("fact_id") or "").strip().isdigit()
+            and str(mapping.get("episode_id") or "").strip().isdigit()
+            and int(mapping["fact_id"]) > 0
+            and int(mapping["episode_id"]) > 0
+        }
+        if not normalized_pairs:
+            return 0
+        fact_ids = sorted({fact_id for fact_id, _episode_id in normalized_pairs})
+        episode_ids = sorted(
+            {episode_id for _fact_id, episode_id in normalized_pairs}
+        )
+        fact_placeholders = ",".join("?" for _ in fact_ids)
+        episode_placeholders = ",".join("?" for _ in episode_ids)
+        existing_fact_ids = {
+            int(row["id"])
+            for row in self._conn.execute(
+                f"SELECT id FROM memory_facts WHERE id IN ({fact_placeholders})",
+                fact_ids,
+            ).fetchall()
+        }
+        existing_episode_ids = {
+            int(row["id"])
+            for row in self._conn.execute(
+                f"SELECT id FROM memory_episodes WHERE id IN ({episode_placeholders})",
+                episode_ids,
+            ).fetchall()
+        }
+        now = local_now_text()
+        changed_count = 0
+        for fact_id, episode_id in normalized_pairs:
+            if fact_id not in existing_fact_ids or episode_id not in existing_episode_ids:
+                continue
+            self._conn.execute(
+                """
+                INSERT INTO memory_fact_episode_mapping (
+                    fact_id, episode_id, created_at, updated_at
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(fact_id, episode_id) DO NOTHING
+                """,
+                (fact_id, episode_id, now, now),
+            )
+            changed_count += 1
+        self._commit_if_needed()
+        return changed_count
 
     def update_episode(
         self,
@@ -1099,7 +1292,7 @@ class SessionDB:
         fact_type: str,
         fact_kind: str,
         summary: str,
-        keywords: str,
+        keywords: Sequence[str],
         entities: Sequence[str],
         entity_ids: Optional[Sequence[int]],
         fact_root_topic: str,
@@ -1113,6 +1306,19 @@ class SessionDB:
         identity_text: str,
     ) -> int:
         now = local_now_text()
+        keyword_values = (
+            [
+                value
+                for value in str(keywords).split()
+                if value
+            ]
+            if isinstance(keywords, str)
+            else [
+                str(value).strip()
+                for value in keywords or []
+                if str(value).strip()
+            ]
+        )
         cur = self._conn.execute(
             """
             INSERT INTO memory_facts (
@@ -1129,7 +1335,7 @@ class SessionDB:
                 fact_type,
                 fact_kind,
                 summary,
-                keywords,
+                _json_dumps(keyword_values),
                 _json_dumps(list(entities or [])),
                 _json_dumps([int(value) for value in entity_ids or []]),
                 str(fact_root_topic or ""),
@@ -1151,6 +1357,13 @@ class SessionDB:
             row_id=fact_id,
             identity_text=str(identity_text or ""),
         )
+        if episode_id is not None:
+            self.insert_fact_episode_mappings([
+                {
+                    "fact_id": fact_id,
+                    "episode_id": int(episode_id),
+                }
+            ])
         self.insert_entity_memory_mappings([
             {
                 "entity_id": int(entity_id),
@@ -1629,6 +1842,25 @@ class SessionDB:
         by_id = {int(row["id"]): self._row_to_dict(row) for row in rows}
         return [by_id[item] for item in ids if item in by_id]
 
+    def memory_facts_with_identity_embeddings(
+        self,
+        *,
+        source_types: Optional[Sequence[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Load every embeddable fact for bounded in-process vector ranking."""
+        clauses = ["identity_text_embedding IS NOT NULL"]
+        params: List[Any] = []
+        if source_types:
+            placeholders = ",".join("?" for _ in source_types)
+            clauses.append(f"source_type IN ({placeholders})")
+            params.extend(source_types)
+        where = " WHERE " + " AND ".join(clauses)
+        rows = self._conn.execute(
+            f"SELECT * FROM memory_facts{where} ORDER BY id ASC",
+            params,
+        ).fetchall()
+        return [self._row_to_dict(row) for row in rows]
+
     def memory_episodes_by_ids(self, episode_ids: Sequence[int]) -> List[Dict[str, Any]]:
         ids = [int(value) for value in episode_ids if value is not None]
         if not ids:
@@ -1667,6 +1899,80 @@ class SessionDB:
         ).fetchall()
         return [self._row_to_dict(row) for row in rows]
 
+    def related_fact_pairs_by_episode_fact_ids(
+        self,
+        fact_ids: Sequence[int],
+        *,
+        limit: int = 200,
+    ) -> List[Dict[str, int]]:
+        """Return other facts sharing an episode with each supplied fact."""
+        ids = list(dict.fromkeys(
+            int(value)
+            for value in fact_ids or []
+            if str(value).strip().isdigit() and int(value) > 0
+        ))
+        if not ids:
+            return []
+        placeholders = ",".join("?" for _ in ids)
+        rows = self._conn.execute(
+            f"""
+            SELECT seed.fact_id AS seed_fact_id,
+                   related.fact_id AS related_fact_id
+            FROM memory_fact_episode_mapping AS seed
+            INNER JOIN memory_fact_episode_mapping AS related
+                ON related.episode_id = seed.episode_id
+            WHERE seed.fact_id IN ({placeholders})
+              AND related.fact_id != seed.fact_id
+            ORDER BY seed.fact_id ASC, related.fact_id ASC
+            LIMIT ?
+            """,
+            (*ids, max(1, int(limit or 200))),
+        ).fetchall()
+        return [
+            {
+                "seed_fact_id": int(row["seed_fact_id"]),
+                "related_fact_id": int(row["related_fact_id"]),
+            }
+            for row in rows
+        ]
+
+    def related_fact_pairs_by_state_fact_ids(
+        self,
+        fact_ids: Sequence[int],
+        *,
+        limit: int = 200,
+    ) -> List[Dict[str, int]]:
+        """Return other facts supporting at least one shared memory state."""
+        ids = list(dict.fromkeys(
+            int(value)
+            for value in fact_ids or []
+            if str(value).strip().isdigit() and int(value) > 0
+        ))
+        if not ids:
+            return []
+        placeholders = ",".join("?" for _ in ids)
+        rows = self._conn.execute(
+            f"""
+            SELECT seed.fact_id AS seed_fact_id,
+                   related.fact_id AS related_fact_id
+            FROM memory_fact_state_mapping AS seed
+            INNER JOIN memory_fact_state_mapping AS related
+                ON related.state_id = seed.state_id
+            WHERE seed.fact_id IN ({placeholders})
+              AND related.fact_id != seed.fact_id
+            ORDER BY seed.fact_id ASC, related.fact_id ASC
+            LIMIT ?
+            """,
+            (*ids, max(1, int(limit or 200))),
+        ).fetchall()
+        return [
+            {
+                "seed_fact_id": int(row["seed_fact_id"]),
+                "related_fact_id": int(row["related_fact_id"]),
+            }
+            for row in rows
+        ]
+
     def memory_states_by_ids(self, state_ids: Sequence[int]) -> List[Dict[str, Any]]:
         ids = [int(value) for value in state_ids if value is not None]
         if not ids:
@@ -1678,6 +1984,25 @@ class SessionDB:
         ).fetchall()
         by_id = {int(row["id"]): self._row_to_dict(row) for row in rows}
         return [by_id[item] for item in ids if item in by_id]
+
+    def memory_states_with_identity_embeddings(
+        self,
+        *,
+        source_types: Optional[Sequence[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Load every embeddable state for bounded in-process vector ranking."""
+        clauses = ["identity_text_embedding IS NOT NULL"]
+        params: List[Any] = []
+        if source_types:
+            placeholders = ",".join("?" for _ in source_types)
+            clauses.append(f"source_type IN ({placeholders})")
+            params.extend(source_types)
+        where = " WHERE " + " AND ".join(clauses)
+        rows = self._conn.execute(
+            f"SELECT * FROM memory_states{where} ORDER BY id ASC",
+            params,
+        ).fetchall()
+        return [self._row_to_dict(row) for row in rows]
 
     def memory_actionable_items_by_ids(
         self,
@@ -1764,6 +2089,24 @@ class SessionDB:
 
     def _row_to_dict(self, row: sqlite3.Row) -> Dict[str, Any]:
         item = dict(row)
+        if "keywords" in item:
+            raw_keywords = item["keywords"]
+            parsed_keywords = _json_loads(raw_keywords, None)
+            if isinstance(parsed_keywords, list):
+                item["keywords"] = [
+                    str(value).strip()
+                    for value in parsed_keywords
+                    if str(value).strip()
+                ]
+            else:
+                # Facts stored before keyword lists were serialized used a
+                # whitespace-joined string. Their original phrase boundaries
+                # cannot be recovered, so retain the former token behavior.
+                item["keywords"] = [
+                    value
+                    for value in str(raw_keywords or "").split()
+                    if value
+                ]
         for key in (
             "entities",
             "entity_ids",
