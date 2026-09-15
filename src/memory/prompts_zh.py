@@ -103,6 +103,17 @@ UNIFIED_MEMORY_EXTRACTION_PROMPT_ZH = """你是 AI 眼镜长期记忆系统的�
 
 你现在需要从下面按时间顺序排列的对话/转写证据批次中提取 Hindsight 风格的高质量 narrative facts。episode summary、episode canonical_topics 将由独立模块根据已生成 facts 负责，不要在本 prompt 中输出 episode 级字段。
 
+写入资格门槛（先判断，未通过时直接输出空 `facts`；不要为了覆盖输入而生成 fact）：
+- 默认输出 0 条 fact。只有同时满足“证据可靠”和“未来可用”时才输出；可被流畅概括不等于值得长期记忆。
+- fact 的核心内容必须由用户的语义完整、指代明确的表达，或当前批次中可验证的执行结果支撑。助手的猜测、补全、泛化介绍、安慰、追问、复述和推荐，不能单独证明用户的偏好、身份、情绪、计划、能力或事实。
+- “这个/那个/他/她/对/嗯/不去/这就是”等指代不明、语义不完整的短句，只有在当前批次后续的用户表达明确消歧时才能作为证据；不能根据助手的猜测或回答补全其含义。
+- 不要把“助手没有理解”“用户没有补充”“问题尚未澄清”本身写成 `open_question` 或其他 fact；除非用户明确要求后续跟进某个对象明确、仍未解决的问题。
+- 优先保留：用户明确的稳定身份、偏好、习惯、关系或约束；带具体对象及时间/地点的个人事件或计划；明确决定、承诺、长期指令；用户确认的项目结果、风险或重要问题。
+- 可以保留用户明确表达的持续兴趣、困难或目标，但只记录用户事实。助手给出的建议、教程、解释或方案，只有被用户明确接受、选择、执行或成为后续讨论的约束时才可写入。
+- 丢弃：唤醒词和寒暄、礼貌确认、浏览或展示过程、重复确认、泛知识讲解、一次模糊提问、未被采纳的建议、纯对话修复、无后续价值的感叹，以及不能独立解释的 ASR 碎片。
+- 如果当前证据只是重复已有 memory_state 或其中已知事实，且没有新增属性、变化、时间进展、明确决定或新的约束，不要生成重复 fact。
+- 不要输出被丢弃内容的解释、占位 fact 或低优先级 fact；只返回通过门槛的 facts。
+
 memory_states 使用规则：
 - state_scope=topic_state 且 state_type=topic 的状态，只作为 fact `fact_root_topic` 的命名参考；如果当前证据表达的是同一长期对象或议题，优先原样复用 canonical_name。
 - state_scope=entity_state 的状态，只用于理解实体的长期属性、偏好、约束、风险或关系，不能直接把 entity_state 的 canonical_name 当作 episode topic 或 fact 的 fact_root_topic。
@@ -111,12 +122,13 @@ memory_states 使用规则：
 - `fact_root_topic` 只有在该 fact 的核心对象、讨论目标和语义范围都与 topic_state 的 canonical_name 相近时，才可以原样复用该名称；`fact_aspect_topic` 应保留该 fact 在根主题下的具体讨论方面。
 - 不要仅因为 fact 与某个 topic_state 同属“健康”“产品”“团队”等宽泛领域，或 fact 中出现了该 topic 的相关背景，就复用该名称。若当前证据不能支持这种严格对应，应使用当前证据中的更具体主题，必要时输出新的保守 topic。
 - 不能因为 entity_state 的名称、summary 或历史 timeline 而改变 fact 的 root_topic；entity_state 只能辅助理解，不得作为 topic 候选直接复用。
+- 如果当前批次只是重复已有 state 已记录的同一事实，且没有新增变化，不要为了复用 topic_state 而输出重复 fact。
 - `entities` 保留所有与 fact 直接相关的实体，用于完整召回；`primary_entity` 表示这条 fact 主要描述、影响或归属的单一实体，必须来自 `entities`。对于用户自己的偏好、习惯、约束或风险，优先将“用户”作为 primary_entity；对于助手自己的动作或建议，优先将“助手”作为 primary_entity。
 
 """ + ENTITY_EXTRACTION_GUIDANCE_ZH + """
 
 Hindsight 风格 narrative fact 的核心要求：
-- 每条 fact 应覆盖一次完整 exchange 或一个清晰议题片段，而不是单个 utterance。不要把“用户提出问题”“助手给出建议”“用户否定/接受建议”机械拆成多条碎片；如果它们围绕同一问题相互回应，应优先合并成一条 narrative fact。
+- 以下要求只适用于已经通过写入资格门槛的 fact。每条 fact 应覆盖一次完整 exchange 或一个清晰议题片段，而不是单个 utterance。不要把“用户提出问题”“助手给出建议”“用户否定/接受建议”机械拆成多条碎片；如果它们围绕同一问题相互回应，应优先合并成一条 narrative fact。
 - 每条 fact 必须能在不阅读原始对话的情况下独立理解，并保留对话的 pragmatic flow：用户为什么提出这个问题，助手给了什么方案，用户如何回应，最后形成了什么倾向、决定、约束、未解决问题或下一步。
 - 每条 fact 应在 text 中优先体现 what（完整事件/议题/方案/结论）；when、where、who、why 只有在输入证据明确出现且有助于理解时才加入。缺失的信息直接省略，不要写“未提及具体地点/场景”“没有说明原因”等无信息量的占位句。
 - 压缩解释过程，不压缩事实答案；删除无关细节，但不要删除理解事实所需的主体、对象、时间、关键动作、用户态度、结果、决定或约束。
@@ -142,25 +154,22 @@ fact_type 判别规则：
 - 带时间锚或顺序词的个人经历即使只是顺带提到，也应认真保留，例如购买、保养/维修、修理、预约、参加活动、旅行、会议、测试、失败、决定等。
 
 提取规则：
-1. 提取 0-5 条 facts，不要为了覆盖每一轮强行生成 fact。
-2. 每条 fact 必须是一段完整叙事，至少包含“议题背景 + 用户/助手的观点或动作流动 + 理由/分歧/约束/结论/下一步”中的关键要素。
-3. 保留可被直接问到的具体细节：人名、地点、标题、颜色、日期、星期、相对时间、数量、金额、时长、产品、机构、建议、约束、决定和用户偏好。
-4. 压缩助手的解释、推导和泛化建议，但保留未来可能直接成为答案的事实细节，以及用户明确接受、拒绝、选择或形成的决定。
-5. 不要丢弃 “by the way / I also / I just / last Saturday / two months ago / 顺便 / 我还” 这类附带提到的个人事件；但如果它们属于同一 exchange 的上下文，应合并进同一条 narrative fact，而不是拆成无背景短句。
-6. 只有真正互不相关的事件才拆开；时间推理需要比较先后/间隔的事件可以拆成多条，但每条仍必须保留完整背景和时间锚点。
-7. 只使用输入证据，不要编造完成状态、意图或原因。
-8. 如果助手的推荐中包含未来可能被问到的具体条目，要放入相关 exchange 的 narrative fact，并写清用户是否接受、拒绝、犹豫或提出约束。
-9. priority 为 0-100，只保留至少 60 分的事实。
-10. fact_type 只能是 semantic 或 episodic，并严格按照上面的稳定知识/长期信息与单次事件边界判断。
-11. fact_kind 只能是 preference、decision、request、recommendation、action、commitment、open_question、risk、error、context、instruction、other。
-12. 不要输出只有“用户说了 X”“助手建议 Y”的短 fact；如果删除议题背景、理由、分歧或结论后会变成泛泛短句，必须补回这些信息；若对话没有足够信息支撑，则不要输出该 fact。
-13. 不要把助手的寒暄、礼貌收尾、泛化鼓励或无具体信息的回复单独作为 fact，例如“希望这个方法能帮到您”“有其他问题可以继续沟通”“好的”“不客气”等；除非它明确改变了用户决定、承诺或下一步。
-14. keywords 只能包含用于检索的短实体、主题、症状、方案、约束、决定和关键时间/顺序锚，通常每个关键词 2-8 个汉字或一个短英文短语；对带时间锚的事件，必须加入原始或补全后的时间词，例如“March 15 2023”“first service”“3/22”“last Saturday”“two months ago”“上周六”“两个月前”。不要把完整句子、寒暄、礼貌话、语气词、泛化表达或“希望这个方法能帮到您”这类文本放入 keywords。
-15. 只返回 JSON，不要 markdown。
+1. 提取 0-5 条 facts，但 0 条是常见且正确的结果；不要为了覆盖每一轮、维持话题连续性或解释助手回复而生成 fact。
+2. 每条 fact 必须是一段完整叙事，至少包含“议题背景 + 用户已明确表达或确认的关键事实 + 结果/决定/约束/下一步”中的必要要素。助手的观点或动作只可作为经用户确认的结果背景，不能成为叙事核心。
+3. 保留可被直接问到且有长期或近期复用价值的具体细节：人名、地点、日期、相对时间、数量、产品、机构、用户明确的约束、决定、计划和偏好。不要仅因助手提到某个细节就保留它。
+4. 压缩助手的解释、推导和泛化建议。只有用户明确接受、拒绝、选择、执行，或它已成为后续讨论的具体约束时，才保留相关方案及用户态度。
+5. 不要丢弃 “by the way / I also / I just / last Saturday / two months ago / 顺便 / 我还” 这类附带提到、但语义完整的个人事件；如果它们只是模糊片段、无对象的感叹或同一 exchange 的无关上下文，则丢弃。
+6. 只有真正互不相关且各自通过写入资格门槛的事件才拆开；时间推理需要比较先后/间隔的事件可以拆成多条，但每条仍必须保留完整背景和时间锚点。
+7. 只使用输入证据，不要编造完成状态、意图、原因或用户属性；尤其不要把助手声称的用户爱好、性格、经历或偏好当作用户事实，除非当前批次中用户明确确认。
+8. priority 为 0-100。仅输出 priority >= 80 的 fact：90-100 用于稳定身份/偏好/约束、明确决定或重要计划；80-89 用于带明确对象的近期事件、有效计划、用户确认的结果或风险；低于 80 直接丢弃，不要输出。
+9. fact_type 只能是 semantic 或 episodic，并严格按照上面的稳定知识/长期信息与单次事件边界判断。
+10. fact_kind 只能是 preference、decision、request、recommendation、action、commitment、open_question、risk、error、context、instruction、other；不要仅因助手未回答或用户表述模糊而使用 `open_question`。
+11. keywords 只能包含用于检索的短实体、主题、症状、方案、约束、决定和关键时间/顺序锚，通常每个关键词 2-8 个汉字或一个短英文短语；对带时间锚的事件，必须加入原始或补全后的时间词，例如“March 15 2023”“first service”“3/22”“last Saturday”“two months ago”“上周六”“两个月前”。不要把完整句子、寒暄、礼貌话、语气词、泛化表达或“希望这个方法能帮到您”这类文本放入 keywords。
+12. 只返回 JSON，不要 markdown。
 
 entity_state_signal 输出规则：
 - `entity_state_signal` 只是提示当前 fact 可能对用户或关键实体的长期状态有贡献，不是最终的 entity_state 更新。
-- 只有证据明确表达偏好、画像、习惯、关系、约束或风险，且具有跨场景复用价值时才输出；普通一次性事件、临时建议、寒暄和低价值背景输出空数组。
+- 只有用户或该实体在当前批次中明确表达或确认偏好、画像、习惯、关系、约束或风险，且具有跨场景复用价值时才输出；普通一次性事件、临时建议、助手猜测、寒暄和低价值背景输出空数组。
 - 每条 fact 最多输出 3 个 signal。每个 signal 只保留 `state_type`、`attribute_name`、`evidence_basis`、`confidence`，以及证据明确时的 `entity`；不要生成 aspect_summary，不要引用历史 state。
 - `state_type` 只能是 preference、profile、routine、relationship、constraint、risk。
 - `attribute_name` 应具体描述可能受影响的属性；`evidence_basis` 必须引用当前 fact 中的证据。后续 reflection 会结合已有 entity_state 决定是否创建、更新或忽略该信号。
@@ -434,9 +443,10 @@ episode 是原始对话/转写批次的存储容器，包含 title、summary、�
 - 查询涉及“目前进展、长期状态和下一步”时，通常同时选择 `state`、`actionable_item` 和 `fact`。
 - 不确定时保持宽检索，漏掉证据比多取几个候选更糟，但不要无差别默认选择所有层。
 - `layer_preference` 输出 1-3 个最相关的层，值只能是 `fact`、`state`、`actionable_item`；它表示需要优先加强的召回层，不是新的数据库表。
-- `keywords` 输出 2-8 个短检索词，优先保留具体人物、组织、产品、项目、主题、动作、结果、约束和时间锚点；不要输出完整句子、寒暄或泛化词。
+- `keywords` 输出 2-8 个短检索词，优先保留具体人物、组织、产品、项目、主题、动作、结果和约束；不要输出完整句子、寒暄、泛化词或普通时间表达。
 - `entities` 输出对语义检索有帮助的实体名称及类型。实体可以是人物、组织、地点、产品、项目、技术或具体概念；普通的“今天/昨天/上周”等时间表达不要作为实体。
 - `temporal_mode` 表示时间范围应该匹配哪一种 fact 时间：`event_time` 表示事实描述的现实事件时间，`dialogue_time` 表示对话/转写发生时间，`both` 表示任一时间命中即可，`none` 表示不做时间硬过滤。询问“做了什么/发生了什么/买过什么”优先使用 `event_time`；询问“讨论了什么/提到过什么/问过什么”优先使用 `dialogue_time`；无法判断时使用 `none`。
+- `temporal_bounds` 由你根据原始 query 和参考时间解析；`start` / `end` 使用 `YYYY-MM-DD HH:MM:SS` 或 `null`，至少提供一个边界。`end` 是排他上界。没有时间约束时输出 `null`。
 
 只返回 JSON：
 {
@@ -446,9 +456,13 @@ episode 是原始对话/转写批次的存储容器，包含 title、summary、�
   "query_rewrite": "面向原始记忆表检索的改写",
   "keywords": ["关键词1", "关键词2"],
   "entities": [{"name": "实体名", "type": "PERSON|ORGANIZATION|LOCATION|PRODUCT|PROJECT|TECHNOLOGY|CONCEPT|OTHER"}],
+  "temporal_bounds": {"start": "YYYY-MM-DD HH:MM:SS|null", "end": "YYYY-MM-DD HH:MM:SS|null"},
   "temporal_mode": "event_time|dialogue_time|both|none"
 }
 
-用户查询：
+原始用户查询：
 {query}
+
+解析相对时间表达时使用的参考时间：
+{reference_time}
 """

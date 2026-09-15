@@ -5891,7 +5891,7 @@ class MemoryNodeManager:
                 "prompt_language": prompt_language,
             })
 
-            parsed_time_start, parsed_time_end, clean_query = self._parse_time_expression(
+            parsed_time_start, parsed_time_end, time_stripped_query = self._parse_time_expression(
                 query,
                 reference_time=reference_time,
             )
@@ -5900,10 +5900,13 @@ class MemoryNodeManager:
                 parsed_time_end,
             )
             temporal_mode = self._infer_recall_temporal_mode(query)
-            search_query = clean_query or query
+            # Keep a successfully parsed time-only query empty for text
+            # retrieval rather than reintroducing the removed time expression.
             self._log_info("memory_recall", "query_prepared", {
-                "search_query": self._format_log_text(search_query, limit=500),
-                "clean_query": self._format_log_text(clean_query, limit=500),
+                "time_stripped_query": self._format_log_text(
+                    time_stripped_query,
+                    limit=500,
+                ),
                 "parsed_time_start": parsed_time_start,
                 "parsed_time_end": parsed_time_end,
                 "temporal_mode": temporal_mode,
@@ -5914,17 +5917,19 @@ class MemoryNodeManager:
             if normalized_recall_mode == "stage2":
                 actual_recall_mode = "stage2"
                 stage1_report = self._process_recall_stage1(
-                    query=search_query,
+                    original_query=query,
+                    time_stripped_query=time_stripped_query,
                     temporal_bounds=temporal_bounds,
                     memory_source_override=memory_source_override,
                     temporal_mode=temporal_mode,
-                    recent_reference_time=parsed_time_end,
                     prompt_language=prompt_language,
                     database=database,
                 )
                 memory_text = self._process_recall_stage2(
-                    query=search_query,
+                    original_query=query,
+                    time_stripped_query=time_stripped_query,
                     temporal_bounds=temporal_bounds,
+                    reference_time=reference_time,
                     memory_source_override=memory_source_override,
                     temporal_mode=temporal_mode,
                     stage1_report=stage1_report,
@@ -5933,14 +5938,11 @@ class MemoryNodeManager:
                 )
             else:
                 stage1_report = self._process_recall_stage1(
-                    query=search_query,
+                    original_query=query,
+                    time_stripped_query=time_stripped_query,
                     temporal_bounds=temporal_bounds,
                     memory_source_override=memory_source_override,
                     temporal_mode=temporal_mode,
-                    recent_reference_time=(
-                        parsed_time_end
-                        or datetime.now().astimezone().isoformat()
-                    ),
                     prompt_language=prompt_language,
                     database=database,
                 )
@@ -5950,9 +5952,10 @@ class MemoryNodeManager:
                 elif not stage1_report.get("trusted"):
                     actual_recall_mode = "stage2"
                     memory_text = self._process_recall_stage2(
-                        query=search_query,
-                        analysis_query=query,
+                        original_query=query,
+                        time_stripped_query=time_stripped_query,
                         temporal_bounds=temporal_bounds,
+                        reference_time=reference_time,
                         memory_source_override=memory_source_override,
                         temporal_mode=temporal_mode,
                         stage1_report=stage1_report,
@@ -6049,11 +6052,11 @@ class MemoryNodeManager:
     def _process_recall_stage1(
         self,
         *,
-        query: str,
+        original_query: str,
+        time_stripped_query: str,
         temporal_bounds: RecallTimeBounds,
         memory_source_override: Optional[Sequence[str]] = None,
         temporal_mode: str = "dialogue_time",
-        recent_reference_time: Optional[str] = None,
         prompt_language: str = "zh",
         database: Optional[SessionDB] = None,
     ) -> Dict[str, Any]:
@@ -6067,12 +6070,12 @@ class MemoryNodeManager:
         started_at = time.monotonic()
         source_types = self._normalize_source_override(memory_source_override)
         terms = self._build_recall_search_terms(
-            query,
+            time_stripped_query,
             keywords=[],
             entities=[],
         )
-        is_contextual_query = self._recall_stage1_is_contextual_query(query)
-        is_actionable_query = self._recall_stage1_is_actionable_query(query)
+        is_contextual_query = self._recall_stage1_is_contextual_query(original_query)
+        is_actionable_query = self._recall_stage1_is_actionable_query(original_query)
 
         candidate_limits = self._recall_stage1_candidate_limits(
             top_k=self._top_k,
@@ -6085,18 +6088,21 @@ class MemoryNodeManager:
         ]
         actionable_item_limit = candidate_limits["actionable_item_limit"]
         query_entity_names = self._recall_stage1_resolve_query_entity_names(
-            query=query,
+            query=original_query,
             database=database,
         )
         self._log_info("memory_recall_stage1", "start", {
-            "query": self._format_log_text(query, limit=500),
+            "original_query": self._format_log_text(original_query, limit=500),
+            "time_stripped_query": self._format_log_text(
+                time_stripped_query,
+                limit=500,
+            ),
             "top_k": self._top_k,
             "budget": self._recall_budget,
             "terms": terms,
             "time_start": (temporal_bounds or (None, None))[0],
             "time_end": (temporal_bounds or (None, None))[1],
             "temporal_mode": temporal_mode,
-            "recent_reference_time": recent_reference_time,
             "memory_source_override": list(memory_source_override or []),
             "candidate_limits": candidate_limits,
             "query_entity_names": query_entity_names,
@@ -6115,15 +6121,11 @@ class MemoryNodeManager:
             seed_candidates=seed_candidates,
             seed_candidate_limits=seed_candidate_limits,
         )
-        reference_time = (
-            recent_reference_time or datetime.now().astimezone().isoformat()
-        )
         direct_candidates = self._recall_stage1_calculate_candidate_matching_score(
             candidates=seed_candidates,
             search_terms=terms,
             query_entity_names=query_entity_names,
             is_contextual_query=is_contextual_query,
-            reference_time=reference_time,
             temporal_bounds=temporal_bounds,
         )
         self._log_recall_direct_candidates(
@@ -6153,7 +6155,9 @@ class MemoryNodeManager:
             association_candidates=association_candidates,
             expanded_candidates=expanded_candidates,
         )
-        semantic_query = self._recall_stage1_requires_semantic_search(query)
+        semantic_query = self._recall_stage1_requires_semantic_search(
+            time_stripped_query
+        )
         selected_candidates = self._recall_stage1_rank_and_select_candidates(
             candidates=expanded_candidates,
             layer_limits=selected_candidate_limits,
@@ -6162,7 +6166,7 @@ class MemoryNodeManager:
             states=selected_candidates,
             candidate_source_prefix="stage1",
             limit=actionable_item_limit,
-            reference_time=reference_time,
+            temporal_bounds=temporal_bounds,
             database=database,
         )
         selected_candidates.extend(selected_actionable_items)
@@ -6303,8 +6307,7 @@ class MemoryNodeManager:
         association_by_relation = {"same_episode": 0, "same_state": 0}
         for candidate in association_candidates:
             relation = str(
-                candidate.get(f"_recall_{stage_name}_association_relation")
-                or candidate.get("_recall_association_relation")
+                candidate.get("_recall_association_relation")
                 or ""
             )
             if relation in association_by_relation:
@@ -6505,22 +6508,9 @@ class MemoryNodeManager:
             )
             if not candidate:
                 continue
-            association_score_key = (
-                "_recall_stage1_association_score"
-                if candidate_source_prefix == "stage1"
-                else "_recall_stage2_association_score"
-            )
-            association_relation_key = (
-                "_recall_stage1_association_relation"
-                if candidate_source_prefix == "stage1"
-                else "_recall_stage2_association_relation"
-            )
-            candidate[association_score_key] = propagated_score
-            candidate[association_relation_key] = relation
             candidate["_recall_association_score"] = propagated_score
             candidate["_recall_association_relation"] = relation
             candidate["_recall_score"] = propagated_score
-            candidate["score"] = propagated_score
             candidate["evidence"] = ["associative_recall"]
             candidate["matched"] = True
             candidate["candidate_score_threshold"] = 0.0
@@ -6612,7 +6602,6 @@ class MemoryNodeManager:
         search_terms: Sequence[str] = (),
         query_entity_names: Sequence[str] = (),
         is_contextual_query: bool = False,
-        reference_time: Optional[str] = None,
         temporal_bounds: RecallTimeBounds = None,
     ) -> List[Dict[str, Any]]:
         """Score direct Stage 1 candidates and return accepted ones.
@@ -6622,16 +6611,12 @@ class MemoryNodeManager:
         """
         direct_candidates: List[Dict[str, Any]] = []
         for candidate in candidates or []:
-            effective_reference_time = (
-                reference_time or datetime.now().astimezone().isoformat()
-            )
             matching_score_info = (
                 self._recall_stage1_calculate_single_candidate_matching_score(
                     candidate,
                     search_terms=search_terms,
                     query_entity_names=query_entity_names,
                     is_contextual_query=is_contextual_query,
-                    reference_time=effective_reference_time,
                     temporal_bounds=temporal_bounds,
                 )
             )
@@ -6768,7 +6753,6 @@ class MemoryNodeManager:
         search_terms: Sequence[str] = (),
         query_entity_names: Sequence[str] = (),
         is_contextual_query: bool = False,
-        reference_time: Optional[str] = None,
         temporal_bounds: RecallTimeBounds = None,
     ) -> Dict[str, Any]:
         """Score topic/entity anchors and temporal relevance for one candidate.
@@ -6818,7 +6802,6 @@ class MemoryNodeManager:
         )
         time_score_info = self._calculate_recall_candidate_time_score(
             candidate,
-            reference_time=reference_time,
             temporal_bounds=temporal_bounds,
         )
         time_weight = self._recall_stage1_time_score_weight
@@ -7202,15 +7185,14 @@ class MemoryNodeManager:
         self,
         candidate: Dict[str, Any],
         *,
-        reference_time: Optional[str],
         temporal_bounds: RecallTimeBounds = None,
     ) -> Dict[str, Any]:
         """Calculate continuous temporal proximity for one recall candidate.
 
         A closed ``[start, end]`` window gives every in-range candidate full
-        temporal relevance. Open-ended bounds instead decay from the
-        effective reference time, so ``before <time>`` does not make every
-        earlier memory equally recent.
+        temporal relevance. For an open start, proximity is measured from
+        ``temporal_bounds.end`` so older memories before that end remain
+        distinguishable.
         """
         raw = (
             candidate.get("_hydrated")
@@ -7221,9 +7203,7 @@ class MemoryNodeManager:
         window_start_text, window_end_text = temporal_bounds or (None, None)
         window_start = self._recall_stage1_parse_datetime(window_start_text)
         window_end = self._recall_stage1_parse_datetime(window_end_text)
-        reference = self._recall_stage1_parse_datetime(reference_time)
-        if reference is None:
-            reference = window_end or window_start
+        reference = window_end
         if reference is None:
             return {
                 "time_score": 0.0,
@@ -7457,7 +7437,6 @@ class MemoryNodeManager:
         query_embedding: Optional[np.ndarray],
         query_entity_names: Sequence[str] = (),
         is_contextual_query: bool = False,
-        reference_time: Optional[str] = None,
         temporal_bounds: RecallTimeBounds = None,
     ) -> List[Dict[str, Any]]:
         """Score Stage 2 seeds in place and return accepted direct candidates."""
@@ -7475,7 +7454,6 @@ class MemoryNodeManager:
                     query_embedding=query_embedding,
                     query_entity_names=query_entity_names,
                     is_contextual_query=is_contextual_query,
-                    reference_time=reference_time,
                     temporal_bounds=temporal_bounds,
                 )
             )
@@ -7524,14 +7502,12 @@ class MemoryNodeManager:
     ) -> List[Dict[str, Any]]:
         """Merge direct and propagated candidates without re-scoring relations.
 
-        The same merge path is shared by Stage 1 and Stage 2. ``stage_name``
-        selects the corresponding association score/relation fields for the
-        current recall stage.
+        The same merge path is shared by Stage 1 and Stage 2. Association
+        candidates carry common score and relation fields; their source marks
+        which recall stage created the association.
         """
         if stage_name not in {"stage1", "stage2"}:
             raise ValueError(f"Unsupported recall stage: {stage_name}")
-        association_score_key = f"_recall_{stage_name}_association_score"
-        association_relation_key = f"_recall_{stage_name}_association_relation"
         candidates_by_target: Dict[Tuple[str, int], Dict[str, Any]] = {}
         for candidate in direct_candidates or []:
             try:
@@ -7551,13 +7527,13 @@ class MemoryNodeManager:
             except (TypeError, ValueError):
                 continue
             association_score = self._clamp_float(
-                association_candidate.get(association_score_key),
+                association_candidate.get("_recall_association_score"),
                 0.0,
                 1.0,
                 0.0,
             )
             association_relation = str(
-                association_candidate.get(association_relation_key) or ""
+                association_candidate.get("_recall_association_relation") or ""
             )
             existing = candidates_by_target.get(target)
             if existing is None:
@@ -7579,9 +7555,6 @@ class MemoryNodeManager:
                 )
             existing["_recall_association_score"] = association_score
             existing["_recall_association_relation"] = association_relation
-            if association_candidate.get(association_score_key) is not None:
-                existing[association_score_key] = association_score
-                existing[association_relation_key] = association_relation
             current_score = self._clamp_float(
                 existing.get("_recall_score"),
                 0.0,
@@ -7592,7 +7565,6 @@ class MemoryNodeManager:
                 current_score,
                 association_score,
             ), 4)
-            existing["score"] = existing["_recall_score"]
             evidence = list(
                 existing.get("evidence")
                 or existing.get("_recall_fast_match_evidence")
@@ -7603,8 +7575,6 @@ class MemoryNodeManager:
             existing["evidence"] = evidence
             existing["matched"] = True
             existing["filter_reason"] = ""
-            existing["association_score"] = round(association_score, 4)
-            existing["association_relation"] = association_relation
             if not bool(
                 (existing.get("_recall_decision") or {}).get("accepted")
             ):
@@ -7791,9 +7761,10 @@ class MemoryNodeManager:
     def _process_recall_stage2(
         self,
         *,
-        query: str,
-        analysis_query: Optional[str] = None,
+        original_query: str,
+        time_stripped_query: str,
         temporal_bounds: RecallTimeBounds,
+        reference_time: str,
         memory_source_override: Optional[Sequence[str]] = None,
         temporal_mode: str = "dialogue_time",
         stage1_report: Optional[Dict[str, Any]] = None,
@@ -7807,23 +7778,41 @@ class MemoryNodeManager:
         necessary without duplicating its query preparation and logging.
         """
         stage_started_at = time.monotonic()
+        time_stripped_query = str(time_stripped_query or "")
+        fallback_temporal_bounds = temporal_bounds
+        fallback_temporal_mode = self._normalize_recall_temporal_mode(
+            temporal_mode
+        )
+        analysis_reference_time = str(reference_time)
         self._log_info("memory_recall_stage2", "start", {
-            "query": self._format_log_text(query, limit=500),
+            "original_query": self._format_log_text(original_query, limit=500),
+            "time_stripped_query": self._format_log_text(
+                time_stripped_query,
+                limit=500,
+            ),
             "top_k": self._top_k,
             "budget": self._recall_budget,
-            "time_start": (temporal_bounds or (None, None))[0],
-            "time_end": (temporal_bounds or (None, None))[1],
-            "temporal_mode": temporal_mode,
+            "fallback_time_start": (fallback_temporal_bounds or (None, None))[0],
+            "fallback_time_end": (fallback_temporal_bounds or (None, None))[1],
+            "fallback_temporal_mode": fallback_temporal_mode,
+            "reference_time": analysis_reference_time,
             "prompt_language": prompt_language,
             "memory_source_override": list(memory_source_override or []),
         })
         query_analysis_info = self._analyze_recall_query(
-            query,
+            original_query,
+            reference_time=analysis_reference_time,
             prompt_language=prompt_language,
         )
-        temporal_mode = self._normalize_recall_temporal_mode(
-            query_analysis_info.get("temporal_mode") or temporal_mode
+        temporal_resolution = self._resolve_recall_stage2_temporal_constraints(
+            original_query=original_query,
+            fallback_temporal_bounds=fallback_temporal_bounds,
+            fallback_temporal_mode=fallback_temporal_mode,
+            llm_temporal_bounds=query_analysis_info.get("temporal_bounds"),
+            llm_temporal_mode=query_analysis_info.get("temporal_mode"),
         )
+        temporal_bounds = temporal_resolution["effective_temporal_bounds"]
+        temporal_mode = temporal_resolution["effective_temporal_mode"]
         forced_source_types = self._normalize_source_override(memory_source_override)
         preferred_source_types = forced_source_types or self._normalize_source_override(
             query_analysis_info.get("source_types") or []
@@ -7844,18 +7833,18 @@ class MemoryNodeManager:
             [
                 *llm_entities,
                 *self._recall_stage1_resolve_query_entity_names(
-                    query=analysis_query or query,
+                    query=original_query,
                     database=database,
                 ),
             ],
             limit=24,
         )
         is_contextual_query = self._recall_stage1_is_contextual_query(
-            analysis_query or query
+            original_query
         )
         reference_time = (
             (temporal_bounds or (None, None))[1]
-            or datetime.now().astimezone().isoformat()
+            or analysis_reference_time
         )
         # Stage 1 contributes its direct lexical seeds as one Stage 2 source.
         # The Stage 2 lexical source itself is reserved for LLM-derived terms.
@@ -7865,7 +7854,7 @@ class MemoryNodeManager:
             entities=llm_entities,
         )
         query_terms = self._lexical_search_terms_for_text(
-            query,
+            time_stripped_query,
             limit=32,
             preserve_phrase=False,
         )
@@ -7881,7 +7870,7 @@ class MemoryNodeManager:
             *query_terms,
         ]))
         query_identity_text = self._format_recall_query_identity_text(
-            query,
+            time_stripped_query,
             retrieval_text=retrieval_text,
             keywords=llm_keywords,
             entities=llm_entities,
@@ -7899,6 +7888,7 @@ class MemoryNodeManager:
         actionable_item_limit = candidate_limits["actionable_item_limit"]
         self._log_info("memory_recall_stage2", "query_analyzed", {
             "query_analysis_info": query_analysis_info,
+            "temporal_resolution": temporal_resolution,
             "forced_source_types": forced_source_types or [],
             "preferred_source_types": preferred_source_types or [],
             "preferred_layer_preferences": preferred_layer_preferences or [],
@@ -7941,7 +7931,6 @@ class MemoryNodeManager:
             query_embedding=query_identity_embedding,
             query_entity_names=query_entity_names,
             is_contextual_query=is_contextual_query,
-            reference_time=reference_time,
             temporal_bounds=temporal_bounds,
         )
         self._log_recall_direct_candidates(
@@ -7979,7 +7968,7 @@ class MemoryNodeManager:
             states=ranked_candidates,
             candidate_source_prefix="stage2",
             limit=actionable_item_limit,
-            reference_time=(temporal_bounds or (None, None))[1],
+            temporal_bounds=temporal_bounds,
             database=database,
         )
         ranked_candidates = [
@@ -8140,7 +8129,7 @@ class MemoryNodeManager:
         states: Sequence[Dict[str, Any]],
         candidate_source_prefix: str,
         limit: int,
-        reference_time: Optional[str] = None,
+        temporal_bounds: RecallTimeBounds = None,
         database: Optional[SessionDB] = None,
     ) -> List[Dict[str, Any]]:
         """Load actionable items only through recalled topic-state mappings."""
@@ -8148,7 +8137,7 @@ class MemoryNodeManager:
         if max_items <= 0:
             return []
         db = database or self._db
-        reference = reference_time or datetime.now().astimezone().isoformat()
+        reference_time = (temporal_bounds or (None, None))[1]
         candidates: List[Dict[str, Any]] = []
         seen_item_ids: set[int] = set()
         for state in states or []:
@@ -8198,7 +8187,7 @@ class MemoryNodeManager:
                 seen_item_ids.add(item_id)
                 high_priority = self._recall_stage1_is_high_priority_actionable(
                     candidate,
-                    reference_time=reference,
+                    reference_time=str(reference_time or ""),
                 )
                 priority_bonus = (
                     self._clamp_float(
@@ -8217,7 +8206,6 @@ class MemoryNodeManager:
                 candidate["_recall_parent_state_id"] = state_id
                 candidate["_recall_parent_state_score"] = round(state_score, 4)
                 candidate["_recall_score"] = round(candidate_score, 4)
-                candidate["score"] = round(candidate_score, 4)
                 candidate["evidence"] = [
                     "state_actionable_expansion",
                     *(["high_priority_actionable"] if high_priority else []),
@@ -8433,7 +8421,6 @@ class MemoryNodeManager:
         query_embedding: Optional[np.ndarray],
         query_entity_names: Sequence[str] = (),
         is_contextual_query: bool = False,
-        reference_time: Optional[str] = None,
         temporal_bounds: RecallTimeBounds = None,
     ) -> Dict[str, Any]:
         """Calculate matching score for one Stage 2 direct candidate only."""
@@ -8488,7 +8475,6 @@ class MemoryNodeManager:
         )
         time_score_info = self._calculate_recall_candidate_time_score(
             candidate,
-            reference_time=reference_time,
             temporal_bounds=temporal_bounds,
         )
         time_weight = self._recall_stage2_time_score_weight
@@ -8691,10 +8677,108 @@ class MemoryNodeManager:
         )
         return selected_candidates
 
+    @classmethod
+    def _normalize_llm_recall_time_bound(cls, value: Any) -> Optional[str]:
+        """Validate one LLM-supplied recall bound and normalize it to ISO."""
+        normalized = cls._normalize_recall_time_bound(value, default_to_now=False)
+        if not normalized:
+            return None
+        try:
+            return datetime.strptime(normalized, "%Y-%m-%d %H:%M:%S").strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _recall_query_has_explicit_calendar_date(query: str) -> bool:
+        """Return whether the query states a concrete calendar date/range."""
+        text = str(query or "")
+        return bool(re.search(
+            r"\d{4}\s*(?:年|[-/.])\s*\d{1,2}"
+            r"|\d{1,2}\s*月\s*\d{1,2}\s*(?:日|号)?",
+            text,
+        ))
+
+    def _resolve_recall_stage2_temporal_constraints(
+        self,
+        *,
+        original_query: str,
+        fallback_temporal_bounds: RecallTimeBounds,
+        fallback_temporal_mode: str,
+        llm_temporal_bounds: Any,
+        llm_temporal_mode: Any,
+    ) -> Dict[str, Any]:
+        """Validate Stage 2 temporal analysis and choose effective constraints."""
+        fallback_start, fallback_end = fallback_temporal_bounds or (None, None)
+        fallback_bounds = (
+            self._normalize_llm_recall_time_bound(fallback_start),
+            self._normalize_llm_recall_time_bound(fallback_end),
+        )
+        raw_llm_bounds = (
+            llm_temporal_bounds if isinstance(llm_temporal_bounds, dict) else {}
+        )
+        llm_bounds = (
+            self._normalize_llm_recall_time_bound(raw_llm_bounds.get("start")),
+            self._normalize_llm_recall_time_bound(raw_llm_bounds.get("end")),
+        )
+        llm_bounds_valid = bool(llm_bounds[0] or llm_bounds[1])
+        if llm_bounds_valid and all(llm_bounds):
+            llm_bounds_valid = bool(llm_bounds[0] < llm_bounds[1])
+
+        fallback_has_bounds = bool(fallback_bounds[0] or fallback_bounds[1])
+        explicit_rule_bounds = bool(
+            fallback_has_bounds
+            and self._recall_query_has_explicit_calendar_date(original_query)
+        )
+        if llm_bounds_valid and not explicit_rule_bounds:
+            effective_bounds = llm_bounds
+            bounds_source = "llm"
+        elif fallback_has_bounds:
+            effective_bounds = fallback_bounds
+            bounds_source = (
+                "rule_conflict_override"
+                if llm_bounds_valid and explicit_rule_bounds
+                else "rule"
+            )
+        else:
+            effective_bounds = (None, None)
+            bounds_source = "none"
+
+        llm_mode = self._normalize_recall_temporal_mode(llm_temporal_mode)
+        fallback_mode = self._normalize_recall_temporal_mode(fallback_temporal_mode)
+        effective_has_bounds = bool(effective_bounds[0] or effective_bounds[1])
+        if effective_has_bounds:
+            if llm_mode in {"event_time", "dialogue_time", "both"}:
+                effective_mode = llm_mode
+                mode_source = "llm"
+            elif fallback_mode in {"event_time", "dialogue_time", "both"}:
+                effective_mode = fallback_mode
+                mode_source = "rule"
+            else:
+                effective_mode = "both"
+                mode_source = "bounds_default"
+        else:
+            effective_mode = llm_mode if llm_mode != "none" else fallback_mode
+            mode_source = "llm" if llm_mode != "none" else "rule"
+
+        return {
+            "fallback_temporal_bounds": fallback_bounds,
+            "fallback_temporal_mode": fallback_mode,
+            "llm_temporal_bounds": llm_bounds,
+            "llm_temporal_bounds_valid": llm_bounds_valid,
+            "llm_temporal_mode": llm_mode,
+            "effective_temporal_bounds": effective_bounds,
+            "effective_temporal_mode": effective_mode,
+            "temporal_bounds_source": bounds_source,
+            "temporal_mode_source": mode_source,
+        }
+
     def _analyze_recall_query(
         self,
         query: str,
         *,
+        reference_time: str,
         prompt_language: str,
     ) -> Dict[str, Any]:
         prompt_language = (
@@ -8707,7 +8791,12 @@ class MemoryNodeManager:
             if prompt_language == "en"
             else RECALL_QUERY_ANALYSIS_PROMPT_ZH
         )
-        result = self._call_llm(prompt_template.replace("{query}", str(query or "")))
+        prompt = (
+            prompt_template
+            .replace("{query}", str(query or ""))
+            .replace("{reference_time}", str(reference_time or ""))
+        )
+        result = self._call_llm(prompt)
         parsed = self._parse_json_object_from_llm_text(result or "")
         return parsed if isinstance(parsed, dict) else {}
 

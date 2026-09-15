@@ -105,6 +105,18 @@ voice_runtime:
         hotwords_score: 1.0
         blank_penalty: 0.0
         tail_padding_s: 0.66
+
+  # Ephemeral local context before a keyword wake. This uses the active ASR
+  # backend above (currently qwen3_asr), never writes PCM or transcripts to
+  # disk, and must not be submitted to MemoryRuntime.
+  prewake_context:
+    enabled: false
+    buffer_seconds: 60.0
+    guard_seconds: 1.5
+    max_context_characters: 800
+    min_text_characters: 2
+    min_speech_seconds: 0.35
+    max_pending_segments: 10
   
   output:
     simplify_chinese: true
