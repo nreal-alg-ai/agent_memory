@@ -174,8 +174,6 @@ class MemoryRuntime:
         **extra: Any,
     ) -> Dict[str, Any]:
         """Buffer one interaction and store a complete batch when due."""
-        if not self._memory_manager.enabled:
-            return {"queued": False, "reason": "memory_disabled"}
         if turn_timestamp is None:
             turn_timestamp = extra.get("timestamp")
         turn = {
@@ -184,6 +182,18 @@ class MemoryRuntime:
             "tags": list(tags or []),
             "turn_timestamp": _to_timestamp_text(turn_timestamp) or _now_text(),
         }
+        self._logger.info(
+            "memory runtime received interaction turn timestamp=%s tags=%s "
+            "user_chars=%s assistant_chars=%s user_message=%s assistant_response=%s",
+            turn["turn_timestamp"],
+            turn["tags"],
+            len(turn["user_message"]),
+            len(turn["assistant_response"]),
+            turn["user_message"],
+            turn["assistant_response"],
+        )
+        if not self._memory_manager.enabled:
+            return {"queued": False, "reason": "memory_disabled"}
         if not turn["user_message"] and not turn["assistant_response"]:
             return {"queued": False, "reason": "empty_turn"}
 
@@ -248,6 +258,17 @@ class MemoryRuntime:
         normalized_segment = self._normalize_single_transcript_segment(segment)
         if normalized_segment is None:
             return {"queued": False, "reason": "empty_segment"}
+        self._logger.info(
+            "memory runtime received transcript segment source_type=%s is_last_segment=%s "
+            "speaker=%s started_at=%s ended_at=%s text_chars=%s text=%s",
+            source_type,
+            is_last_segment,
+            normalized_segment["speaker"],
+            normalized_segment["started_at"],
+            normalized_segment["ended_at"],
+            len(normalized_segment["text"]),
+            normalized_segment["text"],
+        )
 
         current_start = self._parse_runtime_timestamp(normalized_segment.get("started_at"))
         gap_trigger = self.should_trigger_episode_summary(normalized_segment)

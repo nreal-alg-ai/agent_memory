@@ -179,10 +179,19 @@ def main() -> int:
     logger = logging.getLogger("agent_memory.prewake_context")
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
-    logger.addHandler(logging.StreamHandler(sys.stderr))
+    logger.propagate = False
+    formatter = logging.Formatter(
+        "%(asctime)s %(levelname)s %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    stderr_handler = logging.StreamHandler(sys.stderr)
+    stderr_handler.setFormatter(formatter)
+    logger.addHandler(stderr_handler)
     if log_path:
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        logger.addHandler(logging.FileHandler(log_path, encoding="utf-8"))
+        file_handler = logging.FileHandler(log_path, encoding="utf-8")
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
     config = _load_config(args.config.expanduser().resolve())
     _runtime_config, _manager_config, voice_config = split_memory_config(
         config,
