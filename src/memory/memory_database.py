@@ -5,7 +5,7 @@ The schema deliberately keeps a few legacy table names used by existing
 benchmark scripts (`memory_facts`, `memory_observations`,
 `memory_interpretations`, `memory_entity_nodes`) while adding the new unified line:
 
-    memory_episodes -> memory_facts -> memory_states/actionable_items
+    memory_episodes -> memory_facts -> memory_states/entity_claims
 
 `memory_index_entries` is the MemPalace-style directory layer: every retrievable
 memory object writes one index card that points back to its source row.
@@ -250,6 +250,7 @@ class SessionDB:
                 started_at TEXT,
                 ended_at TEXT,
                 metadata TEXT NOT NULL DEFAULT '{}',
+                processed_for_memory_entity_claim_induction INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -272,6 +273,7 @@ class SessionDB:
                 importance REAL NOT NULL DEFAULT 0.5,
                 processed_for_memory_state INTEGER NOT NULL DEFAULT 0,
                 processed_for_memory_actionable_item INTEGER NOT NULL DEFAULT 0,
+                processed_for_memory_entity_claim INTEGER NOT NULL DEFAULT 0,
                 metadata TEXT NOT NULL DEFAULT '{}',
                 identity_text_embedding BLOB,
                 identity_text TEXT NOT NULL DEFAULT '',
@@ -383,6 +385,77 @@ class SessionDB:
                 FOREIGN KEY(topic_item_id) REFERENCES memory_topic_items(id) ON DELETE CASCADE
             );
 
+            CREATE TABLE IF NOT EXISTS memory_entity_claims (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                subject_entity_id INTEGER NOT NULL,
+                predicate TEXT NOT NULL,
+                object_entity_id INTEGER NOT NULL DEFAULT 0,
+                normalized_value TEXT NOT NULL DEFAULT '',
+                claim_text TEXT NOT NULL DEFAULT '',
+                claim_type TEXT NOT NULL,
+                claim_origin TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'candidate',
+                confidence REAL NOT NULL DEFAULT 0.7,
+                valid_from TEXT NOT NULL DEFAULT '',
+                valid_to TEXT NOT NULL DEFAULT '',
+                source_actor_entity_id INTEGER,
+                extractor_version TEXT NOT NULL DEFAULT '',
+                prompt_version TEXT NOT NULL DEFAULT '',
+                metadata TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(subject_entity_id, predicate, object_entity_id,
+                       normalized_value, claim_type, claim_origin),
+                FOREIGN KEY(subject_entity_id) REFERENCES memory_entity_nodes(id) ON DELETE CASCADE,
+                FOREIGN KEY(source_actor_entity_id) REFERENCES memory_entity_nodes(id) ON DELETE SET NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS memory_entity_claim_evidence (
+                claim_id INTEGER NOT NULL,
+                evidence_type TEXT NOT NULL,
+                evidence_id INTEGER NOT NULL,
+                role TEXT NOT NULL DEFAULT 'support',
+                weight REAL NOT NULL DEFAULT 1.0,
+                observed_at TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(claim_id, evidence_type, evidence_id, role),
+                FOREIGN KEY(claim_id) REFERENCES memory_entity_claims(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS memory_entity_claim_induction (
+                claim_id INTEGER PRIMARY KEY,
+                condition_text TEXT NOT NULL DEFAULT '',
+                behavior_or_outcome_text TEXT NOT NULL DEFAULT '',
+                support_count INTEGER NOT NULL DEFAULT 0,
+                counterexample_count INTEGER NOT NULL DEFAULT 0,
+                first_observed_at TEXT NOT NULL DEFAULT '',
+                last_observed_at TEXT NOT NULL DEFAULT '',
+                consolidation_version TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(claim_id) REFERENCES memory_entity_claims(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS memory_entity_claim_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                target_claim_id INTEGER NOT NULL,
+                trigger_claim_id INTEGER,
+                event_type TEXT NOT NULL DEFAULT 'status_transition',
+                previous_status TEXT NOT NULL,
+                new_status TEXT NOT NULL,
+                semantic_relation TEXT NOT NULL DEFAULT '',
+                effective_at TEXT NOT NULL DEFAULT '',
+                decision_source TEXT NOT NULL DEFAULT '',
+                semantic_confidence REAL,
+                semantic_reason TEXT NOT NULL DEFAULT '',
+                policy_reason TEXT NOT NULL DEFAULT '',
+                details TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(target_claim_id) REFERENCES memory_entity_claims(id) ON DELETE CASCADE,
+                FOREIGN KEY(trigger_claim_id) REFERENCES memory_entity_claims(id) ON DELETE SET NULL
+            );
+
             CREATE TABLE IF NOT EXISTS memory_topic_actionable_item_mapping (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 topic_state_id INTEGER NOT NULL,
@@ -413,10 +486,20 @@ class SessionDB:
             ON memory_topic_items(topic_kind, last_seen_at DESC);
             CREATE INDEX IF NOT EXISTS idx_memory_topic_actionable_state
             ON memory_topic_actionable_item_mapping(topic_state_id, updated_at);
+            CREATE INDEX IF NOT EXISTS idx_memory_entity_claims_subject
+            ON memory_entity_claims(subject_entity_id, claim_type, claim_origin, status);
+            CREATE INDEX IF NOT EXISTS idx_memory_entity_claim_evidence_claim
+            ON memory_entity_claim_evidence(claim_id, role, evidence_type);
+            CREATE INDEX IF NOT EXISTS idx_memory_entity_claim_events_target
+            ON memory_entity_claim_events(target_claim_id, effective_at DESC, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_memory_entity_claim_events_trigger
+            ON memory_entity_claim_events(trigger_claim_id, id DESC);
             """
         )
         self._ensure_entity_ids_schema()
         self._ensure_memory_facts_processing_schema()
+        self._ensure_memory_entity_claim_processing_schema()
+        self._ensure_memory_entity_claims_schema()
         self._ensure_memory_states_scope_schema()
         self._ensure_memory_states_time_line_schema()
         self._ensure_memory_states_entity_key_schema()
@@ -513,6 +596,49 @@ class SessionDB:
             "CREATE INDEX IF NOT EXISTS idx_memory_facts_actionable_processing "
             "ON memory_facts(processed_for_memory_actionable_item, created_at)"
         )
+
+    def _ensure_memory_entity_claim_processing_schema(self) -> None:
+        """Add independent reflect cursors for the claim projections."""
+        fact_columns = {
+            str(row["name"])
+            for row in self._conn.execute("PRAGMA table_info(memory_facts)").fetchall()
+        }
+        if "processed_for_memory_entity_claim" not in fact_columns:
+            self._conn.execute(
+                "ALTER TABLE memory_facts ADD COLUMN "
+                "processed_for_memory_entity_claim INTEGER NOT NULL DEFAULT 0"
+            )
+        episode_columns = {
+            str(row["name"])
+            for row in self._conn.execute("PRAGMA table_info(memory_episodes)").fetchall()
+        }
+        if "processed_for_memory_entity_claim_induction" not in episode_columns:
+            self._conn.execute(
+                "ALTER TABLE memory_episodes ADD COLUMN "
+                "processed_for_memory_entity_claim_induction INTEGER NOT NULL DEFAULT 0"
+            )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_memory_facts_entity_claim_processing "
+            "ON memory_facts(processed_for_memory_entity_claim, created_at)"
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_memory_episodes_entity_claim_induction "
+            "ON memory_episodes(processed_for_memory_entity_claim_induction, created_at)"
+        )
+
+    def _ensure_memory_entity_claims_schema(self) -> None:
+        """Keep claim rows readable without overloading their canonical key."""
+        columns = {
+            str(row["name"])
+            for row in self._conn.execute(
+                "PRAGMA table_info(memory_entity_claims)"
+            ).fetchall()
+        }
+        if "claim_text" not in columns:
+            self._conn.execute(
+                "ALTER TABLE memory_entity_claims "
+                "ADD COLUMN claim_text TEXT NOT NULL DEFAULT ''"
+            )
 
     def _ensure_memory_states_scope_schema(self) -> None:
         """Normalize the state scope columns for databases created earlier."""
@@ -920,112 +1046,6 @@ class SessionDB:
         ).fetchall()
         return [self._row_to_dict(row) for row in rows]
 
-    def upsert_state(
-        self,
-        *,
-        state_scope: str,
-        state_type: str,
-        source_type: str,
-        entity_key: str,
-        canonical_name: str,
-        summary: str,
-        time_line: Optional[Sequence[Dict[str, Any]]],
-        entity_ids: Optional[Sequence[int]],
-        evidence_fact_ids: Sequence[int],
-        confidence: float,
-        metadata: Optional[Dict[str, Any]],
-        identity_text_embedding: Optional[np.ndarray],
-        canonical_name_embedding: Optional[np.ndarray],
-        identity_text: str,
-    ) -> int:
-        now = local_now_text()
-        normalized_scope = str(state_scope or "entity_state").strip()
-        normalized_type = str(state_type or "profile").strip()
-        normalized_source = str(source_type or "unified")
-        normalized_entity_key = str(entity_key or "").strip().lower()
-        normalized_name = str(canonical_name or "general").strip()
-        values = (
-            normalized_scope,
-            normalized_type,
-            normalized_source,
-            normalized_entity_key,
-            normalized_name,
-            str(summary or "").strip(),
-            _json_dumps(list(time_line or [])),
-            _json_dumps([int(value) for value in entity_ids or []]),
-            _json_dumps([int(value) for value in evidence_fact_ids or []]),
-            float(confidence),
-            _json_dumps(metadata or {}),
-            _embedding_to_blob(identity_text_embedding),
-            _embedding_to_blob(canonical_name_embedding),
-            str(identity_text or ""),
-        )
-        existing = self._conn.execute(
-            """
-            SELECT id FROM memory_states
-            WHERE source_type = ? AND state_scope = ? AND state_type = ?
-              AND entity_key = ? AND canonical_name = ?
-            """,
-            (
-                normalized_source, normalized_scope, normalized_type,
-                normalized_entity_key, normalized_name,
-            ),
-        ).fetchone()
-        if existing:
-            self._conn.execute(
-                """
-                UPDATE memory_states
-                SET summary = ?, time_line = ?, entity_ids = ?, evidence_fact_ids = ?, confidence = ?,
-                    metadata = ?, identity_text_embedding = ?, canonical_name_embedding = ?,
-                    identity_text = ?, updated_at = ?
-                WHERE id = ?
-                """,
-                (*values[5:], now, int(existing["id"])),
-            )
-        else:
-            self._conn.execute(
-                """
-                INSERT INTO memory_states (
-                    state_scope, state_type, source_type, entity_key, canonical_name, summary,
-                    time_line, entity_ids, evidence_fact_ids, confidence, metadata,
-                    identity_text_embedding, canonical_name_embedding, identity_text,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (*values, now, now),
-            )
-        row = self._conn.execute(
-            """
-            SELECT id FROM memory_states
-            WHERE source_type = ? AND state_scope = ? AND state_type = ?
-              AND entity_key = ? AND canonical_name = ?
-            """,
-            (
-                normalized_source, normalized_scope, normalized_type,
-                normalized_entity_key, normalized_name,
-            ),
-        ).fetchone()
-        state_id = int(row["id"]) if row else 0
-        if state_id:
-            self._sync_identity_fts(
-                source_table="memory_states",
-                row_id=state_id,
-                identity_text=str(identity_text or ""),
-            )
-            self.replace_fact_state_mappings_for_state(
-                state_id=state_id,
-                fact_ids=evidence_fact_ids,
-            )
-            self.insert_entity_memory_mappings([
-                {
-                    "entity_id": int(entity_id),
-                    "state_id": [state_id],
-                }
-                for entity_id in entity_ids or []
-            ])
-        self._commit_if_needed()
-        return state_id
-
     def upsert_actionable_item(
         self,
         *,
@@ -1123,15 +1143,15 @@ class SessionDB:
         restrict_to_today: bool = True,
     ) -> List[Dict[str, Any]]:
         processing_columns = {
-            "state": "processed_for_memory_state",
             "actionable_item": "processed_for_memory_actionable_item",
+            "entity_claim": "processed_for_memory_entity_claim",
         }
-        target = str(processing_target or "state").strip().lower()
+        target = str(processing_target or "entity_claim").strip().lower()
         try:
             processing_column = processing_columns[target]
         except KeyError as exc:
             raise ValueError(
-                "processing_target must be 'state' or 'actionable_item'"
+                "processing_target must be 'actionable_item' or 'entity_claim'"
             ) from exc
 
         clauses: List[str] = [f"{processing_column} = 0"]
@@ -1391,15 +1411,15 @@ class SessionDB:
         fact_ids: Sequence[int],
     ) -> int:
         processing_columns = {
-            "state": "processed_for_memory_state",
             "actionable_item": "processed_for_memory_actionable_item",
+            "entity_claim": "processed_for_memory_entity_claim",
         }
         target = str(processing_target or "").strip().lower()
         try:
             processing_column = processing_columns[target]
         except KeyError as exc:
             raise ValueError(
-                "processing_target must be 'state' or 'actionable_item'"
+                "processing_target must be 'actionable_item' or 'entity_claim'"
             ) from exc
         ids = [int(value) for value in fact_ids if value is not None]
         if not ids:
@@ -1416,6 +1436,316 @@ class SessionDB:
         )
         self._commit_if_needed()
         return int(cur.rowcount or 0)
+
+    def get_unprocessed_episodes_for_entity_claim_induction(
+        self,
+        *,
+        limit: int = 24,
+    ) -> List[Dict[str, Any]]:
+        """Return completed episodes that have not yet entered induction."""
+        rows = self._conn.execute(
+            """
+            SELECT * FROM memory_episodes
+            WHERE processed_for_memory_entity_claim_induction = 0
+            ORDER BY replace(substr(created_at, 1, 19), 'T', ' ') ASC, id ASC
+            LIMIT ?
+            """,
+            (max(1, int(limit or 24)),),
+        ).fetchall()
+        return [self._row_to_dict(row) for row in rows]
+
+    def mark_episodes_processed_for_entity_claim_induction(
+        self,
+        episode_ids: Sequence[int],
+    ) -> int:
+        ids = [int(value) for value in episode_ids if str(value).strip().isdigit()]
+        if not ids:
+            return 0
+        placeholders = ",".join("?" for _ in ids)
+        cur = self._conn.execute(
+            f"""
+            UPDATE memory_episodes
+            SET processed_for_memory_entity_claim_induction = 1,
+                updated_at = ?
+            WHERE id IN ({placeholders})
+            """,
+            (local_now_text(), *ids),
+        )
+        self._commit_if_needed()
+        return int(cur.rowcount or 0)
+
+    def upsert_entity_claim(
+        self,
+        *,
+        subject_entity_id: int,
+        predicate: str,
+        object_entity_id: Optional[int] = None,
+        normalized_value: str = "",
+        claim_text: str = "",
+        claim_type: str,
+        claim_origin: str,
+        status: str = "candidate",
+        confidence: float = 0.7,
+        valid_from: str = "",
+        valid_to: str = "",
+        source_actor_entity_id: Optional[int] = None,
+        extractor_version: str = "",
+        prompt_version: str = "",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> tuple[int, bool]:
+        """Insert a semantic claim or refresh its confidence and payload."""
+        now = local_now_text()
+        object_id = int(object_entity_id or 0)
+        subject_id = int(subject_entity_id)
+        predicate = str(predicate or "").strip()
+        normalized_value = str(normalized_value or "").strip()
+        claim_text = str(claim_text or "").strip()
+        existing = self._conn.execute(
+            """
+            SELECT id, confidence, status FROM memory_entity_claims
+            WHERE subject_entity_id = ? AND predicate = ? AND object_entity_id = ?
+              AND normalized_value = ? AND claim_type = ? AND claim_origin = ?
+            """,
+            (subject_id, predicate, object_id, normalized_value, claim_type, claim_origin),
+        ).fetchone()
+        if existing:
+            claim_id = int(existing["id"])
+            self._conn.execute(
+                """
+                UPDATE memory_entity_claims
+                SET claim_text = ?, status = ?, confidence = ?, valid_from = ?, valid_to = ?,
+                    source_actor_entity_id = ?, extractor_version = ?, prompt_version = ?,
+                    metadata = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    claim_text, status,
+                    max(float(existing["confidence"] or 0.0), float(confidence or 0.0)),
+                    valid_from, valid_to, source_actor_entity_id, extractor_version,
+                    prompt_version, _json_dumps(metadata or {}), now, claim_id,
+                ),
+            )
+            self._commit_if_needed()
+            return claim_id, False
+        cur = self._conn.execute(
+            """
+            INSERT INTO memory_entity_claims (
+                subject_entity_id, predicate, object_entity_id, normalized_value, claim_text,
+                claim_type, claim_origin, status, confidence, valid_from, valid_to,
+                source_actor_entity_id, extractor_version, prompt_version, metadata,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                subject_id, predicate, object_id, normalized_value, claim_text,
+                claim_type, claim_origin, status, float(confidence or 0.0),
+                valid_from, valid_to, source_actor_entity_id, extractor_version,
+                prompt_version, _json_dumps(metadata or {}), now, now,
+            ),
+        )
+        self._commit_if_needed()
+        return int(cur.lastrowid), True
+
+    def transition_entity_claim_status(
+        self,
+        *,
+        target_claim_id: int,
+        new_status: str,
+        trigger_claim_id: Optional[int] = None,
+        semantic_relation: str = "",
+        effective_at: str = "",
+        decision_source: str = "",
+        semantic_confidence: Optional[float] = None,
+        semantic_reason: str = "",
+        policy_reason: str = "",
+        details: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Change a claim status and retain the causally linked history event.
+
+        The event is deliberately written only for an actual status transition;
+        evidence additions and duplicate merges do not make a claim appear to
+        have been abandoned or revived.
+        """
+        target_id = int(target_claim_id)
+        status = str(new_status or "").strip()
+        if not status:
+            return False
+        occurred_at = str(effective_at or "").strip()
+        now = local_now_text()
+        with self.transaction():
+            row = self._conn.execute(
+                "SELECT status FROM memory_entity_claims WHERE id = ?",
+                (target_id,),
+            ).fetchone()
+            if not row:
+                return False
+            previous_status = str(row["status"] or "")
+            if previous_status == status:
+                return False
+            # A superseding claim closes the prior claim's validity interval.
+            # We leave valid_to untouched for a weakened claim: it may still
+            # describe a partially valid or temporarily interrupted pattern.
+            if status == "superseded" and occurred_at:
+                self._conn.execute(
+                    """
+                    UPDATE memory_entity_claims
+                    SET status = ?,
+                        valid_to = CASE
+                            WHEN valid_to = '' OR valid_to > ? THEN ?
+                            ELSE valid_to
+                        END,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (status, occurred_at, occurred_at, now, target_id),
+                )
+            else:
+                self._conn.execute(
+                    "UPDATE memory_entity_claims SET status = ?, updated_at = ? WHERE id = ?",
+                    (status, now, target_id),
+                )
+            self._conn.execute(
+                """
+                INSERT INTO memory_entity_claim_events (
+                    target_claim_id, trigger_claim_id, event_type,
+                    previous_status, new_status, semantic_relation, effective_at,
+                    decision_source, semantic_confidence, semantic_reason,
+                    policy_reason, details, created_at
+                ) VALUES (?, ?, 'status_transition', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    target_id,
+                    int(trigger_claim_id) if trigger_claim_id is not None else None,
+                    previous_status,
+                    status,
+                    str(semantic_relation or "").strip(),
+                    occurred_at,
+                    str(decision_source or "").strip(),
+                    float(semantic_confidence) if semantic_confidence is not None else None,
+                    str(semantic_reason or "").strip(),
+                    str(policy_reason or "").strip(),
+                    _json_dumps(details or {}),
+                    now,
+                ),
+            )
+        return True
+
+    def get_entity_claim_events(
+        self,
+        claim_id: int,
+        *,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """Return status-history events for one claim, newest event first."""
+        rows = self._conn.execute(
+            """
+            SELECT * FROM memory_entity_claim_events
+            WHERE target_claim_id = ?
+            ORDER BY effective_at DESC, id DESC
+            LIMIT ?
+            """,
+            (int(claim_id), max(1, int(limit or 100))),
+        ).fetchall()
+        return [self._row_to_dict(row) for row in rows]
+
+    def get_entity_claims(
+        self,
+        *,
+        subject_entity_id: Optional[int] = None,
+        claim_type: Optional[str] = None,
+        claim_origin: Optional[str] = None,
+        predicate: Optional[str] = None,
+        statuses: Optional[Sequence[str]] = None,
+        limit: int = 200,
+    ) -> List[Dict[str, Any]]:
+        clauses: List[str] = []
+        params: List[Any] = []
+        for column, value in (
+            ("subject_entity_id", subject_entity_id),
+            ("claim_type", claim_type),
+            ("claim_origin", claim_origin),
+            ("predicate", predicate),
+        ):
+            if value is not None:
+                clauses.append(f"{column} = ?")
+                params.append(value)
+        if statuses:
+            placeholders = ",".join("?" for _ in statuses)
+            clauses.append(f"status IN ({placeholders})")
+            params.extend(str(value) for value in statuses)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        rows = self._conn.execute(
+            f"SELECT * FROM memory_entity_claims{where} ORDER BY updated_at DESC, id DESC LIMIT ?",
+            (*params, max(1, int(limit or 200))),
+        ).fetchall()
+        return [self._row_to_dict(row) for row in rows]
+
+    def upsert_entity_claim_evidence(self, evidence: Sequence[Dict[str, Any]]) -> int:
+        now = local_now_text()
+        changed = 0
+        for item in evidence or []:
+            try:
+                claim_id = int(item["claim_id"])
+                evidence_id = int(item["evidence_id"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            evidence_type = str(item.get("evidence_type") or "fact")
+            role = str(item.get("role") or "support")
+            if claim_id <= 0 or evidence_id <= 0 or evidence_type not in {"fact", "episode"}:
+                continue
+            self._conn.execute(
+                """
+                INSERT INTO memory_entity_claim_evidence (
+                    claim_id, evidence_type, evidence_id, role, weight, observed_at,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(claim_id, evidence_type, evidence_id, role) DO UPDATE SET
+                    weight = MAX(memory_entity_claim_evidence.weight, excluded.weight),
+                    observed_at = excluded.observed_at, updated_at = excluded.updated_at
+                """,
+                (claim_id, evidence_type, evidence_id, role, float(item.get("weight") or 1.0),
+                 str(item.get("observed_at") or ""), now, now),
+            )
+            changed += 1
+        self._commit_if_needed()
+        return changed
+
+    def upsert_entity_claim_induction(
+        self,
+        *,
+        claim_id: int,
+        condition_text: str,
+        behavior_or_outcome_text: str,
+        support_count: int,
+        counterexample_count: int,
+        first_observed_at: str,
+        last_observed_at: str,
+        consolidation_version: str = "v1",
+    ) -> None:
+        now = local_now_text()
+        self._conn.execute(
+            """
+            INSERT INTO memory_entity_claim_induction (
+                claim_id, condition_text, behavior_or_outcome_text, support_count,
+                counterexample_count, first_observed_at, last_observed_at,
+                consolidation_version, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(claim_id) DO UPDATE SET
+                condition_text = excluded.condition_text,
+                behavior_or_outcome_text = excluded.behavior_or_outcome_text,
+                support_count = excluded.support_count,
+                counterexample_count = excluded.counterexample_count,
+                first_observed_at = excluded.first_observed_at,
+                last_observed_at = excluded.last_observed_at,
+                consolidation_version = excluded.consolidation_version,
+                updated_at = excluded.updated_at
+            """,
+            (int(claim_id), str(condition_text or ""), str(behavior_or_outcome_text or ""),
+             max(0, int(support_count or 0)), max(0, int(counterexample_count or 0)),
+             str(first_observed_at or ""), str(last_observed_at or ""),
+             str(consolidation_version or "v1"), now, now),
+        )
+        self._commit_if_needed()
 
     def get_recent_memory_states(
         self,
@@ -2110,6 +2440,26 @@ class SessionDB:
         ).fetchall()
         return [self._row_to_dict(row) for row in rows]
 
+    def memory_episode_facts_for_entity_id(
+        self,
+        entity_id: int,
+        *,
+        limit: int = 240,
+    ) -> List[Dict[str, Any]]:
+        """Load completed-episode facts directly linked to one entity."""
+        entity_token = f"%,{int(entity_id)},%"
+        rows = self._conn.execute(
+            """
+            SELECT * FROM memory_facts
+            WHERE episode_id IS NOT NULL
+              AND (',' || replace(replace(replace(replace(entity_ids, ' ', ''), '\n', ''), '[', ''), ']', '') || ',') LIKE ?
+            ORDER BY dialogue_time_key ASC, id ASC
+            LIMIT ?
+            """,
+            (entity_token, max(1, int(limit or 240))),
+        ).fetchall()
+        return [self._row_to_dict(row) for row in rows]
+
     def related_fact_pairs_by_episode_fact_ids(
         self,
         fact_ids: Sequence[int],
@@ -2332,13 +2682,17 @@ class SessionDB:
             "canonical_topics",
             "participants",
             "metadata",
+            "details",
             "evidence_fact_ids",
             "time_line",
             "fact_ids",
             "episode_ids",
         ):
             if key in item:
-                item[key] = _json_loads(item[key], [] if key != "metadata" else {})
+                item[key] = _json_loads(
+                    item[key],
+                    {} if key in {"metadata", "details"} else [],
+                )
         for key in (
             "embedding",
             "identity_text_embedding",

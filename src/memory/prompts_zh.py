@@ -170,12 +170,13 @@ fact_type 判别规则：
 11. keywords 只能包含用于检索的短实体、主题、症状、方案、约束、决定和关键时间/顺序锚，通常每个关键词 2-8 个汉字或一个短英文短语；对带时间锚的事件，必须加入原始或补全后的时间词，例如“March 15 2023”“first service”“3/22”“last Saturday”“two months ago”“上周六”“两个月前”。不要把完整句子、寒暄、礼貌话、语气词、泛化表达或“希望这个方法能帮到您”这类文本放入 keywords。
 12. 只返回 JSON，不要 markdown。
 
-entity_state_signal 输出规则：
-- `entity_state_signal` 只是提示当前 fact 可能对用户或关键实体的长期状态有贡献，不是最终的 entity_state 更新。
-- 只有用户或该实体在当前批次中明确表达或确认偏好、画像、习惯、关系、约束或风险，且具有跨场景复用价值时才输出；普通一次性事件、临时建议、助手猜测、寒暄和低价值背景输出空数组。
-- 每条 fact 最多输出 3 个 signal。每个 signal 只保留 `state_type`、`attribute_name`、`evidence_basis`、`confidence`，以及证据明确时的 `entity`；不要生成 aspect_summary，不要引用历史 state。
-- `state_type` 只能是 preference、profile、routine、relationship、constraint、risk。
-- `attribute_name` 应具体描述可能受影响的属性；`evidence_basis` 必须引用当前 fact 中的证据。后续 reflection 会结合已有 entity_state 决定是否创建、更新或忽略该信号。
+entity_claim_signal 输出规则：
+- `entity_claim_signal` 是当前 fact 对个人世界模型中 entity claim 的结构化证据提示，不是最终 claim，也不能直接决定与已有 claim 的关系。
+- `signal_kind` 只能是：`explicit_assertion`（实体明确陈述或可靠记录直接确认的稳定主张）、`pattern_observation`（可在未来与其他 episode 共同支持或反驳规律的观察）、`counterexample`（可能削弱已有偏好或规律的观察）。
+- `claim_type_hint` 只能是 identity_profile、affiliation、relationship、preference、constraint、behavior_pattern。单次行为不得作为 explicit_assertion 直接生成 behavior_pattern；它至多是 pattern_observation。
+- `claim_anchor` 是简短、稳定的聚合标签，用于把不同 episode 中可能描述同一主张或规律的 facts 收拢，例如“安静旅行偏好”“游泳活动习惯”。它不是完整句子，也不是最终 normalized_value。
+- 只有当前 fact 对某个实体主张或未来规律归纳有实际证据价值时才输出。普通一次性背景、临时建议、助手猜测、寒暄和低价值信息输出空数组。
+- 每条 fact 最多输出 3 个 signal。每个 signal 必须包含 entity、signal_kind、claim_type_hint、claim_anchor、evidence_basis、confidence；其中 evidence_basis 必须引用当前 fact 的具体证据，不要引用历史 claim。
 
 action_signal 输出规则：
 - `action_signal` 只是候选线索，不是最终的 actionable_item。它允许有少量误报，后续 actionable 提取模块会重新核验。
@@ -201,11 +202,12 @@ action_signal 输出规则：
       "event_time_key": "根据对话时间锚点和 fact 内容推导出的事件实际发生时间或代表性时间锚点；无法判断时为空字符串",
       "time_confidence": "explicit|inferred_from_turn|unknown；分别表示原文明确给出、结合当前片段 Time 和相对表达推断、无法判断",
       "where": "明确出现的地点、场景、平台或项目范围；没有明确证据时保持为空字符串，不要填写‘未提及’或类似说明",
-      "entity_state_signal": [
+      "entity_claim_signal": [
         {
-          "state_type": "preference|profile|routine|relationship|constraint|risk",
-          "attribute_name": "具体属性名",
           "entity": {"name": "明确受影响的实体", "type": "PERSON|ORGANIZATION|LOCATION|PRODUCT|PROJECT|TECHNOLOGY|CONCEPT|TOPIC|PREFERENCE|OTHER"},
+          "signal_kind": "explicit_assertion|pattern_observation|counterexample",
+          "claim_type_hint": "identity_profile|affiliation|relationship|preference|constraint|behavior_pattern",
+          "claim_anchor": "用于跨 fact 聚合的具体主张或规律标签",
           "evidence_basis": "当前 fact 中支持该 signal 的具体证据",
           "confidence": 0.8
         }
@@ -233,70 +235,127 @@ action_signal 输出规则：
 {dialogue_batch}
 """
 
-UNIFIED_ENTITY_STATE_UPDATE_PROMPT_ZH = """你是 AI 眼镜长期记忆系统中的 entity-scoped state 更新模块。
+EXPLICIT_ENTITY_CLAIM_EXTRACTION_PROMPT_ZH = """你是个人世界模型的显式主张（explicit claim）更新模块。
 
-输入已经完成实体解析和属性主题初步分组：系统已经判断这批 facts 可能更新某个实体的某类长期状态。你的任务是更新这个实体的某个具体属性，而不是重新决定实体归属。
+输入是已经落库、可追溯的 narrative facts。每条 fact 可能带有 `entity_claim_signal`，它只是当前 fact 的结构化提示；必须以 fact summary 与 evidence_fact_ids 为准，不得把 signal 当作额外事实。请只提取 fact 中被说话者明确陈述、或由可靠事件记录直接确认的原子主张；不要把单次行为、建议、助手推测或常识扩展成偏好、习惯或人格结论。
 
-entity-scoped state 的目标：
-- preference：某个实体稳定偏好、选择倾向、反复表达的喜好/厌恶。
-- relationship：某个实体与他人/组织/项目之间的关系状态。
-- profile：某个实体稳定画像、身份、背景、长期职责或重要上下文。
-- routine：某个实体反复出现的习惯、流程、节奏。
-- constraint：某个实体长期或当前持续影响行动的限制条件。
-- risk：某个实体持续存在、会影响后续判断或行动的风险。
+允许的 claim_type 只有：
+- identity_profile：身份、背景、角色、稳定画像；
+- affiliation：所属组织、团队、项目、地点；
+- relationship：人与人/组织/项目的明确关系；
+- preference：明确喜欢、厌恶、优先选择；
+- constraint：明确限制、禁止、能力边界、持续条件；
+- behavior_pattern：本 prompt 禁止输出，行为规律只能由 induction 产生。
 
 规则：
-1. 只围绕给定 entity、state_type 和 attribute_name 更新，不要写成主题进展总结。
-2. 如果 facts 只说明某个议题或一次事件的进展，不要写入 entity_state；这里只保留对 entity 本身长期有用的具体属性。
-3. 如果 existing_entity_state 与当前属性不是同一件事，返回 update_needed=false，不要强行合并。
-4. 如果 existing_entity_state 已有内容，要增量融合，不要简单拼接。
-5. canonical_name 只能是简短、具体的属性或主题标题，例如“灵活健身方式偏好”或“健康管理”；不要包含实体名、state_type、斜杠、连字符或完整句子。实体由输入的 entity 单独表示，state_type 由单独字段表示。如果已有 entity_state 与当前属性相同，复用其不含实体和 state_type 的 canonical_name。
-6. 如果输入只支持一次性事件、单次建议、临时请求或礼貌回应，返回 update_needed=false。
-7. summary 必须是简短的当前状态快照，最多 1-2 句话，建议不超过 120 个中文字符；不要把历史 timeline 拼接进 summary。
-8. time_line_updates 只记录本次 facts 带来的状态变化，输出 0-3 条；每条包含发生时间、变化类型、简短变化说明和 fact_ids。不要重复输出已有 timeline，也不要把没有变化的内容写入 timeline。
-9. summary 必须能回答：“关于这个实体的这个属性，我们长期应该记住什么？”
-10. evidence_fact_ids 必须引用输入 facts 中支撑本次更新的 fact ID。
-11. 只返回 JSON，不要 markdown。
+1. subject_entity、object_entity（如有）必须来自输入 facts 的 entities；不能凭空造实体。
+2. evidence_fact_ids 必须只引用输入 fact_id。每条 claim 至少引用一个直接支持它的 fact。
+3. predicate 使用简短、稳定的小写英文键，例如 has_role、works_with、member_of、located_in、prefers、dislikes、requires、cannot、has_constraint。
+4. normalized_value 是可比较的简短规范值，不是完整句子；关系型主张优先使用 object_entity，非关系主张写入 normalized_value。
+5. claim_text 是给人阅读的完整、自包含陈述，必须明确主语、关系/属性和值，例如“用户明确偏好安静、节奏较慢的旅行方式”。不要只重复 normalized_value。
+6. 否定语义必须写入 predicate 与 claim_text，例如 dislikes、cannot、is_not_member_of；不要输出独立的正负字段。没有直接明示时不要输出。
+7. 不要输出一次行程、临时任务、单次建议、待办、开放问题；它们属于 fact / intent 层，而不是 claim。
+8. 输出空数组是正确结果。只返回 JSON。
 
-输出格式：
+输出：
 {
-  "update_needed": true,
-  "canonical_name": "属性或主题短标题，不包含实体名和 state_type",
-  "summary": "简短的当前 entity-scoped state 快照",
-  "time_line_updates": [
+  "claims": [
     {
-      "occurred_at": "",
-      "change_type": "confirmed|changed|rejected|resolved|updated",
-      "summary": "本次状态变化",
-      "fact_ids": [1]
+      "subject_entity": "",
+      "claim_type": "identity_profile|affiliation|relationship|preference|constraint",
+      "predicate": "",
+      "object_entity": "",
+      "normalized_value": "",
+      "claim_text": "包含主体和完整语义的陈述",
+      "valid_from": "",
+      "valid_to": "",
+      "evidence_fact_ids": [1],
+      "confidence": 0.85
     }
-  ],
-  "keywords": ["关键词1", "关键词2"],
-  "entities": ["实体1", "实体2"],
-  "evidence_fact_ids": [1, 2],
-  "importance": 0.8,
-  "confidence": 0.85,
-  "status": "active|stable|resolved|uncertain"
+  ]
 }
 
-entity_state_target：
-{entity_state_target}
+facts：
+{facts}
+"""
 
-entity_state_target 字段说明与使用方式：
-- `entity`：本次更新所描述的实体名称。所有 summary、canonical_name 和 time_line_updates 都必须围绕这个实体展开，不要把其他被提及但不是主要对象的实体写成当前状态的归属者。
-- `entity_key`：该实体的稳定内部标识，用于确认实体身份。它不是自然语言内容，不要把它写入 summary、canonical_name 或 timeline；只需用它确认本次 candidate 与已有 entity_state 是否属于同一个实体。
-- `state_type`：本次允许更新的 entity_state 类型，只能围绕这个类型提炼信息。不要因为候选内容同时涉及其他方面，就擅自改成 preference、profile、routine、relationship、constraint 或 risk 中的另一类。
-- `attribute_name`：本次候选状态的具体属性名称，是更新的主要语义边界。summary 应该说明这个属性对该实体的长期含义，而不是泛泛总结整段对话或一次议题进展。
-- `attribute_key`：属性的稳定内部键，用于辅助确认属性身份。它不是需要展示给用户的内容，不要直接复制到 summary 或 canonical_name。
-- `attribute_name_aliases`：该属性可能出现的同义名称或历史名称。判断已有 entity_state 是否描述同一属性时可以参考这些别名，但不要把所有别名机械拼接进输出；如果已有状态表达的是不同属性，应返回 `update_needed=false`。
-- `state_signal_evidence`：当前候选 facts 中支持该 entity_state 信号的证据。信号不是最终状态结论；请结合完整 fact summary 和 existing_entity_state 判断是否真的需要更新。
-- `state_signal_evidence[].fact_id`：支持该信号的 fact 标识，只用于在输出的 `evidence_fact_ids` 和 `time_line_updates[].fact_ids` 中引用。
-- `state_signal_evidence[].confidence`：信号提炼置信度，用于保守判断；低置信度或证据不足时不要扩展出新的长期结论。
 
-处理原则：先使用 `entity` 和 `entity_key` 确认状态归属，再使用 `state_type`、`attribute_name` 和属性别名确认更新边界，最后综合当前 facts、`state_signal_evidence` 与 existing_entity_state 生成当前状态。只有当证据对该实体属性确实具有长期价值时才更新；一次性事件、单次建议、临时请求或仅属于某个议题进展的内容都应返回 `update_needed=false`。如果 existing_entity_state 与 candidate 是同一实体和同一属性，则在保留已有长期结论的基础上增量融合；如果属性不同，不要强行合并。
+INDUCTIVE_ENTITY_CLAIM_EXTRACTION_PROMPT_ZH = """你是个人世界模型的规律归纳（inductive claim）模块。
 
-已有 entity_state：
-{existing_entity_state}
+输入是同一实体、同一 claim_anchor 下，来自多个已完成 episode 的可追溯 facts。claim_anchor 只用于召集候选证据，不是结论；你的任务是保守地判断这些独立经历是否支持一条规律，而不是重新复述 facts。
+
+只允许输出：preference 或 behavior_pattern，claim_origin 固定由系统写为 inductive。
+
+硬规则：
+1. 一条 claim 至少需要 3 个不同 episode 的 support_fact_ids，且至少覆盖 2 个不同日期/时间窗口。
+2. 单次表达、一次事件、计划、任务、助手建议不能归纳为规律。
+3. 有明显反例时在 counterexample_fact_ids 中列出；反例存在时宁可不输出。不要把偶然行为升级为偏好。
+4. subject_entity 必须是输入给定实体。predicate 使用 prefers、dislikes、usually_does、avoids、has_routine 之一。
+5. normalized_value 必须短、可比较；claim_text 必须是一条带实体主体的完整规律陈述；condition_text 为空或简短条件；behavior_or_outcome_text 用一句话说明规律。
+6. evidence IDs 必须来自输入。输出空数组是正确结果。只返回 JSON。
+
+输出：
+{
+  "claims": [
+    {
+      "subject_entity": "",
+      "claim_type": "preference|behavior_pattern",
+      "predicate": "prefers|dislikes|usually_does|avoids|has_routine",
+      "normalized_value": "",
+      "claim_text": "包含主体和完整规律语义的陈述",
+      "condition_text": "",
+      "behavior_or_outcome_text": "",
+      "support_fact_ids": [1, 2, 3],
+      "counterexample_fact_ids": [],
+      "confidence": 0.8
+    }
+  ]
+}
+
+候选实体与 claim 聚合线索：
+{induction_target}
+
+episode evidence facts：
+{facts}
+"""
+
+
+ENTITY_CLAIM_RECONCILIATION_PROMPT_ZH = """你是个人世界模型中的 entity claim reconciliation 模块。
+
+输入只包含新旧 entity claim 的文本。你的任务只通过这些文本的自然语言语义，判断每个 candidate 与已有 claim 的关系；不要推断来源可信度、不要考虑 claim_origin、置信度、时间、数据库状态或后续写入策略。
+
+semantic_relation 只能是：
+- duplicate：两条文本表达同一主张；
+- supports：candidate 是旧 claim 的直接支持或重复佐证，但表达不完全相同；
+- contradicts：两条文本不能同时为真，但文本本身没有明确的替换/更新含义；
+- refines：candidate 为旧 claim 增加条件、范围、例外或更具体表述；
+- supersedes：candidate 文本明确表示旧主张被改变、否定、修正或替代；
+- unrelated：两条文本可以同时成立，或没有明确关系。
+
+不同偏好、角色或关系不天然冲突，例如“喜欢绘画”和“喜欢钢琴”通常是 unrelated。一个 candidate 可以同时与多个已有 claim 存在关系；请列出所有明确相关的 existing claim。没有相关 claim 时 relations 输出空数组。只返回 JSON。
+
+输出：
+{
+  "decisions": [
+    {
+      "candidate_claim_index": 0,
+      "relations": [
+        {
+          "existing_claim_id": 12,
+          "semantic_relation": "duplicate|supports|contradicts|refines|supersedes",
+          "confidence": 0.9,
+          "reason": "简短说明"
+        }
+      ]
+    }
+  ]
+}
+
+candidate_claims：
+{candidate_claims}
+
+existing_claims：
+{existing_claims}
 """
 
 

@@ -154,12 +154,13 @@ Rules:
 13. keywords must be short retrieval terms: entities, topics, symptoms, plans, constraints, decisions, and important time/order anchors. For time-sensitive facts, include the original or resolved time phrase such as "March 15 2023", "first service", "3/22", "last Saturday", or "two months ago". Do not put full sentences, pleasantries, filler, generic encouragement, or phrases like "hope this method helps you" into keywords.
 14. Return JSON only. No markdown.
 
-entity_state_signal rules:
-- `entity_state_signal` only flags that the fact may contribute to a durable state of the user or another key entity; it is not the final entity_state update.
-- Output it only when the evidence explicitly expresses a reusable preference, profile, routine, relationship, constraint, or risk. Use an empty array for one-off events, temporary suggestions, pleasantries, and low-value background.
-- Return at most 3 signals per fact. Each signal contains only `state_type`, `attribute_name`, `evidence_basis`, and `confidence`, plus an evidence-supported `entity` when needed; do not generate an aspect summary or use prior state. Later reflection decides whether to create, update, or ignore it.
-- state_type must be one of: preference, profile, routine, relationship, constraint, risk.
-- attribute_name should name the specific potentially affected attribute, and evidence_basis must cite evidence from the current fact.
+entity_claim_signal rules:
+- `entity_claim_signal` is a structured evidence hint from this fact for entity claims in the personal world model. It is not a final claim and must not decide its relation to existing claims.
+- `signal_kind` must be one of: `explicit_assertion` (a durable proposition directly stated by an entity or confirmed by a reliable record), `pattern_observation` (an observation that may support or refute a pattern together with other episodes), or `counterexample` (an observation that may weaken an existing preference or pattern).
+- `claim_type_hint` must be one of: identity_profile, affiliation, relationship, preference, constraint, behavior_pattern. A single action must not become an explicit_assertion for behavior_pattern; at most it is a pattern_observation.
+- `claim_anchor` is a short, stable grouping label that can collect facts from different episodes about one possible claim or pattern, such as "quiet travel preference" or "swimming routine". It is neither a sentence nor the final normalized_value.
+- Output signals only when this fact has concrete evidence value for an entity claim or later pattern induction. Use an empty array for one-off background, temporary suggestions, assistant speculation, pleasantries, and low-value content.
+- Return at most 3 signals per fact. Every signal must contain entity, signal_kind, claim_type_hint, claim_anchor, evidence_basis, and confidence. evidence_basis must cite the current fact, never a prior claim.
 
 action_signal rules:
 - `action_signal` is only a candidate hint, not the final actionable_item. It may contain a small number of false positives and will be re-checked by the actionable extraction module.
@@ -185,11 +186,12 @@ Output schema:
       "event_time_key": "real-world event occurrence time or representative temporal anchor derived from the dialogue time anchor and fact content; empty when it cannot be determined",
       "time_confidence": "explicit|inferred_from_turn|unknown; explicit evidence, resolved from the segment Time and a relative expression, or undetermined",
       "where": "",
-      "entity_state_signal": [
+      "entity_claim_signal": [
         {
-          "state_type": "preference|profile|routine|relationship|constraint|risk",
-          "attribute_name": "specific attribute name",
           "entity": {"name": "explicitly affected entity", "type": "PERSON|ORGANIZATION|LOCATION|PRODUCT|PROJECT|TECHNOLOGY|CONCEPT|TOPIC|PREFERENCE|OTHER"},
+          "signal_kind": "explicit_assertion|pattern_observation|counterexample",
+          "claim_type_hint": "identity_profile|affiliation|relationship|preference|constraint|behavior_pattern",
+          "claim_anchor": "specific claim or pattern grouping label",
           "evidence_basis": "specific evidence from this fact supporting the signal",
           "confidence": 0.8
         }
@@ -214,70 +216,112 @@ Dialogue/transcript evidence batch:
 {dialogue_batch}
 """
 
-UNIFIED_ENTITY_STATE_UPDATE_PROMPT_EN = """You are the entity-scoped state update module for a unified AI-glasses long-term memory system inspired by MemPalace.
+EXPLICIT_ENTITY_CLAIM_EXTRACTION_PROMPT_EN = """You update explicit claims in a personal world model.
 
-The input has already passed entity and preliminary attribute-topic resolution: the system has decided that these facts may update one durable state type for one entity and one attribute. Your task is to update that specific entity attribute, not to re-route the entity.
+The input contains stored, traceable narrative facts. Each fact may include an `entity_claim_signal`, which is only a structured hint from that fact; use the fact summary and evidence_fact_ids as the evidence, never the signal as an additional fact. Extract only atomic claims explicitly stated by a speaker or directly confirmed by a reliable event record. Do not infer a preference, habit, or personality conclusion from a one-off action, a recommendation, or assistant speculation.
 
-entity-scoped state targets:
-- preference: stable preferences, selection tendencies, likes/dislikes.
-- relationship: durable relationship state between this entity and other people, organizations, or projects.
-- profile: stable identity, background, responsibility, role, or important context.
-- routine: repeated habits, processes, cadence, or workflow.
-- constraint: durable or currently persistent limitations that affect action.
-- risk: a persistent risk about an entity that can affect future decisions or actions.
+Allowed claim_type values: identity_profile, affiliation, relationship, preference, constraint. Never output behavior_pattern here; it is induction-only.
 
 Rules:
-1. Update only the given entity, state_type, and attribute_name. Do not write a topic progress summary.
-2. If the facts only describe topic or one-off event progress, do not write them into entity_state. Keep only durable information about this specific entity attribute.
-3. If existing_entity_state is about a different attribute, return update_needed=false instead of forcing a merge.
-4. If existing_entity_state is present and about the same attribute, merge incrementally instead of concatenating.
-5. canonical_name must be only a short, concrete attribute or topic title, such as "flexible workout preference" or "health management". Do not include the entity name, state_type, slashes, hyphens, or a full sentence. The entity is provided separately and state_type is a separate field. If existing_entity_state describes the same attribute, reuse its canonical_name without entity or state_type decorations.
-6. If the input supports only a one-off event, single recommendation, temporary request, or courtesy response, return update_needed=false.
-7. summary must be a concise current-state snapshot: at most 1-2 sentences and preferably no more than 60 English words. Do not append the historical timeline to summary.
-8. time_line_updates must contain only changes supported by the new facts, with 0-3 events. Each event must include time, change_type, a short change summary, and fact_ids. Do not repeat existing timeline events or record unchanged information.
-9. The summary must answer: "What should we remember long-term about this entity attribute?"
-10. evidence_fact_ids must cite supporting fact IDs from the input facts.
-11. Return JSON only. No markdown.
+1. subject_entity and object_entity, if present, must occur in input fact entities.
+2. evidence_fact_ids must cite only input fact IDs and each claim needs direct evidence.
+3. Use concise stable lowercase predicates, such as has_role, works_with, member_of, located_in, prefers, dislikes, requires, cannot, has_constraint.
+4. normalized_value is a short canonical comparison key, not a full sentence. Use object_entity for relational claims and normalized_value for comparable non-relational values.
+5. claim_text is a complete, self-contained, reader-facing proposition with its subject, predicate, and value. Do not merely repeat normalized_value.
+6. Encode negation in predicate and claim_text, such as dislikes, cannot, or is_not_member_of; do not output a standalone positive/negative field. Return no claim without direct evidence.
+7. Do not output a one-time trip, task, plan, recommendation, or open question. An empty list is correct. Return JSON only.
 
-Output schema:
+Output:
 {
-  "update_needed": true,
-  "canonical_name": "short attribute or topic title without entity or state_type",
-  "summary": "concise current entity-scoped state snapshot",
-  "time_line_updates": [
-    {
-      "occurred_at": "",
-      "change_type": "confirmed|changed|rejected|resolved|updated",
-      "summary": "the state change in this update",
-      "fact_ids": [1]
-    }
-  ],
-  "keywords": ["keyword1", "keyword2"],
-  "entities": ["entity1", "entity2"],
-  "evidence_fact_ids": [1, 2],
-  "importance": 0.8,
-  "confidence": 0.85,
-  "status": "active|stable|resolved|uncertain"
+  "claims": [{
+    "subject_entity": "",
+    "claim_type": "identity_profile|affiliation|relationship|preference|constraint",
+    "predicate": "",
+    "object_entity": "",
+    "normalized_value": "",
+    "claim_text": "complete proposition with subject and meaning",
+    "valid_from": "",
+    "valid_to": "",
+    "evidence_fact_ids": [1],
+    "confidence": 0.85
+  }]
 }
 
-entity_state_target:
-{entity_state_target}
+facts:
+{facts}
+"""
 
-entity_state_target field descriptions and usage:
-- `entity`: the entity described by this update. All summary, canonical_name, and time_line_updates content must be about this entity. Do not assign the state to another entity that is only mentioned as background or context.
-- `entity_key`: the stable internal identity key for the entity. Use it only to confirm that the candidate and existing_entity_state refer to the same entity. It is not natural-language content and must not be copied into summary, canonical_name, or the timeline.
-- `state_type`: the entity_state type that this update is allowed to modify. Stay within this type; do not switch to preference, profile, routine, relationship, constraint, or risk merely because the candidate also touches another aspect.
-- `attribute_name`: the specific attribute represented by this candidate and the main semantic boundary of the update. The summary must explain what this attribute means long-term for the entity, rather than summarizing the whole dialogue or one topic's progress.
-- `attribute_key`: the stable internal key for the attribute. Use it to help confirm attribute identity, but do not copy it into summary or canonical_name.
-- `attribute_name_aliases`: alternative or historical names for the same attribute. Use them when deciding whether existing_entity_state describes the same attribute, but do not mechanically concatenate all aliases into the output. If the existing state describes a different attribute, return `update_needed=false`.
-- `state_signal_evidence`: evidence in the candidate facts supporting this entity_state signal. The signal is not a final state conclusion; use the full fact summaries and existing_entity_state to decide whether an update is warranted.
-- `state_signal_evidence[].fact_id`: the fact identifier supporting the signal. Use it only to cite evidence in `evidence_fact_ids` and `time_line_updates[].fact_ids`.
-- `state_signal_evidence[].confidence`: the extraction confidence for the signal. Use it to stay conservative; low-confidence or weakly supported signals must not be expanded into new long-term conclusions.
 
-Processing principle: first use `entity` and `entity_key` to confirm the state owner, then use `state_type`, `attribute_name`, and the attribute aliases to establish the update boundary, and finally use the current facts, `state_signal_evidence`, and existing_entity_state to produce the current state. Update only when the evidence has durable value for this entity attribute. For one-off events, single recommendations, temporary requests, or topic-only progress, return `update_needed=false`. When existing_entity_state refers to the same entity and attribute, merge the candidate incrementally while preserving the existing long-term conclusion. If the attribute is different, do not force a merge.
+INDUCTIVE_ENTITY_CLAIM_EXTRACTION_PROMPT_EN = """You conservatively consolidate inductive claims for a personal world model.
 
-existing_entity_state:
-{existing_entity_state}
+Input facts are traceable observations for one entity and one claim_anchor, drawn from completed episodes. The claim_anchor only gathers candidate evidence; it is not a conclusion. Decide whether independent evidence supports a pattern; do not summarize facts.
+
+Only preference and behavior_pattern claims are allowed.
+
+Hard rules:
+1. A claim requires support_fact_ids from at least three distinct episodes and two different date/time windows.
+2. A single statement, event, plan, task, or assistant recommendation is not a pattern.
+3. List clear contradictions in counterexample_fact_ids; when meaningful counterexamples exist, prefer no output.
+4. subject_entity must equal the given subject. predicate is one of prefers, dislikes, usually_does, avoids, has_routine.
+5. normalized_value is a compact comparison key; claim_text is a complete reader-facing pattern proposition with its subject.
+6. Evidence IDs must be input IDs. An empty list is correct. Return JSON only.
+
+Output:
+{
+  "claims": [{
+    "subject_entity": "",
+    "claim_type": "preference|behavior_pattern",
+    "predicate": "prefers|dislikes|usually_does|avoids|has_routine",
+    "normalized_value": "",
+    "claim_text": "complete pattern proposition with subject and meaning",
+    "condition_text": "",
+    "behavior_or_outcome_text": "",
+    "support_fact_ids": [1, 2, 3],
+    "counterexample_fact_ids": [],
+    "confidence": 0.8
+  }]
+}
+
+candidate entity and claim grouping hint:
+{induction_target}
+
+episode evidence facts:
+{facts}
+"""
+
+
+ENTITY_CLAIM_RECONCILIATION_PROMPT_EN = """You reconcile entity claims in a personal world model.
+
+The input contains only the natural-language text of new candidate claims and existing claims. Determine their semantic relationship from text alone. Do not infer source reliability, claim origin, confidence, time, database status, or any write strategy.
+
+semantic_relation is one of:
+- duplicate: the texts state the same proposition;
+- supports: the candidate directly supports or repeats the existing claim without identical wording;
+- contradicts: the texts cannot both be true, but the candidate does not explicitly replace or update the existing claim;
+- refines: the candidate adds a condition, scope, exception, or more specific form;
+- supersedes: the candidate text explicitly says that the old proposition changed, was negated, corrected, or replaced;
+- unrelated: both can be true or no clear relation exists.
+
+Different preferences, roles, or relationships are not inherently contradictory: liking painting and liking piano are normally unrelated. One candidate can relate to multiple existing claims; list every clearly related existing claim. Return an empty relations array when none is related. Return JSON only.
+
+Output:
+{
+  "decisions": [{
+    "candidate_claim_index": 0,
+    "relations": [{
+      "existing_claim_id": 12,
+      "semantic_relation": "duplicate|supports|contradicts|refines|supersedes",
+      "confidence": 0.9,
+      "reason": "short explanation"
+    }]
+  }]
+}
+
+candidate_claims:
+{candidate_claims}
+
+existing_claims:
+{existing_claims}
 """
 
 

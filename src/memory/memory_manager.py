@@ -7,7 +7,7 @@ internal model is deliberately unified:
 1. assistant_wakeup turns and future allday transcript episodes both become
    `memory_episodes`.
 2. Extracted evidence becomes narrative `memory_facts`.
-3. Longer-running entity preferences and constraints can become `memory_states`.
+3. Traceable explicit and inductive propositions live in entity claims.
 4. The legacy actionable-item projection is temporarily disabled while the
    intent and work-item layer is redesigned.
 
@@ -38,19 +38,23 @@ except ImportError:  # pragma: no cover - exercised only in minimal installs
 from .embedding_client import EmbeddingClient
 from .memory_database import SessionDB
 from .prompts_en import (
+    ENTITY_CLAIM_RECONCILIATION_PROMPT_EN,
+    EXPLICIT_ENTITY_CLAIM_EXTRACTION_PROMPT_EN,
+    INDUCTIVE_ENTITY_CLAIM_EXTRACTION_PROMPT_EN,
     EPISODE_SUMMARY_PROMPT_EN,
     MEMORY_RETRIEVED_FORMAT_PROMPT_EN,
     MEMORY_RETRIEVED_SECTION_SPECS_EN,
     RECALL_QUERY_ANALYSIS_PROMPT_EN,
-    UNIFIED_ENTITY_STATE_UPDATE_PROMPT_EN,
     UNIFIED_MEMORY_EXTRACTION_PROMPT_EN,
 )
 from .prompts_zh import (
+    ENTITY_CLAIM_RECONCILIATION_PROMPT_ZH,
+    EXPLICIT_ENTITY_CLAIM_EXTRACTION_PROMPT_ZH,
+    INDUCTIVE_ENTITY_CLAIM_EXTRACTION_PROMPT_ZH,
     EPISODE_SUMMARY_PROMPT_ZH,
     MEMORY_RETRIEVED_FORMAT_PROMPT_ZH,
     MEMORY_RETRIEVED_SECTION_SPECS_ZH,
     RECALL_QUERY_ANALYSIS_PROMPT_ZH,
-    UNIFIED_ENTITY_STATE_UPDATE_PROMPT_ZH,
     UNIFIED_MEMORY_EXTRACTION_PROMPT_ZH,
 )
 from .utils import _cal_embedding_cosine_similarity
@@ -495,13 +499,27 @@ class MemoryNodeManager:
             or "source"
         )
         self._memory_enabled = bool(self._memory_cfg.get("memory_enabled", True))
-        self._enable_memory_state_update = self._config_bool(
-            self._memory_cfg.get("enable_memory_state_update", True),
-            True,
-        )
         self._enable_memory_actionable_item_update = self._config_bool(
             self._memory_cfg.get("enable_memory_actionable_item_update", True),
             True,
+        )
+        self._enable_memory_entity_claim_update = self._config_bool(
+            self._memory_cfg.get("enable_memory_entity_claim_update", True),
+            True,
+        )
+        self._entity_claim_explicit_min_confidence = self._clamp_float(
+            self._memory_cfg.get("entity_claim_explicit_min_confidence"),
+            0.0,
+            1.0,
+            0.72,
+        )
+        self._entity_claim_induction_min_episodes = max(
+            3,
+            int(self._memory_cfg.get("entity_claim_induction_min_episodes", 3) or 3),
+        )
+        self._entity_claim_induction_min_time_windows = max(
+            2,
+            int(self._memory_cfg.get("entity_claim_induction_min_time_windows", 2) or 2),
         )
         self._initialize_recall_config()
         self._embedding_client: Optional[EmbeddingClient] = None
@@ -519,16 +537,6 @@ class MemoryNodeManager:
         # Kept by the serialized task worker: advance only after an episode and
         # its fact links have both been persisted successfully.
         self._episode_summary_last_fact_id_by_source: Dict[str, int] = {}
-        self._entity_state_max_entities_per_fact = max(
-            1,
-            int(self._memory_cfg.get("entity_state_max_entities_per_fact", 4) or 4),
-        )
-        self._entity_state_resolution_similarity_threshold = float(
-            self._memory_cfg.get("entity_state_resolution_similarity_threshold", 0.72) or 0.72
-        )
-        self._entity_state_attribute_similarity_threshold = float(
-            self._memory_cfg.get("entity_state_attribute_similarity_threshold", 0.62) or 0.62
-        )
 
     def _initialize_recall_config(self) -> None:
         """Parse nested recall settings and keep legacy flat overrides working."""
@@ -1311,7 +1319,7 @@ class MemoryNodeManager:
                     "primary_entity": fact.get("primary_entity"),
                     "fact_root_topic": fact.get("fact_root_topic") or "",
                     "fact_aspect_topic": fact.get("fact_aspect_topic") or "",
-                    "entity_state_signal": fact.get("entity_state_signal") or [],
+                    "entity_claim_signal": fact.get("entity_claim_signal") or [],
                     "action_signal": fact.get("action_signal") or [],
                     "importance": fact.get("importance"),
                     "confidence": fact.get("confidence"),
@@ -1595,8 +1603,8 @@ class MemoryNodeManager:
                 fallback_root_topic=fact_topic_fallback,
                 fallback_aspect_topic=fact_topic_fallback,
             )
-            entity_state_signal = self._normalize_entity_state_signal(
-                raw_fact.get("entity_state_signal"),
+            entity_claim_signal = self._normalize_entity_claim_signal(
+                raw_fact.get("entity_claim_signal"),
                 fallback_entity=primary_entity,
             )
             action_signal = self._normalize_action_signal(
@@ -1612,7 +1620,7 @@ class MemoryNodeManager:
                 "keywords": keywords,
                 "entities": entities,
                 "primary_entity": primary_entity,
-                "entity_state_signal": entity_state_signal,
+                "entity_claim_signal": entity_claim_signal,
                 "action_signal": action_signal,
                 "fact_root_topic": fact_root_topic,
                 "fact_aspect_topic": fact_aspect_topic,
@@ -1647,7 +1655,7 @@ class MemoryNodeManager:
         )
         return normalized_root, normalized_aspect
 
-    def _normalize_entity_state_signal(
+    def _normalize_entity_claim_signal(
         self,
         value: Any,
         *,
@@ -1661,24 +1669,38 @@ class MemoryNodeManager:
             int(
                 limit
                 if limit is not None
-                else self._memory_cfg.get("entity_state_signal_max_per_fact", 3) or 3
+                else self._memory_cfg.get("entity_claim_signal_max_per_fact", 3) or 3
             ),
         )
         if max_items <= 0:
             return []
-        allowed_types = self._entity_scoped_state_types()
+        allowed_types = self._entity_claim_types()
+        allowed_kinds = {
+            "explicit_assertion", "pattern_observation", "counterexample",
+        }
         normalized: List[Dict[str, Any]] = []
-        seen: set[Tuple[str, str, str]] = set()
+        seen: set[Tuple[str, str, str, str]] = set()
         for raw in value:
             if not isinstance(raw, dict):
                 continue
-            state_type = str(raw.get("state_type") or "").strip().lower()
-            if state_type not in allowed_types:
+            signal_kind = str(raw.get("signal_kind") or "").strip().lower()
+            claim_type_hint = str(raw.get("claim_type_hint") or "").strip().lower()
+            if signal_kind not in allowed_kinds or claim_type_hint not in allowed_types:
                 continue
-            attribute_name = _compact_whitespace(
-                raw.get("attribute_name")
-                or raw.get("canonical_name")
-                or raw.get("attribute")
+            if (
+                signal_kind == "explicit_assertion"
+                and claim_type_hint == "behavior_pattern"
+            ):
+                continue
+            if (
+                signal_kind in {"pattern_observation", "counterexample"}
+                and claim_type_hint not in {"preference", "behavior_pattern"}
+            ):
+                continue
+            claim_anchor = _compact_whitespace(
+                raw.get("claim_anchor")
+                or raw.get("anchor")
+                or raw.get("attribute_name")
                 or ""
             )
             evidence_basis = _compact_whitespace(
@@ -1687,7 +1709,10 @@ class MemoryNodeManager:
                 or raw.get("reason")
                 or ""
             )
-            if not attribute_name or not evidence_basis:
+            if (
+                not claim_anchor
+                or not evidence_basis
+            ):
                 continue
             confidence = self._clamp_float(raw.get("confidence"), 0.0, 1.0, 0.75)
             entity = raw.get("entity") or raw.get("primary_entity") or fallback_entity
@@ -1703,16 +1728,18 @@ class MemoryNodeManager:
                 else None
             )
             key = (
-                state_type,
-                attribute_name.lower(),
+                signal_kind,
+                claim_type_hint,
+                claim_anchor.lower(),
                 evidence_basis.lower(),
             )
             if key in seen:
                 continue
             seen.add(key)
             item: Dict[str, Any] = {
-                "state_type": state_type,
-                "attribute_name": attribute_name,
+                "signal_kind": signal_kind,
+                "claim_type_hint": claim_type_hint,
+                "claim_anchor": claim_anchor,
                 "evidence_basis": evidence_basis,
                 "confidence": confidence,
             }
@@ -2401,7 +2428,7 @@ class MemoryNodeManager:
             fact_metadata = {
                 **metadata,
                 "tags": tags,
-                "entity_state_signal": fact.get("entity_state_signal") or [],
+                "entity_claim_signal": fact.get("entity_claim_signal") or [],
                 "action_signal": fact.get("action_signal") or [],
                 "episode_context_topics": list(episode_context_topics or []),
                 "episode_context_entities": list(episode_context_entities or []),
@@ -2438,7 +2465,7 @@ class MemoryNodeManager:
             "topic_item_updates": topic_item_updates,
         }
 
-    # ── Reflection: facts -> evolving states ─────────────────────────────
+    # ── Reflection: facts/episodes -> entity claims ──────────────────────
 
     def submit_memory_reflect_task(self, *_, **kwargs: Any) -> Dict[str, Any]:
         """Queue reflection after all previously accepted memory tasks."""
@@ -2460,7 +2487,7 @@ class MemoryNodeManager:
         reflect_timestamp: Optional[Any] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        """Update entity-state projections from recent facts."""
+        """Project new facts and completed episodes into entity claims."""
         reflect_started_at = time.monotonic()
         limit = max(1, int(limit or self._memory_cfg.get("reflect_limit") or 100))
         if reflect_timestamp is None:
@@ -2469,29 +2496,31 @@ class MemoryNodeManager:
             "limit": limit,
             "reflect_timestamp": reflect_timestamp,
         })
-        # Keep entity-state projection writes and processed markers atomic.
         with self._db.transaction():
-            state_report = self._update_memory_states_using_facts(
+            claim_report = self._update_memory_entity_claims(
                 limit=limit,
                 reference_timestamp=reflect_timestamp,
             )
-            entity_report = state_report["entity_report"]
         report = {
             "status": (
                 "ok"
-                if state_report.get("fact_count", 0)
+                if (
+                    claim_report.get("explicit", {}).get("fact_count", 0)
+                    or claim_report.get("inductive", {}).get("episode_count", 0)
+                )
                 else "empty"
             ),
-            "states_updated": int(state_report.get("states_updated", 0) or 0),
-            "entity_facts_considered": int(
-                state_report.get("entity_facts_considered", 0) or 0
+            "explicit_claims_updated": int(
+                claim_report.get("explicit", {}).get("updated", 0) or 0
             ),
-            "evidence_only_facts": int(
-                state_report.get("evidence_only_facts", 0) or 0
+            "inductive_claims_updated": int(
+                claim_report.get("inductive", {}).get("updated", 0) or 0
             ),
-            "entity_states_updated": int(entity_report.get("updated", 0) or 0),
-            "facts_marked_processed_for_memory_state": int(
-                state_report.get("facts_marked_processed", 0) or 0
+            "facts_marked_processed_for_memory_entity_claim": int(
+                claim_report.get("explicit", {}).get("facts_marked_processed", 0) or 0
+            ),
+            "episodes_marked_processed_for_entity_claim_induction": int(
+                claim_report.get("inductive", {}).get("episodes_marked_processed", 0) or 0
             ),
             "legacy_actionable_item_flow": "disabled_pending_work_item_redesign",
             "total_elapsed_ms": round(
@@ -2502,83 +2531,911 @@ class MemoryNodeManager:
         self._log_info("memory_reflect", "finish", report)
         return report
 
-    def _update_memory_states_using_facts(
+    @staticmethod
+    def _entity_claim_types() -> set[str]:
+        return {
+            "identity_profile", "affiliation", "relationship", "preference",
+            "constraint", "behavior_pattern",
+        }
+
+    def _update_memory_entity_claims(
         self,
         *,
         limit: int,
         reference_timestamp: Any,
-    ) -> Dict[str, Any]:
-        """Update entity-state projections from the current facts only."""
+    ) -> Dict[str, Dict[str, Any]]:
+        """Project facts and completed episodes into traceable claim records."""
+        disabled = {
+            "enabled": 0, "updated": 0, "facts_marked_processed": 0,
+            "episodes_marked_processed": 0,
+        }
+        if not self._enable_memory_entity_claim_update:
+            return {"explicit": dict(disabled), "inductive": dict(disabled)}
 
-        started_at = time.monotonic()
-        if not self._enable_memory_state_update:
-            report = {
-                "enabled": 0,
-                "fact_count": 0,
-                "fact_ids": [],
-                "entity_report": {
-                    "enabled": 0,
-                    "updated": 0,
-                },
-                "entity_facts_considered": 0,
-                "evidence_only_facts": 0,
-                "states_updated": 0,
-                "facts_marked_processed": 0,
-                "total_elapsed_ms": round(
-                    (time.monotonic() - started_at) * 1000,
-                    2,
-                ),
-            }
-            self._log_info("memory_reflect", "state_update_skipped", report)
-            return report
-        facts = self._db.get_unprocessed_facts(
-            processing_target="state",
+        explicit_facts = self._db.get_unprocessed_facts(
+            processing_target="entity_claim",
             limit=limit,
             reference_timestamp=reference_timestamp,
         )
-        self._log_reflect_facts_loaded(
-            "state",
-            facts,
-            limit,
-            reference_timestamp,
+        explicit_report = self._update_explicit_entity_claims_from_facts(explicit_facts)
+        # A valid empty result is a completed projection.  An unavailable or
+        # malformed LLM response is retried on the next reflect task.
+        if explicit_report.pop("completed", False):
+            explicit_report["facts_marked_processed"] = self._db.mark_facts_processed(
+                processing_target="entity_claim",
+                fact_ids=[fact.get("id") for fact in explicit_facts],
+            )
+        else:
+            explicit_report["facts_marked_processed"] = 0
+
+        episodes = self._db.get_unprocessed_episodes_for_entity_claim_induction(
+            limit=max(1, min(limit, 24)),
         )
-        entity_facts = [
-            fact for fact in facts
-            if self._fact_can_seed_entity_state(fact)
+        inductive_report = self._update_inductive_entity_claims_from_episodes(episodes)
+        if inductive_report.pop("completed", False):
+            inductive_report["episodes_marked_processed"] = (
+                self._db.mark_episodes_processed_for_entity_claim_induction(
+                    [episode.get("id") for episode in episodes]
+                )
+            )
+        else:
+            inductive_report["episodes_marked_processed"] = 0
+        self._log_info("memory_reflect", "entity_claim_update_finish", {
+            "explicit": explicit_report,
+            "inductive": inductive_report,
+        })
+        return {"explicit": explicit_report, "inductive": inductive_report}
+
+    def _claim_fact_prompt_view(self, fact: Dict[str, Any]) -> Dict[str, Any]:
+        metadata = fact.get("metadata") if isinstance(fact.get("metadata"), dict) else {}
+        return {
+            "fact_id": fact.get("id"),
+            "summary": fact.get("summary") or "",
+            "fact_kind": fact.get("fact_kind") or "",
+            "entities": fact.get("entities") or [],
+            "primary_entity": fact.get("primary_entity") or metadata.get("primary_entity"),
+            "keywords": fact.get("keywords") or [],
+            "entity_claim_signal": (
+                fact.get("entity_claim_signal")
+                or metadata.get("entity_claim_signal")
+                or []
+            ),
+            "event_time": fact.get("event_time_key") or "",
+            "dialogue_time": fact.get("dialogue_time_key") or "",
+            "episode_id": fact.get("episode_id"),
+        }
+
+    def _claim_entity_name_to_id(self, facts: Sequence[Dict[str, Any]]) -> Dict[str, int]:
+        names = [
+            name
+            for fact in facts
+            for name in self._normalize_entity_names(fact.get("entities") or [], limit=24)
         ]
-        self._log_info("memory_reflect", "state_fact_candidates", {
-            "entity_fact_count": len(entity_facts),
-            "entity_fact_ids": [
-                fact.get("id") for fact in entity_facts if fact.get("id") is not None
+        return self._db.add_entity_names(names)
+
+    @staticmethod
+    def _entity_claim_origin_priority(origin: Any) -> int:
+        """Origin is a hard reconciliation precedence, not a soft score."""
+        return {"explicit": 3, "inductive": 2, "derived": 1}.get(
+            str(origin or "").strip().lower(),
+            0,
+        )
+
+    @staticmethod
+    def _entity_claim_storage_payload(candidate: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            key: value
+            for key, value in candidate.items()
+            if key not in {
+                "evidence_fact_ids", "support_fact_ids", "counterexample_fact_ids",
+            }
+        }
+
+    @staticmethod
+    def _entity_claim_evidence_ids(
+        candidate: Dict[str, Any],
+    ) -> Tuple[List[int], List[int]]:
+        support_ids = candidate.get("support_fact_ids")
+        if support_ids is None:
+            support_ids = candidate.get("evidence_fact_ids") or []
+        return (
+            [int(value) for value in support_ids if str(value).strip().isdigit()],
+            [
+                int(value)
+                for value in candidate.get("counterexample_fact_ids") or []
+                if str(value).strip().isdigit()
+            ],
+        )
+
+    def _retrieve_related_entity_claims(
+        self,
+        candidate: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        """Bound relation candidates to one entity and compatible claim type."""
+        rows = self._db.get_entity_claims(
+            subject_entity_id=int(candidate["subject_entity_id"]),
+            claim_type=str(candidate["claim_type"]),
+            statuses=["active", "candidate", "weakened"],
+            limit=80,
+        )
+        predicate = str(candidate.get("predicate") or "")
+        normalized_value = str(candidate.get("normalized_value") or "")
+        rows.sort(
+            key=lambda row: (
+                str(row.get("predicate") or "") != predicate,
+                str(row.get("normalized_value") or "") != normalized_value,
+                -self._entity_claim_origin_priority(row.get("claim_origin")),
+                -float(row.get("confidence") or 0.0),
+            )
+        )
+        return rows[:24]
+
+    def _finalize_entity_claim_relation_decision(
+        self,
+        candidate: Dict[str, Any],
+        target: Optional[Dict[str, Any]],
+        semantic_decision: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Translate text-only relation into a safe origin-aware write plan."""
+        semantic_relation = str(
+            semantic_decision.get("semantic_relation")
+            or semantic_decision.get("relation")
+            or "unrelated"
+        )
+        decision = {
+            **semantic_decision,
+            "semantic_relation": semantic_relation,
+            "merge_into_target": False,
+            "candidate_status": str(candidate.get("status") or "candidate"),
+            "target_status": "",
+            "target_evidence_role": "",
+        }
+        if not target:
+            return decision
+        candidate_priority = self._entity_claim_origin_priority(
+            candidate.get("claim_origin")
+        )
+        target_priority = self._entity_claim_origin_priority(
+            target.get("claim_origin")
+        )
+        if semantic_relation == "duplicate":
+            if candidate_priority <= target_priority:
+                decision["merge_into_target"] = True
+                decision["target_evidence_role"] = (
+                    "context" if candidate_priority < target_priority else "support"
+                )
+            else:
+                # Keep a direct explicit assertion as its own, stronger claim,
+                # while using it to support the older inductive conclusion.
+                decision["target_evidence_role"] = "support"
+            return decision
+        if semantic_relation in {"supports", "refines"}:
+            decision["target_evidence_role"] = (
+                "context" if candidate_priority < target_priority else "support"
+            )
+            return decision
+        if semantic_relation not in {"contradicts", "supersedes"}:
+            return decision
+        if candidate_priority < target_priority:
+            # An inferred pattern can coexist as a tentative competing claim,
+            # but it never changes an explicit claim's state.
+            decision["candidate_status"] = "candidate"
+            return decision
+        decision["target_evidence_role"] = "counterexample"
+        decision["target_status"] = (
+            "superseded" if semantic_relation == "supersedes" else "weakened"
+        )
+        return decision
+
+    def _classify_entity_claim_relations(
+        self,
+        candidates: Sequence[Dict[str, Any]],
+        related_by_index: Dict[int, List[Dict[str, Any]]],
+    ) -> List[List[Dict[str, Any]]]:
+        if not any(related_by_index.values()):
+            return [[] for _candidate in candidates]
+        language = self._resolve_prompt_language_from_text(
+            "\n".join(str(candidate.get("claim_text") or "") for candidate in candidates)
+        )
+        template = (
+            ENTITY_CLAIM_RECONCILIATION_PROMPT_EN
+            if language == "en" else ENTITY_CLAIM_RECONCILIATION_PROMPT_ZH
+        )
+        prompt_candidates = [
+            {
+                "candidate_claim_index": index,
+                "claim_text": candidate.get("claim_text") or "",
+            }
+            for index, candidate in enumerate(candidates)
+        ]
+        existing_by_id = {
+            int(claim["id"]): claim
+            for claims in related_by_index.values()
+            for claim in claims
+            if str(claim.get("id") or "").strip().isdigit()
+        }
+        raw = self._call_llm(
+            template.replace("{candidate_claims}", json.dumps(
+                prompt_candidates, ensure_ascii=False, indent=2,
+            )).replace("{existing_claims}", json.dumps(
+                [
+                    {"id": claim.get("id"), "claim_text": claim.get("claim_text") or ""}
+                    for claim in existing_by_id.values()
+                ],
+                ensure_ascii=False, indent=2,
+            ))
+        )
+        parsed = self._parse_json_object_from_llm_text(raw or "")
+        if not parsed or not isinstance(parsed.get("decisions"), list):
+            return [[] for _candidate in candidates]
+        else:
+            allowed_relations = {
+                "duplicate", "supports", "contradicts", "refines", "supersedes",
+            }
+            semantic_resolved: List[List[Dict[str, Any]]] = [
+                [] for _candidate in candidates
+            ]
+            for raw_decision in parsed["decisions"]:
+                if not isinstance(raw_decision, dict):
+                    continue
+                try:
+                    index = int(raw_decision.get("candidate_claim_index"))
+                except (TypeError, ValueError):
+                    continue
+                if index < 0 or index >= len(candidates):
+                    continue
+                raw_relations = raw_decision.get("relations")
+                if not isinstance(raw_relations, list):
+                    continue
+                allowed_ids = {
+                    int(claim["id"])
+                    for claim in related_by_index.get(index, [])
+                    if str(claim.get("id") or "").strip().isdigit()
+                }
+                parsed_by_id: Dict[int, Dict[str, Any]] = {}
+                for raw_relation in raw_relations:
+                    if not isinstance(raw_relation, dict):
+                        continue
+                    try:
+                        target_id = int(raw_relation.get("existing_claim_id"))
+                    except (TypeError, ValueError):
+                        continue
+                    relation = str(
+                        raw_relation.get("semantic_relation") or ""
+                    ).strip().lower()
+                    if target_id not in allowed_ids or relation not in allowed_relations:
+                        continue
+                    parsed_by_id[target_id] = {
+                        "existing_claim_id": target_id,
+                        "semantic_relation": relation,
+                        "confidence": self._clamp_float(
+                            raw_relation.get("confidence"), 0.0, 1.0, 0.7,
+                        ),
+                        "reason": _compact_whitespace(
+                            raw_relation.get("reason") or ""
+                        )[:240],
+                    }
+                semantic_resolved[index] = list(parsed_by_id.values())
+        finalized: List[List[Dict[str, Any]]] = []
+        for index, candidate in enumerate(candidates):
+            candidate_decisions: List[Dict[str, Any]] = []
+            for semantic_decision in semantic_resolved[index]:
+                target_id = semantic_decision.get("existing_claim_id")
+                target = next(
+                    (
+                        claim for claim in related_by_index.get(index, [])
+                        if int(claim.get("id") or 0) == int(target_id or 0)
+                    ),
+                    None,
+                )
+                if target:
+                    candidate_decisions.append(
+                        self._finalize_entity_claim_relation_decision(
+                            candidate, target, semantic_decision,
+                        )
+                    )
+            finalized.append(candidate_decisions)
+        return finalized
+
+    def _write_entity_claim_evidence(
+        self,
+        *,
+        claim_id: int,
+        support_ids: Sequence[int],
+        counterexample_ids: Sequence[int],
+        facts_by_id: Dict[int, Dict[str, Any]],
+        confidence: float,
+        support_role: str = "support",
+    ) -> None:
+        evidence: List[Dict[str, Any]] = []
+        for role, fact_ids in (
+            (support_role, support_ids),
+            ("counterexample", counterexample_ids),
+        ):
+            for fact_id in fact_ids:
+                fact = facts_by_id.get(int(fact_id))
+                if not fact:
+                    continue
+                evidence.append({
+                    "claim_id": claim_id,
+                    "evidence_type": "fact",
+                    "evidence_id": int(fact_id),
+                    "role": role,
+                    "weight": confidence,
+                    "observed_at": fact.get("event_time_key")
+                    or fact.get("dialogue_time_key") or "",
+                })
+        self._db.upsert_entity_claim_evidence(evidence)
+
+    @staticmethod
+    def _entity_claim_transition_effective_at(
+        candidate: Dict[str, Any],
+        *,
+        support_ids: Sequence[int],
+        counterexample_ids: Sequence[int],
+        facts_by_id: Dict[int, Dict[str, Any]],
+    ) -> str:
+        """Use the candidate's own temporal assertion, then its newest fact."""
+        valid_from = _compact_whitespace(candidate.get("valid_from") or "")
+        if valid_from:
+            return valid_from
+        observed_at = [
+            _compact_whitespace(
+                fact.get("event_time_key") or fact.get("dialogue_time_key") or ""
+            )
+            for fact_id in [*support_ids, *counterexample_ids]
+            for fact in [facts_by_id.get(int(fact_id))]
+            if fact
+        ]
+        return max((value for value in observed_at if value), default="")
+
+    def _transition_entity_claim_target(
+        self,
+        *,
+        target: Dict[str, Any],
+        trigger_claim_id: int,
+        candidate: Dict[str, Any],
+        decision: Dict[str, Any],
+        effective_at: str,
+    ) -> bool:
+        """Persist an origin-aware claim-state transition with its audit trail."""
+        target_status = str(decision.get("target_status") or "")
+        if not target_status:
+            return False
+        candidate_origin = str(candidate.get("claim_origin") or "")
+        target_origin = str(target.get("claim_origin") or "")
+        candidate_priority = self._entity_claim_origin_priority(candidate_origin)
+        target_priority = self._entity_claim_origin_priority(target_origin)
+        details = {
+            "trigger_claim_snapshot": {
+                "claim_text": candidate.get("claim_text") or "",
+                "claim_origin": candidate_origin,
+                "claim_type": candidate.get("claim_type") or "",
+                "confidence": candidate.get("confidence"),
+            },
+            "target_claim_snapshot": {
+                "claim_text": target.get("claim_text") or "",
+                "claim_origin": target_origin,
+                "claim_type": target.get("claim_type") or "",
+                "confidence": target.get("confidence"),
+            },
+            "origin_priorities": {
+                "trigger": candidate_priority,
+                "target": target_priority,
+            },
+        }
+        return self._db.transition_entity_claim_status(
+            target_claim_id=int(target["id"]),
+            new_status=target_status,
+            trigger_claim_id=trigger_claim_id,
+            semantic_relation=str(decision.get("semantic_relation") or ""),
+            effective_at=effective_at,
+            decision_source="entity_claim_reconciliation_v1:llm_semantics+origin_policy",
+            semantic_confidence=self._clamp_float(
+                decision.get("confidence"), 0.0, 1.0, 0.0,
+            ),
+            semantic_reason=_compact_whitespace(decision.get("reason") or "")[:240],
+            policy_reason=(
+                f"origin_precedence: trigger={candidate_origin}({candidate_priority}), "
+                f"target={target_origin}({target_priority}), "
+                f"target_status={target_status}"
+            ),
+            details=details,
+        )
+
+    def _reconcile_entity_claims(
+        self,
+        candidates: Sequence[Dict[str, Any]],
+        *,
+        facts_by_id: Dict[int, Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Resolve new candidate claims before they become durable claims."""
+        unique_candidates: List[Dict[str, Any]] = []
+        seen: set[Tuple[Any, ...]] = set()
+        for candidate in candidates:
+            key = (
+                candidate.get("subject_entity_id"), candidate.get("claim_type"),
+                candidate.get("predicate"), candidate.get("object_entity_id") or 0,
+                candidate.get("normalized_value"), candidate.get("claim_origin"),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            unique_candidates.append(candidate)
+        related_by_index = {
+            index: self._retrieve_related_entity_claims(candidate)
+            for index, candidate in enumerate(unique_candidates)
+        }
+        decisions = self._classify_entity_claim_relations(
+            unique_candidates, related_by_index,
+        )
+        applied: List[Dict[str, Any]] = []
+        for index, candidate in enumerate(unique_candidates):
+            candidate_decisions = decisions[index]
+            candidate_origin = str(candidate.get("claim_origin") or "")
+            support_ids, counterexample_ids = self._entity_claim_evidence_ids(candidate)
+            effective_at = self._entity_claim_transition_effective_at(
+                candidate,
+                support_ids=support_ids,
+                counterexample_ids=counterexample_ids,
+                facts_by_id=facts_by_id,
+            )
+            candidate_status = str(candidate.get("status") or "candidate")
+            if any(
+                str(decision.get("candidate_status") or "") == "candidate"
+                for decision in candidate_decisions
+            ):
+                candidate_status = "candidate"
+
+            def target_for(decision: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+                target_id = decision.get("existing_claim_id")
+                return next(
+                    (
+                        item for item in related_by_index[index]
+                        if int(item.get("id") or 0) == int(target_id or 0)
+                    ),
+                    None,
+                )
+
+            merge_decisions = [
+                decision for decision in candidate_decisions
+                if decision.get("merge_into_target") and target_for(decision)
+            ]
+            if merge_decisions:
+                primary_merge = max(
+                    merge_decisions,
+                    key=lambda decision: self._entity_claim_origin_priority(
+                        (target_for(decision) or {}).get("claim_origin")
+                    ),
+                )
+                primary_target = target_for(primary_merge)
+                assert primary_target is not None
+                claim_id = int(primary_target["id"])
+                for decision in candidate_decisions:
+                    target = target_for(decision)
+                    if not target:
+                        continue
+                    target_status = str(decision.get("target_status") or "")
+                    target_evidence_role = str(
+                        decision.get("target_evidence_role") or ""
+                    )
+                    if target_status:
+                        self._transition_entity_claim_target(
+                            target=target,
+                            trigger_claim_id=claim_id,
+                            candidate=candidate,
+                            decision=decision,
+                            effective_at=effective_at,
+                        )
+                    if target_evidence_role:
+                        self._write_entity_claim_evidence(
+                            claim_id=int(target["id"]),
+                            support_ids=support_ids,
+                            counterexample_ids=counterexample_ids,
+                            facts_by_id=facts_by_id,
+                            confidence=float(candidate.get("confidence") or 0.0),
+                            support_role=target_evidence_role,
+                        )
+                applied.append({
+                    "claim": candidate, "claim_id": claim_id, "created": False,
+                    "effective_origin": primary_target.get("claim_origin") or "",
+                    "relations": candidate_decisions, "merged": True,
+                })
+                continue
+
+            storage_payload = self._entity_claim_storage_payload(candidate)
+            storage_payload["status"] = candidate_status
+            claim_id, created = self._db.upsert_entity_claim(**storage_payload)
+            self._write_entity_claim_evidence(
+                claim_id=claim_id,
+                support_ids=support_ids,
+                counterexample_ids=counterexample_ids,
+                facts_by_id=facts_by_id,
+                confidence=float(candidate.get("confidence") or 0.0),
+            )
+            for decision in candidate_decisions:
+                target = target_for(decision)
+                if not target:
+                    continue
+                target_status = str(decision.get("target_status") or "")
+                target_evidence_role = str(
+                    decision.get("target_evidence_role") or ""
+                )
+                if target_status:
+                    self._transition_entity_claim_target(
+                        target=target,
+                        trigger_claim_id=claim_id,
+                        candidate=candidate,
+                        decision=decision,
+                        effective_at=effective_at,
+                    )
+                if target_evidence_role:
+                    self._write_entity_claim_evidence(
+                        claim_id=int(target["id"]),
+                        support_ids=support_ids,
+                        counterexample_ids=counterexample_ids,
+                        facts_by_id=facts_by_id,
+                        confidence=float(candidate.get("confidence") or 0.0),
+                        support_role=target_evidence_role,
+                    )
+            applied.append({
+                "claim": candidate, "claim_id": claim_id, "created": created,
+                "effective_origin": candidate_origin,
+                "relations": candidate_decisions,
+                "merged": False,
+            })
+        self._log_info("memory_reflect", "entity_claim_reconciled", {
+            "candidate_count": len(unique_candidates),
+            "applied_count": len(applied),
+            "relations": [
+                {
+                    "claim_id": item["claim_id"], "origin": item["claim"].get("claim_origin"),
+                    "relations": [
+                        {
+                            "existing_claim_id": decision.get("existing_claim_id"),
+                            "semantic_relation": decision.get("semantic_relation"),
+                        }
+                        for decision in item["relations"]
+                    ],
+                    "merged": item["merged"],
+                }
+                for item in applied
             ],
         })
+        return applied
 
-        entity_report = self._resolve_and_update_entity_scoped_states_from_facts(
-            facts=entity_facts,
-        )
-        facts_marked_processed = self._db.mark_facts_processed(
-            processing_target="state",
-            fact_ids=[fact.get("id") for fact in facts],
-        )
-        report = {
-            "fact_count": len(facts),
-            "fact_ids": [fact.get("id") for fact in facts],
-            "entity_report": entity_report,
-            "entity_facts_considered": len(entity_facts),
-            "evidence_only_facts": max(0, len(facts) - len(set(
-                int(fact["id"])
-                for fact in entity_facts
-                if str(fact.get("id") or "").strip().isdigit()
-            ))),
-            "states_updated": int(entity_report.get("updated", 0) or 0),
-            "facts_marked_processed": facts_marked_processed,
-            "total_elapsed_ms": round(
-                (time.monotonic() - started_at) * 1000,
-                2,
-            ),
+    def _update_explicit_entity_claims_from_facts(
+        self,
+        facts: Sequence[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        report: Dict[str, Any] = {
+            "enabled": 1, "fact_count": len(facts), "claim_count": 0,
+            "updated": 0, "created": 0, "completed": True,
         }
-        self._log_info("memory_reflect", "state_update_finish", report)
+        if not facts:
+            return report
+        prompt_language = self._resolve_prompt_language_from_text(
+            "\n".join(str(fact.get("summary") or "") for fact in facts[:20])
+        )
+        template = (
+            EXPLICIT_ENTITY_CLAIM_EXTRACTION_PROMPT_EN
+            if prompt_language == "en" else EXPLICIT_ENTITY_CLAIM_EXTRACTION_PROMPT_ZH
+        )
+        raw = self._call_llm(template.replace(
+            "{facts}", json.dumps(
+                [self._claim_fact_prompt_view(fact) for fact in facts[:40]],
+                ensure_ascii=False, indent=2,
+            ),
+        ))
+        parsed = self._parse_json_object_from_llm_text(raw or "")
+        if parsed is None or not isinstance(parsed.get("claims"), list):
+            report["completed"] = False
+            report["error"] = "invalid_llm_claim_response"
+            return report
+        entity_ids = self._claim_entity_name_to_id(facts)
+        facts_by_id = {
+            int(fact["id"]): fact for fact in facts
+            if str(fact.get("id") or "").strip().isdigit()
+        }
+        candidates: List[Dict[str, Any]] = []
+        for raw_claim in parsed["claims"][:32]:
+            claim = self._normalize_explicit_entity_claim(
+                raw_claim, facts_by_id=facts_by_id, entity_ids=entity_ids,
+            )
+            if not claim:
+                continue
+            candidates.append(claim)
+        applied = self._reconcile_entity_claims(candidates, facts_by_id=facts_by_id)
+        report["updated"] = len(applied)
+        report["created"] = sum(int(item["created"]) for item in applied)
+        report["merged"] = sum(int(item["merged"]) for item in applied)
+        report["claim_count"] = len(candidates)
         return report
+
+    def _normalize_explicit_entity_claim(
+        self,
+        raw: Any,
+        *,
+        facts_by_id: Dict[int, Dict[str, Any]],
+        entity_ids: Dict[str, int],
+    ) -> Optional[Dict[str, Any]]:
+        if not isinstance(raw, dict):
+            return None
+        claim_type = str(raw.get("claim_type") or "").strip().lower()
+        if claim_type not in self._entity_claim_types() - {"behavior_pattern"}:
+            return None
+        subject = _compact_whitespace(raw.get("subject_entity") or "")
+        subject_id = entity_ids.get(subject)
+        predicate = re.sub(r"[^a-z0-9_]+", "_", str(raw.get("predicate") or "").lower()).strip("_")
+        if not subject_id or not predicate:
+            return None
+        evidence_ids = list(dict.fromkeys(
+            int(value) for value in (raw.get("evidence_fact_ids") or [])
+            if str(value).strip().isdigit() and int(value) in facts_by_id
+        ))[:12]
+        if not evidence_ids or not all(
+            subject in (facts_by_id[fact_id].get("entities") or [])
+            for fact_id in evidence_ids
+        ):
+            return None
+        object_name = _compact_whitespace(raw.get("object_entity") or "")
+        object_id = entity_ids.get(object_name) if object_name else None
+        normalized_value = _compact_whitespace(raw.get("normalized_value") or "")[:160]
+        if not object_id and not normalized_value:
+            return None
+        confidence = self._clamp_float(raw.get("confidence"), 0.0, 1.0, 0.7)
+        claim_text = self._normalize_entity_claim_text(
+            raw.get("claim_text"),
+            subject=subject,
+            predicate=predicate,
+            object_name=object_name,
+            normalized_value=normalized_value,
+        )
+        return {
+            "subject_entity_id": subject_id,
+            "predicate": predicate,
+            "object_entity_id": object_id,
+            "normalized_value": normalized_value,
+            "claim_text": claim_text,
+            "claim_type": claim_type,
+            "claim_origin": "explicit",
+            "status": "active" if confidence >= self._entity_claim_explicit_min_confidence else "candidate",
+            "confidence": confidence,
+            "valid_from": _compact_whitespace(raw.get("valid_from") or ""),
+            "valid_to": _compact_whitespace(raw.get("valid_to") or ""),
+            "extractor_version": "entity_claim_explicit_v1",
+            "prompt_version": "v1",
+            "metadata": {"source_fact_count": len(evidence_ids)},
+            "evidence_fact_ids": evidence_ids,
+        }
+
+    def _update_inductive_entity_claims_from_episodes(
+        self,
+        episodes: Sequence[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        report: Dict[str, Any] = {
+            "enabled": 1, "episode_count": len(episodes), "candidate_count": 0,
+            "updated": 0, "created": 0, "completed": True,
+        }
+        if not episodes:
+            return report
+        seed_facts = self._db.memory_facts_by_episode_ids(
+            [episode.get("id") for episode in episodes], limit=360,
+        )
+        groups: Dict[Tuple[int, str, str], Dict[str, Any]] = {}
+        for fact in seed_facts:
+            for signal in self._entity_claim_signals_from_fact(fact):
+                claim_type_hint = str(signal.get("claim_type_hint") or "").lower()
+                if claim_type_hint not in {"preference", "behavior_pattern"}:
+                    continue
+                if str(signal.get("signal_kind") or "") not in {
+                    "explicit_assertion", "pattern_observation", "counterexample",
+                }:
+                    continue
+                names = self._entities_for_entity_claim_signal(signal, fact)
+                mapping = self._db.add_entity_names(names)
+                if not names or names[0] not in mapping:
+                    continue
+                claim_anchor = _compact_whitespace(signal.get("claim_anchor") or "")
+                if not claim_anchor:
+                    continue
+                key = (
+                    int(mapping[names[0]]),
+                    claim_type_hint,
+                    self._generate_topic_name_key(claim_anchor),
+                )
+                groups.setdefault(key, {
+                    "subject": names[0], "subject_entity_id": int(mapping[names[0]]),
+                    "claim_type_hint": claim_type_hint,
+                    "claim_anchor": claim_anchor,
+                })
+        report["candidate_count"] = len(groups)
+        for group in list(groups.values())[:12]:
+            all_entity_facts = self._db.memory_episode_facts_for_entity_id(
+                group["subject_entity_id"], limit=240,
+            )
+            evidence_facts = [
+                fact for fact in all_entity_facts
+                if any(
+                    str(signal.get("claim_type_hint") or "").lower()
+                    == group["claim_type_hint"]
+                    and self._generate_topic_name_key(signal.get("claim_anchor") or "")
+                    == self._generate_topic_name_key(group["claim_anchor"])
+                    and group["subject"]
+                    in self._entities_for_entity_claim_signal(signal, fact)
+                    for signal in self._entity_claim_signals_from_fact(fact)
+                )
+            ]
+            distinct_episodes = {
+                int(fact["episode_id"]) for fact in evidence_facts
+                if str(fact.get("episode_id") or "").strip().isdigit()
+            }
+            time_windows = {
+                str(fact.get("event_time_key") or fact.get("dialogue_time_key") or "")[:10]
+                for fact in evidence_facts
+                if str(fact.get("event_time_key") or fact.get("dialogue_time_key") or "")
+            }
+            if (
+                len(distinct_episodes) < self._entity_claim_induction_min_episodes
+                or len(time_windows) < self._entity_claim_induction_min_time_windows
+            ):
+                continue
+            outcome = self._extract_inductive_entity_claims(
+                group=group, facts=evidence_facts,
+            )
+            if outcome is None:
+                # Do not mark the episode cursor on a transport/format error:
+                # the same completed evidence must remain eligible for retry.
+                report["completed"] = False
+                report["error"] = "invalid_llm_induction_response"
+                return report
+            by_id = {int(fact["id"]): fact for fact in evidence_facts}
+            applied = self._reconcile_entity_claims(outcome, facts_by_id=by_id)
+            for item in applied:
+                claim = item["claim"]
+                if item["effective_origin"] != "inductive":
+                    continue
+                support_ids, counterexample_ids = self._entity_claim_evidence_ids(claim)
+                if not support_ids:
+                    continue
+                claim_id = int(item["claim_id"])
+                self._db.upsert_entity_claim_induction(
+                    claim_id=claim_id,
+                    condition_text=str(claim.get("metadata", {}).get("condition_text") or ""),
+                    behavior_or_outcome_text=str(claim.get("metadata", {}).get("behavior_or_outcome_text") or ""),
+                    support_count=len(support_ids),
+                    counterexample_count=len(counterexample_ids),
+                    first_observed_at=min(
+                        (by_id[item].get("event_time_key") or by_id[item].get("dialogue_time_key") or "")
+                        for item in support_ids
+                    ),
+                    last_observed_at=max(
+                        (by_id[item].get("event_time_key") or by_id[item].get("dialogue_time_key") or "")
+                        for item in support_ids
+                    ),
+                )
+            report["updated"] += len(applied)
+            report["created"] += sum(int(item["created"]) for item in applied)
+        return report
+
+    def _extract_inductive_entity_claims(
+        self,
+        *,
+        group: Dict[str, Any],
+        facts: Sequence[Dict[str, Any]],
+    ) -> Optional[List[Dict[str, Any]]]:
+        language = self._resolve_prompt_language_from_text(
+            "\n".join(str(fact.get("summary") or "") for fact in facts[:16])
+        )
+        template = (
+            INDUCTIVE_ENTITY_CLAIM_EXTRACTION_PROMPT_EN
+            if language == "en" else INDUCTIVE_ENTITY_CLAIM_EXTRACTION_PROMPT_ZH
+        )
+        raw = self._call_llm(
+            template.replace("{induction_target}", json.dumps({
+                "subject_entity": group["subject"],
+                "claim_type_hint": group["claim_type_hint"],
+                "claim_anchor": group["claim_anchor"],
+            }, ensure_ascii=False, indent=2)).replace("{facts}", json.dumps([
+                self._claim_fact_prompt_view(fact) for fact in facts[:32]
+            ], ensure_ascii=False, indent=2))
+        )
+        parsed = self._parse_json_object_from_llm_text(raw or "")
+        if parsed is None or not isinstance(parsed.get("claims"), list):
+            return None
+        facts_by_id = {
+            int(fact["id"]): fact for fact in facts
+            if str(fact.get("id") or "").strip().isdigit()
+        }
+        result: List[Dict[str, Any]] = []
+        for raw_claim in parsed["claims"][:4]:
+            claim = self._normalize_inductive_entity_claim(
+                raw_claim, group=group, facts_by_id=facts_by_id,
+            )
+            if claim:
+                result.append(claim)
+        return result
+
+    def _normalize_inductive_entity_claim(
+        self,
+        raw: Any,
+        *,
+        group: Dict[str, Any],
+        facts_by_id: Dict[int, Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        if not isinstance(raw, dict):
+            return None
+        claim_type = str(raw.get("claim_type") or "").strip().lower()
+        if claim_type not in {"preference", "behavior_pattern"}:
+            return None
+        if _compact_whitespace(raw.get("subject_entity") or "") != group["subject"]:
+            return None
+        predicate = re.sub(r"[^a-z0-9_]+", "_", str(raw.get("predicate") or "").lower()).strip("_")
+        if predicate not in {"prefers", "dislikes", "usually_does", "avoids", "has_routine"}:
+            return None
+        support_ids = list(dict.fromkeys(
+            int(value) for value in (raw.get("support_fact_ids") or [])
+            if str(value).strip().isdigit() and int(value) in facts_by_id
+        ))[:24]
+        counterexample_ids = list(dict.fromkeys(
+            int(value) for value in (raw.get("counterexample_fact_ids") or [])
+            if str(value).strip().isdigit() and int(value) in facts_by_id
+        ))[:24]
+        episode_ids = {
+            int(facts_by_id[fact_id]["episode_id"]) for fact_id in support_ids
+            if str(facts_by_id[fact_id].get("episode_id") or "").strip().isdigit()
+        }
+        windows = {
+            str(facts_by_id[fact_id].get("event_time_key") or facts_by_id[fact_id].get("dialogue_time_key") or "")[:10]
+            for fact_id in support_ids
+        } - {""}
+        if (
+            len(episode_ids) < self._entity_claim_induction_min_episodes
+            or len(windows) < self._entity_claim_induction_min_time_windows
+        ):
+            return None
+        normalized_value = _compact_whitespace(raw.get("normalized_value") or "")[:160]
+        if not normalized_value:
+            return None
+        confidence = self._clamp_float(raw.get("confidence"), 0.0, 1.0, 0.7)
+        claim_text = self._normalize_entity_claim_text(
+            raw.get("claim_text") or raw.get("behavior_or_outcome_text"),
+            subject=group["subject"],
+            predicate=predicate,
+            normalized_value=normalized_value,
+        )
+        return {
+            "subject_entity_id": group["subject_entity_id"], "predicate": predicate,
+            "normalized_value": normalized_value,
+            "claim_text": claim_text,
+            "claim_type": claim_type, "claim_origin": "inductive",
+            "status": "weakened" if counterexample_ids else "active",
+            "confidence": confidence,
+            "extractor_version": "entity_claim_induction_v1", "prompt_version": "v1",
+            "metadata": {
+                "condition_text": _compact_whitespace(raw.get("condition_text") or ""),
+                "behavior_or_outcome_text": _compact_whitespace(raw.get("behavior_or_outcome_text") or ""),
+                "claim_anchor": group["claim_anchor"],
+            },
+            "support_fact_ids": support_ids,
+            "counterexample_fact_ids": counterexample_ids,
+        }
+
+    @staticmethod
+    def _normalize_entity_claim_text(
+        value: Any,
+        *,
+        subject: str,
+        predicate: str,
+        object_name: str = "",
+        normalized_value: str = "",
+    ) -> str:
+        """Keep a readable proposition separate from the compact merge key."""
+        text = _compact_whitespace(value or "")[:480]
+        if text:
+            return text
+        target = _compact_whitespace(object_name or normalized_value)
+        return _compact_whitespace(f"{subject} {predicate} {target}")[:480]
 
     def _log_reflect_facts_loaded(
         self,
@@ -2601,24 +3458,6 @@ class MemoryNodeManager:
             "time_start": facts[0].get("dialogue_time_key") if facts else "",
             "time_end": facts[-1].get("dialogue_time_key") if facts else "",
         })
-
-    @classmethod
-    def _fact_topic_names(cls, fact: Dict[str, Any]) -> List[str]:
-        topics = [
-            cls._normalize_topic_name(fact.get("fact_root_topic")),
-            cls._normalize_topic_name(fact.get("fact_aspect_topic")),
-        ]
-        return list(dict.fromkeys(topic for topic in topics if topic))
-
-    def _fact_can_seed_entity_state(self, fact: Dict[str, Any]) -> bool:
-        """Entity states require an explicit projected aspect."""
-        state_signals = self._entity_state_signals_from_fact(fact)
-        return any(
-            str(aspect.get("state_type") or "").strip().lower()
-            in self._entity_scoped_state_types()
-            and bool(self._entities_for_state_signal(aspect, fact))
-            for aspect in state_signals
-        )
 
     @staticmethod
     def _generate_topic_name_key(value: Any) -> str:
@@ -2912,29 +3751,6 @@ class MemoryNodeManager:
         }
 
     @staticmethod
-    def _format_existing_entity_state_for_prompt(state: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-        """Format only the semantic context needed to update an entity state."""
-        if not state:
-            return {}
-        metadata = state.get("metadata") or {}
-        return {
-            "state_scope": state.get("state_scope") or "entity_state",
-            "state_type": state.get("state_type"),
-            "entity": metadata.get("entity") or "",
-            "entity_key": metadata.get("entity_key") or "",
-            "canonical_name": state.get("canonical_name"),
-            "attribute_name_aliases": metadata.get("attribute_name_aliases") or [],
-            "summary": state.get("summary"),
-            "time_line": MemoryNodeManager._normalize_time_line(
-                state.get("time_line"),
-                limit=8,
-                max_chars=1000,
-            ),
-            "confidence": state.get("confidence"),
-            "status": state.get("status") or "active",
-        }
-
-    @staticmethod
     def _normalize_state_summary(value: Any, *, max_chars: int = 280) -> str:
         """Keep state summaries as short current snapshots, not history logs."""
         text = _compact_whitespace(value)
@@ -3013,358 +3829,28 @@ class MemoryNodeManager:
             events.pop(0)
         return events
 
-    def _fallback_time_line_update(
-        self,
-        candidate: Dict[str, Any],
-    ) -> List[Dict[str, Any]]:
-        aspect_items = [
-            aspect for aspect in candidate.get("state_signals") or []
-            if isinstance(aspect, dict)
-            and _compact_whitespace(aspect.get("aspect_summary") or "")
-        ]
-        if aspect_items:
-            fact_ids = [
-                int(aspect.get("fact_id"))
-                for aspect in aspect_items
-                if str(aspect.get("fact_id") or "").strip().isdigit()
-            ]
-            latest = aspect_items[-1]
-            occurred_at = _compact_whitespace(
-                str(
-                    latest.get("fact_dialogue_time_key")
-                    or latest.get("fact_event_time_key")
-                    or ""
-                ).split("#", 1)[0]
-            )
-            return [{
-                "occurred_at": occurred_at,
-                "change_type": "updated",
-                "summary": self._normalize_state_summary(
-                    latest.get("aspect_summary") or "",
-                    max_chars=120,
-                ),
-                "fact_ids": list(dict.fromkeys(fact_ids))[-12:],
-            }]
-        facts = [
-            fact for fact in candidate.get("facts") or []
-            if _compact_whitespace(fact.get("summary") or "")
-        ]
-        if not facts:
-            return []
-        fact_ids = [
-            int(fact["id"])
-            for fact in facts
-            if str(fact.get("id") or "").strip().isdigit()
-        ]
-        latest = facts[-1]
-        dialogue_time_key = _compact_whitespace(latest.get("dialogue_time_key") or "")
-        occurred_at = dialogue_time_key if dialogue_time_key else ""
-        return [{
-            "occurred_at": occurred_at,
-            "change_type": "updated",
-            "summary": self._normalize_state_summary(
-                latest.get("summary") or "",
-                max_chars=120,
-            ),
-            "fact_ids": fact_ids[-12:],
-        }]
-
-    def _build_state_time_line(
-        self,
-        *,
-        raw_updates: Any,
-        candidate: Dict[str, Any],
-        existing_state: Optional[Dict[str, Any]],
-    ) -> List[Dict[str, Any]]:
-        valid_fact_ids = {
-            int(fact["id"])
-            for fact in candidate.get("facts") or []
-            if str(fact.get("id") or "").strip().isdigit()
-        }
-        updates = raw_updates
-        if not updates:
-            updates = self._fallback_time_line_update(candidate)
-        existing_events = self._normalize_time_line(
-            (existing_state or {}).get("time_line"),
-            limit=20,
-            max_chars=2400,
-        )
-        update_events = self._normalize_time_line(
-            updates,
-            limit=20,
-            max_chars=2400,
-            valid_fact_ids=valid_fact_ids,
-        )
-        return self._normalize_time_line(
-            [
-                *existing_events,
-                *update_events,
-            ],
-            limit=20,
-            max_chars=2400,
-        )
-
-    def _resolve_and_update_entity_scoped_states_from_facts(
-        self,
-        *,
-        facts: List[Dict[str, Any]],
-    ) -> Dict[str, int]:
-        update_started_at = time.monotonic()
-        existing_entity_states = self._db.get_recent_memory_states(
-            state_type=sorted(self._entity_scoped_state_types()),
-            state_scope="entity_state",
-            limit=80,
-        )
-        candidates = self._build_entity_state_candidates_from_facts(facts)
-        updated = 0
-        for candidate in candidates:
-            existing_state, match_info = self._match_entity_state_candidate_existing_states(
-                candidate=candidate,
-                existing_entity_states=existing_entity_states,
-            )
-            state_update = self._extract_entity_state_update_with_llm(
-                candidate=candidate,
-                existing_state=existing_state,
-                match_info=match_info,
-            )
-            if not state_update or not state_update.get("summary"):
-                continue
-            state_id = self._store_state(state_update)
-            if state_id:
-                self._log_info(
-                    "memory_reflect",
-                    "entity_state_updated",
-                    self._state_update_log_payload(
-                        state_id=state_id,
-                        state_update=state_update,
-                        candidate=candidate,
-                        existing_state=existing_state,
-                    ),
-                )
-                updated += 1
-                refreshed_state = self._db.get_memory_state_by_id(state_id)
-                if refreshed_state:
-                    replaced = False
-                    for index, existing in enumerate(existing_entity_states):
-                        if int(existing.get("id") or -1) == int(state_id):
-                            existing_entity_states[index] = refreshed_state
-                            replaced = True
-                            break
-                    if not replaced:
-                        existing_entity_states.append(refreshed_state)
-        report = {"enabled": 1, "candidate_count": len(candidates), "updated": updated}
-        self._log_info("memory_reflect", "entity_state_update_finish", {
-            **report,
-            "elapsed_ms": round(
-                (time.monotonic() - update_started_at) * 1000,
-                2,
-            ),
-        })
-        return report
-
-    def _state_update_log_payload(
-        self,
-        *,
-        state_id: int,
-        state_update: Dict[str, Any],
-        candidate: Dict[str, Any],
-        existing_state: Optional[Dict[str, Any]],
-    ) -> Dict[str, Any]:
-        facts = list(candidate.get("facts") or [])
-        return {
-            "state_id": state_id,
-            "candidate": {
-                "state_scope": candidate.get("state_scope"),
-                "state_type": candidate.get("state_type"),
-                "source_type": candidate.get("source_type"),
-                "entity": candidate.get("entity"),
-                "entity_key": candidate.get("entity_key"),
-                "attribute_name": candidate.get("attribute_name"),
-                "fact_ids": candidate.get("fact_ids") or [],
-            },
-            "existing_state": self._state_log_view(existing_state),
-            "participating_facts": [
-                self._fact_log_view_for_state_update(fact)
-                for fact in facts
-            ],
-            "updated_state": self._state_log_view(
-                {
-                    **state_update,
-                    "id": state_id,
-                }
-            ),
-        }
-
-    def _fact_log_view_for_state_update(self, fact: Dict[str, Any]) -> Dict[str, Any]:
+    def _entity_claim_signals_from_fact(self, fact: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Read claim-level extraction signals from a stored fact."""
         metadata = fact.get("metadata") if isinstance(fact.get("metadata"), dict) else {}
-        return {
-            "id": fact.get("id"),
-            "episode_id": fact.get("episode_id"),
-            "source_type": fact.get("source_type"),
-            "fact_type": fact.get("fact_type"),
-            "fact_kind": fact.get("fact_kind"),
-            "event_time_key": fact.get("event_time_key"),
-            "dialogue_time_key": fact.get("dialogue_time_key"),
-            "summary": self._format_log_text(fact.get("summary") or "", limit=1200),
-            "keywords": fact.get("keywords"),
-            "entities": fact.get("entities") or [],
-            "primary_entity": fact.get("primary_entity"),
-            "fact_root_topic": fact.get("fact_root_topic") or "",
-            "fact_aspect_topic": fact.get("fact_aspect_topic") or "",
-            "entity_state_signal": fact.get("entity_state_signal") or metadata.get("entity_state_signal") or [],
-            "action_signal": fact.get("action_signal") or metadata.get("action_signal") or [],
-            "confidence": fact.get("confidence"),
-            "importance": fact.get("importance"),
-        }
-
-    def _state_log_view(self, state: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-        if not state:
-            return {}
-        metadata = state.get("metadata") if isinstance(state.get("metadata"), dict) else {}
-        return {
-            "id": state.get("id"),
-            "state_scope": state.get("state_scope"),
-            "state_type": state.get("state_type"),
-            "source_type": state.get("source_type"),
-            "entity_key": state.get("entity_key") or metadata.get("entity_key") or "",
-            "canonical_name": state.get("canonical_name"),
-            "summary": self._format_log_text(state.get("summary") or "", limit=1200),
-            "time_line": self._normalize_time_line(
-                state.get("time_line"),
-                limit=20,
-                max_chars=2400,
-            ),
-            "evidence_fact_ids": state.get("evidence_fact_ids") or [],
-            "confidence": state.get("confidence"),
-            "metadata": metadata,
-        }
-
-    @staticmethod
-    def _entity_scoped_state_types() -> set[str]:
-        return {"preference", "profile", "routine", "relationship", "constraint", "risk"}
-
-    def _build_entity_state_candidates_from_facts(
-        self,
-        facts: List[Dict[str, Any]],
-    ) -> List[Dict[str, Any]]:
-        grouped: Dict[Tuple[str, str, str, str], Dict[str, Any]] = {}
-        for fact in facts:
-            source_type = fact.get("source_type")
-            state_signals = self._entity_state_signals_from_fact(fact)
-            if state_signals:
-                for aspect in state_signals:
-                    state_type = str(aspect.get("state_type") or "").strip().lower()
-                    if state_type not in self._entity_scoped_state_types():
-                        continue
-                    entities = self._entities_for_state_signal(aspect, fact)
-                    if not entities:
-                        continue
-                    attribute_name = _compact_whitespace(aspect.get("attribute_name") or "")
-                    if not attribute_name:
-                        continue
-                    for entity in entities[:1]:
-                        entity_key = self._generate_entity_name_key(entity)
-                        attribute_key = self._generate_topic_name_key(attribute_name)
-                        key = (source_type, state_type, entity_key, attribute_key)
-                        item = grouped.setdefault(key, {
-                            "source_type": source_type,
-                            "state_scope": "entity_state",
-                            "state_type": state_type,
-                            "entity": entity,
-                            "entity_key": entity_key,
-                            "attribute_key": attribute_key,
-                            "attribute_name": attribute_name,
-                            "attribute_name_aliases": [attribute_name],
-                            "facts": [],
-                            "fact_ids": [],
-                            "state_signals": [],
-                        })
-                        item["facts"].append(fact)
-                        fact_id = None
-                        if str(fact.get("id") or "").strip().isdigit():
-                            fact_id = int(fact["id"])
-                            item["fact_ids"].append(fact_id)
-                        item["state_signals"].append({
-                            **aspect,
-                            # Reflection, rather than fact extraction, owns
-                            # the final state summary. Keep fact text only as
-                            # internal fallback/evidence context.
-                            "aspect_summary": fact.get("summary") or "",
-                            "fact_id": fact_id,
-                            "fact_summary": fact.get("summary") or "",
-                            "fact_event_time_key": fact.get("event_time_key") or "",
-                            "fact_dialogue_time_key": fact.get("dialogue_time_key") or "",
-                        })
-        candidates: List[Dict[str, Any]] = []
-        for item in grouped.values():
-            item["fact_ids"] = list(dict.fromkeys(item.get("fact_ids") or []))
-            if not item["fact_ids"]:
-                continue
-            aspect_summaries = [
-                _compact_whitespace(aspect.get("aspect_summary") or "")
-                for aspect in item.get("state_signals") or []
-                if _compact_whitespace(aspect.get("aspect_summary") or "")
-            ]
-            aspect_evidence = [
-                _compact_whitespace(aspect.get("evidence_basis") or "")
-                for aspect in item.get("state_signals") or []
-                if _compact_whitespace(aspect.get("evidence_basis") or "")
-            ]
-            item["summary_text"] = "\n".join(
-                aspect_summaries
-                or [str(fact.get("summary") or "") for fact in item.get("facts") or []]
-            )[:2400]
-            item["identity_text"] = "\n".join([
-                str(item.get("attribute_name") or ""),
-                " ".join(item.get("attribute_name_aliases") or []),
-                item["summary_text"],
-                "\n".join(aspect_evidence),
-            ])[:2800]
-            candidates.append(item)
-        if candidates:
-            self._ensure_embedding_client()
-            if self._embedding_client is not None:
-                identity_embeddings = self._embedding_client.embed_batch(
-                    [str(candidate.get("identity_text") or "") for candidate in candidates]
-                )
-                name_embeddings = self._embedding_client.embed_batch(
-                    [str(candidate.get("attribute_name") or "") for candidate in candidates]
-                )
-                for index, candidate in enumerate(candidates):
-                    candidate["candidate_identity_embedding"] = (
-                        identity_embeddings[index]
-                        if index < len(identity_embeddings)
-                        else None
-                    )
-                    candidate["candidate_name_embedding"] = (
-                        name_embeddings[index]
-                        if index < len(name_embeddings)
-                        else None
-                    )
-        return candidates
-
-    def _entity_state_signals_from_fact(self, fact: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Build internal state candidates from lightweight extraction signals."""
-        metadata = fact.get("metadata") if isinstance(fact.get("metadata"), dict) else {}
-        raw = fact.get("entity_state_signal") or metadata.get("entity_state_signal")
+        raw = fact.get("entity_claim_signal") or metadata.get("entity_claim_signal")
         fallback_entity = fact.get("primary_entity")
-        return self._normalize_entity_state_signal(raw, fallback_entity=fallback_entity)
+        return self._normalize_entity_claim_signal(raw, fallback_entity=fallback_entity)
 
-    def _entities_for_state_signal(
+    def _entities_for_entity_claim_signal(
         self,
-        aspect: Dict[str, Any],
+        signal: Dict[str, Any],
         fact: Dict[str, Any],
     ) -> List[str]:
-        entity = aspect.get("entity") or aspect.get("primary_entity")
+        entity = signal.get("entity") or signal.get("primary_entity")
         if isinstance(entity, dict):
             name = _compact_whitespace(entity.get("name") or entity.get("text") or "")
         else:
             name = _compact_whitespace(entity)
         if name:
             return [name]
-        return self._entities_for_entity_state_fact(fact)
+        return self._entities_for_entity_claim_fact(fact)
 
-    def _entities_for_entity_state_fact(
+    def _entities_for_entity_claim_fact(
         self,
         fact: Dict[str, Any],
     ) -> List[str]:
@@ -3384,8 +3870,6 @@ class MemoryNodeManager:
             for value in (fact.get("entities") or [])
             if _compact_whitespace(value)
         ]
-        if not entities:
-            entities.extend(self._fact_topic_names(fact))
         out: List[str] = []
         seen: set[str] = set()
         for entity in entities:
@@ -3398,422 +3882,6 @@ class MemoryNodeManager:
             seen.add(key)
             out.append(clean)
         return out[:1]
-
-    @staticmethod
-    def _generate_entity_name_key(value: Any) -> str:
-        return _compact_whitespace(value).lower()
-
-    def _match_entity_state_candidate_existing_states(
-        self,
-        *,
-        candidate: Dict[str, Any],
-        existing_entity_states: List[Dict[str, Any]],
-    ) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
-        candidate_entity = str(candidate.get("entity") or "")
-        candidate_type = str(candidate.get("state_type") or "")
-        candidate_entity_key = self._generate_entity_name_key(candidate.get("entity_key") or candidate_entity)
-        candidate_attribute_aliases = self._normalize_unique_labels([
-            candidate.get("attribute_name"),
-            *(candidate.get("attribute_name_aliases") or []),
-        ], limit=12)
-        best_state: Optional[Dict[str, Any]] = None
-        best_score = 0.0
-        best_info: Dict[str, Any] = {"matched": False, "score": 0.0}
-        matching_states: List[Dict[str, Any]] = []
-        for state in existing_entity_states:
-            if str(state.get("source_type") or "") != str(candidate.get("source_type") or ""):
-                continue
-            if str(state.get("state_scope") or "") != "entity_state":
-                continue
-            if str(state.get("state_type") or "") != candidate_type:
-                continue
-            metadata = state.get("metadata") or {}
-            state_entity_key = self._generate_entity_name_key(
-                metadata.get("entity_key")
-                or metadata.get("entity")
-                or candidate_entity
-            )
-            if state_entity_key != candidate_entity_key:
-                continue
-            matching_states.append(state)
-
-        if not matching_states:
-            return None, best_info
-
-        candidate_name_embedding = candidate.get("candidate_name_embedding")
-        candidate_identity_embedding = candidate.get("candidate_identity_embedding")
-
-        for state in matching_states:
-            metadata = state.get("metadata") or {}
-            state_attribute_aliases = self._normalize_unique_labels([
-                *(metadata.get("attribute_name_aliases") or []),
-                state.get("canonical_name"),
-            ], limit=16)
-            attribute_overlap = self._topic_name_best_pair_similarity(
-                candidate_attribute_aliases,
-                state_attribute_aliases,
-            )
-            identity_embedding_similarity = _cal_embedding_cosine_similarity(
-                candidate_identity_embedding,
-                state.get("identity_text_embedding"),
-            )
-            canonical_name_embedding_similarity = _cal_embedding_cosine_similarity(
-                candidate_name_embedding,
-                state.get("canonical_name_embedding"),
-            )
-            embedding_similarity = max(
-                identity_embedding_similarity,
-                canonical_name_embedding_similarity,
-            )
-            exact_attribute_match = any(
-                self._generate_topic_name_key(left) == self._generate_topic_name_key(right)
-                for left in candidate_attribute_aliases
-                for right in state_attribute_aliases
-                if left and right
-            )
-            matched = (
-                exact_attribute_match
-                or attribute_overlap >= self._entity_state_attribute_similarity_threshold
-                or (
-                    embedding_similarity >= self._entity_state_resolution_similarity_threshold
-                    and attribute_overlap >= 0.2
-                )
-            )
-            score = max(
-                1.0 if exact_attribute_match else 0.0,
-                attribute_overlap,
-                embedding_similarity,
-            )
-            if score > best_score:
-                best_score = score
-                best_state = state
-                best_info = {
-                    "matched": matched,
-                    "score": round(score, 4),
-                    "attribute_overlap": round(attribute_overlap, 4),
-                    "embedding_similarity": round(embedding_similarity, 4),
-                    "identity_embedding_similarity": round(identity_embedding_similarity, 4),
-                    "canonical_name_embedding_similarity": round(
-                        canonical_name_embedding_similarity,
-                        4,
-                    ),
-                    "exact_attribute_match": exact_attribute_match,
-                    "existing_state_id": state.get("id"),
-                    "existing_canonical_name": state.get("canonical_name"),
-                }
-        if best_state and best_info.get("matched"):
-            return best_state, {
-                "matched": True,
-                "score": round(best_score, 4),
-                "existing_state_id": best_state.get("id"),
-                "existing_canonical_name": best_state.get("canonical_name"),
-                "attribute_overlap": best_info.get("attribute_overlap", 0.0),
-                "embedding_similarity": best_info.get("embedding_similarity", 0.0),
-                "identity_embedding_similarity": best_info.get(
-                    "identity_embedding_similarity",
-                    0.0,
-                ),
-                "canonical_name_embedding_similarity": best_info.get(
-                    "canonical_name_embedding_similarity",
-                    0.0,
-                ),
-            }
-        return None, best_info
-
-    def _extract_entity_state_update_with_llm(
-        self,
-        *,
-        candidate: Dict[str, Any],
-        existing_state: Optional[Dict[str, Any]],
-        match_info: Dict[str, Any],
-    ) -> Optional[Dict[str, Any]]:
-        facts = list(candidate.get("facts") or [])
-        prompt_language = self._resolve_prompt_language_from_text(
-            "\n".join(str(item.get("summary") or "") for item in facts[:12])
-        )
-        prompt_template = (
-            UNIFIED_ENTITY_STATE_UPDATE_PROMPT_EN
-            if prompt_language == "en"
-            else UNIFIED_ENTITY_STATE_UPDATE_PROMPT_ZH
-        )
-        prompt = (
-            prompt_template
-            .replace("{entity_state_target}", json.dumps({
-                "entity": candidate.get("entity"),
-                "entity_key": candidate.get("entity_key"),
-                "state_type": candidate.get("state_type"),
-                "attribute_name": candidate.get("attribute_name"),
-                "attribute_key": candidate.get("attribute_key"),
-                "attribute_name_aliases": candidate.get("attribute_name_aliases", []),
-                "state_signal_evidence": [
-                    {
-                        "fact_id": aspect.get("fact_id"),
-                        "evidence_basis": aspect.get("evidence_basis") or "",
-                        "confidence": aspect.get("confidence"),
-                    }
-                    for aspect in candidate.get("state_signals") or []
-                    if isinstance(aspect, dict)
-                ],
-            }, ensure_ascii=False, indent=2))
-            .replace("{existing_entity_state}", json.dumps(
-                self._format_existing_entity_state_for_prompt(existing_state),
-                ensure_ascii=False,
-                indent=2,
-            ))
-        )
-        result = self._call_llm(prompt)
-        parsed = self._parse_json_object_from_llm_text(result or "")
-        if parsed:
-            if not self._config_bool(parsed.get("update_needed", True), True):
-                self._logger.debug(
-                    "LLM declined entity-state update for entity=%s attribute=%s",
-                    candidate.get("entity"),
-                    candidate.get("attribute_name"),
-                )
-                return None
-            normalized = self._normalize_entity_state_update_payload(
-                parsed,
-                candidate=candidate,
-                existing_state=existing_state,
-            )
-            if normalized:
-                return normalized
-        return self._fallback_entity_state_update(candidate, existing_state)
-
-    def _entity_state_canonical_topics_from_facts(
-        self,
-        *,
-        candidate: Dict[str, Any],
-        existing_state: Optional[Dict[str, Any]],
-    ) -> List[str]:
-        fact_topics = [
-            topic
-            for fact in candidate.get("facts") or []
-            if isinstance(fact, dict)
-            for topic in (
-                fact.get("fact_root_topic"),
-                fact.get("fact_aspect_topic"),
-            )
-        ]
-        return self._normalize_unique_labels([
-            *fact_topics,
-            *((existing_state or {}).get("canonical_topics") or []),
-        ], limit=24)
-
-    def _normalize_entity_state_update_payload(
-        self,
-        raw: Dict[str, Any],
-        *,
-        candidate: Dict[str, Any],
-        existing_state: Optional[Dict[str, Any]],
-    ) -> Optional[Dict[str, Any]]:
-        if not self._config_bool(raw.get("update_needed", True), True):
-            return None
-        summary = self._normalize_state_summary(raw.get("summary") or "", max_chars=120)
-        if not summary:
-            return None
-        valid_fact_ids = {
-            int(fact["id"])
-            for fact in candidate.get("facts", [])
-            if str(fact.get("id") or "").strip().isdigit()
-        }
-        evidence_ids = [
-            int(value)
-            for value in (raw.get("evidence_fact_ids") or [])
-            if str(value).strip().isdigit() and int(value) in valid_fact_ids
-        ] or list(candidate.get("fact_ids") or [])[:24]
-        existing_ids = [
-            int(value)
-            for value in ((existing_state or {}).get("evidence_fact_ids") or [])
-            if str(value).strip().isdigit()
-        ]
-        evidence_ids = list(dict.fromkeys([*existing_ids, *evidence_ids]))[:80]
-        canonical_name = (
-            _compact_whitespace((existing_state or {}).get("canonical_name") or "")
-            or _compact_whitespace(candidate.get("attribute_name") or "")
-            or _compact_whitespace(raw.get("canonical_name") or "")
-        )
-        if canonical_name.lower() in self._entity_scoped_state_types() or len(canonical_name) < 3:
-            canonical_name = _compact_whitespace(candidate.get("attribute_name") or "")
-        existing_metadata = dict((existing_state or {}).get("metadata") or {})
-        attribute_name_aliases = self._normalize_unique_labels([
-            (existing_state or {}).get("canonical_name"),
-            *(existing_metadata.get("attribute_name_aliases") or []),
-            candidate.get("attribute_name"),
-        ], limit=16)
-        canonical_topics = self._entity_state_canonical_topics_from_facts(
-            candidate=candidate,
-            existing_state=existing_state,
-        )
-        time_line = self._build_state_time_line(
-            raw_updates=raw.get("time_line"),
-            candidate=candidate,
-            existing_state=existing_state,
-        )
-        entity_name = self._normalize_entity_names([
-            candidate.get("entity")
-            or existing_metadata.get("entity")
-            or candidate.get("entity_key")
-        ], limit=1)
-        return {
-            "state_scope": "entity_state",
-            "state_type": candidate["state_type"],
-            "source_type": candidate.get("source_type") or (existing_state or {}).get("source_type"),
-            "canonical_name": canonical_name,
-            "summary": summary,
-            "time_line": time_line,
-            "evidence_fact_ids": evidence_ids,
-            "keywords": self._normalize_string_list(raw.get("keywords"), limit=18),
-            "entities": entity_name,
-            "canonical_topics": canonical_topics,
-            "importance": self._clamp_float(raw.get("importance"), 0.0, 1.0, 0.68),
-            "confidence": self._clamp_float(raw.get("confidence"), 0.0, 1.0, 0.74),
-            "status": _compact_whitespace(raw.get("status") or "active") or "active",
-            "metadata": {
-                "entity": candidate.get("entity"),
-                "entity_key": candidate.get("entity_key"),
-                "attribute_name_aliases": attribute_name_aliases,
-                "extractor": "entity_scoped_state_update",
-            },
-        }
-
-    def _fallback_entity_state_update(
-        self,
-        candidate: Dict[str, Any],
-        existing_state: Optional[Dict[str, Any]],
-    ) -> Dict[str, Any]:
-        summaries = [
-            _compact_whitespace(
-                aspect.get("aspect_summary")
-                or aspect.get("evidence_basis")
-                or ""
-            )
-            for aspect in candidate.get("state_signals") or []
-            if isinstance(aspect, dict)
-            and _compact_whitespace(aspect.get("aspect_summary") or "")
-        ][:5]
-        if not summaries:
-            summaries = [
-                _compact_whitespace(fact.get("summary") or "")
-                for fact in candidate.get("facts", [])
-                if _compact_whitespace(fact.get("summary") or "")
-            ][:5]
-        base = _compact_whitespace((existing_state or {}).get("summary") or "")
-        update_text = "；".join(summaries)
-        summary_source = (
-            f"{base}；最新变化：{update_text}"
-            if base and update_text
-            else update_text or base or _compact_whitespace(candidate.get("summary_text") or "")
-        )
-        summary = self._normalize_state_summary(summary_source, max_chars=120)
-        existing_metadata = dict((existing_state or {}).get("metadata") or {})
-        attribute_name_aliases = self._normalize_unique_labels([
-            (existing_state or {}).get("canonical_name"),
-            *(existing_metadata.get("attribute_name_aliases") or []),
-            candidate.get("attribute_name"),
-        ], limit=16)
-        canonical_topics = self._entity_state_canonical_topics_from_facts(
-            candidate=candidate,
-            existing_state=existing_state,
-        )
-        existing_ids = [
-            int(value)
-            for value in ((existing_state or {}).get("evidence_fact_ids") or [])
-            if str(value).strip().isdigit()
-        ]
-        evidence_ids = list(dict.fromkeys([*existing_ids, *(candidate.get("fact_ids") or [])]))[:80]
-        return {
-            "state_scope": "entity_state",
-            "state_type": candidate["state_type"],
-            "source_type": candidate.get("source_type") or (existing_state or {}).get("source_type"),
-            "canonical_name": _compact_whitespace(
-                (existing_state or {}).get("canonical_name")
-                or candidate.get("attribute_name")
-                or "general"
-            ),
-            "summary": summary,
-            "time_line": self._build_state_time_line(
-                raw_updates=None,
-                candidate=candidate,
-                existing_state=existing_state,
-            ),
-            "evidence_fact_ids": evidence_ids,
-            "keywords": self._keywords(summary, limit=18),
-            "entities": [candidate.get("entity")] if candidate.get("entity") else [],
-            "canonical_topics": canonical_topics,
-            "importance": 0.66,
-            "confidence": 0.58,
-            "status": "active",
-            "metadata": {
-                "entity": candidate.get("entity"),
-                "entity_key": candidate.get("entity_key"),
-                "attribute_name_aliases": attribute_name_aliases,
-                "extractor": "fallback_entity_scoped_state_update",
-            },
-        }
-
-    def _store_state(self, state: Dict[str, Any]) -> int:
-        state_scope = self._normalize_state_scope(
-            state.get("state_scope"),
-            state.get("state_type"),
-        )
-        state_type = self._normalize_state_type(state.get("state_type"))
-        if not state_scope or not state_type:
-            self._logger.debug("Skipping state with invalid scope/type: %s", state)
-            return 0
-        if state_scope == "entity_state" and state_type not in self._entity_scoped_state_types():
-            self._logger.debug("Skipping entity state with invalid type: %s", state)
-            return 0
-        keywords = state.get("keywords") or self._keywords(state["summary"], limit=18)
-        entities = state.get("entities") or self._entities(state["summary"])
-        canonical_topics = state.get("canonical_topics") or [state["canonical_name"]]
-        evidence_fact_ids = [int(value) for value in state.get("evidence_fact_ids") or []]
-        state_metadata = dict(state.get("metadata") or {})
-
-        entity_key = ""
-        if state_scope == "entity_state":
-            entity_key = self._generate_entity_name_key(
-                state_metadata.get("entity_key")
-                or state_metadata.get("entity")
-                or ""
-            )
-        entity_names = list(entities or [])
-        if entity_key:
-            entity_names.append(entity_key)
-        entity_ids = self._entity_ids_for_names(entity_names, limit=64)
-        identity_text = "\n".join([
-            state["canonical_name"],
-            state["summary"],
-            f"keywords: {' '.join(keywords)}",
-            f"entities: {', '.join(entities)}",
-        ])
-        identity_text_embedding = self._generate_embedding_vector(identity_text)
-        canonical_name_embedding = self._generate_embedding_vector(state["canonical_name"])
-        state_id = self._db.upsert_state(
-            state_scope=state_scope,
-            state_type=state_type,
-            source_type=state["source_type"],
-            entity_key=entity_key,
-            canonical_name=state["canonical_name"],
-            summary=state["summary"],
-            time_line=state.get("time_line") or [],
-            entity_ids=entity_ids,
-            evidence_fact_ids=evidence_fact_ids,
-            confidence=state["confidence"],
-            metadata={
-                **state_metadata,
-                "entity_key": entity_key,
-                "keywords": keywords,
-                "entities": entities,
-                "canonical_topics": canonical_topics,
-                "importance": state["importance"],
-                "status": state["status"],
-            },
-            identity_text_embedding=identity_text_embedding,
-            canonical_name_embedding=canonical_name_embedding,
-            identity_text=identity_text,
-        )
-        return state_id
 
     def _action_signals_from_fact(self, fact: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Return lightweight action signals for reflection gating."""
@@ -4028,25 +4096,6 @@ class MemoryNodeManager:
         return rows
 
     @staticmethod
-    def _normalize_state_scope(value: Any, state_type: Any = None) -> str:
-        text = str(value or "").strip().lower()
-        if text in {"entity_state", "entity"}:
-            return "entity_state"
-        if str(state_type or "").strip().lower() in {
-            "preference", "profile", "routine", "relationship", "constraint", "risk",
-        }:
-            return "entity_state"
-        return ""
-
-    @staticmethod
-    def _normalize_state_type(value: Any) -> str:
-        text = str(value or "").strip().lower()
-        allowed = {
-            "preference", "profile", "routine", "relationship", "constraint", "risk",
-        }
-        return text if text in allowed else ""
-
-    @staticmethod
     def _normalize_actionable_item_type(value: Any) -> str:
         text = str(value or "other").strip().lower()
         allowed = {
@@ -4087,19 +4136,6 @@ class MemoryNodeManager:
         except (TypeError, ValueError):
             number = default
         return max(low, min(high, number))
-
-    @staticmethod
-    def _state_source_type_for_facts(facts: List[Dict[str, Any]], fact_ids: List[int]) -> str:
-        by_id = {int(item["id"]): item for item in facts if item.get("id") is not None}
-        sources = {
-            str(by_id[item].get("source_type") or "")
-            for item in fact_ids
-            if item in by_id
-        }
-        sources.discard("")
-        if len(sources) == 1:
-            return next(iter(sources))
-        return "unified"
 
     def _log_info(self, scope: str, event: str, payload: Dict[str, Any]) -> None:
         record = {
