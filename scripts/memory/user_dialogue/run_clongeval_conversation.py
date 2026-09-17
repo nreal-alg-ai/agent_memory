@@ -322,8 +322,6 @@ def db_counts(db: Any) -> Dict[str, int]:
     for table in (
         "memory_episodes",
         "memory_facts",
-        "memory_states",
-        "memory_actionable_items",
     ):
         row = db._conn.execute(f"SELECT COUNT(*) AS count FROM {table}").fetchone()
         counts[table] = int(row["count"] if row else 0)

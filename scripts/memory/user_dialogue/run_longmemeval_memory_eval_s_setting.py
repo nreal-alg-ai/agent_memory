@@ -769,8 +769,6 @@ def db_counts(db: Any) -> Dict[str, int]:
     tables = {
         "episodes": "memory_episodes",
         "facts": "memory_facts",
-        "states": "memory_states",
-        "actionable_items": "memory_actionable_items",
         "entities": "memory_entity_nodes",
     }
     counts: Dict[str, int] = {}

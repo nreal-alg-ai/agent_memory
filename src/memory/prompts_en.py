@@ -1,7 +1,7 @@
 """English prompt templates for the unified memory prototype."""
 
 MEMORY_RETRIEVED_FORMAT_PROMPT_EN = """[Unified Memory]
-System note: Memories are grouped by semantic role. States and actionable items provide compact summaries; facts provide traceable evidence.
+System note: Current recall provides only traceable fact evidence.
 System note: For facts, dialogue_time is when the conversation/transcript discussed the fact, while event_time is when the real-world event described by the fact occurred. They are different fields; an unknown event_time must not be inferred from dialogue_time.
 {memory_sections}"""
 
@@ -10,16 +10,6 @@ MEMORY_RETRIEVED_SECTION_SPECS_EN = (
         "[Retrieved Facts]",
         "These are ranked narrative facts retrieved directly from memory_facts.",
         "fact",
-    ),
-    (
-        "[Long-term States]",
-        "These are evolving state projections derived from memory facts. Treat them as summarized context, not direct user quotations.",
-        "state",
-    ),
-    (
-        "[Actionable Items]",
-        "These are decisions, tasks, commitments, risks, or open questions that may require follow-up.",
-        "actionable_item",
     ),
 )
 
@@ -387,19 +377,13 @@ Understand the memory structure before analyzing the query.
 
 Memory structure:
 1. `memory_facts` / fact: traceable, self-contained narrative facts extracted from one conversation episode or all-day transcript. They preserve what happened, participants, time, place or scene, reasons, viewpoint changes, suggestions, acceptance or rejection, constraints, conclusions, and unresolved questions. A fact may contain an explicitly stated preference, routine, profile detail, risk, or constraint, but it remains current conversational evidence rather than a cross-episode long-term summary. Facts usually include `fact_type`, `fact_kind`, `primary_entity`, `summary`, `keywords`, `entities`, `fact_root_topic`, `fact_aspect_topic`, `event_time_key`, and `dialogue_time_key`.
-2. `memory_states` / state: durable entity-attribute projections updated from multiple facts, not raw dialogue quotations. It currently contains only `entity_state`: durable properties of an entity, including preference, routine, profile, relationship, constraint, and risk. Use state for stable entity knowledge, but do not treat it as a replacement for concrete fact evidence.
-3. `memory_actionable_items` / actionable_item: concrete items extracted from facts that need future execution, follow-up, reminder, review, or decision tracking. They include tasks, commitments, decisions, follow-ups, open questions, risks, reminders, recommendations, and constraints that block a specific action. Items usually include `canonical_name`, `summary`, `owner`, `status`, `due_at`, and `evidence_fact_ids`. Ordinary preferences, background, one-off descriptions, and suggestions without a concrete next action are not actionable items.
-
-An episode is the storage container for a conversation or transcript batch with a title, summary, participants, and time range. The default recall path does not retrieve episodes as an independent selectable layer. For recalling an experience, prefer `fact`; for a durable overview, consider `state` as well. States and actionable items can be traced back to facts through `evidence_fact_ids`.
+An episode is the storage container for a conversation or transcript batch with a title, summary, participants, and time range. Current recall retrieves only `fact`; episodes only establish associations between facts.
 
 Guidance:
 - Use `source_types` only when the query clearly points to assistant_wakeup interactions or allday_recording transcripts. Otherwise use both.
 - Prefer `fact` for what happened, dates, places, people, exact evidence, event order, and traceable details.
-- Prefer `state` for stable preferences, durable constraints, routines, relationships, and profiles. Prefer `fact` for topic, project, or issue evolution.
-- Prefer `actionable_item` for tasks, commitments, decisions, open questions, risks, reminders, recommendations, and explicit next steps. If the user also asks for background or evidence, include `fact` too.
-- For entity-attribute queries, usually include `state` and `fact`; prefer `fact` for topic or project progress.
-- Keep the plan broad when unsure, but do not select every layer by default. Missing evidence is worse than retrieving a few extra candidates.
-- Output 1-3 values in `layer_preference`, chosen from `fact`, `state`, and `actionable_item`. It identifies layers to prioritize; it is not a new database table.
+- Retrieve stable preferences, durable constraints, routines, relationships, profiles, tasks, commitments, and next steps from the concrete facts that support them.
+- Keep the plan broad when unsure. Missing evidence is worse than retrieving a few extra candidates.
 - Extract 2-8 short retrieval keywords, prioritizing concrete people, organizations, products, projects, topics, actions, outcomes, and constraints. Do not output full sentences, pleasantries, generic words, or ordinary time expressions.
 - Extract useful semantic entities with names and types. Entities may be people, organizations, locations, products, projects, technologies, or concrete concepts; ordinary time expressions such as today, yesterday, or last week are not entities.
 - `temporal_mode` selects which fact timestamp should be used for a time range: `event_time` means the real-world event time described by the fact, `dialogue_time` means when the conversation/transcript occurred, `both` means either timestamp may match, and `none` means no hard time filter. Prefer `event_time` for queries asking what happened, was done, bought, or visited; prefer `dialogue_time` for queries asking what was discussed, mentioned, or asked; use `none` when the temporal intent is unclear.
@@ -408,7 +392,6 @@ Guidance:
 Return JSON only:
 {
   "source_types": ["assistant_wakeup", "allday_recording"],
-  "layer_preference": ["fact", "actionable_item", "state"],
   "needs_broad_evidence": false,
   "query_rewrite": "retrieval-focused rewrite over raw memory tables",
   "keywords": ["keyword1", "keyword2"],

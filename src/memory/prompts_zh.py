@@ -1,7 +1,7 @@
 """Chinese prompt templates for the unified memory prototype."""
 
 MEMORY_RETRIEVED_FORMAT_PROMPT_ZH = """[统一记忆]
-系统说明：记忆按语义角色分组。state 和 actionable item 提供紧凑摘要；fact 提供可追溯证据。
+系统说明：当前召回只提供可追溯的 fact 证据。
 时间字段说明：对于 fact，dialogue_time 表示对话/转写讨论该 fact 的时间；event_time 表示 fact 描述的现实事件发生时间。二者含义不同；event_time 未知时，不要用 dialogue_time 推断它。
 {memory_sections}"""
 
@@ -10,16 +10,6 @@ MEMORY_RETRIEVED_SECTION_SPECS_ZH = (
         "[检索事实]",
         "这些是直接从 memory_facts 检索出的、按相关性排序的叙事事实。",
         "fact",
-    ),
-    (
-        "[长期状态]",
-        "这些是根据 memory facts 反思得到的演化状态，应作为摘要上下文理解，不是用户的直接原话。",
-        "state",
-    ),
-    (
-        "[行动事项]",
-        "这些是可能需要后续跟进的决定、任务、承诺、风险或开放问题。",
-        "actionable_item",
     ),
 )
 
@@ -421,23 +411,17 @@ existing_claims：
 
 RECALL_QUERY_ANALYSIS_PROMPT_ZH = """你是 AI 眼镜长期记忆系统中的 recall query 分析器。
 
-请先理解当前记忆结构，再分析用户查询应该优先检索哪些记忆层。
+请先理解当前记忆结构，再分析用户查询的检索方式。
 
 记忆结构：
 1. `memory_facts` / fact：从一次 episode 的对话或全天候转写中提炼出的、可追溯且自包含的 narrative fact。它保留具体发生了什么、谁参与、时间、地点/场景、原因、观点变化、建议、接受/拒绝、约束、结论和未解决问题等证据。fact 可能是一次事件、一次讨论结论，也可能是用户明确表达的偏好、习惯、画像、风险或约束；但它仍然是当前对话证据，不等于跨多次对话融合后的长期状态。fact 通常带有 `fact_type`、`fact_kind`、`primary_entity`、`summary`、`keywords`、`entities`、`fact_root_topic`、`fact_aspect_topic`、`event_time_key` 和 `dialogue_time_key`。
-2. `memory_states` / state：由多个 facts 反思更新出的实体属性投影，不是原始对话引用。目前只保留 `entity_state`：某个实体的长期属性，包括 preference（偏好）、routine（习惯/流程）、profile（画像/背景）、relationship（关系）、constraint（约束）和 risk（风险）。state 适合回答“对某人的稳定认识是什么”，但不能替代具体 fact 证据。
-3. `memory_actionable_items` / actionable_item：从 facts 中提炼出的需要未来执行、跟进、提醒、复盘或决策追踪的事项。包括 task、commitment、decision、follow_up、open_question、risk、reminder、recommendation 和被明确行动阻塞的 constraint。每个 item 通常带有 `canonical_name`、`summary`、`owner`、`status`、`due_at` 和 `evidence_fact_ids`。普通偏好、背景、一次性描述或没有明确后续动作的建议不属于 actionable_item。
-
-episode 是原始对话/转写批次的存储容器，包含 title、summary、参与者和时间范围；当前默认 recall 不把 episode 作为独立可选择的检索层。需要回顾一段经历时，优先选择 `fact`；需要长期概括时，同时考虑 `state`。states 和 actionable_items 都可以通过 `evidence_fact_ids` 追溯到 facts。
+episode 是原始对话/转写批次的存储容器，包含 title、summary、参与者和时间范围；当前 recall 只检索 `fact`，episode 仅用于在事实之间建立关联。
 
 判断准则：
 - 只有当 query 明确指向用户与助手的主动对话，才偏向 `assistant_wakeup`；明确指向全天录音、会议、旁听、多人数对话，才偏向 `allday_recording`；不确定时两者都保留。
 - 具体发生了什么、日期、地点、人名、原话语义、事件先后和可追溯证据，优先 `fact`。
-- 稳定偏好、长期约束、习惯/流程、关系画像和个人背景，优先 `state`；主题、项目或议题的历史演变优先检索 `fact`。
-- 任务、承诺、决定、开放问题、风险、提醒、推荐和明确下一步，优先 `actionable_item`；如果用户同时询问事项的背景或来源，可以同时选择 `fact`。
-- 查询涉及实体长期属性和相关证据时，通常同时选择 `state` 与 `fact`；主题或项目进展优先选择 `fact`。
-- 不确定时保持宽检索，漏掉证据比多取几个候选更糟，但不要无差别默认选择所有层。
-- `layer_preference` 输出 1-3 个最相关的层，值只能是 `fact`、`state`、`actionable_item`；它表示需要优先加强的召回层，不是新的数据库表。
+- 稳定偏好、长期约束、习惯/流程、关系画像、个人背景、任务或承诺等查询，也从支撑它们的具体 `fact` 中检索证据。
+- 不确定时保持宽检索，漏掉证据比少取几个候选更糟。
 - `keywords` 输出 2-8 个短检索词，优先保留具体人物、组织、产品、项目、主题、动作、结果和约束；不要输出完整句子、寒暄、泛化词或普通时间表达。
 - `entities` 输出对语义检索有帮助的实体名称及类型。实体可以是人物、组织、地点、产品、项目、技术或具体概念；普通的“今天/昨天/上周”等时间表达不要作为实体。
 - `temporal_mode` 表示时间范围应该匹配哪一种 fact 时间：`event_time` 表示事实描述的现实事件时间，`dialogue_time` 表示对话/转写发生时间，`both` 表示任一时间命中即可，`none` 表示不做时间硬过滤。询问“做了什么/发生了什么/买过什么”优先使用 `event_time`；询问“讨论了什么/提到过什么/问过什么”优先使用 `dialogue_time`；无法判断时使用 `none`。
@@ -446,7 +430,6 @@ episode 是原始对话/转写批次的存储容器，包含 title、summary、�
 只返回 JSON：
 {
   "source_types": ["assistant_wakeup", "allday_recording"],
-  "layer_preference": ["fact", "actionable_item", "state"],
   "needs_broad_evidence": false,
   "query_rewrite": "面向原始记忆表检索的改写",
   "keywords": ["关键词1", "关键词2"],

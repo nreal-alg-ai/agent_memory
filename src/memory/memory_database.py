@@ -5,7 +5,7 @@ The schema deliberately keeps a few legacy table names used by existing
 benchmark scripts (`memory_facts`, `memory_observations`,
 `memory_interpretations`, `memory_entity_nodes`) while adding the new unified line:
 
-    memory_episodes -> memory_facts -> memory_states/entity_claims
+    memory_episodes -> memory_facts -> entity_claims / intent-execution
 
 `memory_index_entries` is the MemPalace-style directory layer: every retrievable
 memory object writes one index card that points back to its source row.
@@ -28,13 +28,8 @@ try:
 except ImportError:  # pragma: no cover - exercised only in minimal installs
     jieba = None
 
-_HAS_FAISS = False
-EMBEDDING_DIM = 384
-
 _IDENTITY_FTS_TABLES = {
     "memory_facts": "memory_facts_identity_fts",
-    "memory_states": "memory_states_identity_fts",
-    "memory_actionable_items": "memory_actionable_items_identity_fts",
 }
 
 _LEXICAL_DATE_PATTERNS = (
@@ -271,8 +266,6 @@ class SessionDB:
                 dialogue_time_key TEXT NOT NULL DEFAULT '',
                 confidence REAL NOT NULL DEFAULT 0.85,
                 importance REAL NOT NULL DEFAULT 0.5,
-                processed_for_memory_state INTEGER NOT NULL DEFAULT 0,
-                processed_for_memory_actionable_item INTEGER NOT NULL DEFAULT 0,
                 processed_for_memory_entity_claim INTEGER NOT NULL DEFAULT 0,
                 processed_for_memory_intent_execution INTEGER NOT NULL DEFAULT 0,
                 metadata TEXT NOT NULL DEFAULT '{}',
@@ -281,48 +274,6 @@ class SessionDB:
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 FOREIGN KEY(episode_id) REFERENCES memory_episodes(id) ON DELETE CASCADE
-            );
-
-            CREATE TABLE IF NOT EXISTS memory_states (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                state_scope TEXT NOT NULL DEFAULT 'entity_state',
-                state_type TEXT NOT NULL,
-                source_type TEXT NOT NULL DEFAULT 'unified',
-                entity_key TEXT NOT NULL DEFAULT '',
-                canonical_name TEXT NOT NULL,
-                summary TEXT NOT NULL,
-                time_line TEXT NOT NULL DEFAULT '[]',
-                entity_ids TEXT NOT NULL DEFAULT '[]',
-                evidence_fact_ids TEXT NOT NULL DEFAULT '[]',
-                confidence REAL NOT NULL DEFAULT 0.75,
-                metadata TEXT NOT NULL DEFAULT '{}',
-                identity_text_embedding BLOB,
-                canonical_name_embedding BLOB,
-                identity_text TEXT NOT NULL DEFAULT '',
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                UNIQUE(source_type, state_scope, state_type, entity_key, canonical_name)
-            );
-
-            CREATE TABLE IF NOT EXISTS memory_actionable_items (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                item_type TEXT NOT NULL,
-                source_type TEXT NOT NULL DEFAULT 'unified',
-                canonical_name TEXT NOT NULL,
-                summary TEXT NOT NULL,
-                owner TEXT NOT NULL DEFAULT 'unknown',
-                status TEXT NOT NULL DEFAULT 'unknown',
-                due_at TEXT NOT NULL DEFAULT '',
-                entity_ids TEXT NOT NULL DEFAULT '[]',
-                evidence_fact_ids TEXT NOT NULL DEFAULT '[]',
-                confidence REAL NOT NULL DEFAULT 0.75,
-                importance REAL NOT NULL DEFAULT 0.6,
-                metadata TEXT NOT NULL DEFAULT '{}',
-                identity_text_embedding BLOB,
-                identity_text TEXT NOT NULL DEFAULT '',
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                UNIQUE(source_type, item_type, canonical_name)
             );
 
             CREATE TABLE IF NOT EXISTS memory_entity_nodes (
@@ -336,21 +287,9 @@ class SessionDB:
                 entity_id INTEGER PRIMARY KEY,
                 episode_id TEXT NOT NULL DEFAULT '[]',
                 fact_id TEXT NOT NULL DEFAULT '[]',
-                state_id TEXT NOT NULL DEFAULT '[]',
-                actionable_item_id TEXT NOT NULL DEFAULT '[]',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 FOREIGN KEY(entity_id) REFERENCES memory_entity_nodes(id) ON DELETE CASCADE
-            );
-
-            CREATE TABLE IF NOT EXISTS memory_fact_state_mapping (
-                fact_id INTEGER NOT NULL,
-                state_id INTEGER NOT NULL,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                PRIMARY KEY(fact_id, state_id),
-                FOREIGN KEY(fact_id) REFERENCES memory_facts(id) ON DELETE CASCADE,
-                FOREIGN KEY(state_id) REFERENCES memory_states(id) ON DELETE CASCADE
             );
 
             CREATE TABLE IF NOT EXISTS memory_fact_episode_mapping (
@@ -607,36 +546,13 @@ class SessionDB:
                 FOREIGN KEY(target_work_item_id) REFERENCES memory_work_items(id) ON DELETE CASCADE
             );
 
-            CREATE TABLE IF NOT EXISTS memory_topic_actionable_item_mapping (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                topic_state_id INTEGER NOT NULL,
-                actionable_item_id INTEGER NOT NULL,
-                evidence_fact_ids TEXT NOT NULL DEFAULT '[]',
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                UNIQUE(topic_state_id, actionable_item_id),
-                FOREIGN KEY(topic_state_id) REFERENCES memory_states(id) ON DELETE CASCADE,
-                FOREIGN KEY(actionable_item_id) REFERENCES memory_actionable_items(id) ON DELETE CASCADE
-            );
-
             CREATE INDEX IF NOT EXISTS idx_memory_facts_event_time ON memory_facts(event_time_key);
             CREATE INDEX IF NOT EXISTS idx_memory_facts_dialogue_time ON memory_facts(dialogue_time_key);
             CREATE INDEX IF NOT EXISTS idx_memory_facts_source ON memory_facts(source_type);
-            CREATE INDEX IF NOT EXISTS idx_memory_facts_state_processing
-            ON memory_facts(processed_for_memory_state, created_at);
-            CREATE INDEX IF NOT EXISTS idx_memory_states_source ON memory_states(source_type, state_type);
-            CREATE INDEX IF NOT EXISTS idx_memory_states_scope
-            ON memory_states(source_type, state_scope, state_type);
-            CREATE INDEX IF NOT EXISTS idx_memory_actionable_source
-            ON memory_actionable_items(source_type, item_type, status);
-            CREATE INDEX IF NOT EXISTS idx_memory_fact_state_state
-            ON memory_fact_state_mapping(state_id, updated_at);
             CREATE INDEX IF NOT EXISTS idx_memory_fact_episode_episode
             ON memory_fact_episode_mapping(episode_id, updated_at);
             CREATE INDEX IF NOT EXISTS idx_memory_topic_items_kind_seen
             ON memory_topic_items(topic_kind, last_seen_at DESC);
-            CREATE INDEX IF NOT EXISTS idx_memory_topic_actionable_state
-            ON memory_topic_actionable_item_mapping(topic_state_id, updated_at);
             CREATE INDEX IF NOT EXISTS idx_memory_entity_claims_subject
             ON memory_entity_claims(subject_entity_id, claim_type, claim_origin, status);
             CREATE INDEX IF NOT EXISTS idx_memory_entity_claim_evidence_claim
@@ -660,18 +576,13 @@ class SessionDB:
             """
         )
         self._ensure_entity_ids_schema()
-        self._ensure_memory_facts_processing_schema()
         self._ensure_memory_entity_claim_processing_schema()
         self._ensure_memory_intent_execution_processing_schema()
         self._ensure_memory_entity_claims_schema()
-        self._ensure_memory_states_scope_schema()
-        self._ensure_memory_states_time_line_schema()
-        self._ensure_memory_states_entity_key_schema()
-        self._ensure_memory_states_canonical_name_embedding_schema()
-        self._backfill_fact_relation_mappings()
+        self._backfill_fact_episode_mappings()
         self._init_identity_fts()
         self._commit_if_needed()
-
+    
     def _init_identity_fts(self) -> None:
         """Create and backfill one tokenized BM25 index per memory table."""
         for source_table, fts_table in _IDENTITY_FTS_TABLES.items():
@@ -733,8 +644,6 @@ class SessionDB:
         for table in (
             "memory_episodes",
             "memory_facts",
-            "memory_states",
-            "memory_actionable_items",
         ):
             columns = {
                 str(row["name"])
@@ -744,22 +653,6 @@ class SessionDB:
                 self._conn.execute(
                     f"ALTER TABLE {table} ADD COLUMN entity_ids TEXT NOT NULL DEFAULT '[]'"
                 )
-
-    def _ensure_memory_facts_processing_schema(self) -> None:
-        """Ensure each reflect projection has an independent fact cursor."""
-        columns = {
-            str(row["name"])
-            for row in self._conn.execute("PRAGMA table_info(memory_facts)").fetchall()
-        }
-        if "processed_for_memory_actionable_item" not in columns:
-            self._conn.execute(
-                "ALTER TABLE memory_facts ADD COLUMN "
-                "processed_for_memory_actionable_item INTEGER NOT NULL DEFAULT 0"
-            )
-        self._conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_memory_facts_actionable_processing "
-            "ON memory_facts(processed_for_memory_actionable_item, created_at)"
-        )
 
     def _ensure_memory_entity_claim_processing_schema(self) -> None:
         """Add independent reflect cursors for the claim projections."""
@@ -820,133 +713,8 @@ class SessionDB:
                 "ADD COLUMN claim_text TEXT NOT NULL DEFAULT ''"
             )
 
-    def _ensure_memory_states_scope_schema(self) -> None:
-        """Normalize the state scope columns for databases created earlier."""
-        columns = {
-            str(row["name"])
-            for row in self._conn.execute("PRAGMA table_info(memory_states)").fetchall()
-        }
-        if "state_scope" not in columns:
-            self._conn.execute(
-                "ALTER TABLE memory_states ADD COLUMN state_scope TEXT NOT NULL DEFAULT 'entity_state'"
-            )
-            self._conn.execute(
-                """
-                UPDATE memory_states
-                SET state_scope = 'topic_state', state_type = 'topic'
-                WHERE state_type = 'topic_state'
-                """
-            )
-        else:
-            self._conn.execute(
-                """
-                UPDATE memory_states
-                SET state_scope = 'topic_state', state_type = 'topic'
-                WHERE state_type = 'topic_state'
-                """
-            )
-
-    def _ensure_memory_states_time_line_schema(self) -> None:
-        """Add the state change timeline column to existing databases."""
-        columns = {
-            str(row["name"])
-            for row in self._conn.execute("PRAGMA table_info(memory_states)").fetchall()
-        }
-        if "time_line" not in columns:
-            self._conn.execute(
-                "ALTER TABLE memory_states ADD COLUMN time_line TEXT NOT NULL DEFAULT '[]'"
-            )
-
-    def _ensure_memory_states_entity_key_schema(self) -> None:
-        """Keep same-named entity states separate from topic states."""
-        columns = {
-            str(row["name"])
-            for row in self._conn.execute("PRAGMA table_info(memory_states)").fetchall()
-        }
-        if "entity_key" in columns:
-            return
-        rows = self._conn.execute("SELECT * FROM memory_states ORDER BY id").fetchall()
-        self._conn.execute("DROP INDEX IF EXISTS idx_memory_states_source")
-        self._conn.execute("DROP INDEX IF EXISTS idx_memory_states_scope")
-        self._conn.execute("ALTER TABLE memory_states RENAME TO memory_states_legacy")
-        self._conn.execute(
-            """
-            CREATE TABLE memory_states (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                state_scope TEXT NOT NULL DEFAULT 'entity_state',
-                state_type TEXT NOT NULL,
-                source_type TEXT NOT NULL DEFAULT 'unified',
-                entity_key TEXT NOT NULL DEFAULT '',
-                canonical_name TEXT NOT NULL,
-                summary TEXT NOT NULL,
-                time_line TEXT NOT NULL DEFAULT '[]',
-                entity_ids TEXT NOT NULL DEFAULT '[]',
-                evidence_fact_ids TEXT NOT NULL DEFAULT '[]',
-                confidence REAL NOT NULL DEFAULT 0.75,
-                metadata TEXT NOT NULL DEFAULT '{}',
-                identity_text_embedding BLOB,
-                canonical_name_embedding BLOB,
-                identity_text TEXT NOT NULL DEFAULT '',
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                UNIQUE(source_type, state_scope, state_type, entity_key, canonical_name)
-            )
-            """
-        )
-        for row in rows:
-            metadata = _json_loads(row["metadata"], {})
-            scope = str(row["state_scope"] or "entity_state")
-            entity_key = ""
-            if scope == "entity_state" and isinstance(metadata, dict):
-                entity_key = str(
-                    metadata.get("entity_key")
-                    or metadata.get("entity")
-                    or ""
-                ).strip().lower()
-            self._conn.execute(
-                """
-                INSERT INTO memory_states (
-                    id, state_scope, state_type, source_type, entity_key,
-                    canonical_name, summary, time_line, entity_ids, evidence_fact_ids,
-                    confidence, metadata, identity_text_embedding, canonical_name_embedding,
-                    identity_text,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    row["id"], row["state_scope"], row["state_type"],
-                    row["source_type"], entity_key, row["canonical_name"],
-                    row["summary"], row["time_line"], row["entity_ids"],
-                    row["evidence_fact_ids"], row["confidence"], row["metadata"],
-                    row["identity_text_embedding"],
-                    row["canonical_name_embedding"]
-                    if "canonical_name_embedding" in row.keys()
-                    else None,
-                    row["identity_text"], row["created_at"],
-                    row["updated_at"],
-                ),
-            )
-        self._conn.execute("DROP TABLE memory_states_legacy")
-        self._conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_memory_states_source ON memory_states(source_type, state_type)"
-        )
-        self._conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_memory_states_scope ON memory_states(source_type, state_scope, state_type)"
-        )
-
-    def _ensure_memory_states_canonical_name_embedding_schema(self) -> None:
-        """Add the persisted canonical-name vector used by state matching."""
-        columns = {
-            str(row["name"])
-            for row in self._conn.execute("PRAGMA table_info(memory_states)").fetchall()
-        }
-        if "canonical_name_embedding" not in columns:
-            self._conn.execute(
-                "ALTER TABLE memory_states ADD COLUMN canonical_name_embedding BLOB"
-            )
-
-    def _backfill_fact_relation_mappings(self) -> None:
-        """Mirror legacy fact episode/state references into relation tables."""
+    def _backfill_fact_episode_mappings(self) -> None:
+        """Mirror legacy fact episode references into the relation table."""
         episode_rows = self._conn.execute(
             "SELECT id, episode_id FROM memory_facts WHERE episode_id IS NOT NULL"
         ).fetchall()
@@ -957,18 +725,6 @@ class SessionDB:
             }
             for row in episode_rows
             if row["episode_id"] is not None
-        ])
-
-        state_rows = self._conn.execute(
-            "SELECT id, evidence_fact_ids FROM memory_states"
-        ).fetchall()
-        self.insert_fact_state_mappings([
-            {
-                "fact_id": fact_id,
-                "state_id": int(row["id"]),
-            }
-            for row in state_rows
-            for fact_id in _json_loads(row["evidence_fact_ids"], [])
         ])
 
     @staticmethod
@@ -1226,93 +982,6 @@ class SessionDB:
         ).fetchall()
         return [self._row_to_dict(row) for row in rows]
 
-    def upsert_actionable_item(
-        self,
-        *,
-        item_type: str,
-        source_type: str,
-        canonical_name: str,
-        summary: str,
-        owner: str,
-        status: str,
-        due_at: str,
-        entity_ids: Optional[Sequence[int]],
-        evidence_fact_ids: Sequence[int],
-        confidence: float,
-        importance: float,
-        metadata: Optional[Dict[str, Any]],
-        identity_text_embedding: Optional[np.ndarray],
-        identity_text: str,
-    ) -> int:
-        now = local_now_text()
-        self._conn.execute(
-            """
-            INSERT INTO memory_actionable_items (
-                item_type, source_type, canonical_name, summary, owner,
-                status, due_at, entity_ids, evidence_fact_ids, confidence, importance,
-                metadata, identity_text_embedding, identity_text, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(source_type, item_type, canonical_name) DO UPDATE SET
-                summary = excluded.summary,
-                owner = excluded.owner,
-                status = excluded.status,
-                due_at = excluded.due_at,
-                entity_ids = excluded.entity_ids,
-                evidence_fact_ids = excluded.evidence_fact_ids,
-                confidence = excluded.confidence,
-                importance = excluded.importance,
-                metadata = excluded.metadata,
-                identity_text_embedding = excluded.identity_text_embedding,
-                identity_text = excluded.identity_text,
-                updated_at = excluded.updated_at
-            """,
-            (
-                str(item_type or "other"),
-                str(source_type or "unified"),
-                str(canonical_name or "general").strip(),
-                str(summary or "").strip(),
-                str(owner or "unknown").strip(),
-                str(status or "unknown").strip(),
-                str(due_at or "").strip(),
-                _json_dumps([int(value) for value in entity_ids or []]),
-                _json_dumps([int(value) for value in evidence_fact_ids or []]),
-                float(confidence),
-                float(importance),
-                _json_dumps(metadata or {}),
-                _embedding_to_blob(identity_text_embedding),
-                str(identity_text or ""),
-                now,
-                now,
-            ),
-        )
-        row = self._conn.execute(
-            """
-            SELECT id FROM memory_actionable_items
-            WHERE source_type = ? AND item_type = ? AND canonical_name = ?
-            """,
-            (
-                str(source_type or "unified"),
-                str(item_type or "other"),
-                str(canonical_name or "general").strip(),
-            ),
-        ).fetchone()
-        actionable_item_id = int(row["id"]) if row else 0
-        if actionable_item_id:
-            self._sync_identity_fts(
-                source_table="memory_actionable_items",
-                row_id=actionable_item_id,
-                identity_text=str(identity_text or ""),
-            )
-            self.insert_entity_memory_mappings([
-                {
-                    "entity_id": int(entity_id),
-                    "actionable_item_id": [actionable_item_id],
-                }
-                for entity_id in entity_ids or []
-            ])
-        self._commit_if_needed()
-        return actionable_item_id
-
     def get_unprocessed_facts(
         self,
         *,
@@ -1323,7 +992,6 @@ class SessionDB:
         restrict_to_today: bool = True,
     ) -> List[Dict[str, Any]]:
         processing_columns = {
-            "actionable_item": "processed_for_memory_actionable_item",
             "entity_claim": "processed_for_memory_entity_claim",
             "intent_execution": "processed_for_memory_intent_execution",
         }
@@ -1332,8 +1000,7 @@ class SessionDB:
             processing_column = processing_columns[target]
         except KeyError as exc:
             raise ValueError(
-                "processing_target must be 'actionable_item', 'entity_claim', "
-                "or 'intent_execution'"
+                "processing_target must be 'entity_claim' or 'intent_execution'"
             ) from exc
 
         clauses: List[str] = [f"{processing_column} = 0"]
@@ -1423,79 +1090,6 @@ class SessionDB:
             self.insert_entity_memory_mappings(mappings)
         self._commit_if_needed()
         return int(cur.rowcount or 0)
-
-    def insert_fact_state_mappings(
-        self,
-        mappings: Sequence[Dict[str, Any]],
-    ) -> int:
-        """Persist stable evidence links from facts to memory states."""
-        normalized_pairs = {
-            (int(mapping["fact_id"]), int(mapping["state_id"]))
-            for mapping in mappings or []
-            if str(mapping.get("fact_id") or "").strip().isdigit()
-            and str(mapping.get("state_id") or "").strip().isdigit()
-            and int(mapping["fact_id"]) > 0
-            and int(mapping["state_id"]) > 0
-        }
-        if not normalized_pairs:
-            return 0
-        fact_ids = sorted({fact_id for fact_id, _state_id in normalized_pairs})
-        state_ids = sorted({state_id for _fact_id, state_id in normalized_pairs})
-        fact_placeholders = ",".join("?" for _ in fact_ids)
-        state_placeholders = ",".join("?" for _ in state_ids)
-        existing_fact_ids = {
-            int(row["id"])
-            for row in self._conn.execute(
-                f"SELECT id FROM memory_facts WHERE id IN ({fact_placeholders})",
-                fact_ids,
-            ).fetchall()
-        }
-        existing_state_ids = {
-            int(row["id"])
-            for row in self._conn.execute(
-                f"SELECT id FROM memory_states WHERE id IN ({state_placeholders})",
-                state_ids,
-            ).fetchall()
-        }
-        now = local_now_text()
-        changed_count = 0
-        for fact_id, state_id in normalized_pairs:
-            if fact_id not in existing_fact_ids or state_id not in existing_state_ids:
-                continue
-            self._conn.execute(
-                """
-                INSERT INTO memory_fact_state_mapping (
-                    fact_id, state_id, created_at, updated_at
-                ) VALUES (?, ?, ?, ?)
-                ON CONFLICT(fact_id, state_id) DO NOTHING
-                """,
-                (fact_id, state_id, now, now),
-            )
-            changed_count += 1
-        self._commit_if_needed()
-        return changed_count
-
-    def replace_fact_state_mappings_for_state(
-        self,
-        *,
-        state_id: int,
-        fact_ids: Sequence[int],
-    ) -> int:
-        """Synchronize one state's fact evidence links with its current input."""
-        normalized_state_id = int(state_id or 0)
-        if normalized_state_id <= 0:
-            return 0
-        self._conn.execute(
-            "DELETE FROM memory_fact_state_mapping WHERE state_id = ?",
-            (normalized_state_id,),
-        )
-        return self.insert_fact_state_mappings([
-            {
-                "fact_id": fact_id,
-                "state_id": normalized_state_id,
-            }
-            for fact_id in fact_ids or []
-        ])
 
     def insert_fact_episode_mappings(
         self,
@@ -1593,7 +1187,6 @@ class SessionDB:
         fact_ids: Sequence[int],
     ) -> int:
         processing_columns = {
-            "actionable_item": "processed_for_memory_actionable_item",
             "entity_claim": "processed_for_memory_entity_claim",
             "intent_execution": "processed_for_memory_intent_execution",
         }
@@ -1602,8 +1195,7 @@ class SessionDB:
             processing_column = processing_columns[target]
         except KeyError as exc:
             raise ValueError(
-                "processing_target must be 'actionable_item', 'entity_claim', "
-                "or 'intent_execution'"
+                "processing_target must be 'entity_claim' or 'intent_execution'"
             ) from exc
         ids = [int(value) for value in fact_ids if value is not None]
         if not ids:
@@ -2181,77 +1773,6 @@ class SessionDB:
         )
         self._commit_if_needed()
 
-    def get_recent_memory_states(
-        self,
-        *,
-        source_types: Optional[Sequence[str]] = None,
-        state_type: Optional[Any] = None,
-        state_scope: Optional[str] = None,
-        limit: int = 80,
-    ) -> List[Dict[str, Any]]:
-        clauses: List[str] = []
-        params: List[Any] = []
-        if source_types:
-            placeholders = ",".join("?" for _ in source_types)
-            clauses.append(f"source_type IN ({placeholders})")
-            params.extend(source_types)
-        state_type_values = (
-            [state_type]
-            if isinstance(state_type, str)
-            else list(state_type or [])
-        )
-        if state_type_values:
-            placeholders = ",".join("?" for _ in state_type_values)
-            clauses.append(f"state_type IN ({placeholders})")
-            params.extend(state_type_values)
-        normalized_scope = str(state_scope or "").strip().lower()
-        if normalized_scope:
-            clauses.append("state_scope = ?")
-            params.append(normalized_scope)
-        where = "WHERE " + " AND ".join(clauses) if clauses else ""
-        rows = self._conn.execute(
-            f"""
-            SELECT * FROM memory_states
-            {where}
-            ORDER BY updated_at DESC, id DESC
-            LIMIT ?
-            """,
-            (*params, max(1, int(limit))),
-        ).fetchall()
-        return [self._row_to_dict(row) for row in rows]
-
-    def get_memory_state_by_id(self, state_id: int) -> Optional[Dict[str, Any]]:
-        """Return one fully hydrated memory state by its primary key."""
-        row = self._conn.execute(
-            "SELECT * FROM memory_states WHERE id = ?",
-            (int(state_id),),
-        ).fetchone()
-        return self._row_to_dict(row) if row else None
-
-    def recent_actionable_items(
-        self,
-        *,
-        source_types: Optional[Sequence[str]] = None,
-        limit: int = 80,
-    ) -> List[Dict[str, Any]]:
-        clauses: List[str] = []
-        params: List[Any] = []
-        if source_types:
-            placeholders = ",".join("?" for _ in source_types)
-            clauses.append(f"source_type IN ({placeholders})")
-            params.extend(source_types)
-        where = "WHERE " + " AND ".join(clauses) if clauses else ""
-        rows = self._conn.execute(
-            f"""
-            SELECT * FROM memory_actionable_items
-            {where}
-            ORDER BY updated_at DESC, id DESC
-            LIMIT ?
-            """,
-            (*params, max(1, int(limit or 80))),
-        ).fetchall()
-        return [self._row_to_dict(row) for row in rows]
-
     def insert_fact(
         self,
         *,
@@ -2403,7 +1924,7 @@ class SessionDB:
         placeholders = ",".join("?" for _ in ids)
         rows = self._conn.execute(
             f"""
-            SELECT entity_id, episode_id, fact_id, state_id, actionable_item_id
+            SELECT entity_id, episode_id, fact_id
             FROM memory_entity_mapping
             WHERE entity_id IN ({placeholders})
             """,
@@ -2414,8 +1935,6 @@ class SessionDB:
                 "entity_id": int(row["entity_id"]),
                 "episode_id": _json_loads(row["episode_id"], []),
                 "fact_id": _json_loads(row["fact_id"], []),
-                "state_id": _json_loads(row["state_id"], []),
-                "actionable_item_id": _json_loads(row["actionable_item_id"], []),
             }
             for row in rows
         ]
@@ -2424,15 +1943,13 @@ class SessionDB:
         self,
         mappings: Sequence[Dict[str, Any]],
     ) -> int:
-        """Merge episode, fact, and future memory links into one row per entity."""
+        """Merge fact and episode links into one row per entity."""
         if not mappings:
             return 0
 
         mapping_fields = (
             "episode_id",
             "fact_id",
-            "state_id",
-            "actionable_item_id",
         )
 
         def normalize_ids(value: Any) -> List[int]:
@@ -2476,7 +1993,7 @@ class SessionDB:
         for entity_id, mapping in grouped.items():
             existing = self._conn.execute(
                 """
-                SELECT episode_id, fact_id, state_id, actionable_item_id
+                SELECT episode_id, fact_id
                 FROM memory_entity_mapping
                 WHERE entity_id = ?
                 """,
@@ -2494,15 +2011,12 @@ class SessionDB:
                 self._conn.execute(
                     """
                     UPDATE memory_entity_mapping
-                    SET episode_id = ?, fact_id = ?, state_id = ?,
-                        actionable_item_id = ?, updated_at = ?
+                    SET episode_id = ?, fact_id = ?, updated_at = ?
                     WHERE entity_id = ?
                     """,
                     (
                         _json_dumps(merged["episode_id"]),
                         _json_dumps(merged["fact_id"]),
-                        _json_dumps(merged["state_id"]),
-                        _json_dumps(merged["actionable_item_id"]),
                         now,
                         entity_id,
                     ),
@@ -2511,16 +2025,13 @@ class SessionDB:
                 self._conn.execute(
                     """
                     INSERT INTO memory_entity_mapping (
-                        entity_id, episode_id, fact_id, state_id,
-                        actionable_item_id, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        entity_id, episode_id, fact_id, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?)
                     """,
                     (
                         entity_id,
                         _json_dumps(merged["episode_id"]),
                         _json_dumps(merged["fact_id"]),
-                        _json_dumps(merged["state_id"]),
-                        _json_dumps(merged["actionable_item_id"]),
                         now,
                         now,
                     ),
@@ -2537,8 +2048,6 @@ class SessionDB:
         time_fields: Optional[Sequence[str]] = None,
         terms: Optional[Sequence[str]],
         source_types: Optional[Sequence[str]],
-        state_type: Optional[Any] = None,
-        state_scope: Optional[str] = None,
         time_start: Optional[str],
         time_end: Optional[str],
         limit: int,
@@ -2546,8 +2055,8 @@ class SessionDB:
     ) -> List[Dict[str, Any]]:
         """Return raw rows ranked by BM25 over their identity text.
 
-        Table and field names are internal constants supplied by the three
-        public wrappers below; user input is only ever bound as SQL values.
+        Table and field names are internal constants supplied by the public
+        fact-search wrapper; user input is only ever bound as SQL values.
         Only identity-text lexical hits are returned. BM25 results are merged
         with the LIKE fallback when FTS5 is unavailable, while time filtering
         remains controlled by the caller.
@@ -2558,19 +2067,6 @@ class SessionDB:
             placeholders = ",".join("?" for _ in source_types)
             base_clauses.append(f"source_type IN ({placeholders})")
             base_params.extend(source_types)
-        state_type_values = (
-            [state_type]
-            if isinstance(state_type, str)
-            else list(state_type or [])
-        )
-        if state_type_values:
-            placeholders = ",".join("?" for _ in state_type_values)
-            base_clauses.append(f"state_type IN ({placeholders})")
-            base_params.extend(state_type_values)
-        normalized_scope = str(state_scope or "").strip().lower()
-        if normalized_scope:
-            base_clauses.append("state_scope = ?")
-            base_params.append(normalized_scope)
         selected_time_fields = [
             str(field).strip()
             for field in (time_fields or [])
@@ -2761,50 +2257,6 @@ class SessionDB:
             strict_time_filter=True,
         )
 
-    def search_memory_states(
-        self,
-        *,
-        terms: Optional[Sequence[str]] = None,
-        source_types: Optional[Sequence[str]] = None,
-        state_type: Optional[Any] = None,
-        state_scope: Optional[str] = None,
-        time_start: Optional[str] = None,
-        time_end: Optional[str] = None,
-        limit: int = 200,
-    ) -> List[Dict[str, Any]]:
-        return self._search_memory_rows(
-            table="memory_states",
-            identity_fts_table="memory_states_identity_fts",
-            time_fields=[],
-            terms=terms,
-            source_types=source_types,
-            state_type=state_type,
-            state_scope=state_scope,
-            time_start=None,
-            time_end=None,
-            limit=limit,
-        )
-
-    def search_memory_actionable_items(
-        self,
-        *,
-        terms: Optional[Sequence[str]] = None,
-        source_types: Optional[Sequence[str]] = None,
-        time_start: Optional[str] = None,
-        time_end: Optional[str] = None,
-        limit: int = 200,
-    ) -> List[Dict[str, Any]]:
-        return self._search_memory_rows(
-            table="memory_actionable_items",
-            identity_fts_table="memory_actionable_items_identity_fts",
-            time_fields=[],
-            terms=terms,
-            source_types=source_types,
-            time_start=None,
-            time_end=None,
-            limit=limit,
-        )
-
     def memory_facts_by_ids(self, fact_ids: Sequence[int]) -> List[Dict[str, Any]]:
         ids = [int(value) for value in fact_ids if value is not None]
         if not ids:
@@ -2931,165 +2383,6 @@ class SessionDB:
             for row in rows
         ]
 
-    def related_fact_pairs_by_state_fact_ids(
-        self,
-        fact_ids: Sequence[int],
-        *,
-        limit: int = 200,
-    ) -> List[Dict[str, int]]:
-        """Return other facts supporting at least one shared memory state."""
-        ids = list(dict.fromkeys(
-            int(value)
-            for value in fact_ids or []
-            if str(value).strip().isdigit() and int(value) > 0
-        ))
-        if not ids:
-            return []
-        placeholders = ",".join("?" for _ in ids)
-        rows = self._conn.execute(
-            f"""
-            SELECT seed.fact_id AS seed_fact_id,
-                   related.fact_id AS related_fact_id
-            FROM memory_fact_state_mapping AS seed
-            INNER JOIN memory_fact_state_mapping AS related
-                ON related.state_id = seed.state_id
-            INNER JOIN memory_states AS state
-                ON state.id = seed.state_id
-            WHERE seed.fact_id IN ({placeholders})
-              AND related.fact_id != seed.fact_id
-              AND state.state_scope = 'entity_state'
-            ORDER BY seed.fact_id ASC, related.fact_id ASC
-            LIMIT ?
-            """,
-            (*ids, max(1, int(limit or 200))),
-        ).fetchall()
-        return [
-            {
-                "seed_fact_id": int(row["seed_fact_id"]),
-                "related_fact_id": int(row["related_fact_id"]),
-            }
-            for row in rows
-        ]
-
-    def memory_states_by_ids(self, state_ids: Sequence[int]) -> List[Dict[str, Any]]:
-        ids = [int(value) for value in state_ids if value is not None]
-        if not ids:
-            return []
-        placeholders = ",".join("?" for _ in ids)
-        rows = self._conn.execute(
-            f"SELECT * FROM memory_states WHERE id IN ({placeholders})",
-            ids,
-        ).fetchall()
-        by_id = {int(row["id"]): self._row_to_dict(row) for row in rows}
-        return [by_id[item] for item in ids if item in by_id]
-
-    def memory_states_with_identity_embeddings(
-        self,
-        *,
-        source_types: Optional[Sequence[str]] = None,
-        state_scope: Optional[str] = None,
-    ) -> List[Dict[str, Any]]:
-        """Load every embeddable state for bounded in-process vector ranking."""
-        clauses = ["identity_text_embedding IS NOT NULL"]
-        params: List[Any] = []
-        if source_types:
-            placeholders = ",".join("?" for _ in source_types)
-            clauses.append(f"source_type IN ({placeholders})")
-            params.extend(source_types)
-        normalized_scope = str(state_scope or "").strip().lower()
-        if normalized_scope:
-            clauses.append("state_scope = ?")
-            params.append(normalized_scope)
-        where = " WHERE " + " AND ".join(clauses)
-        rows = self._conn.execute(
-            f"SELECT * FROM memory_states{where} ORDER BY id ASC",
-            params,
-        ).fetchall()
-        return [self._row_to_dict(row) for row in rows]
-
-    def memory_actionable_items_by_ids(
-        self,
-        item_ids: Sequence[int],
-    ) -> List[Dict[str, Any]]:
-        ids = [int(value) for value in item_ids if value is not None]
-        if not ids:
-            return []
-        placeholders = ",".join("?" for _ in ids)
-        rows = self._conn.execute(
-            f"SELECT * FROM memory_actionable_items WHERE id IN ({placeholders})",
-            ids,
-        ).fetchall()
-        by_id = {int(row["id"]): self._row_to_dict(row) for row in rows}
-        return [by_id[item] for item in ids if item in by_id]
-
-    def memory_actionable_items_by_topic_state_id(
-        self,
-        topic_state_id: int,
-        *,
-        limit: int = 32,
-    ) -> List[Dict[str, Any]]:
-        """Load actionable items linked to one topic state by stable IDs."""
-        rows = self._conn.execute(
-            """
-            SELECT item.*
-            FROM memory_actionable_items AS item
-            INNER JOIN memory_topic_actionable_item_mapping AS mapping
-                ON mapping.actionable_item_id = item.id
-            WHERE mapping.topic_state_id = ?
-            ORDER BY item.updated_at DESC, item.id DESC
-            LIMIT ?
-            """,
-            (int(topic_state_id), max(1, int(limit or 32))),
-        ).fetchall()
-        return [self._row_to_dict(row) for row in rows]
-
-    def insert_topic_actionable_item_mappings(
-        self,
-        mappings: Sequence[Dict[str, Any]],
-    ) -> int:
-        """Persist stable topic-state to actionable-item relationships."""
-        if not mappings:
-            return 0
-        now = local_now_text()
-        changed_count = 0
-        for mapping in mappings:
-            try:
-                topic_state_id = int(mapping["topic_state_id"])
-                actionable_item_id = int(mapping["actionable_item_id"])
-            except (KeyError, TypeError, ValueError):
-                continue
-            if topic_state_id <= 0 or actionable_item_id <= 0:
-                continue
-            evidence_fact_ids = []
-            for value in mapping.get("evidence_fact_ids") or []:
-                try:
-                    fact_id = int(value)
-                except (TypeError, ValueError):
-                    continue
-                if fact_id > 0 and fact_id not in evidence_fact_ids:
-                    evidence_fact_ids.append(fact_id)
-            self._conn.execute(
-                """
-                INSERT INTO memory_topic_actionable_item_mapping (
-                    topic_state_id, actionable_item_id, evidence_fact_ids,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(topic_state_id, actionable_item_id) DO UPDATE SET
-                    evidence_fact_ids = excluded.evidence_fact_ids,
-                    updated_at = excluded.updated_at
-                """,
-                (
-                    topic_state_id,
-                    actionable_item_id,
-                    _json_dumps(evidence_fact_ids),
-                    now,
-                    now,
-                ),
-            )
-            changed_count += 1
-        self._commit_if_needed()
-        return changed_count
-
     def _row_to_dict(self, row: sqlite3.Row) -> Dict[str, Any]:
         item = dict(row)
         if "keywords" in item:
@@ -3120,7 +2413,6 @@ class SessionDB:
             "previous_payload",
             "new_payload",
             "evidence_fact_ids",
-            "time_line",
             "fact_ids",
             "episode_ids",
         ):
@@ -3132,7 +2424,6 @@ class SessionDB:
         for key in (
             "embedding",
             "identity_text_embedding",
-            "canonical_name_embedding",
         ):
             if key in item:
                 item[key] = _blob_to_embedding(item[key])

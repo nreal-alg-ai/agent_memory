@@ -638,18 +638,10 @@ def log_memory_index_state(db: Any, event: str) -> None:
     fact_count = db._conn.execute(
         "SELECT COUNT(*) AS count FROM memory_facts"
     ).fetchone()["count"]
-    state_count = db._conn.execute(
-        "SELECT COUNT(*) AS count FROM memory_states"
-    ).fetchone()["count"]
-    actionable_count = db._conn.execute(
-        "SELECT COUNT(*) AS count FROM memory_actionable_items"
-    ).fetchone()["count"]
     logging.info(
-        "Memory index state event=%s facts=%s states=%s actionable_items=%s",
+        "Memory index state event=%s facts=%s",
         event,
         fact_count,
-        state_count,
-        actionable_count,
     )
 
 
