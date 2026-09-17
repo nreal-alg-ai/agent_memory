@@ -360,6 +360,29 @@ class SessionDB:
                 FOREIGN KEY(episode_id) REFERENCES memory_episodes(id) ON DELETE CASCADE
             );
 
+            CREATE TABLE IF NOT EXISTS memory_topic_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                topic_kind TEXT NOT NULL,
+                topic_name TEXT NOT NULL,
+                topic_key TEXT NOT NULL,
+                fact_occurrence_count INTEGER NOT NULL DEFAULT 0,
+                episode_occurrence_count INTEGER NOT NULL DEFAULT 0,
+                first_seen_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(topic_kind, topic_key)
+            );
+
+            CREATE TABLE IF NOT EXISTS memory_topic_mapping (
+                topic_item_id INTEGER PRIMARY KEY,
+                fact_ids TEXT NOT NULL DEFAULT '[]',
+                episode_ids TEXT NOT NULL DEFAULT '[]',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(topic_item_id) REFERENCES memory_topic_items(id) ON DELETE CASCADE
+            );
+
             CREATE TABLE IF NOT EXISTS memory_topic_actionable_item_mapping (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 topic_state_id INTEGER NOT NULL,
@@ -386,6 +409,8 @@ class SessionDB:
             ON memory_fact_state_mapping(state_id, updated_at);
             CREATE INDEX IF NOT EXISTS idx_memory_fact_episode_episode
             ON memory_fact_episode_mapping(episode_id, updated_at);
+            CREATE INDEX IF NOT EXISTS idx_memory_topic_items_kind_seen
+            ON memory_topic_items(topic_kind, last_seen_at DESC);
             CREATE INDEX IF NOT EXISTS idx_memory_topic_actionable_state
             ON memory_topic_actionable_item_mapping(topic_state_id, updated_at);
             """
@@ -720,6 +745,180 @@ class SessionDB:
         ])
         self._commit_if_needed()
         return episode_id
+
+    def upsert_memory_topic_items(
+        self,
+        items: Sequence[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Upsert topic registry items and merge their fact/episode IDs.
+
+        ``memory_topic_items`` holds one reusable topic name per
+        ``(topic_kind, topic_key)``. Its companion mapping row deliberately
+        stores the aggregated evidence IDs as JSON arrays, matching the
+        compact topic-directory model used by this project.
+        """
+        grouped: Dict[str, Dict[str, Any]] = {}
+
+        def normalize_ids(value: Any) -> List[int]:
+            values = value if isinstance(value, (list, tuple, set)) else [value]
+            normalized: List[int] = []
+            for raw in values:
+                try:
+                    item_id = int(raw)
+                except (TypeError, ValueError):
+                    continue
+                if item_id > 0 and item_id not in normalized:
+                    normalized.append(item_id)
+            return normalized
+
+        for item in items or []:
+            if not isinstance(item, dict):
+                continue
+            topic_kind = str(item.get("topic_kind") or "").strip().lower()
+            topic_name = str(item.get("topic_name") or "").strip()
+            topic_key = str(item.get("topic_key") or "").strip().lower()
+            if topic_kind not in {"canonical", "aspect"} or not topic_name or not topic_key:
+                continue
+            group_key = f"{topic_kind}\x1f{topic_key}"
+            grouped_item = grouped.setdefault(
+                group_key,
+                {
+                    "topic_kind": topic_kind,
+                    "topic_name": topic_name,
+                    "topic_key": topic_key,
+                    "fact_ids": [],
+                    "episode_ids": [],
+                },
+            )
+            for field in ("fact_ids", "episode_ids"):
+                for item_id in normalize_ids(item.get(field)):
+                    if item_id not in grouped_item[field]:
+                        grouped_item[field].append(item_id)
+
+        report = {
+            "topic_item_ids": [],
+            "created_count": 0,
+            "updated_count": 0,
+            "fact_links_added": 0,
+            "episode_links_added": 0,
+        }
+        if not grouped:
+            return report
+
+        now = local_now_text()
+        for item in grouped.values():
+            existing = self._conn.execute(
+                """
+                SELECT id FROM memory_topic_items
+                WHERE topic_kind = ? AND topic_key = ?
+                """,
+                (item["topic_kind"], item["topic_key"]),
+            ).fetchone()
+            if existing is None:
+                cur = self._conn.execute(
+                    """
+                    INSERT INTO memory_topic_items (
+                        topic_kind, topic_name, topic_key,
+                        fact_occurrence_count, episode_occurrence_count,
+                        first_seen_at, last_seen_at, created_at, updated_at
+                    ) VALUES (?, ?, ?, 0, 0, ?, ?, ?, ?)
+                    """,
+                    (
+                        item["topic_kind"],
+                        item["topic_name"],
+                        item["topic_key"],
+                        now,
+                        now,
+                        now,
+                        now,
+                    ),
+                )
+                topic_item_id = int(cur.lastrowid)
+                report["created_count"] += 1
+            else:
+                topic_item_id = int(existing["id"])
+
+            mapping = self._conn.execute(
+                """
+                SELECT fact_ids, episode_ids FROM memory_topic_mapping
+                WHERE topic_item_id = ?
+                """,
+                (topic_item_id,),
+            ).fetchone()
+            existing_fact_ids = normalize_ids(
+                _json_loads(mapping["fact_ids"], []) if mapping else []
+            )
+            existing_episode_ids = normalize_ids(
+                _json_loads(mapping["episode_ids"], []) if mapping else []
+            )
+            new_fact_ids = [
+                fact_id for fact_id in item["fact_ids"]
+                if fact_id not in existing_fact_ids
+            ]
+            new_episode_ids = [
+                episode_id for episode_id in item["episode_ids"]
+                if episode_id not in existing_episode_ids
+            ]
+            merged_fact_ids = [*existing_fact_ids, *new_fact_ids]
+            merged_episode_ids = [*existing_episode_ids, *new_episode_ids]
+
+            self._conn.execute(
+                """
+                INSERT INTO memory_topic_mapping (
+                    topic_item_id, fact_ids, episode_ids, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(topic_item_id) DO UPDATE SET
+                    fact_ids = excluded.fact_ids,
+                    episode_ids = excluded.episode_ids,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    topic_item_id,
+                    _json_dumps(merged_fact_ids),
+                    _json_dumps(merged_episode_ids),
+                    now,
+                    now,
+                ),
+            )
+            if new_fact_ids or new_episode_ids:
+                self._conn.execute(
+                    """
+                    UPDATE memory_topic_items
+                    SET fact_occurrence_count = fact_occurrence_count + ?,
+                        episode_occurrence_count = episode_occurrence_count + ?,
+                        last_seen_at = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        len(new_fact_ids),
+                        len(new_episode_ids),
+                        now,
+                        now,
+                        topic_item_id,
+                    ),
+                )
+                report["updated_count"] += 1
+            report["topic_item_ids"].append(topic_item_id)
+            report["fact_links_added"] += len(new_fact_ids)
+            report["episode_links_added"] += len(new_episode_ids)
+
+        self._commit_if_needed()
+        return report
+
+    def list_memory_topic_items(self, *, limit: int = 240) -> List[Dict[str, Any]]:
+        """Load recent topic registry items with their compact evidence IDs."""
+        rows = self._conn.execute(
+            """
+            SELECT item.*, mapping.fact_ids, mapping.episode_ids
+            FROM memory_topic_items AS item
+            LEFT JOIN memory_topic_mapping AS mapping
+                ON mapping.topic_item_id = item.id
+            ORDER BY item.last_seen_at DESC, item.id DESC
+            LIMIT ?
+            """,
+            (max(1, int(limit or 240)),),
+        ).fetchall()
+        return [self._row_to_dict(row) for row in rows]
 
     def upsert_state(
         self,
@@ -1223,6 +1422,7 @@ class SessionDB:
         *,
         source_types: Optional[Sequence[str]] = None,
         state_type: Optional[Any] = None,
+        state_scope: Optional[str] = None,
         limit: int = 80,
     ) -> List[Dict[str, Any]]:
         clauses: List[str] = []
@@ -1240,6 +1440,10 @@ class SessionDB:
             placeholders = ",".join("?" for _ in state_type_values)
             clauses.append(f"state_type IN ({placeholders})")
             params.extend(state_type_values)
+        normalized_scope = str(state_scope or "").strip().lower()
+        if normalized_scope:
+            clauses.append("state_scope = ?")
+            params.append(normalized_scope)
         where = "WHERE " + " AND ".join(clauses) if clauses else ""
         rows = self._conn.execute(
             f"""
@@ -1570,6 +1774,7 @@ class SessionDB:
         terms: Optional[Sequence[str]],
         source_types: Optional[Sequence[str]],
         state_type: Optional[Any] = None,
+        state_scope: Optional[str] = None,
         time_start: Optional[str],
         time_end: Optional[str],
         limit: int,
@@ -1598,6 +1803,10 @@ class SessionDB:
             placeholders = ",".join("?" for _ in state_type_values)
             base_clauses.append(f"state_type IN ({placeholders})")
             base_params.extend(state_type_values)
+        normalized_scope = str(state_scope or "").strip().lower()
+        if normalized_scope:
+            base_clauses.append("state_scope = ?")
+            base_params.append(normalized_scope)
         selected_time_fields = [
             str(field).strip()
             for field in (time_fields or [])
@@ -1794,6 +2003,7 @@ class SessionDB:
         terms: Optional[Sequence[str]] = None,
         source_types: Optional[Sequence[str]] = None,
         state_type: Optional[Any] = None,
+        state_scope: Optional[str] = None,
         time_start: Optional[str] = None,
         time_end: Optional[str] = None,
         limit: int = 200,
@@ -1805,6 +2015,7 @@ class SessionDB:
             terms=terms,
             source_types=source_types,
             state_type=state_type,
+            state_scope=state_scope,
             time_start=None,
             time_end=None,
             limit=limit,
@@ -1958,8 +2169,11 @@ class SessionDB:
             FROM memory_fact_state_mapping AS seed
             INNER JOIN memory_fact_state_mapping AS related
                 ON related.state_id = seed.state_id
+            INNER JOIN memory_states AS state
+                ON state.id = seed.state_id
             WHERE seed.fact_id IN ({placeholders})
               AND related.fact_id != seed.fact_id
+              AND state.state_scope = 'entity_state'
             ORDER BY seed.fact_id ASC, related.fact_id ASC
             LIMIT ?
             """,
@@ -1989,6 +2203,7 @@ class SessionDB:
         self,
         *,
         source_types: Optional[Sequence[str]] = None,
+        state_scope: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Load every embeddable state for bounded in-process vector ranking."""
         clauses = ["identity_text_embedding IS NOT NULL"]
@@ -1997,6 +2212,10 @@ class SessionDB:
             placeholders = ",".join("?" for _ in source_types)
             clauses.append(f"source_type IN ({placeholders})")
             params.extend(source_types)
+        normalized_scope = str(state_scope or "").strip().lower()
+        if normalized_scope:
+            clauses.append("state_scope = ?")
+            params.append(normalized_scope)
         where = " WHERE " + " AND ".join(clauses)
         rows = self._conn.execute(
             f"SELECT * FROM memory_states{where} ORDER BY id ASC",
@@ -2115,6 +2334,8 @@ class SessionDB:
             "metadata",
             "evidence_fact_ids",
             "time_line",
+            "fact_ids",
+            "episode_ids",
         ):
             if key in item:
                 item[key] = _json_loads(item[key], [] if key != "metadata" else {})

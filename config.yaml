@@ -243,5 +243,4 @@ memory_manager:
       recall_stage2_time_score_weight: 0.12
       recall_stage2_contextual_time_score_multiplier: 2.0
     recall_fact_time_score_half_life_seconds: 604800
-    recall_topic_state_time_score_half_life_seconds: 1209600
     recall_persistent_state_time_score_half_life_seconds: 7776000

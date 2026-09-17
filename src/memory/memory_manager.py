@@ -7,8 +7,9 @@ internal model is deliberately unified:
 1. assistant_wakeup turns and future allday transcript episodes both become
    `memory_episodes`.
 2. Extracted evidence becomes narrative `memory_facts`.
-3. Longer-running preferences/topics/constraints can become `memory_states`.
-4. Concrete decisions/tasks/commitments become `memory_actionable_items`.
+3. Longer-running entity preferences and constraints can become `memory_states`.
+4. The legacy actionable-item projection is temporarily disabled while the
+   intent and work-item layer is redesigned.
 
 """
 
@@ -41,20 +42,16 @@ from .prompts_en import (
     MEMORY_RETRIEVED_FORMAT_PROMPT_EN,
     MEMORY_RETRIEVED_SECTION_SPECS_EN,
     RECALL_QUERY_ANALYSIS_PROMPT_EN,
-    UNIFIED_ACTIONABLE_ITEM_EXTRACTION_PROMPT_EN,
     UNIFIED_ENTITY_STATE_UPDATE_PROMPT_EN,
     UNIFIED_MEMORY_EXTRACTION_PROMPT_EN,
-    UNIFIED_TOPIC_STATE_UPDATE_PROMPT_EN,
 )
 from .prompts_zh import (
     EPISODE_SUMMARY_PROMPT_ZH,
     MEMORY_RETRIEVED_FORMAT_PROMPT_ZH,
     MEMORY_RETRIEVED_SECTION_SPECS_ZH,
     RECALL_QUERY_ANALYSIS_PROMPT_ZH,
-    UNIFIED_ACTIONABLE_ITEM_EXTRACTION_PROMPT_ZH,
     UNIFIED_ENTITY_STATE_UPDATE_PROMPT_ZH,
     UNIFIED_MEMORY_EXTRACTION_PROMPT_ZH,
-    UNIFIED_TOPIC_STATE_UPDATE_PROMPT_ZH,
 )
 from .utils import _cal_embedding_cosine_similarity
 
@@ -508,22 +505,6 @@ class MemoryNodeManager:
         )
         self._initialize_recall_config()
         self._embedding_client: Optional[EmbeddingClient] = None
-        self._topic_state_max_topics_per_episode = max(
-            1,
-            int(self._memory_cfg.get("topic_state_max_topics_per_episode", 3) or 3),
-        )
-        self._topic_state_resolution_similarity_threshold = float(
-            self._memory_cfg.get("topic_state_resolution_similarity_threshold", 0.62) or 0.62
-        )
-        self._topic_state_grounding_similarity_threshold = float(
-            self._memory_cfg.get("topic_state_grounding_similarity_threshold", 0.42) or 0.42
-        )
-        self._topic_identity_embedding_similarity_threshold = float(
-            self._memory_cfg.get("topic_identity_embedding_similarity_threshold", 0.78) or 0.78
-        )
-        self._topic_identity_grounding_similarity_threshold = float(
-            self._memory_cfg.get("topic_identity_grounding_similarity_threshold", 0.64) or 0.64
-        )
         self._task_queue_maxsize = max(
             1,
             int(self._memory_cfg.get("task_queue_maxsize", 100) or 100),
@@ -839,10 +820,6 @@ class MemoryNodeManager:
         self._recall_fact_time_score_half_life_seconds = max(
             1,
             int(recall_value("recall_fact_time_score_half_life_seconds", 604800) or 604800),
-        )
-        self._recall_topic_state_time_score_half_life_seconds = max(
-            1,
-            int(recall_value("recall_topic_state_time_score_half_life_seconds", 1209600) or 1209600),
         )
         self._recall_persistent_state_time_score_half_life_seconds = max(
             1,
@@ -1171,21 +1148,28 @@ class MemoryNodeManager:
         )
         if episode_info.get("status") != "ok":
             return episode_info
-        episode_id = self._db.insert_episode(
-            source_type=source_type,
-            episode_type=self._episode_type_for_source_type(source_type),
-            title=episode_info["title"],
-            summary=episode_info["summary"],
-            participants=episode_info.get("participants") or [],
-            started_at=episode_info.get("started_at") or _now_text(),
-            ended_at=episode_info.get("ended_at") or episode_info.get("started_at") or _now_text(),
-            canonical_topics=episode_info.get("canonical_topics") or [],
-            entity_ids=episode_info.get("entity_ids") or [],
-            metadata={"tags": list(tags or []), "fact_count": len(facts), "generated_from_facts": True},
-        )
-        attached = self._db.update_facts_episode_id(
-            fact_ids=episode_info.get("fact_ids") or [], episode_id=episode_id,
-        )
+        with self._db.transaction():
+            episode_id = self._db.insert_episode(
+                source_type=source_type,
+                episode_type=self._episode_type_for_source_type(source_type),
+                title=episode_info["title"],
+                summary=episode_info["summary"],
+                participants=episode_info.get("participants") or [],
+                started_at=episode_info.get("started_at") or _now_text(),
+                ended_at=episode_info.get("ended_at") or episode_info.get("started_at") or _now_text(),
+                canonical_topics=episode_info.get("canonical_topics") or [],
+                entity_ids=episode_info.get("entity_ids") or [],
+                metadata={"tags": list(tags or []), "fact_count": len(facts), "generated_from_facts": True},
+            )
+            topic_report = self._db.upsert_memory_topic_items(
+                self._build_memory_topic_item_updates(
+                    canonical_topics=episode_info.get("canonical_topics") or [],
+                    episode_id=episode_id,
+                )
+            )
+            attached = self._db.update_facts_episode_id(
+                fact_ids=episode_info.get("fact_ids") or [], episode_id=episode_id,
+            )
         fact_ids = [int(fact_id) for fact_id in (episode_info.get("fact_ids") or [])]
         last_fact_id = fact_id_after
         if attached and fact_ids:
@@ -1195,6 +1179,8 @@ class MemoryNodeManager:
             "episode_id": episode_id,
             "fact_count": attached,
             "new_episode_count": 1,
+            "topic_items_created": int(topic_report.get("created_count", 0) or 0),
+            "topic_items_updated": int(topic_report.get("updated_count", 0) or 0),
             "fact_id_after": fact_id_after,
             "last_fact_id": last_fact_id,
         })
@@ -1205,6 +1191,8 @@ class MemoryNodeManager:
             "last_fact_id": last_fact_id,
             "source_type": source_type,
             "title": episode_info.get("title") or "",
+            "topic_items_created": episode_info.get("topic_items_created", 0),
+            "topic_items_updated": episode_info.get("topic_items_updated", 0),
         })
         return episode_info
 
@@ -1245,22 +1233,28 @@ class MemoryNodeManager:
         )
         facts = list(extracted_info.get("facts") or [])
         self._log_extracted_fact_info(facts=facts)
-        save_entity_info = self._store_extracted_memory_entities_into_db(
-            participants=[], raw_segments=raw_segments, facts=facts, episode_summary="",
-        )
-        save_fact_info = self._store_extracted_memory_facts_into_db(
-            episode_id=None,
-            facts=facts,
-            tags=tags,
-            source_type=source_type,
-            episode_context_topics=None,
-            entity_info=save_entity_info,
-        )
+        with self._db.transaction():
+            save_entity_info = self._store_extracted_memory_entities_into_db(
+                participants=[], raw_segments=raw_segments, facts=facts, episode_summary="",
+            )
+            save_fact_info = self._store_extracted_memory_facts_into_db(
+                episode_id=None,
+                facts=facts,
+                tags=tags,
+                source_type=source_type,
+                episode_context_topics=None,
+                entity_info=save_entity_info,
+            )
+            topic_report = self._db.upsert_memory_topic_items(
+                save_fact_info.get("topic_item_updates") or []
+            )
         report = {
             "status": "ok",
             "new_episode_count": 0,
             "new_fact_count": len(list(save_fact_info.get("fact_ids") or [])),
             "fact_ids": list(save_fact_info.get("fact_ids") or []),
+            "topic_items_created": int(topic_report.get("created_count", 0) or 0),
+            "topic_items_updated": int(topic_report.get("updated_count", 0) or 0),
             "total_elapsed_ms": round((time.monotonic() - store_started_at) * 1000, 2),
         }
         self._log_info("memory_store", "finish", {
@@ -1429,11 +1423,20 @@ class MemoryNodeManager:
             else UNIFIED_MEMORY_EXTRACTION_PROMPT_ZH
         )
         memory_state_context = self._collect_memory_state_context(limit=12)
+        memory_topic_item_context = (
+            self._collect_memory_topic_item_context(segments=segments)
+            if prompt_language != "en"
+            else {"canonical_topics": [], "aspect_topics": []}
+        )
         prompt = (
             prompt_template
             .replace(
                 "{existing_memory_states}",
                 self._format_memory_states_for_prompt(memory_state_context),
+            )
+            .replace(
+                "{existing_memory_topic_items}",
+                self._format_memory_topic_items_for_prompt(memory_topic_item_context),
             )
             .replace(
                 "{dialogue_batch}",
@@ -1942,18 +1945,18 @@ class MemoryNodeManager:
         return "\n\n".join(blocks)
 
     def _collect_memory_state_context(self, *, limit: int = 12) -> List[Dict[str, Any]]:
-        """Collect a small, balanced state reference set for fact extraction."""
+        """Collect entity-state references for fact extraction only."""
         try:
-            states = self._db.get_recent_memory_states(limit=max(40, int(limit or 12) * 6))
+            states = self._db.get_recent_memory_states(
+                state_scope="entity_state",
+                limit=max(40, int(limit or 12) * 6),
+            )
         except Exception as exc:
             self._logger.debug("Failed to load memory state context: %s", exc)
             return []
         rows: List[Dict[str, Any]] = []
         seen: set[Tuple[str, str, str]] = set()
-        scope_counts: Counter[str] = Counter()
         type_counts: Counter[Tuple[str, str]] = Counter()
-        scope_limits = {"topic_state": 4, "entity_state": 8}
-        type_limits = {"topic": 4}
         max_items = max(1, int(limit or 12))
         for state in states:
             scope = _compact_whitespace(state.get("state_scope") or "")
@@ -1963,18 +1966,15 @@ class MemoryNodeManager:
                 state.get("summary") or "",
                 max_chars=120,
             )
-            if scope not in scope_limits or not state_type or not canonical_name or not summary:
+            if scope != "entity_state" or not state_type or not canonical_name or not summary:
                 continue
             key = (scope, state_type, canonical_name.lower())
             if key in seen:
                 continue
-            if scope_counts[scope] >= scope_limits[scope]:
-                continue
             type_key = (scope, state_type)
-            if type_counts[type_key] >= type_limits.get(state_type, 2):
+            if type_counts[type_key] >= 2:
                 continue
             seen.add(key)
-            scope_counts[scope] += 1
             type_counts[type_key] += 1
             rows.append({
                 "state_scope": scope,
@@ -2000,6 +2000,163 @@ class MemoryNodeManager:
             if len(text) <= max_chars:
                 return text
             rows.pop()
+        return "[]"
+
+    def _is_indexable_memory_topic(self, value: Any) -> bool:
+        """Reject fallback labels that must not become reusable topic names."""
+        topic = self._normalize_topic_name(value)
+        if not topic:
+            return False
+        return self._generate_topic_name_key(topic) not in {
+            "general",
+            "通用",
+            "其他",
+            "其它",
+            "unknown",
+            "未知",
+        }
+
+    def _build_memory_topic_item_updates(
+        self,
+        *,
+        canonical_topics: Sequence[Any],
+        aspect_topics: Sequence[Any] = (),
+        fact_id: Optional[int] = None,
+        episode_id: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Create compact topic-registry updates from persisted memory fields."""
+        normalized_fact_id = int(fact_id or 0)
+        normalized_episode_id = int(episode_id or 0)
+        updates: List[Dict[str, Any]] = []
+        canonical_keys: set[str] = set()
+
+        def add(topic_kind: str, value: Any) -> None:
+            topic_name = self._normalize_topic_name(value)
+            if not topic_name or not self._is_indexable_memory_topic(topic_name):
+                return
+            topic_key = self._generate_topic_name_key(topic_name)
+            if topic_kind == "aspect" and topic_key in canonical_keys:
+                # An aspect equal to its fact root adds no finer-grained
+                # vocabulary and would only duplicate prompt candidates.
+                return
+            item: Dict[str, Any] = {
+                "topic_kind": topic_kind,
+                "topic_name": topic_name,
+                "topic_key": topic_key,
+                "fact_ids": [normalized_fact_id] if normalized_fact_id > 0 else [],
+                "episode_ids": [normalized_episode_id] if normalized_episode_id > 0 else [],
+            }
+            if not any(
+                existing["topic_kind"] == topic_kind
+                and existing["topic_key"] == topic_key
+                for existing in updates
+            ):
+                updates.append(item)
+
+        for topic in canonical_topics or ():
+            topic_name = self._normalize_topic_name(topic)
+            if topic_name and self._is_indexable_memory_topic(topic_name):
+                canonical_keys.add(self._generate_topic_name_key(topic_name))
+            add("canonical", topic)
+        # Aspect topics are defined only by facts. Episode callers therefore
+        # leave this sequence empty.
+        if normalized_fact_id > 0:
+            for topic in aspect_topics or ():
+                add("aspect", topic)
+        return updates
+
+    def _collect_memory_topic_item_context(
+        self,
+        *,
+        segments: Sequence[Dict[str, Any]],
+        canonical_limit: int = 12,
+        aspect_limit: int = 12,
+    ) -> Dict[str, List[str]]:
+        """Return only topic names lexically related to the incoming evidence."""
+        query_text = " ".join(
+            _compact_whitespace(segment.get("text") or "")
+            for segment in segments or ()
+            if isinstance(segment, dict)
+        )
+        query_terms = self._lexical_search_terms_for_text(
+            query_text,
+            limit=24,
+            preserve_phrase=False,
+        )
+        if not query_terms:
+            return {"canonical_topics": [], "aspect_topics": []}
+        try:
+            rows = self._db.list_memory_topic_items(limit=240)
+        except Exception as exc:
+            self._logger.debug("Failed to load memory topic item context: %s", exc)
+            return {"canonical_topics": [], "aspect_topics": []}
+
+        ranked: List[Tuple[float, Dict[str, Any]]] = []
+        query_key = self._generate_topic_name_key(query_text)
+        for row in rows:
+            topic_name = self._normalize_topic_name(row.get("topic_name") or "")
+            topic_key = self._generate_topic_name_key(topic_name) if topic_name else ""
+            if not topic_name or not topic_key:
+                continue
+            score = self._topic_name_best_pair_similarity(
+                query_terms,
+                [topic_name],
+            )
+            if query_key and topic_key and topic_key in query_key:
+                score = max(score, 0.9)
+            if score < 0.5:
+                continue
+            ranked.append((score, row))
+
+        result: Dict[str, List[str]] = {
+            "canonical_topics": [],
+            "aspect_topics": [],
+        }
+        limits = {
+            "canonical": max(1, int(canonical_limit or 12)),
+            "aspect": max(1, int(aspect_limit or 12)),
+        }
+        for _score, row in sorted(
+            ranked,
+            key=lambda item: (
+                item[0],
+                str(item[1].get("last_seen_at") or ""),
+                int(item[1].get("fact_occurrence_count") or 0)
+                + int(item[1].get("episode_occurrence_count") or 0),
+            ),
+            reverse=True,
+        ):
+            kind = str(row.get("topic_kind") or "").strip().lower()
+            result_key = f"{kind}_topics"
+            topic_name = self._normalize_topic_name(row.get("topic_name") or "")
+            if (
+                kind not in limits
+                or not topic_name
+                or topic_name in result[result_key]
+                or len(result[result_key]) >= limits[kind]
+            ):
+                continue
+            result[result_key].append(topic_name)
+        return result
+
+    @staticmethod
+    def _format_memory_topic_items_for_prompt(
+        topic_items: Dict[str, List[str]],
+        *,
+        max_chars: int = 1200,
+    ) -> str:
+        payload = {
+            "canonical_topics": list(topic_items.get("canonical_topics") or []),
+            "aspect_topics": list(topic_items.get("aspect_topics") or []),
+        }
+        while payload["canonical_topics"] or payload["aspect_topics"]:
+            text = json.dumps(payload, ensure_ascii=False, indent=2)
+            if len(text) <= max_chars:
+                return text
+            if len(payload["aspect_topics"]) >= len(payload["canonical_topics"]):
+                payload["aspect_topics"].pop()
+            else:
+                payload["canonical_topics"].pop()
         return "[]"
 
     def _normalize_episode_canonical_topics(
@@ -2197,6 +2354,7 @@ class MemoryNodeManager:
         entity_info: Optional[Dict[str, int]] = None,
     ) -> Dict[str, Any]:
         fact_ids: List[int] = []
+        topic_item_updates: List[Dict[str, Any]] = []
         normalized_entity_info = {
             str(entity_name): int(entity_id)
             for entity_name, entity_id in (entity_info or {}).items()
@@ -2268,8 +2426,16 @@ class MemoryNodeManager:
                 identity_text=identity_text,
             )
             fact_ids.append(fact_id)
+            topic_item_updates.extend(
+                self._build_memory_topic_item_updates(
+                    canonical_topics=[fact_root_topic],
+                    aspect_topics=[fact_aspect_topic],
+                    fact_id=fact_id,
+                )
+            )
         return {
             "fact_ids": fact_ids,
+            "topic_item_updates": topic_item_updates,
         }
 
     # ── Reflection: facts -> evolving states ─────────────────────────────
@@ -2294,7 +2460,7 @@ class MemoryNodeManager:
         reflect_timestamp: Optional[Any] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        """Update topic/entity projections and actionable items from recent facts."""
+        """Update entity-state projections from recent facts."""
         reflect_started_at = time.monotonic()
         limit = max(1, int(limit or self._memory_cfg.get("reflect_limit") or 100))
         if reflect_timestamp is None:
@@ -2303,50 +2469,31 @@ class MemoryNodeManager:
             "limit": limit,
             "reflect_timestamp": reflect_timestamp,
         })
-        # Keep the projection apply atomic. The expensive extraction and
-        # embedding work still happens inside the existing worker, while all
-        # state/actionable writes and processed markers share one commit point.
+        # Keep entity-state projection writes and processed markers atomic.
         with self._db.transaction():
             state_report = self._update_memory_states_using_facts(
                 limit=limit,
                 reference_timestamp=reflect_timestamp,
             )
-            topic_report = state_report["topic_report"]
             entity_report = state_report["entity_report"]
-            actionable_report = topic_report.get("actionable_report") or {}
         report = {
             "status": (
                 "ok"
                 if state_report.get("fact_count", 0)
-                or actionable_report.get("fact_count", 0)
                 else "empty"
             ),
             "states_updated": int(state_report.get("states_updated", 0) or 0),
-            "topic_facts_considered": int(
-                state_report.get("topic_facts_considered", 0) or 0
-            ),
             "entity_facts_considered": int(
                 state_report.get("entity_facts_considered", 0) or 0
             ),
             "evidence_only_facts": int(
                 state_report.get("evidence_only_facts", 0) or 0
             ),
-            "topic_states_updated": int(topic_report.get("updated", 0) or 0),
-            "topic_candidates_unresolved": int(topic_report.get("unresolved", 0) or 0),
             "entity_states_updated": int(entity_report.get("updated", 0) or 0),
-            "actionable_facts_considered": int(
-                actionable_report.get("candidate_fact_count", 0) or 0
-            ),
             "facts_marked_processed_for_memory_state": int(
                 state_report.get("facts_marked_processed", 0) or 0
             ),
-            "facts_marked_processed_for_memory_actionable_item": int(
-                actionable_report.get("facts_marked_processed", 0) or 0
-            ),
-            "actionable_items_updated": int(
-                actionable_report.get("stored_count", 0) or 0
-            ),
-            "actionable_item_ids": actionable_report.get("item_ids") or [],
+            "legacy_actionable_item_flow": "disabled_pending_work_item_redesign",
             "total_elapsed_ms": round(
                 (time.monotonic() - reflect_started_at) * 1000,
                 2,
@@ -2361,36 +2508,22 @@ class MemoryNodeManager:
         limit: int,
         reference_timestamp: Any,
     ) -> Dict[str, Any]:
-        """Update topic and entity state projections from the current facts."""
+        """Update entity-state projections from the current facts only."""
 
         started_at = time.monotonic()
-        if not self._enable_memory_state_update and not self._enable_memory_actionable_item_update:
+        if not self._enable_memory_state_update:
             report = {
                 "enabled": 0,
                 "fact_count": 0,
                 "fact_ids": [],
-                "topic_report": {
-                    "enabled": 0,
-                    "updated": 0,
-                    "unresolved": 0,
-                },
                 "entity_report": {
                     "enabled": 0,
                     "updated": 0,
                 },
-                "topic_facts_considered": 0,
                 "entity_facts_considered": 0,
                 "evidence_only_facts": 0,
                 "states_updated": 0,
                 "facts_marked_processed": 0,
-                "actionable_report": {
-                    "enabled": 0,
-                    "fact_count": 0,
-                    "candidate_fact_count": 0,
-                    "stored_count": 0,
-                    "item_ids": [],
-                    "facts_marked_processed": 0,
-                },
                 "total_elapsed_ms": round(
                     (time.monotonic() - started_at) * 1000,
                     2,
@@ -2398,83 +2531,46 @@ class MemoryNodeManager:
             }
             self._log_info("memory_reflect", "state_update_skipped", report)
             return report
-        processing_target = (
-            "state" if self._enable_memory_state_update else "actionable_item"
-        )
         facts = self._db.get_unprocessed_facts(
-            processing_target=processing_target,
+            processing_target="state",
             limit=limit,
             reference_timestamp=reference_timestamp,
         )
         self._log_reflect_facts_loaded(
-            processing_target,
+            "state",
             facts,
             limit,
             reference_timestamp,
         )
-        topic_facts = [fact for fact in facts if self._fact_can_seed_topic_state(fact)]
         entity_facts = [
             fact for fact in facts
-            if self._enable_memory_state_update
-            and self._fact_can_seed_entity_state(fact)
+            if self._fact_can_seed_entity_state(fact)
         ]
         self._log_info("memory_reflect", "state_fact_candidates", {
-            "topic_fact_count": len(topic_facts),
-            "topic_fact_ids": [
-                fact.get("id") for fact in topic_facts if fact.get("id") is not None
-            ],
             "entity_fact_count": len(entity_facts),
             "entity_fact_ids": [
                 fact.get("id") for fact in entity_facts if fact.get("id") is not None
             ],
         })
 
-        topic_report = self._resolve_and_update_topic_states_from_facts(
-            facts=topic_facts,
-            update_topic_state=self._enable_memory_state_update,
+        entity_report = self._resolve_and_update_entity_scoped_states_from_facts(
+            facts=entity_facts,
         )
-        entity_report = (
-            self._resolve_and_update_entity_scoped_states_from_facts(
-                facts=entity_facts,
-            )
-            if self._enable_memory_state_update
-            else {"enabled": 0, "updated": 0}
+        facts_marked_processed = self._db.mark_facts_processed(
+            processing_target="state",
+            fact_ids=[fact.get("id") for fact in facts],
         )
-        facts_marked_processed = (
-            self._db.mark_facts_processed(
-                processing_target="state",
-                fact_ids=[fact.get("id") for fact in facts],
-            )
-            if self._enable_memory_state_update
-            else 0
-        )
-        actionable_report = topic_report.get("actionable_report") or {}
-        actionable_facts_marked_processed = (
-            self._db.mark_facts_processed(
-                processing_target="actionable_item",
-                fact_ids=[fact.get("id") for fact in facts],
-            )
-            if self._enable_memory_actionable_item_update
-            else 0
-        )
-        actionable_report["facts_marked_processed"] = actionable_facts_marked_processed
-        topic_report["actionable_report"] = actionable_report
         report = {
             "fact_count": len(facts),
             "fact_ids": [fact.get("id") for fact in facts],
-            "topic_report": topic_report,
             "entity_report": entity_report,
-            "topic_facts_considered": len(topic_facts),
             "entity_facts_considered": len(entity_facts),
             "evidence_only_facts": max(0, len(facts) - len(set(
                 int(fact["id"])
-                for fact in [*topic_facts, *entity_facts]
+                for fact in entity_facts
                 if str(fact.get("id") or "").strip().isdigit()
             ))),
-            "states_updated": (
-                int(topic_report.get("updated", 0) or 0)
-                + int(entity_report.get("updated", 0) or 0)
-            ),
+            "states_updated": int(entity_report.get("updated", 0) or 0),
             "facts_marked_processed": facts_marked_processed,
             "total_elapsed_ms": round(
                 (time.monotonic() - started_at) * 1000,
@@ -2507,35 +2603,6 @@ class MemoryNodeManager:
         })
 
     @classmethod
-    def _fact_has_durable_state_signal(cls, fact: Dict[str, Any]) -> bool:
-        """Return whether a fact contains durable state signal, not just an event."""
-        kind = str(fact.get("fact_kind") or "").strip().lower()
-        fact_type = str(fact.get("fact_type") or "").strip().lower()
-        summary = str(fact.get("summary") or "").lower()
-        if kind in {"action", "request", "commitment", "other"} and fact_type != "semantic":
-            return any(
-                marker in summary
-                for marker in (
-                    "长期", "持续", "反复", "一直", "通常", "习惯", "偏好", "喜欢",
-                    "计划", "决定", "策略", "风险", "约束", "长期", "ongoing",
-                    "persistent", "usually", "habit", "prefer", "decided", "strategy",
-                    "risk", "constraint",
-                )
-            )
-        if fact_type == "semantic":
-            return True
-        return kind in {
-            "preference", "decision", "risk", "error", "open_question",
-            "context", "instruction",
-        }
-
-    @classmethod
-    def _fact_can_seed_topic_state(cls, fact: Dict[str, Any]) -> bool:
-        """Topic states require an anchored topic and durable topic signal."""
-        topics = cls._fact_topic_names(fact)
-        return bool(topics) and cls._fact_has_durable_state_signal(fact)
-
-    @classmethod
     def _fact_topic_names(cls, fact: Dict[str, Any]) -> List[str]:
         topics = [
             cls._normalize_topic_name(fact.get("fact_root_topic")),
@@ -2552,469 +2619,6 @@ class MemoryNodeManager:
             and bool(self._entities_for_state_signal(aspect, fact))
             for aspect in state_signals
         )
-
-    def _resolve_and_update_topic_states_from_facts(
-        self,
-        *,
-        facts: List[Dict[str, Any]],
-        update_topic_state: bool = True,
-    ) -> Dict[str, Any]:
-        update_started_at = time.monotonic()
-
-        candidates = self._build_topic_state_candidates_from_facts(facts)
-        updated = 0
-        unresolved = 0
-        actionable_report: Dict[str, Any] = {
-            "enabled": int(self._enable_memory_actionable_item_update),
-            "fact_count": len(facts),
-            "candidate_fact_count": 0,
-            "candidate_fact_ids": [],
-            "actionable_update_count": 0,
-            "stored_count": 0,
-            "item_ids": [],
-            "mapping_count": 0,
-            "facts_marked_processed": 0,
-        }
-        for candidate in candidates:
-            candidate_existing_topic_states = (
-                self._retrieve_existing_topic_states_for_candidate(
-                    candidate=candidate,
-                    limit=16,
-                )
-            )
-            self._log_info(
-                "memory_reflect",
-                "topic_state_candidates_retrieved",
-                {
-                    "candidate_root_topic": candidate.get("topic_name"),
-                    "candidate_aspect_topics": candidate.get("aspect_topics") or [],
-                    "candidate_fact_ids": candidate.get("fact_ids") or [],
-                    "existing_state_ids": [
-                        state.get("id")
-                        for state in candidate_existing_topic_states
-                        if state.get("id") is not None
-                    ],
-                    "existing_state_count": len(candidate_existing_topic_states),
-                },
-            )
-            matched_state, match_info = self._match_topic_state_candidate_to_existing_state(
-                candidate=candidate,
-                existing_topic_states=candidate_existing_topic_states,
-            )
-            grounded, chosen_state, grounding_info = self._ground_topic_state_candidate(
-                candidate=candidate,
-                matched_state=matched_state,
-                match_info=match_info,
-                existing_topic_states=candidate_existing_topic_states,
-            )
-            if chosen_state:
-                candidate["topic_name"] = str(
-                    chosen_state.get("canonical_name")
-                    or candidate.get("topic_name")
-                    or "general"
-                )
-            state_id = (
-                int(chosen_state["id"])
-                if chosen_state and str(chosen_state.get("id") or "").strip().isdigit()
-                else 0
-            )
-            # Resolve and persist the topic state before creating or updating
-            # actionable items, so every relationship uses a real state ID.
-            if grounded and update_topic_state:
-                state_update = self._extract_topic_state_update_with_llm(
-                    candidate=candidate,
-                    existing_state=chosen_state,
-                )
-                if state_update and state_update.get("summary"):
-                    state_update.setdefault("source_type", candidate.get("source_type"))
-                    stored_state_id = self._store_state(state_update)
-                    if stored_state_id:
-                        state_id = int(stored_state_id)
-                        stored_topic_state = self._db.get_memory_state_by_id(state_id)
-                        candidate["topic_name"] = str(
-                            (stored_topic_state or state_update).get("canonical_name")
-                            or candidate.get("topic_name")
-                            or "general"
-                        )
-                        self._log_info(
-                            "memory_reflect",
-                            "topic_state_updated",
-                            self._state_update_log_payload(
-                                state_id=state_id,
-                                state_update=state_update,
-                                candidate=candidate,
-                                existing_state=chosen_state,
-                            ),
-                        )
-                        updated += 1
-
-            candidate_has_action_signals = any(
-                self._action_signals_from_fact(fact)
-                for fact in (candidate.get("facts") or [])
-            )
-            if self._enable_memory_actionable_item_update and candidate_has_action_signals:
-                existing_actionable_items = (
-                    self._retrieve_existing_actionable_items_for_topic_state(
-                        topic_state_id=state_id,
-                        limit=32,
-                    )
-                    if state_id
-                    else []
-                )
-                candidate_actionable_report = self._update_actionable_items_for_topic_candidate(
-                    candidate=candidate,
-                    topic_state_id=state_id,
-                    existing_actionable_items=existing_actionable_items,
-                )
-                actionable_report["candidate_fact_count"] += int(
-                    candidate_actionable_report.get("candidate_fact_count", 0) or 0
-                )
-                actionable_report["candidate_fact_ids"] = list(dict.fromkeys([
-                    *actionable_report["candidate_fact_ids"],
-                    *(candidate_actionable_report.get("candidate_fact_ids") or []),
-                ]))
-                actionable_report["actionable_update_count"] += int(
-                    candidate_actionable_report.get("actionable_update_count", 0) or 0
-                )
-                actionable_report["stored_count"] += int(
-                    candidate_actionable_report.get("stored_count", 0) or 0
-                )
-                actionable_report["item_ids"] = list(dict.fromkeys([
-                    *actionable_report["item_ids"],
-                    *(candidate_actionable_report.get("item_ids") or []),
-                ]))
-                actionable_report["mapping_count"] += int(
-                    candidate_actionable_report.get("mapping_count", 0) or 0
-                )
-            elif self._enable_memory_actionable_item_update:
-                self._log_info(
-                    "memory_reflect",
-                    "actionable_item_candidate_skipped",
-                    {
-                        "reason": "no_action_signal",
-                        "candidate_root_topic": candidate.get("topic_name"),
-                        "candidate_fact_ids": [
-                            fact.get("id")
-                            for fact in (candidate.get("facts") or [])
-                            if fact.get("id") is not None
-                        ],
-                    },
-                )
-
-            if not grounded:
-                unresolved += 1
-                continue
-        report = {
-            "enabled": int(update_topic_state),
-            "candidate_count": len(candidates),
-            "updated": updated,
-            "unresolved": unresolved,
-            "actionable_report": actionable_report,
-        }
-        self._log_info("memory_reflect", "topic_state_update_finish", {
-            **report,
-            "elapsed_ms": round(
-                (time.monotonic() - update_started_at) * 1000,
-                2,
-            ),
-        })
-        return report
-
-    def _retrieve_existing_actionable_items_for_topic_state(
-        self,
-        *,
-        topic_state_id: int,
-        limit: int = 32,
-    ) -> List[Dict[str, Any]]:
-        """Find existing actionable items through the stable mapping table."""
-        return self._db.memory_actionable_items_by_topic_state_id(
-            topic_state_id,
-            limit=limit,
-        )
-
-    def _update_actionable_items_for_topic_candidate(
-        self,
-        *,
-        candidate: Dict[str, Any],
-        topic_state_id: int,
-        existing_actionable_items: List[Dict[str, Any]],
-    ) -> Dict[str, Any]:
-        """Extract actionable items for one topic candidate and persist them."""
-        # Topic state and actionable extraction intentionally share the same
-        # topic candidate facts. The LLM prompt, rather than a second global
-        # fact filter, decides whether any of them form a real action.
-        actionable_facts = list(candidate.get("facts") or [])
-        report: Dict[str, Any] = {
-            "candidate_fact_count": len(actionable_facts),
-            "candidate_fact_ids": [
-                fact.get("id")
-                for fact in actionable_facts
-                if fact.get("id") is not None
-            ],
-            "actionable_update_count": 0,
-            "stored_count": 0,
-            "item_ids": [],
-            "mapping_count": 0,
-        }
-        if not actionable_facts:
-            return report
-        topic_state = (
-            self._db.get_memory_state_by_id(topic_state_id)
-            if topic_state_id
-            else None
-        )
-        self._log_info("memory_reflect", "actionable_item_candidate_start", {
-            "candidate_root_topic": candidate.get("topic_name"),
-            "candidate_fact_ids": report["candidate_fact_ids"],
-            "existing_actionable_item_ids": [
-                item.get("id")
-                for item in existing_actionable_items
-                if item.get("id") is not None
-            ],
-        })
-        actionable_updates = self._extract_actionable_items_with_llm(
-            topic_candidate=candidate,
-            existing_topic_state=topic_state,
-            existing_actionable_items=existing_actionable_items,
-        )
-        report["actionable_update_count"] = len(actionable_updates)
-        topic_names = [
-            candidate.get("topic_name"),
-            *(candidate.get("aspect_topics") or []),
-        ]
-        if topic_state:
-            topic_names.append(topic_state.get("canonical_name"))
-            metadata = topic_state.get("metadata")
-            metadata = metadata if isinstance(metadata, dict) else {}
-            topic_names.extend(metadata.get("aspect_topic_names") or [])
-        topic_actionable_mappings: List[Dict[str, Any]] = []
-        for item in actionable_updates:
-            item["canonical_topics"] = self._normalize_unique_labels([
-                *(item.get("canonical_topics") or []),
-                *topic_names,
-            ], limit=12)
-            item_id = self._store_actionable_item(item)
-            if item_id:
-                report["stored_count"] += 1
-                report["item_ids"].append(item_id)
-                if topic_state_id:
-                    topic_actionable_mappings.append({
-                        "topic_state_id": topic_state_id,
-                        "actionable_item_id": item_id,
-                        "evidence_fact_ids": item.get("evidence_fact_ids") or report["candidate_fact_ids"],
-                    })
-        if topic_actionable_mappings:
-            report["mapping_count"] = self._db.insert_topic_actionable_item_mappings(
-                topic_actionable_mappings
-            )
-        self._log_info("memory_reflect", "actionable_item_candidate_finish", {
-            "candidate_root_topic": candidate.get("topic_name"),
-            **report,
-        })
-        return report
-
-    def _retrieve_existing_topic_states_for_candidate(
-        self,
-        *,
-        candidate: Dict[str, Any],
-        limit: int = 16,
-    ) -> List[Dict[str, Any]]:
-        """Retrieve only existing topic states relevant to one topic candidate."""
-        candidate_limit = max(1, int(limit or 16))
-        states_by_id: Dict[int, Dict[str, Any]] = {}
-
-        def add_states(rows: Sequence[Dict[str, Any]]) -> None:
-            for row in rows or []:
-                if str(row.get("state_type") or "").strip().lower() != "topic":
-                    continue
-                try:
-                    state_id = int(row.get("id"))
-                except (TypeError, ValueError):
-                    continue
-                states_by_id[state_id] = row
-
-        root_topic = self._normalize_topic_name(candidate.get("topic_name"))
-        if root_topic and self._generate_topic_name_key(root_topic) != "general":
-            add_states(
-                self._db.search_memory_states(
-                    terms=self._build_recall_search_terms(
-                        "",
-                        keywords=[root_topic],
-                        entities=[],
-                    ),
-                    state_type="topic",
-                    limit=candidate_limit,
-                )
-            )
-
-        aspect_topics = self._normalize_unique_labels(
-            candidate.get("aspect_topics") or [],
-            limit=16,
-        )
-        if aspect_topics:
-            add_states(
-                self._db.search_memory_states(
-                    terms=self._build_recall_search_terms(
-                        "",
-                        keywords=aspect_topics,
-                        entities=[],
-                    ),
-                    state_type="topic",
-                    limit=candidate_limit,
-                )
-            )
-
-        supplementary_terms = self._normalize_unique_labels(
-            [
-                *(candidate.get("keywords") or []),
-                *(candidate.get("context_entities") or []),
-            ],
-            limit=20,
-        )
-        if supplementary_terms:
-            add_states(
-                self._db.search_memory_states(
-                    terms=self._build_recall_search_terms(
-                        "",
-                        keywords=supplementary_terms,
-                        entities=[],
-                    ),
-                    state_type="topic",
-                    limit=candidate_limit,
-                )
-            )
-
-        # Keep a small recency fallback for underspecified candidates. This is
-        # intentionally candidate-local and is not used as a shared match pool.
-        recent_states = self._db.get_recent_memory_states(
-            state_type="topic",
-            limit=min(8, candidate_limit),
-        )
-        add_states(recent_states)
-        return list(states_by_id.values())
-
-    def _build_topic_state_candidates_from_facts(
-        self,
-        facts: List[Dict[str, Any]],
-    ) -> List[Dict[str, Any]]:
-        by_source_and_root: Dict[Tuple[str, str], Dict[str, Any]] = {}
-        for fact in facts:
-            source_type = str(fact.get("source_type"))
-            root_topic_name = (
-                self._normalize_topic_name(fact.get("fact_root_topic"))
-                or "general"
-            )
-            root_topic_key = self._generate_topic_name_key(root_topic_name)
-            group = by_source_and_root.setdefault(
-                (source_type, root_topic_key),
-                {
-                    "source_type": source_type,
-                    "root_topic_key": root_topic_key,
-                    "root_topic_name": root_topic_name,
-                    "facts": [],
-                },
-            )
-            group["facts"].append(fact)
-
-        candidates: List[Dict[str, Any]] = []
-        for group in by_source_and_root.values():
-            matched_facts = sorted(
-                group["facts"],
-                key=lambda fact: (
-                    str(fact.get("dialogue_time_key") or ""),
-                    int(fact.get("id") or 0),
-                ),
-            )
-            fact_ids = [
-                int(fact["id"])
-                for fact in matched_facts
-                if str(fact.get("id") or "").strip().isdigit()
-            ]
-            if not fact_ids:
-                continue
-            root_topic_name = str(group["root_topic_name"])
-            root_topic_key = str(group["root_topic_key"])
-            aspect_topics = self._normalize_unique_labels([
-                self._normalize_topic_name(fact.get("fact_aspect_topic"))
-                or self._normalize_topic_name(fact.get("fact_root_topic"))
-                or "general"
-                for fact in matched_facts
-            ], limit=16)
-            parent_topics = self._normalize_unique_labels([
-                topic
-                for fact in matched_facts
-                for topic in (
-                    (fact.get("metadata") or {}).get("episode_context_topics") or []
-                )
-            ], limit=12)
-            aspect_topic_keys = {
-                self._generate_topic_name_key(aspect)
-                for aspect in aspect_topics
-            }
-            parent_topics = [
-                topic
-                for topic in parent_topics
-                if self._generate_topic_name_key(topic) != root_topic_key
-                and self._generate_topic_name_key(topic) not in aspect_topic_keys
-            ]
-            context_entities = self._normalize_entity_names([
-                entity
-                for fact in matched_facts
-                for entity in fact.get("entities") or []
-            ], limit=18)
-            keywords = self._generate_topic_candidate_identity_keywords(
-                matched_facts,
-                limit=12,
-            )
-            fact_summaries = [
-                _compact_whitespace(fact.get("summary") or "")
-                for fact in matched_facts
-                if _compact_whitespace(fact.get("summary") or "")
-            ]
-            identity_text = self._generate_topic_candidate_identity_text(
-                canonical_name=root_topic_name,
-                keywords=keywords,
-                fact_summaries=fact_summaries,
-                context_topics=[*parent_topics, *aspect_topics],
-                context_entities=context_entities,
-            )
-            candidates.append({
-                "topic_key": root_topic_key,
-                "topic_name": root_topic_name,
-                "keywords": keywords,
-                "fact_summaries": fact_summaries,
-                "identity_text": identity_text,
-                "aspect_topics": aspect_topics,
-                "parent_topics": parent_topics,
-                "context_entities": context_entities,
-                "facts": matched_facts,
-                "fact_ids": fact_ids,
-                "source_type": group["source_type"],
-                "summary_text": "\n".join(
-                    str(fact.get("summary") or "") for fact in matched_facts
-                )[:2400],
-            })
-        if candidates:
-            self._ensure_embedding_client()
-            if self._embedding_client is not None:
-                identity_embeddings = self._embedding_client.embed_batch(
-                    [str(candidate.get("identity_text") or "") for candidate in candidates]
-                )
-                name_embeddings = self._embedding_client.embed_batch(
-                    [str(candidate.get("topic_name") or "") for candidate in candidates]
-                )
-                for index, candidate in enumerate(candidates):
-                    candidate["candidate_identity_embedding"] = (
-                        identity_embeddings[index]
-                        if index < len(identity_embeddings)
-                        else None
-                    )
-                    candidate["candidate_name_embedding"] = (
-                        name_embeddings[index]
-                        if index < len(name_embeddings)
-                        else None
-                    )
-        return candidates
 
     @staticmethod
     def _generate_topic_name_key(value: Any) -> str:
@@ -3042,196 +2646,6 @@ class MemoryNodeManager:
             if len(labels) >= limit:
                 break
         return labels
-
-    def _generate_topic_candidate_identity_keywords(
-        self,
-        facts: Sequence[Dict[str, Any]],
-        *,
-        limit: int = 12,
-    ) -> List[str]:
-        values: List[str] = []
-        for fact in facts:
-            raw_keywords = fact.get("keywords") or []
-            if isinstance(raw_keywords, (list, tuple, set)):
-                values.extend(str(value).strip() for value in raw_keywords)
-            else:
-                # Legacy facts stored keywords as one whitespace-joined
-                # string, so their individual keyword boundaries are already
-                # unavailable.
-                values.extend(str(raw_keywords).split())
-        generic = {
-            "用户", "助手", "建议", "认为", "表示", "接受", "拒绝", "尝试",
-            "方案", "问题", "工作", "时间", "方法", "讨论", "不现实",
-            "user", "assistant", "suggestion", "plan", "issue", "work",
-            "time", "method", "discussion",
-        }
-        out: List[str] = []
-        seen: set[str] = set()
-        for value in values:
-            clean = self._normalize_topic_name(value) or _compact_whitespace(value)
-            if not clean:
-                continue
-            if clean in generic:
-                continue
-            key = self._generate_topic_name_key(clean)
-            if key in seen:
-                continue
-            seen.add(key)
-            out.append(clean)
-            if len(out) >= limit:
-                break
-        return out
-
-    def _generate_topic_candidate_identity_text(
-        self,
-        *,
-        canonical_name: Any,
-        keywords: Sequence[Any],
-        fact_summaries: Optional[Sequence[Any]] = None,
-        context_topics: Optional[Sequence[Any]] = None,
-        context_entities: Optional[Sequence[Any]] = None,
-    ) -> str:
-        canonical = self._normalize_topic_name(canonical_name) or _compact_whitespace(canonical_name)
-        keyword_values = self._normalize_unique_labels(keywords, limit=12)
-        raw_summaries = [fact_summaries] if isinstance(fact_summaries, str) else fact_summaries or []
-        summary_values = self._normalize_unique_labels(raw_summaries, limit=5)
-        summary_values = [value[:320] for value in summary_values]
-        context_topic_values = self._normalize_unique_labels(context_topics or [], limit=8)
-        context_entity_values = self._normalize_entity_names(
-            list(context_entities or []),
-            limit=12,
-        )
-        return "\n".join([
-            f"root_topic: {canonical}",
-            f"context_topics: {', '.join(context_topic_values)}",
-            f"context_entities: {', '.join(context_entity_values)}",
-            f"keywords: {', '.join(keyword_values)}",
-            f"fact_summaries: {' | '.join(summary_values)}",
-        ])
-
-    def _match_topic_state_candidate_to_existing_state(
-        self,
-        *,
-        candidate: Dict[str, Any],
-        existing_topic_states: List[Dict[str, Any]],
-    ) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
-        if not existing_topic_states:
-            return None, {"matched": False, "reason": "no_existing_topic_states"}
-        candidate_root_name = (
-            self._normalize_topic_name(candidate.get("topic_name"))
-            or _compact_whitespace(candidate.get("topic_key") or "")
-            or "general"
-        )
-        candidate_root_key = self._generate_topic_name_key(
-            candidate.get("topic_key") or candidate_root_name
-        )
-        candidate_aspect_topics = self._normalize_unique_labels(
-            candidate.get("aspect_topics") or [],
-            limit=16,
-        )
-        candidate_aspect_keys = {
-            self._generate_topic_name_key(topic)
-            for topic in candidate_aspect_topics
-            if self._generate_topic_name_key(topic)
-        }
-        best_state: Optional[Dict[str, Any]] = None
-        best_info: Dict[str, Any] = {"score": 0.0}
-        candidate_identity_embedding = candidate.get("candidate_identity_embedding")
-        candidate_name_embedding = candidate.get("candidate_name_embedding")
-        for state in existing_topic_states:
-            state_metadata = state.get("metadata") if isinstance(state.get("metadata"), dict) else {}
-            state_aspect_topics = self._normalize_unique_labels([
-                *(state_metadata.get("aspect_topic_names") or []),
-            ], limit=16)
-            state_aspect_keys = {
-                self._generate_topic_name_key(topic)
-                for topic in state_aspect_topics
-                if self._generate_topic_name_key(topic)
-            }
-            state_root_name = (
-                self._normalize_topic_name(state.get("canonical_name"))
-                or "general"
-            )
-            state_root_key = self._generate_topic_name_key(state_root_name)
-            exact_root_match = candidate_root_key == state_root_key
-            matched_aspect_keys = candidate_aspect_keys & state_aspect_keys
-            exact_aspect_match = bool(matched_aspect_keys)
-            aspect_to_root_match = state_root_key in candidate_aspect_keys
-            root_name_overlap = self._topic_name_best_pair_similarity(
-                [candidate_root_name],
-                [state_root_name],
-                allow_substring=False,
-            )
-            identity_embedding_similarity = _cal_embedding_cosine_similarity(
-                candidate_identity_embedding,
-                state.get("identity_text_embedding"),
-            )
-            canonical_name_embedding_similarity = _cal_embedding_cosine_similarity(
-                candidate_name_embedding,
-                state.get("canonical_name_embedding"),
-            )
-            embedding_similarity = max(
-                identity_embedding_similarity,
-                canonical_name_embedding_similarity,
-            )
-            strong_name_match = root_name_overlap >= self._topic_state_resolution_similarity_threshold
-            strong_embedding_match = (
-                embedding_similarity >= self._topic_identity_embedding_similarity_threshold
-                and root_name_overlap >= 0.5
-            )
-            aspect_supported_name_threshold = max(
-                0.4,
-                self._topic_state_resolution_similarity_threshold - 0.15,
-            )
-            aspect_supported_match = exact_aspect_match and (
-                root_name_overlap >= aspect_supported_name_threshold
-                or embedding_similarity >= self._topic_identity_embedding_similarity_threshold
-            )
-            matched = (
-                exact_root_match
-                or strong_name_match
-                or strong_embedding_match
-                or aspect_supported_match
-            )
-            aspect_match_bonus = 0.16 if exact_aspect_match else 0.0
-            score = max(
-                1.0 if exact_root_match else 0.0,
-                min(1.0, max(root_name_overlap, embedding_similarity) + aspect_match_bonus),
-            )
-            if score > float(best_info.get("score", 0.0)):
-                best_state = state
-                best_info = {
-                    "matched": matched,
-                    "reason": "matched_existing_topic_state" if matched else "best_match_below_threshold",
-                    "score": round(score, 4),
-                    "exact_aspect_match": exact_aspect_match,
-                    "aspect_to_root_match": aspect_to_root_match,
-                    "exact_root_match": exact_root_match,
-                    "candidate_root_topic": candidate_root_name,
-                    "candidate_aspect_topics": candidate_aspect_topics,
-                    "existing_aspect_topics": state_aspect_topics,
-                    "matched_aspect_keys": sorted(matched_aspect_keys),
-                    "existing_root_topic": state_root_name,
-                    "root_name_overlap": round(root_name_overlap, 4),
-                    "embedding_similarity": round(embedding_similarity, 4),
-                    "identity_embedding_similarity": round(identity_embedding_similarity, 4),
-                    "canonical_name_embedding_similarity": round(
-                        canonical_name_embedding_similarity,
-                        4,
-                    ),
-                    "strong_name_match": strong_name_match,
-                    "strong_embedding_match": strong_embedding_match,
-                    "aspect_supported_match": aspect_supported_match,
-                    "aspect_supported_name_threshold": round(
-                        aspect_supported_name_threshold,
-                        4,
-                    ),
-                    "existing_state_id": state.get("id"),
-                    "existing_canonical_name": state.get("canonical_name"),
-                }
-        if best_state and best_info.get("matched"):
-            return best_state, best_info
-        return None, best_info
 
     def _topic_name_best_pair_similarity(
         self,
@@ -3398,15 +2812,9 @@ class MemoryNodeManager:
             extend_values(raw.get("fact_root_topic"))
             extend_values(raw.get("fact_aspect_topic"))
         elif index_level == "state":
-            state_scope = str(raw.get("state_scope") or "").strip().lower()
             extend_values(raw.get("canonical_name"))
-            if state_scope == "topic_state":
-                extend_values(metadata.get("canonical_topics"))
-                extend_values(metadata.get("parent_topics"))
-                extend_values(metadata.get("aspect_topic_names"))
-            else:
-                extend_values(metadata.get("attribute_name_aliases"))
-                extend_values(metadata.get("canonical_topics"))
+            extend_values(metadata.get("attribute_name_aliases"))
+            extend_values(metadata.get("canonical_topics"))
         else:
             extend_values(raw.get("canonical_name"))
             extend_values(metadata.get("canonical_topics"))
@@ -3501,173 +2909,6 @@ class MemoryNodeManager:
                 overlap.get("matched_topic_values") or []
             ),
             "keyword_values": keyword_values,
-        }
-
-    @classmethod
-    def _topic_anchor_remainder(cls, text: str) -> str:
-        clean = re.sub(r"speaker[_-]?\d+", "", str(text or "").lower())
-        generic_terms = [
-            "产品", "方案", "策略", "讨论", "活动", "项目", "计划", "协作",
-            "落实", "筹备", "管理", "设计", "推广", "促销", "目标", "用户",
-            "定位", "成本", "质量", "部门", "会议", "总结", "后续", "安排",
-            "执行", "上线", "选择", "方式", "内容", "问题", "建议", "相关",
-            "事项", "工作", "阶段", "品牌", "赠品", "供应商", "价格", "折扣",
-            "定价", "合作", "沟通", "配合", "跟进", "确认", "时间", "排期",
-            "颜色", "外观", "风格", "提议", "参考", "偏好", "使用", "要求",
-            "会后", "各", "与", "和", "及", "的", "了",
-            "product", "products", "plan", "plans", "strategy", "strategies",
-            "discussion", "coordination", "implementation", "execution", "design",
-            "activity", "preparation", "management", "topic", "topics", "followup",
-            "follow-up", "meeting", "department", "departments", "scheme",
-            "solution", "solutions", "project", "projects", "promotion", "pricing",
-            "discount", "quality", "cost", "vendor", "vendors", "supplier",
-            "suppliers", "launch", "schedule", "scheduling", "and", "or", "the",
-            "a", "an", "to", "of", "for", "with",
-        ]
-        for term in sorted(generic_terms, key=len, reverse=True):
-            clean = clean.replace(term, "")
-        clean = re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff]+", "", clean)
-        return clean.strip()
-
-    def _topic_candidate_has_anchor(self, candidate: Dict[str, Any]) -> bool:
-        return len(
-            self._topic_anchor_remainder(str(candidate.get("topic_name") or ""))
-        ) >= 2
-
-    def _ground_topic_state_candidate(
-        self,
-        *,
-        candidate: Dict[str, Any],
-        matched_state: Optional[Dict[str, Any]],
-        match_info: Dict[str, Any],
-        existing_topic_states: List[Dict[str, Any]],
-    ) -> Tuple[bool, Optional[Dict[str, Any]], Dict[str, Any]]:
-        if matched_state:
-            return True, matched_state, {
-                "grounded": True,
-                "reason": "matched_existing_topic_state",
-                "candidate_has_anchor": self._topic_candidate_has_anchor(candidate),
-                "match": match_info,
-            }
-        candidate_has_anchor = self._topic_candidate_has_anchor(candidate)
-        if candidate_has_anchor:
-            return True, None, {
-                "grounded": True,
-                "reason": "candidate_has_concrete_anchor",
-                "candidate_has_anchor": True,
-                "match": match_info,
-            }
-        best_state = None
-        if (
-            existing_topic_states
-            and float(match_info.get("embedding_similarity", 0.0) or 0.0) >= self._topic_identity_grounding_similarity_threshold
-            and float(match_info.get("root_name_overlap", 0.0) or 0.0) >= 0.2
-        ):
-            best_id = match_info.get("existing_state_id")
-            for state in existing_topic_states:
-                if best_id is not None and int(state.get("id") or -1) == int(best_id):
-                    best_state = state
-                    break
-        if best_state:
-            return True, best_state, {
-                "grounded": True,
-                "reason": "inherited_existing_topic_for_unanchored_candidate",
-                "candidate_has_anchor": False,
-                "match": match_info,
-            }
-        return False, None, {
-            "grounded": False,
-            "reason": "missing_concrete_topic_anchor",
-            "candidate_has_anchor": False,
-            "match": match_info,
-        }
-
-    def _extract_topic_state_update_with_llm(
-        self,
-        *,
-        candidate: Dict[str, Any],
-        existing_state: Optional[Dict[str, Any]],
-    ) -> Optional[Dict[str, Any]]:
-        facts = list(candidate.get("facts") or [])
-        prompt_language = self._resolve_prompt_language_from_text(
-            "\n".join(str(item.get("summary") or "") for item in facts[:12])
-        )
-        prompt_template = (
-            UNIFIED_TOPIC_STATE_UPDATE_PROMPT_EN
-            if prompt_language == "en"
-            else UNIFIED_TOPIC_STATE_UPDATE_PROMPT_ZH
-        )
-        prompt = (
-            prompt_template
-            .replace("{candidate_topic_state}", json.dumps(
-                self._format_topic_state_candidate_for_prompt(candidate),
-                ensure_ascii=False,
-                indent=2,
-            ))
-            .replace("{existing_topic_state}", json.dumps(
-                self._format_existing_topic_state_for_prompt(existing_state),
-                ensure_ascii=False,
-                indent=2,
-            ))
-        )
-        result = self._call_llm(prompt)
-        parsed = self._parse_json_object_from_llm_text(result or "")
-        if parsed:
-            if not self._config_bool(parsed.get("update_needed", True), True):
-                self._logger.debug(
-                    "LLM declined topic-state update for topic=%s",
-                    candidate.get("topic_name"),
-                )
-                return None
-            normalized = self._normalize_topic_state_update_payload(
-                parsed,
-                candidate=candidate,
-                existing_state=existing_state,
-            )
-            if normalized:
-                return normalized
-        return self._fallback_topic_state_update(candidate, existing_state)
-
-    @staticmethod
-    def _format_topic_state_candidate_for_prompt(
-        candidate: Optional[Dict[str, Any]],
-    ) -> Dict[str, Any]:
-        """Format the resolved topic candidate without duplicating raw facts."""
-        candidate = candidate or {}
-        return {
-            "root_topic_name": candidate.get("topic_name") or "",
-            "topic_key": candidate.get("topic_key") or "",
-            "identity_text": candidate.get("identity_text") or "",
-            "aspect_topics": list(candidate.get("aspect_topics") or []),
-            "parent_topics": list(candidate.get("parent_topics") or []),
-            "keywords": list(candidate.get("keywords") or []),
-            "context_entities": list(candidate.get("context_entities") or []),
-            "fact_summaries": list(candidate.get("fact_summaries") or []),
-            "fact_ids": [
-                int(fact_id)
-                for fact_id in candidate.get("fact_ids") or []
-                if str(fact_id).strip().isdigit()
-            ],
-            "source_type": candidate.get("source_type") or "",
-        }
-
-    @staticmethod
-    def _format_existing_topic_state_for_prompt(state: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-        if not state:
-            return {}
-        metadata = state.get("metadata") or {}
-        return {
-            "state_scope": state.get("state_scope") or "topic_state",
-            "source_type": state.get("source_type"),
-            "canonical_name": state.get("canonical_name"),
-            "summary": state.get("summary"),
-            "time_line": MemoryNodeManager._normalize_time_line(
-                state.get("time_line"),
-                limit=8,
-                max_chars=1000,
-            ),
-            "confidence": state.get("confidence"),
-            "aspect_topic_names": metadata.get("aspect_topic_names") or [],
         }
 
     @staticmethod
@@ -3863,216 +3104,6 @@ class MemoryNodeManager:
             max_chars=2400,
         )
 
-    def _normalize_topic_state_update_payload(
-        self,
-        raw: Dict[str, Any],
-        *,
-        candidate: Dict[str, Any],
-        existing_state: Optional[Dict[str, Any]],
-    ) -> Optional[Dict[str, Any]]:
-        if not self._config_bool(raw.get("update_needed", True), True):
-            return None
-        summary = self._normalize_state_summary(raw.get("summary") or "", max_chars=120)
-        if not summary:
-            return None
-        valid_fact_ids = {
-            int(fact["id"])
-            for fact in candidate.get("facts", [])
-            if str(fact.get("id") or "").strip().isdigit()
-        }
-        evidence_ids = [
-            int(value)
-            for value in (raw.get("evidence_fact_ids") or [])
-            if str(value).strip().isdigit() and int(value) in valid_fact_ids
-        ]
-        if not evidence_ids:
-            evidence_ids = list(candidate.get("fact_ids") or [])[:24]
-        existing_ids = [
-            int(value)
-            for value in ((existing_state or {}).get("evidence_fact_ids") or [])
-            if str(value).strip().isdigit()
-        ]
-        evidence_ids = list(dict.fromkeys([*existing_ids, *evidence_ids]))[:80]
-        canonical_name = (
-            _compact_whitespace((existing_state or {}).get("canonical_name") or "")
-            or _compact_whitespace(candidate.get("topic_name") or "")
-            or self._normalize_topic_name(raw.get("canonical_name"))
-            or "general"
-        )
-        existing_metadata = dict((existing_state or {}).get("metadata") or {})
-        parent_topics = self._normalize_unique_labels([
-            *(existing_metadata.get("parent_topics") or []),
-            *(candidate.get("parent_topics") or []),
-        ], limit=12)
-        context_entities = self._normalize_entity_names([
-            *(existing_metadata.get("context_entities") or []),
-            *(candidate.get("context_entities") or []),
-            *(raw.get("entities") or []),
-        ], limit=18)
-        aspect_topic_names = self._normalize_unique_labels([
-            *(existing_metadata.get("aspect_topic_names") or []),
-            *(candidate.get("aspect_topics") or []),
-        ], limit=16)
-        aspect_fact_ids: Dict[str, List[int]] = {
-            str(key): [
-                int(value)
-                for value in values
-                if str(value).strip().isdigit()
-            ][:80]
-            for key, values in (existing_metadata.get("aspect_fact_ids") or {}).items()
-            if isinstance(values, list)
-        }
-        for fact in candidate.get("facts") or []:
-            fact_id = fact.get("id")
-            if not str(fact_id or "").strip().isdigit():
-                continue
-            aspect = self._normalize_topic_name(fact.get("fact_aspect_topic")) or canonical_name
-            current_ids = aspect_fact_ids.setdefault(str(aspect), [])
-            current_ids.append(int(fact_id))
-            aspect_fact_ids[str(aspect)] = list(dict.fromkeys(current_ids))[-80:]
-        canonical_topics = self._normalize_unique_labels([
-            canonical_name,
-            *(raw.get("canonical_topics") or []),
-            *parent_topics,
-            *aspect_topic_names,
-        ], limit=8)
-        keywords = self._normalize_unique_labels([
-            *self._normalize_string_list(raw.get("keywords"), limit=18),
-            *(candidate.get("keywords") or []),
-            *parent_topics,
-            *aspect_topic_names,
-            *context_entities,
-        ], limit=24)
-        time_line = self._build_state_time_line(
-            raw_updates=raw.get("time_line"),
-            candidate=candidate,
-            existing_state=existing_state,
-        )
-        return {
-            "state_scope": "topic_state",
-            "state_type": "topic",
-            "source_type": candidate.get("source_type") or (existing_state or {}).get("source_type"),
-            "canonical_name": canonical_name,
-            "summary": summary,
-            "time_line": time_line,
-            "evidence_fact_ids": evidence_ids,
-            "keywords": keywords,
-            "entities": context_entities,
-            "canonical_topics": canonical_topics or [canonical_name],
-            "importance": self._clamp_float(raw.get("importance"), 0.0, 1.0, 0.7),
-            "confidence": self._clamp_float(raw.get("confidence"), 0.0, 1.0, 0.75),
-            "status": _compact_whitespace(raw.get("status") or "active") or "active",
-            "metadata": {
-                "parent_topics": parent_topics,
-                "aspect_topic_names": aspect_topic_names,
-                "aspect_fact_ids": aspect_fact_ids,
-                "context_entities": context_entities,
-            },
-        }
-
-    def _fallback_topic_state_update(
-        self,
-        candidate: Dict[str, Any],
-        existing_state: Optional[Dict[str, Any]],
-    ) -> Dict[str, Any]:
-        fact_summaries = [
-            _compact_whitespace(fact.get("summary") or "")
-            for fact in candidate.get("facts", [])
-            if _compact_whitespace(fact.get("summary") or "")
-        ][:5]
-        base = _compact_whitespace((existing_state or {}).get("summary") or "")
-        update_text = "；".join(fact_summaries)
-        summary_source = (
-            f"{base}；最新变化：{update_text}"
-            if base and update_text
-            else update_text or base or _compact_whitespace(candidate.get("summary_text") or "")
-        )
-        summary = self._normalize_state_summary(summary_source, max_chars=120)
-        existing_ids = [
-            int(value)
-            for value in ((existing_state or {}).get("evidence_fact_ids") or [])
-            if str(value).strip().isdigit()
-        ]
-        evidence_ids = list(dict.fromkeys([*existing_ids, *(candidate.get("fact_ids") or [])]))[:80]
-        canonical_name = (
-            _compact_whitespace((existing_state or {}).get("canonical_name") or "")
-            or _compact_whitespace(candidate.get("topic_name") or "")
-            or "general"
-        )
-        existing_metadata = dict((existing_state or {}).get("metadata") or {})
-        for key in (
-            "topic_key",
-            "identity_text",
-            "keywords",
-            "episode_id",
-        ):
-            existing_metadata.pop(key, None)
-        parent_topics = self._normalize_unique_labels([
-            *(existing_metadata.get("parent_topics") or []),
-            *(candidate.get("parent_topics") or []),
-        ], limit=12)
-        context_entities = self._normalize_entity_names([
-            *(existing_metadata.get("context_entities") or []),
-            *(candidate.get("context_entities") or []),
-        ], limit=18)
-        aspect_topic_names = self._normalize_unique_labels([
-            *(existing_metadata.get("aspect_topic_names") or []),
-            *(candidate.get("aspect_topics") or []),
-        ], limit=16)
-        aspect_fact_ids: Dict[str, List[int]] = {
-            str(key): [
-                int(value)
-                for value in values
-                if str(value).strip().isdigit()
-            ][:80]
-            for key, values in (existing_metadata.get("aspect_fact_ids") or {}).items()
-            if isinstance(values, list)
-        }
-        for fact in candidate.get("facts") or []:
-            fact_id = fact.get("id")
-            if not str(fact_id or "").strip().isdigit():
-                continue
-            aspect = self._normalize_topic_name(fact.get("fact_aspect_topic")) or canonical_name
-            current_ids = aspect_fact_ids.setdefault(str(aspect), [])
-            current_ids.append(int(fact_id))
-            aspect_fact_ids[str(aspect)] = list(dict.fromkeys(current_ids))[-80:]
-        return {
-            "state_scope": "topic_state",
-            "state_type": "topic",
-            "source_type": candidate.get("source_type") or (existing_state or {}).get("source_type"),
-            "canonical_name": canonical_name,
-            "summary": summary,
-            "time_line": self._build_state_time_line(
-                raw_updates=None,
-                candidate=candidate,
-                existing_state=existing_state,
-            ),
-            "evidence_fact_ids": evidence_ids,
-            "keywords": self._normalize_unique_labels([
-                *self._keywords(summary, limit=18),
-                *(candidate.get("keywords") or []),
-                *parent_topics,
-                *aspect_topic_names,
-                *context_entities,
-            ], limit=24),
-            "entities": context_entities or self._entities(summary),
-            "canonical_topics": self._normalize_unique_labels([
-                canonical_name,
-                *parent_topics,
-                *aspect_topic_names,
-            ], limit=8),
-            "importance": 0.7,
-            "confidence": 0.58,
-            "status": "active",
-            "metadata": {
-                "extractor": "fallback_topic_state_update",
-                "parent_topics": parent_topics,
-                "aspect_topic_names": aspect_topic_names,
-                "aspect_fact_ids": aspect_fact_ids,
-                "context_entities": context_entities,
-            },
-        }
-
     def _resolve_and_update_entity_scoped_states_from_facts(
         self,
         *,
@@ -4081,6 +3112,7 @@ class MemoryNodeManager:
         update_started_at = time.monotonic()
         existing_entity_states = self._db.get_recent_memory_states(
             state_type=sorted(self._entity_scoped_state_types()),
+            state_scope="entity_state",
             limit=80,
         )
         candidates = self._build_entity_state_candidates_from_facts(facts)
@@ -4729,9 +3761,6 @@ class MemoryNodeManager:
         if not state_scope or not state_type:
             self._logger.debug("Skipping state with invalid scope/type: %s", state)
             return 0
-        if state_scope == "topic_state" and state_type != "topic":
-            self._logger.debug("Skipping topic state with non-topic type: %s", state)
-            return 0
         if state_scope == "entity_state" and state_type not in self._entity_scoped_state_types():
             self._logger.debug("Skipping entity state with invalid type: %s", state)
             return 0
@@ -4757,12 +3786,6 @@ class MemoryNodeManager:
             state["summary"],
             f"keywords: {' '.join(keywords)}",
             f"entities: {', '.join(entities)}",
-        ])
-        if state_scope == "topic_state":
-            identity_text = "\n".join([
-                identity_text,
-                f"parent_topics: {', '.join(state_metadata.get('parent_topics') or [])}",
-                f"aspects: {', '.join(state_metadata.get('aspect_topic_names') or [])}",
         ])
         identity_text_embedding = self._generate_embedding_vector(identity_text)
         canonical_name_embedding = self._generate_embedding_vector(state["canonical_name"])
@@ -4791,257 +3814,6 @@ class MemoryNodeManager:
             identity_text=identity_text,
         )
         return state_id
-
-    def _extract_actionable_items_with_llm(
-        self,
-        *,
-        topic_candidate: Dict[str, Any],
-        existing_topic_state: Optional[Dict[str, Any]] = None,
-        existing_actionable_items: Optional[List[Dict[str, Any]]] = None,
-    ) -> List[Dict[str, Any]]:
-        facts = list(topic_candidate.get("facts") or [])
-        if not facts:
-            self._log_info("memory_reflect", "actionable_llm_skipped", {
-                "reason": "no_candidate_facts",
-            })
-            return []
-        prompt_language = self._resolve_prompt_language_from_text(
-            "\n".join(str(item.get("summary") or "") for item in facts[:20])
-        )
-        prompt_template = (
-            UNIFIED_ACTIONABLE_ITEM_EXTRACTION_PROMPT_EN
-            if prompt_language == "en"
-            else UNIFIED_ACTIONABLE_ITEM_EXTRACTION_PROMPT_ZH
-        )
-        prompt = (
-            prompt_template
-            .replace(
-                "{topic_candidate}",
-                json.dumps(
-                    self._format_topic_candidate_for_actionable_prompt(topic_candidate),
-                    ensure_ascii=False,
-                    indent=2,
-                ),
-            )
-            .replace(
-                "{existing_topic_state}",
-                json.dumps(
-                    self._format_existing_topic_state_for_prompt(existing_topic_state),
-                    ensure_ascii=False,
-                    indent=2,
-                ),
-            )
-            .replace(
-                "{existing_actionable_items}",
-                json.dumps(
-                    [
-                        self._format_existing_actionable_item_for_prompt(item)
-                        for item in (existing_actionable_items or [])
-                    ],
-                    ensure_ascii=False,
-                    indent=2,
-                ),
-            )
-        )
-        self._log_info("memory_reflect", "actionable_llm_call_start", {
-            "candidate_fact_count": len(facts),
-            "candidate_fact_ids": [
-                fact.get("id") for fact in facts if fact.get("id") is not None
-            ],
-            "prompt_language": prompt_language,
-            "prompt_chars": len(prompt),
-        })
-        result = self._call_llm(prompt)
-        parsed = self._parse_json_object_from_llm_text(result or "")
-        if not parsed:
-            self._log_info("memory_reflect", "actionable_llm_parse_failed", {
-                "candidate_fact_count": len(facts),
-                "response_chars": len(result or ""),
-                "response_preview": self._format_log_text(result or "", limit=600),
-            })
-            return []
-        raw_items = parsed.get("actionable_items")
-        if not isinstance(raw_items, list):
-            self._log_info("memory_reflect", "actionable_llm_schema_failed", {
-                "candidate_fact_count": len(facts),
-                "parsed_keys": sorted(str(key) for key in parsed.keys()),
-            })
-            return []
-        normalized: List[Dict[str, Any]] = []
-        valid_fact_ids = {int(item["id"]) for item in facts if item.get("id") is not None}
-        facts_by_id = {int(item["id"]): item for item in facts if item.get("id") is not None}
-        existing_items_by_id = {
-            int(item["id"]): item
-            for item in (existing_actionable_items or [])
-            if str(item.get("id") or "").strip().isdigit()
-        }
-        seen_keys: set[str] = set()
-        rejected_counts: Counter[str] = Counter()
-        for raw in raw_items:
-            if not isinstance(raw, dict):
-                rejected_counts["non_object"] += 1
-                continue
-            operation = _compact_whitespace(raw.get("operation") or "create").lower()
-            if operation not in {"create", "update"}:
-                operation = "create"
-            existing_item_id = (
-                int(raw.get("existing_item_id"))
-                if str(raw.get("existing_item_id") or "").strip().isdigit()
-                else 0
-            )
-            existing_item = existing_items_by_id.get(existing_item_id)
-            summary = _compact_whitespace(raw.get("summary") or "")
-            canonical_name = _compact_whitespace(raw.get("canonical_name") or "")
-            if operation == "update" and existing_item:
-                canonical_name = _compact_whitespace(
-                    existing_item.get("canonical_name") or canonical_name
-                )
-                if not summary:
-                    summary = _compact_whitespace(existing_item.get("summary") or "")
-            if not summary or not canonical_name:
-                rejected_counts["missing_summary_or_name"] += 1
-                continue
-            evidence_ids = [
-                int(value)
-                for value in (raw.get("evidence_fact_ids") or [])
-                if str(value).strip().isdigit() and int(value) in valid_fact_ids
-            ]
-            if not evidence_ids:
-                rejected_counts["missing_valid_evidence"] += 1
-                continue
-            source_type = self._state_source_type_for_facts(facts, evidence_ids)
-            item_type = self._normalize_actionable_item_type(raw.get("item_type"))
-            owner = self._normalize_actionable_owner(raw.get("owner"))
-            status = self._normalize_actionable_status(raw.get("status"))
-            due_at = _compact_whitespace(raw.get("due_at") or "")
-            if operation == "update" and existing_item:
-                source_type = str(existing_item.get("source_type") or source_type)
-                item_type = self._normalize_actionable_item_type(
-                    existing_item.get("item_type") or item_type
-                )
-                raw_owner = self._normalize_actionable_owner(raw.get("owner"))
-                existing_owner = self._normalize_actionable_owner(existing_item.get("owner"))
-                owner = raw_owner
-                if owner == "unknown":
-                    owner = (
-                        existing_owner
-                        if existing_owner != "unknown"
-                        else "unknown"
-                    )
-                status = self._normalize_actionable_status(
-                    raw.get("status") or existing_item.get("status")
-                )
-                due_at = _compact_whitespace(
-                    raw.get("due_at") or existing_item.get("due_at") or ""
-                )
-            existing_metadata = (
-                existing_item.get("metadata")
-                if isinstance(existing_item, dict)
-                and isinstance(existing_item.get("metadata"), dict)
-                else {}
-            )
-            canonical_topics = self._normalize_string_list(
-                raw.get("canonical_topics"),
-                limit=8,
-            )
-            if not canonical_topics and existing_item:
-                canonical_topics = self._normalize_string_list(
-                    existing_metadata.get("canonical_topics"),
-                    limit=8,
-                )
-            elif existing_item:
-                canonical_topics = self._normalize_unique_labels([
-                    *self._normalize_string_list(
-                        existing_metadata.get("canonical_topics"),
-                        limit=8,
-                    ),
-                    *canonical_topics,
-                ], limit=8)
-            item = {
-                "operation": operation,
-                "existing_item_id": existing_item_id if existing_item else 0,
-                "item_type": item_type,
-                "source_type": source_type,
-                "canonical_name": canonical_name,
-                "summary": summary,
-                "owner": owner,
-                "status": status,
-                "due_at": due_at,
-                "evidence_fact_ids": evidence_ids[:24],
-                "keywords": self._normalize_string_list(raw.get("keywords"), limit=18),
-                "canonical_topics": canonical_topics,
-                "importance": self._clamp_float(raw.get("importance"), 0.0, 1.0, 0.7),
-                "confidence": self._clamp_float(raw.get("confidence"), 0.0, 1.0, 0.75),
-            }
-            is_supported_existing_update = bool(
-                operation == "update"
-                and existing_item
-                and item["confidence"] >= 0.55
-                and (
-                    item["status"] != existing_item.get("status")
-                    or item["summary"] != existing_item.get("summary")
-                    or item["due_at"] != (existing_item.get("due_at") or "")
-                )
-            )
-            if not is_supported_existing_update and not self._is_high_value_actionable_item(
-                item,
-                facts_by_id=facts_by_id,
-            ):
-                rejected_counts["low_value"] += 1
-                continue
-            dedupe_key = (
-                f"existing:{existing_item_id}"
-                if is_supported_existing_update
-                else self._actionable_dedupe_key(item)
-            )
-            if dedupe_key in seen_keys:
-                rejected_counts["duplicate"] += 1
-                continue
-            seen_keys.add(dedupe_key)
-            normalized.append(item)
-        self._log_info("memory_reflect", "actionable_llm_normalized", {
-            "candidate_fact_count": len(facts),
-            "raw_item_count": len(raw_items),
-            "normalized_item_count": len(normalized),
-            "rejected_counts": dict(rejected_counts),
-        })
-        return normalized
-
-    def _format_topic_candidate_for_actionable_prompt(
-        self,
-        candidate: Dict[str, Any],
-    ) -> Dict[str, Any]:
-        """Format one topic candidate and its supporting facts as one payload."""
-        payload = self._format_topic_state_candidate_for_prompt(candidate)
-        payload.pop("fact_summaries", None)
-        # The candidate identity text already embeds fact summaries. Keep the
-        # structured candidate fields and detailed facts as the single source
-        # of prompt evidence instead of repeating that text.
-        payload.pop("identity_text", None)
-        payload["facts"] = self._format_facts_for_actionable_prompt(
-            list(candidate.get("facts") or [])
-        )
-        return payload
-
-    @staticmethod
-    def _format_existing_actionable_item_for_prompt(
-        item: Dict[str, Any],
-    ) -> Dict[str, Any]:
-        """Keep actionable context compact and exclude embeddings/internal blobs."""
-        metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
-        return {
-            "id": item.get("id"),
-            "item_type": item.get("item_type"),
-            "canonical_name": item.get("canonical_name"),
-            "summary": item.get("summary"),
-            "owner": item.get("owner"),
-            "status": item.get("status"),
-            "due_at": item.get("due_at"),
-            "evidence_fact_ids": item.get("evidence_fact_ids") or [],
-            "canonical_topics": metadata.get("canonical_topics") or [],
-            "importance": item.get("importance"),
-            "confidence": item.get("confidence"),
-        }
 
     def _action_signals_from_fact(self, fact: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Return lightweight action signals for reflection gating."""
@@ -5258,12 +4030,8 @@ class MemoryNodeManager:
     @staticmethod
     def _normalize_state_scope(value: Any, state_type: Any = None) -> str:
         text = str(value or "").strip().lower()
-        if text in {"topic_state", "topic"}:
-            return "topic_state"
         if text in {"entity_state", "entity"}:
             return "entity_state"
-        if str(state_type or "").strip().lower() in {"topic_state", "topic"}:
-            return "topic_state"
         if str(state_type or "").strip().lower() in {
             "preference", "profile", "routine", "relationship", "constraint", "risk",
         }:
@@ -5274,10 +4042,8 @@ class MemoryNodeManager:
     def _normalize_state_type(value: Any) -> str:
         text = str(value or "").strip().lower()
         allowed = {
-            "topic", "preference", "profile", "routine", "relationship", "constraint", "risk",
+            "preference", "profile", "routine", "relationship", "constraint", "risk",
         }
-        if text == "topic_state":
-            return "topic"
         return text if text in allowed else ""
 
     @staticmethod
@@ -6075,18 +4841,15 @@ class MemoryNodeManager:
             entities=[],
         )
         is_contextual_query = self._recall_stage1_is_contextual_query(original_query)
-        is_actionable_query = self._recall_stage1_is_actionable_query(original_query)
 
         candidate_limits = self._recall_stage1_candidate_limits(
             top_k=self._top_k,
-            is_actionable_query=is_actionable_query,
         )
         seed_candidate_limits = candidate_limits["seed_limits"]
         selected_candidate_limits = candidate_limits["selected_limits"]
         association_per_relation_limit = candidate_limits[
             "association_per_relation_limit"
         ]
-        actionable_item_limit = candidate_limits["actionable_item_limit"]
         query_entity_names = self._recall_stage1_resolve_query_entity_names(
             query=original_query,
             database=database,
@@ -6162,19 +4925,11 @@ class MemoryNodeManager:
             candidates=expanded_candidates,
             layer_limits=selected_candidate_limits,
         )
-        selected_actionable_items = self._retrieve_recall_actionable_candidates_for_states(
-            states=selected_candidates,
-            candidate_source_prefix="stage1",
-            limit=actionable_item_limit,
-            temporal_bounds=temporal_bounds,
-            database=database,
-        )
-        selected_candidates.extend(selected_actionable_items)
         self._log_recall_selected_candidates(
             stage_name="stage1",
             selected_candidates=selected_candidates,
             expanded_candidates=expanded_candidates,
-            actionable_candidates=selected_actionable_items,
+            actionable_candidates=[],
         )
 
         evidence_profile = self._recall_stage1_build_evidence_profile(
@@ -6546,17 +5301,14 @@ class MemoryNodeManager:
     def _recall_stage1_candidate_limits(
         *,
         top_k: int,
-        is_actionable_query: Optional[bool] = None,
     ) -> Dict[str, Any]:
         """Build explicit Stage 1 retrieval, expansion, and output budgets.
 
-        ``top_k`` controls the primary fact quota. States are supplementary
-        evidence and actionable items are derived only for actionable queries.
-        A contextual query changes time scoring, not the amount of memory that
-        Stage 1 is allowed to retrieve or return.
+        ``top_k`` controls the primary fact quota. Entity states are
+        supplementary evidence. Contextual wording changes time scoring, not
+        the amount of memory that Stage 1 is allowed to retrieve or return.
         """
         k = max(1, int(top_k or 1))
-        actionable = bool(is_actionable_query)
         seed_per_level_limit = max(8, min(24, k * 2))
         supplementary_limit = max(1, int(math.ceil(k / 2)))
 
@@ -6577,9 +5329,9 @@ class MemoryNodeManager:
                 "fact": k,
                 "state": supplementary_limit,
             },
-            # Actionable items are not direct Stage 1 seeds. They can only be
-            # expanded from selected topic states for an actionable query.
-            "actionable_item_limit": supplementary_limit if actionable else 0,
+            # The legacy state→actionable expansion is disabled until
+            # memory_work_items replaces memory_actionable_items.
+            "actionable_item_limit": 0,
         }
 
     @staticmethod
@@ -7236,12 +5988,7 @@ class MemoryNodeManager:
             add_time(raw.get("updated_at"))
             add_time(candidate.get("time_end"))
             add_time(candidate.get("time_start"))
-            state_scope = str(raw.get("state_scope") or "").strip().lower()
-            half_life_seconds = (
-                self._recall_topic_state_time_score_half_life_seconds
-                if state_scope == "topic_state"
-                else self._recall_persistent_state_time_score_half_life_seconds
-            )
+            half_life_seconds = self._recall_persistent_state_time_score_half_life_seconds
         else:
             add_time(candidate.get("time_end"))
             add_time(candidate.get("time_start"))
@@ -7885,7 +6632,6 @@ class MemoryNodeManager:
         association_per_relation_limit = candidate_limits[
             "association_per_relation_limit"
         ]
-        actionable_item_limit = candidate_limits["actionable_item_limit"]
         self._log_info("memory_recall_stage2", "query_analyzed", {
             "query_analysis_info": query_analysis_info,
             "temporal_resolution": temporal_resolution,
@@ -7964,22 +6710,11 @@ class MemoryNodeManager:
             candidates=expanded_candidates,
             final_candidate_limits=selected_candidate_limits,
         )
-        state_actionable_candidates = self._retrieve_recall_actionable_candidates_for_states(
-            states=ranked_candidates,
-            candidate_source_prefix="stage2",
-            limit=actionable_item_limit,
-            temporal_bounds=temporal_bounds,
-            database=database,
-        )
-        ranked_candidates = [
-            *ranked_candidates,
-            *state_actionable_candidates,
-        ]
         self._log_recall_selected_candidates(
             stage_name="stage2",
             selected_candidates=ranked_candidates,
             expanded_candidates=expanded_candidates,
-            actionable_candidates=state_actionable_candidates,
+            actionable_candidates=[],
         )
         memory_text = self._build_memory_retrieved_format_text(
             entries=ranked_candidates,
@@ -8123,125 +6858,6 @@ class MemoryNodeManager:
             candidate["canonical_topics"] = topics
         return candidate
 
-    def _retrieve_recall_actionable_candidates_for_states(
-        self,
-        *,
-        states: Sequence[Dict[str, Any]],
-        candidate_source_prefix: str,
-        limit: int,
-        temporal_bounds: RecallTimeBounds = None,
-        database: Optional[SessionDB] = None,
-    ) -> List[Dict[str, Any]]:
-        """Load actionable items only through recalled topic-state mappings."""
-        max_items = max(0, int(limit or 0))
-        if max_items <= 0:
-            return []
-        db = database or self._db
-        reference_time = (temporal_bounds or (None, None))[1]
-        candidates: List[Dict[str, Any]] = []
-        seen_item_ids: set[int] = set()
-        for state in states or []:
-            if str(state.get("index_level") or "") != "state":
-                continue
-            raw_state = (
-                state.get("_hydrated")
-                if isinstance(state.get("_hydrated"), dict)
-                else {}
-            )
-            state_scope = str(raw_state.get("state_scope") or "").strip().lower()
-            if state_scope and state_scope != "topic_state":
-                continue
-            try:
-                state_id = int(state.get("target_id"))
-            except (TypeError, ValueError):
-                continue
-            state_score = self._clamp_float(
-                state.get("_recall_score"),
-                0.0,
-                1.0,
-                0.0,
-            )
-            actionable_rows = db.memory_actionable_items_by_topic_state_id(
-                state_id,
-                limit=max_items,
-            )
-            for row in actionable_rows:
-                try:
-                    item_id = int(row.get("id"))
-                except (TypeError, ValueError):
-                    continue
-                if item_id in seen_item_ids:
-                    continue
-                candidate = self._make_recall_memory_candidate(
-                    level="actionable_item",
-                    row=row,
-                    candidate_source=(
-                        f"{str(candidate_source_prefix).strip()}"
-                        "_state_actionable_expansion"
-                    ),
-                    temporal_bounds=None,
-                    temporal_mode="dialogue_time",
-                )
-                if not candidate:
-                    continue
-                seen_item_ids.add(item_id)
-                high_priority = self._recall_stage1_is_high_priority_actionable(
-                    candidate,
-                    reference_time=str(reference_time or ""),
-                )
-                priority_bonus = (
-                    self._clamp_float(
-                        self._memory_cfg.get(
-                            "recall_fast_high_priority_actionable_score",
-                            0.20,
-                        ),
-                        0.0,
-                        1.0,
-                        0.20,
-                    )
-                    if high_priority
-                    else 0.0
-                )
-                candidate_score = min(1.0, state_score + priority_bonus)
-                candidate["_recall_parent_state_id"] = state_id
-                candidate["_recall_parent_state_score"] = round(state_score, 4)
-                candidate["_recall_score"] = round(candidate_score, 4)
-                candidate["evidence"] = [
-                    "state_actionable_expansion",
-                    *(["high_priority_actionable"] if high_priority else []),
-                ]
-                match_details_key = (
-                    "_recall_stage2_match_details"
-                    if str(candidate_source_prefix).strip() == "stage2"
-                    else "_recall_fast_match_details"
-                )
-                candidate["has_strong_anchor"] = False
-                candidate["strong_anchor_reasons"] = []
-                candidate["matched"] = True
-                candidate["candidate_score_threshold"] = 0.0
-                candidate["filter_reason"] = ""
-                candidate[match_details_key] = {
-                    "topic_match_info": {},
-                    "entity_match_info": {},
-                    "time_score_info": {},
-                    "score_components": {},
-                }
-                candidate["_recall_decision"] = {
-                    "accepted": True,
-                    "decision_reason": "attached_to_recalled_topic_state",
-                }
-                candidates.append(candidate)
-
-        candidates.sort(
-            key=lambda item: (
-                float(item.get("_recall_score") or 0.0),
-                str(item.get("time_start") or ""),
-                int(item.get("target_id") or 0),
-            ),
-            reverse=True,
-        )
-        return candidates[:max_items]
-    
     def _retrieve_recall_full_embedding_candidates(
         self,
         *,
@@ -8268,6 +6884,7 @@ class MemoryNodeManager:
             ),
             "state": db.memory_states_with_identity_embeddings(
                 source_types=source_types,
+                state_scope="entity_state",
             ),
         }
         minimum_similarity_by_level = {
@@ -8355,6 +6972,8 @@ class MemoryNodeManager:
             }
             if level == "fact":
                 loader_kwargs["temporal_mode"] = temporal_mode
+            else:
+                loader_kwargs["state_scope"] = "entity_state"
             rows_by_level[level] = loader(**loader_kwargs)
 
         candidates_by_level: Dict[str, List[Dict[str, Any]]] = {
@@ -9532,15 +8151,12 @@ class MemoryNodeManager:
         preferred = set(preferred_layer_preferences or [])
         supplementary_limit = max(1, int(math.ceil(k / 2)))
         reallocation = max(1, int(math.ceil(k / 4)))
-        state_or_actionable_preferred = bool(
-            preferred & {"state", "actionable_item"}
-        )
+        state_preferred = "state" in preferred
         fact_limit = k
         state_limit = supplementary_limit
-        if state_or_actionable_preferred:
-            # A state/actionable request needs more topic-state coverage to
-            # make state→actionable expansion useful. Reallocate fact quota
-            # instead of growing the final context.
+        if state_preferred:
+            # Entity-state queries may trade some fact quota for durable
+            # entity evidence without growing the final context.
             fact_limit = max(1, fact_limit - reallocation)
             state_limit += reallocation
 
@@ -9566,9 +8182,5 @@ class MemoryNodeManager:
                 "fact": fact_limit,
                 "state": state_limit,
             },
-            # Direct actionable retrieval remains disabled; these are derived
-            # only from selected topic states when the LLM plan requests them.
-            "actionable_item_limit": (
-                supplementary_limit if "actionable_item" in preferred else 0
-            ),
+            "actionable_item_limit": 0,
         }
