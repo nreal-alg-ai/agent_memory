@@ -41,6 +41,8 @@ from .prompts_en import (
     ENTITY_CLAIM_RECONCILIATION_PROMPT_EN,
     EXPLICIT_ENTITY_CLAIM_EXTRACTION_PROMPT_EN,
     INDUCTIVE_ENTITY_CLAIM_EXTRACTION_PROMPT_EN,
+    INTENT_EXECUTION_EXTRACTION_PROMPT_EN,
+    INTENT_EXECUTION_RECONCILIATION_PROMPT_EN,
     EPISODE_SUMMARY_PROMPT_EN,
     MEMORY_RETRIEVED_FORMAT_PROMPT_EN,
     MEMORY_RETRIEVED_SECTION_SPECS_EN,
@@ -51,6 +53,8 @@ from .prompts_zh import (
     ENTITY_CLAIM_RECONCILIATION_PROMPT_ZH,
     EXPLICIT_ENTITY_CLAIM_EXTRACTION_PROMPT_ZH,
     INDUCTIVE_ENTITY_CLAIM_EXTRACTION_PROMPT_ZH,
+    INTENT_EXECUTION_EXTRACTION_PROMPT_ZH,
+    INTENT_EXECUTION_RECONCILIATION_PROMPT_ZH,
     EPISODE_SUMMARY_PROMPT_ZH,
     MEMORY_RETRIEVED_FORMAT_PROMPT_ZH,
     MEMORY_RETRIEVED_SECTION_SPECS_ZH,
@@ -130,63 +134,6 @@ _LOW_VALUE_ENTITY_ALIASES = {
         "speaker_1", "speaker_2",
     },
 }
-
-_WEAK_TRY_PATTERNS = (
-    "愿意尝试",
-    "决定尝试",
-    "打算尝试",
-    "尝试使用",
-    "尝试选择",
-    "可以试一试",
-    "试一试",
-    "听起来不错",
-    "听起来可以",
-    "可以考虑",
-    "觉得可以",
-    "might try",
-    "may try",
-    "willing to try",
-    "could try",
-    "sounds good",
-    "sounds okay",
-    "may consider",
-)
-
-_ACTIONABLE_HARD_MARKERS = (
-    "提醒",
-    "跟进",
-    "后续",
-    "确认",
-    "安排",
-    "预约",
-    "截止",
-    "待办",
-    "承诺",
-    "决定",
-    "必须",
-    "需要完成",
-    "明天",
-    "下周",
-    "每天",
-    "每周",
-    "每月",
-    "remind",
-    "follow up",
-    "confirm",
-    "schedule",
-    "appointment",
-    "deadline",
-    "todo",
-    "commit",
-    "decide",
-    "must",
-    "need to complete",
-    "tomorrow",
-    "next week",
-    "daily",
-    "weekly",
-    "monthly",
-)
 
 
 def _now_text() -> str:
@@ -499,14 +446,17 @@ class MemoryNodeManager:
             or "source"
         )
         self._memory_enabled = bool(self._memory_cfg.get("memory_enabled", True))
-        self._enable_memory_actionable_item_update = self._config_bool(
-            self._memory_cfg.get("enable_memory_actionable_item_update", True),
-            True,
-        )
         self._enable_memory_entity_claim_update = self._config_bool(
             self._memory_cfg.get("enable_memory_entity_claim_update", True),
             True,
         )
+        self._enable_memory_intent_execution = self._config_bool(
+            self._memory_cfg.get("enable_memory_intent_execution", True),
+            True,
+        )
+        self._world_owner_entity_name = _compact_whitespace(
+            self._memory_cfg.get("world_owner_entity_name") or "用户"
+        ) or "用户"
         self._entity_claim_explicit_min_confidence = self._clamp_float(
             self._memory_cfg.get("entity_claim_explicit_min_confidence"),
             0.0,
@@ -946,6 +896,8 @@ class MemoryNodeManager:
                         result = self._process_memory_episode_summary_task(**task["payload"])
                     elif task_kind == "memory_reflect":
                         result = self._process_memory_reflect_task(**task["payload"])
+                    elif task_kind == "memory_intent_execution":
+                        result = self._process_memory_intent_execution_task(**task["payload"])
                     else:
                         raise ValueError(f"Unsupported memory async task: {task_kind}")
                 self._operation_reporter.on_task_finished(
@@ -1320,7 +1272,9 @@ class MemoryNodeManager:
                     "fact_root_topic": fact.get("fact_root_topic") or "",
                     "fact_aspect_topic": fact.get("fact_aspect_topic") or "",
                     "entity_claim_signal": fact.get("entity_claim_signal") or [],
-                    "action_signal": fact.get("action_signal") or [],
+                    "intent_execution_route_candidate": (
+                        self._should_route_fact_to_intent_execution(fact)
+                    ),
                     "importance": fact.get("importance"),
                     "confidence": fact.get("confidence"),
                     "time_confidence": metadata.get("time_confidence") or "",
@@ -1430,7 +1384,6 @@ class MemoryNodeManager:
             if prompt_language == "en"
             else UNIFIED_MEMORY_EXTRACTION_PROMPT_ZH
         )
-        memory_state_context = self._collect_memory_state_context(limit=12)
         memory_topic_item_context = (
             self._collect_memory_topic_item_context(segments=segments)
             if prompt_language != "en"
@@ -1438,10 +1391,6 @@ class MemoryNodeManager:
         )
         prompt = (
             prompt_template
-            .replace(
-                "{existing_memory_states}",
-                self._format_memory_states_for_prompt(memory_state_context),
-            )
             .replace(
                 "{existing_memory_topic_items}",
                 self._format_memory_topic_items_for_prompt(memory_topic_item_context),
@@ -1607,9 +1556,6 @@ class MemoryNodeManager:
                 raw_fact.get("entity_claim_signal"),
                 fallback_entity=primary_entity,
             )
-            action_signal = self._normalize_action_signal(
-                raw_fact.get("action_signal"),
-            )
             event_time_key = _compact_whitespace(raw_fact.get("event_time_key") or "")
             facts.append({
                 "summary": text,
@@ -1621,7 +1567,6 @@ class MemoryNodeManager:
                 "entities": entities,
                 "primary_entity": primary_entity,
                 "entity_claim_signal": entity_claim_signal,
-                "action_signal": action_signal,
                 "fact_root_topic": fact_root_topic,
                 "fact_aspect_topic": fact_aspect_topic,
                 "importance": max(0.6, min(1.0, priority / 100.0)),
@@ -1746,73 +1691,6 @@ class MemoryNodeManager:
             if entity_payload:
                 item["entity"] = entity_payload
             normalized.append(item)
-            if len(normalized) >= max_items:
-                break
-        return normalized
-
-    def _normalize_action_signal(
-        self,
-        value: Any,
-        *,
-        limit: Optional[int] = None,
-    ) -> List[Dict[str, Any]]:
-        if not isinstance(value, list):
-            return []
-        max_items = max(
-            0,
-            int(
-                limit
-                if limit is not None
-                else self._memory_cfg.get("action_signal_max_per_fact", 2) or 2
-            ),
-        )
-        if max_items <= 0:
-            return []
-        allowed_types = {
-            "task", "commitment", "decision", "follow_up", "open_question",
-            "risk", "reminder", "recommendation", "constraint",
-        }
-        allowed_strengths = {
-            "assigned", "committed", "pending_decision", "follow_up",
-        }
-        normalized: List[Dict[str, Any]] = []
-        seen: set[Tuple[str, str]] = set()
-        for raw in value:
-            if not isinstance(raw, dict):
-                continue
-            item_type = self._normalize_actionable_item_type(raw.get("item_type"))
-            if item_type not in allowed_types:
-                continue
-            action_strength = _compact_whitespace(
-                raw.get("action_strength") or ""
-            ).lower()
-            if action_strength not in allowed_strengths:
-                continue
-            evidence_basis = _compact_whitespace(
-                raw.get("evidence_basis")
-                or raw.get("evidence")
-                or raw.get("reason")
-                or ""
-            )
-            if not evidence_basis:
-                continue
-            due_at = _compact_whitespace(raw.get("due_at") or "")
-            confidence = self._clamp_float(raw.get("confidence"), 0.0, 1.0, 0.75)
-            if confidence < 0.7:
-                continue
-            if item_type == "decision" and action_strength != "pending_decision":
-                continue
-            key = (item_type, evidence_basis.lower())
-            if key in seen:
-                continue
-            seen.add(key)
-            normalized.append({
-                "item_type": item_type,
-                "action_strength": action_strength,
-                "due_at": due_at,
-                "evidence_basis": evidence_basis,
-                "confidence": confidence,
-            })
             if len(normalized) >= max_items:
                 break
         return normalized
@@ -1970,64 +1848,6 @@ class MemoryNodeManager:
                 ])
             )
         return "\n\n".join(blocks)
-
-    def _collect_memory_state_context(self, *, limit: int = 12) -> List[Dict[str, Any]]:
-        """Collect entity-state references for fact extraction only."""
-        try:
-            states = self._db.get_recent_memory_states(
-                state_scope="entity_state",
-                limit=max(40, int(limit or 12) * 6),
-            )
-        except Exception as exc:
-            self._logger.debug("Failed to load memory state context: %s", exc)
-            return []
-        rows: List[Dict[str, Any]] = []
-        seen: set[Tuple[str, str, str]] = set()
-        type_counts: Counter[Tuple[str, str]] = Counter()
-        max_items = max(1, int(limit or 12))
-        for state in states:
-            scope = _compact_whitespace(state.get("state_scope") or "")
-            state_type = _compact_whitespace(state.get("state_type") or "")
-            canonical_name = _compact_whitespace(state.get("canonical_name") or "")
-            summary = self._normalize_state_summary(
-                state.get("summary") or "",
-                max_chars=120,
-            )
-            if scope != "entity_state" or not state_type or not canonical_name or not summary:
-                continue
-            key = (scope, state_type, canonical_name.lower())
-            if key in seen:
-                continue
-            type_key = (scope, state_type)
-            if type_counts[type_key] >= 2:
-                continue
-            seen.add(key)
-            type_counts[type_key] += 1
-            rows.append({
-                "state_scope": scope,
-                "state_type": state_type,
-                "canonical_name": canonical_name[:60],
-                "summary": summary,
-            })
-            if len(rows) >= max_items:
-                break
-        return rows
-
-    @staticmethod
-    def _format_memory_states_for_prompt(
-        states: List[Dict[str, Any]],
-        *,
-        max_chars: int = 1800,
-    ) -> str:
-        if not states:
-            return "[]"
-        rows = list(states)
-        while rows:
-            text = json.dumps(rows, ensure_ascii=False, indent=2)
-            if len(text) <= max_chars:
-                return text
-            rows.pop()
-        return "[]"
 
     def _is_indexable_memory_topic(self, value: Any) -> bool:
         """Reject fallback labels that must not become reusable topic names."""
@@ -2429,7 +2249,6 @@ class MemoryNodeManager:
                 **metadata,
                 "tags": tags,
                 "entity_claim_signal": fact.get("entity_claim_signal") or [],
-                "action_signal": fact.get("action_signal") or [],
                 "episode_context_topics": list(episode_context_topics or []),
                 "episode_context_entities": list(episode_context_entities or []),
             }
@@ -2481,6 +2300,20 @@ class MemoryNodeManager:
             payload=dict(kwargs),
         )
 
+    def submit_memory_intent_execution_task(self, *_, **kwargs: Any) -> Dict[str, Any]:
+        """Queue Goal/Plan/Work-item extraction after preceding reflection work."""
+        if not self._memory_enabled or not self._enable_memory_intent_execution:
+            task_id = self._operation_reporter.next_task_id("memory_intent_execution")
+            return self._reject_memory_task(
+                task_kind="memory_intent_execution",
+                task_id=task_id,
+                reason=("memory_disabled" if not self._memory_enabled else "intent_execution_disabled"),
+            )
+        return self._submit_memory_task(
+            task_kind="memory_intent_execution",
+            payload=dict(kwargs),
+        )
+
     def _process_memory_reflect_task(
         self,
         limit: Optional[int] = None,
@@ -2501,6 +2334,10 @@ class MemoryNodeManager:
                 limit=limit,
                 reference_timestamp=reflect_timestamp,
             )
+        intent_execution_task = self.submit_memory_intent_execution_task(
+            limit=limit,
+            reference_timestamp=reflect_timestamp,
+        )
         report = {
             "status": (
                 "ok"
@@ -2522,7 +2359,7 @@ class MemoryNodeManager:
             "episodes_marked_processed_for_entity_claim_induction": int(
                 claim_report.get("inductive", {}).get("episodes_marked_processed", 0) or 0
             ),
-            "legacy_actionable_item_flow": "disabled_pending_work_item_redesign",
+            "intent_execution_task": intent_execution_task,
             "total_elapsed_ms": round(
                 (time.monotonic() - reflect_started_at) * 1000,
                 2,
@@ -2530,6 +2367,433 @@ class MemoryNodeManager:
         }
         self._log_info("memory_reflect", "finish", report)
         return report
+
+    def _process_memory_intent_execution_task(
+        self,
+        *,
+        limit: Optional[int] = None,
+        reference_timestamp: Optional[Any] = None,
+        **_kwargs: Any,
+    ) -> Dict[str, Any]:
+        """Project routed facts into audited Goal, Plan, and Work-item objects."""
+        limit = max(1, int(limit or self._memory_cfg.get("reflect_limit") or 100))
+        reference_timestamp = reference_timestamp or _now_text()
+        facts = self._db.get_unprocessed_facts(
+            processing_target="intent_execution",
+            reference_timestamp=reference_timestamp,
+            limit=limit,
+            restrict_to_today=False,
+        )
+        routed_facts = [
+            fact for fact in facts
+            if self._should_route_fact_to_intent_execution(fact)
+        ]
+        report: Dict[str, Any] = {
+            "status": "empty", "fact_count": len(facts),
+            "routed_fact_count": len(routed_facts), "candidate_count": 0,
+            "created": 0, "updated": 0, "facts_marked_processed": 0,
+        }
+        self._log_reflect_facts_loaded(
+            "intent_execution", facts, limit, reference_timestamp,
+        )
+        if not facts:
+            self._log_info("memory_intent_execution", "finish", report)
+            return report
+        if not routed_facts:
+            with self._db.transaction():
+                report["facts_marked_processed"] = self._db.mark_facts_processed(
+                    processing_target="intent_execution",
+                    fact_ids=[fact.get("id") for fact in facts],
+                )
+            self._log_info("memory_intent_execution", "finish", report)
+            return report
+
+        world_owner_id = self._intent_world_owner_entity_id()
+        language = self._resolve_prompt_language_from_text("\n".join(
+            str(fact.get("summary") or "") for fact in routed_facts[:32]
+        ))
+        template = (
+            INTENT_EXECUTION_EXTRACTION_PROMPT_EN
+            if language == "en" else INTENT_EXECUTION_EXTRACTION_PROMPT_ZH
+        )
+        raw = self._call_llm(
+            template.replace("{world_owner_name}", self._world_owner_entity_name)
+            .replace("{reference_timestamp}", str(reference_timestamp))
+            .replace("{facts}", json.dumps(
+                [self._intent_fact_prompt_view(fact) for fact in routed_facts[:48]],
+                ensure_ascii=False, indent=2,
+            ))
+        )
+        parsed = self._parse_json_object_from_llm_text(raw or "")
+        if parsed is None or not isinstance(parsed.get("candidates"), list):
+            report.update(status="error", error="invalid_llm_intent_execution_response")
+            self._log_info("memory_intent_execution", "finish", report)
+            return report
+
+        facts_by_id = {
+            int(fact["id"]): fact for fact in routed_facts
+            if str(fact.get("id") or "").strip().isdigit()
+        }
+        entity_ids = self._intent_entity_name_to_id(routed_facts)
+        entity_ids[self._world_owner_entity_name] = world_owner_id
+        candidates = [
+            candidate for raw_candidate in parsed["candidates"][:24]
+            if (candidate := self._normalize_intent_candidate(
+                raw_candidate, facts_by_id=facts_by_id, entity_ids=entity_ids,
+                world_owner_id=world_owner_id,
+            )) is not None
+        ]
+        report["candidate_count"] = len(candidates)
+        decisions = self._reconcile_intent_candidates(
+            candidates, world_owner_id=world_owner_id, prompt_language=language,
+        )
+        with self._db.transaction():
+            applied = self._apply_intent_candidates(candidates, decisions)
+            report["facts_marked_processed"] = self._db.mark_facts_processed(
+                processing_target="intent_execution",
+                fact_ids=[fact.get("id") for fact in facts],
+            )
+        report.update(
+            status="ok", created=sum(item["created"] for item in applied),
+            updated=sum(not item["created"] for item in applied), applied_count=len(applied),
+        )
+        self._log_info("memory_intent_execution", "finish", report)
+        return report
+
+    def _intent_world_owner_entity_id(self) -> int:
+        mapping = self._db.add_entity_names([self._world_owner_entity_name])
+        return int(mapping[self._world_owner_entity_name])
+
+    def _intent_fact_prompt_view(self, fact: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "id": fact.get("id"), "summary": fact.get("summary") or "",
+            "fact_kind": fact.get("fact_kind") or "",
+            "entities": fact.get("entities") or [],
+            "primary_entity": fact.get("primary_entity") or {},
+            "event_time": fact.get("event_time_key") or "",
+            "dialogue_time": fact.get("dialogue_time_key") or "",
+            "keywords": fact.get("keywords") or [],
+            "topics": [fact.get("fact_root_topic") or "", fact.get("fact_aspect_topic") or ""],
+        }
+
+    def _intent_entity_name_to_id(self, facts: Sequence[Dict[str, Any]]) -> Dict[str, int]:
+        names: List[str] = [self._world_owner_entity_name]
+        for fact in facts:
+            names.extend(self._normalize_entity_names(fact.get("entities")))
+            primary = fact.get("primary_entity")
+            if isinstance(primary, dict):
+                names.append(_compact_whitespace(primary.get("name") or ""))
+        mapping = self._db.add_entity_names([name for name in names if name])
+        return {str(name): int(entity_id) for name, entity_id in mapping.items()}
+
+    def _normalize_intent_candidate(
+        self,
+        raw: Any,
+        *,
+        facts_by_id: Dict[int, Dict[str, Any]],
+        entity_ids: Dict[str, int],
+        world_owner_id: int,
+    ) -> Optional[Dict[str, Any]]:
+        if not isinstance(raw, dict):
+            return None
+        object_type = str(raw.get("object_type") or "").strip().lower()
+        if object_type not in {"goal", "plan", "work_item"}:
+            return None
+        evidence_ids = list(dict.fromkeys(
+            int(value) for value in (raw.get("evidence_fact_ids") or [])
+            if str(value).strip().isdigit() and int(value) in facts_by_id
+        ))[:12]
+        summary = _compact_whitespace(raw.get("summary") or "")[:480]
+        if not summary or not evidence_ids:
+            return None
+        operation = str(raw.get("operation") or "create").strip().lower()
+        if operation not in {"create", "confirm", "update", "complete", "cancel", "reschedule", "block"}:
+            operation = "create"
+        canonical_key = self._generate_topic_name_key(raw.get("canonical_key") or summary)
+        confidence = self._clamp_float(raw.get("confidence"), 0.0, 1.0, 0.7)
+        candidate: Dict[str, Any] = {
+            "object_type": object_type, "operation": operation, "summary": summary,
+            "canonical_key": canonical_key, "confidence": confidence,
+            "evidence_fact_ids": evidence_ids,
+            "world_owner_entity_id": world_owner_id,
+            "related_goal_key": self._generate_topic_name_key(raw.get("related_goal_key") or ""),
+            "related_plan_key": self._generate_topic_name_key(raw.get("related_plan_key") or ""),
+        }
+        def entity_id(value: Any, *, fallback: int = 0) -> int:
+            name = _compact_whitespace(value or "")
+            if name.lower() in {"我", "本人", "用户", "user", "the user"}:
+                return world_owner_id
+            return int(entity_ids.get(name) or fallback)
+        if object_type == "goal":
+            owner_name = _compact_whitespace(raw.get("owner_entity") or self._world_owner_entity_name)
+            if owner_name.lower() in {"我", "本人", "用户", "user", "the user"}:
+                owner_name = self._world_owner_entity_name
+            owner_id = entity_id(owner_name, fallback=world_owner_id)
+            desired_outcome = _compact_whitespace(raw.get("desired_outcome") or summary)[:480]
+            if not owner_id or not desired_outcome:
+                return None
+            candidate.update(owner_entity_id=owner_id, owner_name=owner_name, desired_outcome=desired_outcome,
+                success_criteria=_compact_whitespace(raw.get("success_criteria") or "")[:480],
+                target_at=_compact_whitespace(raw.get("target_at") or "")[:80])
+        elif object_type == "plan":
+            actor_name = _compact_whitespace(raw.get("actor_entity") or self._world_owner_entity_name)
+            if actor_name.lower() in {"我", "本人", "用户", "user", "the user"}:
+                actor_name = self._world_owner_entity_name
+            actor_id = entity_id(actor_name, fallback=world_owner_id)
+            event = _compact_whitespace(raw.get("event_or_activity") or "")[:320]
+            if not actor_id or not event:
+                return None
+            location = _compact_whitespace(raw.get("location") or "")[:160]
+            if location and location not in entity_ids:
+                entity_ids.update(self._db.add_entity_names([location]))
+            candidate.update(actor_entity_id=actor_id, actor_name=actor_name, event_or_activity=event,
+                start_at=_compact_whitespace(raw.get("start_at") or "")[:80],
+                end_at=_compact_whitespace(raw.get("end_at") or "")[:80],
+                time_precision=(
+                    str(raw.get("time_precision") or "unknown").lower()
+                    if str(raw.get("time_precision") or "unknown").lower()
+                    in {"exact", "day", "week", "relative", "unknown"}
+                    else "unknown"
+                ),
+                location_text=location, location_entity_id=int(entity_ids.get(location) or 0),
+                participant_names=self._normalize_string_list(raw.get("participants"), limit=12))
+        else:
+            responsible_name = _compact_whitespace(raw.get("responsible_entity") or "")
+            if responsible_name.lower() in {"我", "本人", "用户", "user", "the user"}:
+                responsible_name = self._world_owner_entity_name
+            responsible_id = entity_id(responsible_name)
+            action_text = _compact_whitespace(raw.get("action_text") or "")[:480]
+            deliverable = _compact_whitespace(raw.get("deliverable") or "")[:320]
+            responsibility_type = str(raw.get("responsibility_type") or "").lower()
+            if not responsible_id or not action_text or responsibility_type not in {
+                "personal_action", "commitment", "assigned", "external_commitment",
+            }:
+                return None
+            candidate.update(responsible_entity_id=responsible_id, responsible_name=responsible_name, action_text=action_text,
+                deliverable=deliverable, responsibility_type=responsibility_type,
+                due_at=_compact_whitespace(raw.get("due_at") or "")[:80],
+                start_at=_compact_whitespace(raw.get("start_at") or "")[:80],
+                priority=_compact_whitespace(raw.get("priority") or "")[:80],
+                beneficiary_names=self._normalize_string_list(raw.get("beneficiary_entities"), limit=8),
+                delegator_names=self._normalize_string_list(raw.get("delegator_entities"), limit=8),
+                collaborator_names=self._normalize_string_list(raw.get("collaborator_entities"), limit=8))
+        return candidate
+
+    def _reconcile_intent_candidates(
+        self,
+        candidates: Sequence[Dict[str, Any]],
+        *,
+        world_owner_id: int,
+        prompt_language: str,
+    ) -> Dict[int, Dict[str, Any]]:
+        existing_by_type = {
+            "goal": self._db.get_intent_objects(
+                object_type="goal", world_owner_entity_id=world_owner_id,
+                statuses=["active"], limit=48,
+            ),
+            "plan": self._db.get_intent_objects(
+                object_type="plan", world_owner_entity_id=world_owner_id,
+                statuses=["planned", "rescheduled"], limit=48,
+            ),
+            "work_item": self._db.get_intent_objects(
+                object_type="work_item", world_owner_entity_id=world_owner_id,
+                statuses=["open", "in_progress", "blocked"], limit=64,
+            ),
+        }
+        decisions: Dict[int, Dict[str, Any]] = {}
+        for index, candidate in enumerate(candidates):
+            direct = next((
+                item for item in existing_by_type[candidate["object_type"]]
+                if str(item.get("canonical_key") or "") == candidate["canonical_key"]
+            ), None)
+            decisions[index] = {
+                "operation": candidate["operation"] if direct else "create",
+                "target_object_type": candidate["object_type"] if direct else "",
+                "target_object_id": int(direct["id"]) if direct else 0,
+                "reason": "deterministic_canonical_key_match" if direct else "no_direct_match",
+            }
+        existing = [
+            self._intent_object_prompt_view(object_type, item)
+            for object_type, items in existing_by_type.items() for item in items
+        ]
+        if not candidates or not existing:
+            return decisions
+        template = (
+            INTENT_EXECUTION_RECONCILIATION_PROMPT_EN
+            if prompt_language == "en" else INTENT_EXECUTION_RECONCILIATION_PROMPT_ZH
+        )
+        raw = self._call_llm(
+            template.replace("{candidates}", json.dumps(candidates, ensure_ascii=False, indent=2))
+            .replace("{existing_objects}", json.dumps(existing, ensure_ascii=False, indent=2))
+        )
+        parsed = self._parse_json_object_from_llm_text(raw or "")
+        if not isinstance(parsed, dict) or not isinstance(parsed.get("decisions"), list):
+            return decisions
+        valid_ids = {
+            (object_type, int(item["id"]))
+            for object_type, items in existing_by_type.items() for item in items
+        }
+        for raw_decision in parsed["decisions"]:
+            if not isinstance(raw_decision, dict):
+                continue
+            index = raw_decision.get("candidate_index")
+            if not isinstance(index, int) or not 0 <= index < len(candidates):
+                continue
+            operation = str(raw_decision.get("operation") or "create").lower()
+            target_type = str(raw_decision.get("target_object_type") or "").lower()
+            try:
+                target_id = int(raw_decision.get("target_object_id") or 0)
+            except (TypeError, ValueError):
+                continue
+            if operation not in {"create", "confirm", "update", "complete", "cancel", "reschedule", "block"}:
+                continue
+            if operation != "create" and (
+                target_type != candidates[index]["object_type"]
+                or (target_type, target_id) not in valid_ids
+            ):
+                continue
+            decisions[index] = {
+                "operation": operation, "target_object_type": target_type,
+                "target_object_id": target_id,
+                "reason": _compact_whitespace(raw_decision.get("reason") or "llm_reconciliation")[:240],
+            }
+        return decisions
+
+    @staticmethod
+    def _intent_object_prompt_view(object_type: str, item: Dict[str, Any]) -> Dict[str, Any]:
+        fields = {
+            "goal": ("summary", "desired_outcome", "status", "target_at", "canonical_key"),
+            "plan": ("summary", "event_or_activity", "status", "start_at", "end_at", "location_text", "canonical_key"),
+            "work_item": ("summary", "action_text", "deliverable", "status", "due_at", "responsibility_type", "canonical_key"),
+        }[object_type]
+        return {"object_type": object_type, "id": item.get("id"), **{
+            field: item.get(field) or "" for field in fields
+        }}
+
+    def _apply_intent_candidates(
+        self,
+        candidates: Sequence[Dict[str, Any]],
+        decisions: Dict[int, Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        applied: List[Dict[str, Any]] = []
+        for index, candidate in enumerate(candidates):
+            decision = decisions.get(index) or {"operation": "create", "target_object_id": 0}
+            object_type = candidate["object_type"]
+            operation = str(decision.get("operation") or "create")
+            target_id = int(decision.get("target_object_id") or 0)
+            target = self._db.get_intent_object(
+                object_type=object_type, object_id=target_id,
+            ) if target_id else None
+            status = self._intent_status_for_operation(object_type, operation, target)
+            payload = self._intent_storage_payload(candidate, status=status)
+            created = target is None
+            if created:
+                object_id = self._db.create_intent_object(
+                    object_type=object_type, payload=payload,
+                )
+                previous_status = ""
+                previous_payload: Dict[str, Any] = {}
+            else:
+                object_id = int(target["id"])
+                previous_status = str(target.get("status") or "")
+                previous_payload = dict(target)
+                update_payload = {
+                    key: value for key, value in payload.items()
+                    if value not in ("", None, 0, {}) or key in {"status", "confidence"}
+                }
+                self._db.update_intent_object(
+                    object_type=object_type, object_id=object_id, payload=update_payload,
+                )
+            evidence_role = {
+                "create": "creation", "confirm": "confirmation", "complete": "completion",
+                "cancel": "cancellation", "block": "block",
+            }.get(operation, "update")
+            self._db.upsert_intent_evidence([{
+                "object_type": object_type, "object_id": object_id,
+                "evidence_type": "fact", "evidence_id": fact_id,
+                "role": evidence_role, "observed_at": self._intent_effective_at(candidate),
+            } for fact_id in candidate["evidence_fact_ids"]])
+            self._db.insert_intent_event(
+                object_type=object_type, object_id=object_id,
+                event_type="create" if created else operation,
+                previous_status=previous_status, new_status=status,
+                previous_payload=previous_payload, new_payload=payload,
+                evidence_fact_ids=candidate["evidence_fact_ids"],
+                effective_at=self._intent_effective_at(candidate),
+                decision_source=str(decision.get("reason") or "intent_reconciliation"),
+            )
+            self._write_intent_entity_links(object_type, object_id, candidate)
+            self._write_intent_object_relations(object_type, object_id, candidate)
+            applied.append({"object_type": object_type, "object_id": object_id, "created": created})
+        return applied
+
+    @staticmethod
+    def _intent_status_for_operation(
+        object_type: str, operation: str, target: Optional[Dict[str, Any]]) -> str:
+        defaults = {"goal": "active", "plan": "planned", "work_item": "open"}
+        status = str((target or {}).get("status") or defaults[object_type])
+        return {
+            "goal": {"complete": "achieved", "cancel": "abandoned"},
+            "plan": {"complete": "occurred", "cancel": "cancelled", "reschedule": "rescheduled"},
+            "work_item": {"complete": "completed", "cancel": "cancelled", "block": "blocked"},
+        }[object_type].get(operation, status)
+
+    def _intent_storage_payload(self, candidate: Dict[str, Any], *, status: str) -> Dict[str, Any]:
+        payload = {key: value for key, value in candidate.items() if key in {
+            "world_owner_entity_id", "canonical_key", "summary", "owner_entity_id",
+            "desired_outcome", "success_criteria", "target_at", "actor_entity_id",
+            "event_or_activity", "start_at", "end_at", "time_precision", "location_entity_id",
+            "location_text", "responsible_entity_id", "action_text", "deliverable",
+            "responsibility_type", "due_at", "priority",
+        }}
+        payload.update(status=status, confidence=candidate["confidence"], metadata={
+            "source_fact_ids": candidate["evidence_fact_ids"],
+            "related_goal_key": candidate.get("related_goal_key") or "",
+            "related_plan_key": candidate.get("related_plan_key") or "",
+        })
+        if candidate["object_type"] == "work_item":
+            payload.update(
+                completed_at=(self._intent_effective_at(candidate) if status == "completed" else ""),
+                extractor_version="intent_execution_v1", prompt_version="v1",
+            )
+        return payload
+
+    @staticmethod
+    def _intent_effective_at(candidate: Dict[str, Any]) -> str:
+        return str(candidate.get("due_at") or candidate.get("start_at") or candidate.get("target_at") or "")
+
+    def _write_intent_entity_links(self, object_type: str, object_id: int, candidate: Dict[str, Any]) -> None:
+        names_by_role = (
+            {"actor": [candidate.get("actor_name") or ""], "participant": candidate.get("participant_names") or []}
+            if object_type == "plan" else {
+                "beneficiary": candidate.get("beneficiary_names") or [],
+                "delegator": candidate.get("delegator_names") or [],
+                "collaborator": candidate.get("collaborator_names") or [],
+            }
+        )
+        if object_type == "work_item":
+            names_by_role["responsible"] = [candidate.get("responsible_name") or ""]
+        names = [name for values in names_by_role.values() for name in values if name]
+        mapping = self._db.add_entity_names(names)
+        self._db.upsert_intent_entities(
+            object_type=object_type, object_id=object_id,
+            entities=[
+                {"entity_id": mapping[name], "role": role}
+                for role, values in names_by_role.items() for name in values
+                if name in mapping
+            ],
+        )
+
+    def _write_intent_object_relations(self, object_type: str, object_id: int, candidate: Dict[str, Any]) -> None:
+        if object_type != "work_item":
+            return
+        owner_id = int(candidate["world_owner_entity_id"])
+        for goal in self._db.get_intent_objects(object_type="goal", world_owner_entity_id=owner_id, limit=80):
+            if candidate.get("related_goal_key") and goal.get("canonical_key") == candidate["related_goal_key"]:
+                self._db.upsert_goal_work_item_mapping(goal_id=int(goal["id"]), work_item_id=object_id, relation="advances")
+        for plan in self._db.get_intent_objects(object_type="plan", world_owner_entity_id=owner_id, limit=80):
+            if candidate.get("related_plan_key") and plan.get("canonical_key") == candidate["related_plan_key"]:
+                self._db.upsert_plan_work_item_mapping(plan_id=int(plan["id"]), work_item_id=object_id, relation="prepares")
 
     @staticmethod
     def _entity_claim_types() -> set[str]:
@@ -3883,124 +4147,86 @@ class MemoryNodeManager:
             out.append(clean)
         return out[:1]
 
-    def _action_signals_from_fact(self, fact: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Return lightweight action signals for reflection gating."""
-        metadata = fact.get("metadata") if isinstance(fact.get("metadata"), dict) else {}
-        raw = fact.get("action_signal") or metadata.get("action_signal")
-        return self._normalize_action_signal(raw)
+    def _should_route_fact_to_intent_execution(self, fact: Dict[str, Any]) -> bool:
+        """Return whether a fact merits semantic review by the intent task.
 
-    def _is_high_value_actionable_item(
-        self,
-        item: Dict[str, Any],
-        *,
-        facts_by_id: Dict[int, Dict[str, Any]],
-    ) -> bool:
-        item_type = str(item.get("item_type") or "other")
-        status = str(item.get("status") or "unknown")
-        summary = _compact_whitespace(item.get("summary") or "")
-        canonical_name = _compact_whitespace(item.get("canonical_name") or "")
-        if not summary or item_type == "other":
+        This is deliberately a high-recall, deterministic intake gate.  It does
+        not classify a fact as a goal, plan, or work item, and it must not make
+        database changes.  A future intent-execution task will make that
+        decision using the fact, its source context, and related active objects.
+        """
+        if not isinstance(fact, dict):
             return False
-        if float(item.get("confidence") or 0.0) < 0.6:
+        summary = _compact_whitespace(fact.get("summary") or fact.get("text") or "")
+        if not summary:
             return False
 
-        joined = "\n".join([canonical_name, summary, str(item.get("due_at") or "")]).lower()
-        evidence_text = "\n".join(
-            str(facts_by_id.get(int(fact_id), {}).get("summary") or "")
-            for fact_id in item.get("evidence_fact_ids") or []
-        ).lower()
-        all_text = f"{joined}\n{evidence_text}"
-        has_hard_marker = self._has_actionable_hard_marker(all_text) or bool(item.get("due_at"))
-        has_weak_try = any(pattern in all_text for pattern in _WEAK_TRY_PATTERNS)
-
-        if has_weak_try and not self._has_explicit_followup_or_commitment(all_text, item_type=item_type):
+        fact_kind = self._normalize_fact_kind(fact.get("fact_kind"))
+        if fact_kind == "recommendation":
+            # Assistant suggestions are not user intent unless a separate fact
+            # records the user's explicit acceptance or commitment.
             return False
 
-        if item_type in {"task", "commitment", "reminder"}:
-            return has_hard_marker or item_type in {"commitment", "reminder"}
+        text = summary.lower()
 
-        if item_type == "decision":
-            if status == "decided":
-                # A completed decision is durable context, not an open
-                # actionable item. It remains available through facts/state.
-                return False
-            return self._has_strong_decision_marker(all_text) and not has_weak_try
-
-        if item_type in {"follow_up", "open_question"}:
-            if self._is_low_value_followup_question(all_text):
-                return False
-            return self._has_followup_marker(all_text)
-
-        if item_type == "risk":
-            return self._has_blocking_marker(all_text)
-
-        if item_type == "recommendation":
-            return self._has_explicit_followup_or_commitment(all_text, item_type=item_type)
-
-        if item_type == "constraint":
-            return status == "blocked" and self._has_blocking_marker(all_text) and has_hard_marker
-
-        return False
-
-    @staticmethod
-    def _actionable_dedupe_key(item: Dict[str, Any]) -> str:
-        terms: List[str] = []
-        for field in ("canonical_name", "summary"):
-            text = _compact_whitespace(item.get(field) or "").lower()
-            text = re.sub(r"(用户|助手|agent|assistant|user)", "", text)
-            text = re.sub(r"[^\w\u4e00-\u9fff]+", " ", text)
-            terms.extend(part for part in text.split() if len(part) > 1)
-        compact = "".join(terms)
-        return f"{item.get('source_type')}|{item.get('item_type')}|{compact[:80]}"
-
-    @staticmethod
-    def _has_actionable_hard_marker(text: str) -> bool:
-        lower = str(text or "").lower()
-        if any(marker in lower for marker in _ACTIONABLE_HARD_MARKERS):
-            return True
-        return bool(re.search(r"(每\s*\d+\s*(分钟|小时|天|周|月)|\d+\s*(分钟|小时|天|周|月)\s*后)", lower))
-
-    @staticmethod
-    def _has_explicit_followup_or_commitment(text: str, *, item_type: str) -> bool:
-        lower = str(text or "").lower()
-        if item_type == "follow_up":
-            return True
-        if re.search(r"(提醒我|帮我提醒|请提醒|帮我记|请记住)", lower):
-            return True
-        return any(
-            marker in lower
-            for marker in (
-                "跟进", "后续确认", "下次", "明天", "截止", "承诺",
-                "决定执行", "已经决定", "明确采纳", "请记住", "帮我记",
-                "remind", "follow up", "next time", "deadline", "commit",
-                "decided to", "explicitly accepted", "remember this",
-            )
+        lifecycle_markers = (
+            "已完成", "完成了", "做完", "办完", "已经发", "已发", "提交了",
+            "已提交", "取消", "不做了", "不去了", "改期", "改到", "延期", "推迟",
+            "延后", "提前", "受阻", "卡住", "无法", "没法", "等待确认", "等待资料",
+            "completed", "finished", "done", "sent", "submitted", "cancelled",
+            "canceled", "rescheduled", "postponed", "delayed", "blocked",
+            "cannot proceed", "waiting for confirmation",
         )
+        if any(marker in text for marker in lifecycle_markers):
+            return True
 
-    @staticmethod
-    def _has_strong_decision_marker(text: str) -> bool:
-        lower = str(text or "").lower()
-        return any(
-            marker in lower
-            for marker in (
-                "决定", "明确", "拒绝", "否定", "放弃", "采纳", "接受",
-                "不再", "已经", "最终", "decided", "explicitly", "rejected",
-                "declined", "accepted", "will not", "no longer",
-            )
+        if fact_kind == "commitment":
+            return True
+
+        goal_markers = (
+            "长期目标", "目标是", "目标为", "希望达到", "希望实现", "争取", "致力于",
+            "今年完成", "今年实现", "年内完成", "未来要实现", "want to achieve",
+            "hope to achieve", "aim to", "goal is", "long-term goal", "work toward",
         )
+        if any(marker in text for marker in goal_markers):
+            return True
 
-    @staticmethod
-    def _has_followup_marker(text: str) -> bool:
-        lower = str(text or "").lower()
-        return any(
-            marker in lower
-            for marker in (
-                "后续", "跟进", "确认", "未解决", "仍需", "需要进一步",
-                "开放问题", "下次", "follow up", "confirm", "unresolved",
-                "still need", "open question", "next time",
-            )
+        responsibility_markers = (
+            "需要完成", "必须", "负责", "答应", "承诺", "交付", "提交",
+            "交给", "让我", "分配给我", "安排我", "请提醒", "帮我提醒",
+            "need to", "have to", "must", "responsible for", "committed to",
+            "promised to", "deliver", "submit", "assigned me", "remind me",
         )
+        if any(marker in text for marker in responsibility_markers):
+            return True
 
+        future_time_markers = (
+            "明天", "后天", "今晚", "明晚", "下周", "下个月", "明年", "本周",
+            "这周", "周一", "周二", "周三", "周四", "周五", "周六", "周日", "周末",
+            "tomorrow", "tonight", "next week", "next month", "next year",
+            "this week", "on monday", "on tuesday", "on wednesday", "on thursday",
+            "on friday", "this weekend",
+        )
+        future_activity_markers = (
+            "前往", "去", "参加", "出席", "开会", "会面", "见面", "拜访", "出差",
+            "旅行", "约", "预约", "安排", "活动", "会议", "飞", "乘车",
+            "travel", "go to", "attend", "meet", "visit", "schedule", "book",
+            "appointment", "trip", "flight", "meeting",
+        )
+        if (
+            any(marker in text for marker in future_time_markers)
+            and any(marker in text for marker in future_activity_markers)
+        ):
+            return True
+
+        decision_markers = (
+            "决定", "打算", "准备", "计划", "将要", "要去", "要做",
+            "decided", "planning to", "plan to", "going to", "will ",
+        )
+        return fact_kind in {"decision", "action", "instruction"} and any(
+            marker in text for marker in decision_markers
+        )
+        
     @staticmethod
     def _is_low_value_followup_question(text: str) -> bool:
         lower = str(text or "").lower()
@@ -4016,119 +4242,7 @@ class MemoryNodeManager:
                 "whether the user accepts",
             )
         )
-
-    @staticmethod
-    def _has_blocking_marker(text: str) -> bool:
-        lower = str(text or "").lower()
-        return any(
-            marker in lower
-            for marker in (
-                "阻塞", "影响", "限制", "风险", "担心", "冲突", "无法",
-                "不现实", "拒绝", "否定", "blocked", "blocking", "risk",
-                "concern", "constraint", "prevents", "cannot", "unrealistic",
-            )
-        )
-
-    def _store_actionable_item(self, item: Dict[str, Any]) -> int:
-        keywords = item.get("keywords") or self._keywords(item["summary"], limit=18)
-        canonical_topics = item.get("canonical_topics") or [item["canonical_name"]]
-        evidence_fact_ids = [int(value) for value in item.get("evidence_fact_ids") or []]
-        owner = _compact_whitespace(item.get("owner") or "")
-        entity_ids = (
-            self._entity_ids_for_names([owner])
-            if owner and owner.lower() != "unknown"
-            else []
-        )
-        identity_text = "\n".join([
-            item["canonical_name"],
-            item["summary"],
-            f"item_type: {item['item_type']}",
-            f"owner: {item['owner']}",
-            f"status: {item['status']}",
-            f"due_at: {item['due_at']}",
-            f"keywords: {' '.join(keywords)}",
-        ])
-        identity_text_embedding = self._generate_embedding_vector(identity_text)
-        item_id = self._db.upsert_actionable_item(
-            item_type=item["item_type"],
-            source_type=item["source_type"],
-            canonical_name=item["canonical_name"],
-            summary=item["summary"],
-            owner=item["owner"],
-            status=item["status"],
-            due_at=item["due_at"],
-            entity_ids=entity_ids,
-            evidence_fact_ids=evidence_fact_ids,
-            confidence=item["confidence"],
-            importance=item["importance"],
-            metadata={
-                "keywords": keywords,
-                "canonical_topics": canonical_topics,
-            },
-            identity_text_embedding=identity_text_embedding,
-            identity_text=identity_text,
-        )
-
-        return item_id
     
-    def _format_facts_for_actionable_prompt(
-        self,
-        facts: List[Dict[str, Any]],
-    ) -> List[Dict[str, Any]]:
-        rows: List[Dict[str, Any]] = []
-        for fact in facts[:80]:
-            action_signals = self._action_signals_from_fact(fact)
-            rows.append({
-                "id": fact.get("id"),
-                "source_type": fact.get("source_type"),
-                "fact_type": fact.get("fact_type"),
-                "fact_kind": fact.get("fact_kind"),
-                "event_time_key": fact.get("event_time_key"),
-                "dialogue_time_key": fact.get("dialogue_time_key"),
-                "summary": fact.get("summary"),
-                "keywords": fact.get("keywords"),
-                "entities": fact.get("entities") or [],
-                "primary_entity": fact.get("primary_entity"),
-                "fact_root_topic": fact.get("fact_root_topic") or "",
-                "fact_aspect_topic": fact.get("fact_aspect_topic") or "",
-                "action_signal": action_signals,
-            })
-        return rows
-
-    @staticmethod
-    def _normalize_actionable_item_type(value: Any) -> str:
-        text = str(value or "other").strip().lower()
-        allowed = {
-            "task", "commitment", "decision", "follow_up", "open_question",
-            "risk", "reminder", "recommendation", "constraint", "other",
-        }
-        return text if text in allowed else "other"
-
-    @staticmethod
-    def _normalize_actionable_status(value: Any) -> str:
-        text = str(value or "unknown").strip().lower()
-        allowed = {
-            "open", "in_progress", "done", "blocked", "decided", "noted",
-            "unknown",
-        }
-        return text if text in allowed else "unknown"
-
-    @staticmethod
-    def _normalize_actionable_owner(value: Any) -> str:
-        text = _compact_whitespace(value).strip("'\".,:;!?，。！？、；：（）()[]{}")
-        if not text:
-            return "unknown"
-        normalized = text.lower()
-        if normalized in {"用户", "user", "the user"}:
-            return "user"
-        if normalized in {"助手", "assistant", "agent", "the assistant"}:
-            return "assistant"
-        if normalized in {"未知", "unknown"}:
-            return "unknown"
-        if normalized in {"其他", "other"}:
-            return "unknown"
-        return text
-
     @staticmethod
     def _clamp_float(value: Any, low: float, high: float, default: float) -> float:
         try:
@@ -6070,30 +6184,6 @@ class MemoryNodeManager:
             "half_life_seconds": int(half_life_seconds),
         }
 
-    def _recall_stage1_is_high_priority_actionable(
-        self,
-        candidate: Dict[str, Any],
-        *,
-        reference_time: str,
-    ) -> bool:
-        raw = candidate.get("_hydrated") if isinstance(candidate.get("_hydrated"), dict) else {}
-        status = str(raw.get("status") or "").lower()
-        if status not in {"open", "in_progress", "blocked", "pending", "unknown"}:
-            return False
-        importance = self._clamp_float(
-            raw.get("importance"),
-            0.0,
-            1.0,
-            0.0,
-        )
-        due_at = self._recall_stage1_parse_datetime(raw.get("due_at"))
-        reference = self._recall_stage1_parse_datetime(reference_time)
-        due_soon = False
-        if due_at is not None and reference is not None:
-            due_soon = (due_at - reference).total_seconds() <= 24 * 60 * 60
-        min_importance = self._recall_stage1_actionable_min_importance
-        return importance >= min_importance or status == "blocked" or due_soon
-
     @staticmethod
     def _recall_stage1_parse_datetime(value: Any) -> Optional[datetime]:
         text = str(value or "").strip()
@@ -6117,17 +6207,6 @@ class MemoryNodeManager:
         markers = (
             "这个", "那个", "刚才", "前面", "继续", "然后", "目前", "接下来",
             "what about it", "that one", "continue", "then", "next",
-        )
-        return any(marker in lower for marker in markers)
-
-    @staticmethod
-    def _recall_stage1_is_actionable_query(query: str) -> bool:
-        lower = str(query or "").lower()
-        markers = (
-            "待办", "任务", "提醒", "截止", "跟进", "下一步", "承诺", "决定",
-            "风险", "阻塞", "什么时候完成", "还要做什么",
-            "todo", "task", "remind", "deadline", "follow up", "next step",
-            "commit", "decision", "risk", "blocked",
         )
         return any(marker in lower for marker in markers)
 

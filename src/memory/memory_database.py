@@ -274,6 +274,7 @@ class SessionDB:
                 processed_for_memory_state INTEGER NOT NULL DEFAULT 0,
                 processed_for_memory_actionable_item INTEGER NOT NULL DEFAULT 0,
                 processed_for_memory_entity_claim INTEGER NOT NULL DEFAULT 0,
+                processed_for_memory_intent_execution INTEGER NOT NULL DEFAULT 0,
                 metadata TEXT NOT NULL DEFAULT '{}',
                 identity_text_embedding BLOB,
                 identity_text TEXT NOT NULL DEFAULT '',
@@ -456,6 +457,156 @@ class SessionDB:
                 FOREIGN KEY(trigger_claim_id) REFERENCES memory_entity_claims(id) ON DELETE SET NULL
             );
 
+            CREATE TABLE IF NOT EXISTS memory_goals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                world_owner_entity_id INTEGER NOT NULL,
+                owner_entity_id INTEGER NOT NULL,
+                canonical_key TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                desired_outcome TEXT NOT NULL DEFAULT '',
+                success_criteria TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'active',
+                target_at TEXT NOT NULL DEFAULT '',
+                confidence REAL NOT NULL DEFAULT 0.7,
+                metadata TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(world_owner_entity_id, owner_entity_id, canonical_key),
+                FOREIGN KEY(world_owner_entity_id) REFERENCES memory_entity_nodes(id) ON DELETE CASCADE,
+                FOREIGN KEY(owner_entity_id) REFERENCES memory_entity_nodes(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS memory_plans (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                world_owner_entity_id INTEGER NOT NULL,
+                actor_entity_id INTEGER NOT NULL,
+                canonical_key TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                event_or_activity TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'planned',
+                start_at TEXT NOT NULL DEFAULT '',
+                end_at TEXT NOT NULL DEFAULT '',
+                time_precision TEXT NOT NULL DEFAULT 'unknown',
+                location_entity_id INTEGER,
+                location_text TEXT NOT NULL DEFAULT '',
+                confidence REAL NOT NULL DEFAULT 0.7,
+                metadata TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(world_owner_entity_id, actor_entity_id, canonical_key),
+                FOREIGN KEY(world_owner_entity_id) REFERENCES memory_entity_nodes(id) ON DELETE CASCADE,
+                FOREIGN KEY(actor_entity_id) REFERENCES memory_entity_nodes(id) ON DELETE CASCADE,
+                FOREIGN KEY(location_entity_id) REFERENCES memory_entity_nodes(id) ON DELETE SET NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS memory_plan_entities (
+                plan_id INTEGER NOT NULL,
+                entity_id INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(plan_id, entity_id, role),
+                FOREIGN KEY(plan_id) REFERENCES memory_plans(id) ON DELETE CASCADE,
+                FOREIGN KEY(entity_id) REFERENCES memory_entity_nodes(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS memory_work_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                world_owner_entity_id INTEGER NOT NULL,
+                responsible_entity_id INTEGER NOT NULL,
+                canonical_key TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                action_text TEXT NOT NULL DEFAULT '',
+                deliverable TEXT NOT NULL DEFAULT '',
+                responsibility_type TEXT NOT NULL DEFAULT 'personal_action',
+                status TEXT NOT NULL DEFAULT 'open',
+                due_at TEXT NOT NULL DEFAULT '',
+                start_at TEXT NOT NULL DEFAULT '',
+                priority TEXT NOT NULL DEFAULT '',
+                confidence REAL NOT NULL DEFAULT 0.7,
+                completed_at TEXT NOT NULL DEFAULT '',
+                extractor_version TEXT NOT NULL DEFAULT '',
+                prompt_version TEXT NOT NULL DEFAULT '',
+                metadata TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(world_owner_entity_id, responsible_entity_id, canonical_key),
+                FOREIGN KEY(world_owner_entity_id) REFERENCES memory_entity_nodes(id) ON DELETE CASCADE,
+                FOREIGN KEY(responsible_entity_id) REFERENCES memory_entity_nodes(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS memory_work_item_entities (
+                work_item_id INTEGER NOT NULL,
+                entity_id INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(work_item_id, entity_id, role),
+                FOREIGN KEY(work_item_id) REFERENCES memory_work_items(id) ON DELETE CASCADE,
+                FOREIGN KEY(entity_id) REFERENCES memory_entity_nodes(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS memory_intent_evidence (
+                object_type TEXT NOT NULL,
+                object_id INTEGER NOT NULL,
+                evidence_type TEXT NOT NULL,
+                evidence_id INTEGER NOT NULL,
+                role TEXT NOT NULL DEFAULT 'support',
+                observed_at TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(object_type, object_id, evidence_type, evidence_id, role)
+            );
+
+            CREATE TABLE IF NOT EXISTS memory_intent_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                object_type TEXT NOT NULL,
+                object_id INTEGER NOT NULL,
+                event_type TEXT NOT NULL,
+                previous_status TEXT NOT NULL DEFAULT '',
+                new_status TEXT NOT NULL DEFAULT '',
+                previous_payload TEXT NOT NULL DEFAULT '{}',
+                new_payload TEXT NOT NULL DEFAULT '{}',
+                evidence_fact_ids TEXT NOT NULL DEFAULT '[]',
+                effective_at TEXT NOT NULL DEFAULT '',
+                decision_source TEXT NOT NULL DEFAULT '',
+                reason TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS memory_goal_work_item_mappings (
+                goal_id INTEGER NOT NULL,
+                work_item_id INTEGER NOT NULL,
+                relation TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(goal_id, work_item_id, relation),
+                FOREIGN KEY(goal_id) REFERENCES memory_goals(id) ON DELETE CASCADE,
+                FOREIGN KEY(work_item_id) REFERENCES memory_work_items(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS memory_plan_work_item_mappings (
+                plan_id INTEGER NOT NULL,
+                work_item_id INTEGER NOT NULL,
+                relation TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(plan_id, work_item_id, relation),
+                FOREIGN KEY(plan_id) REFERENCES memory_plans(id) ON DELETE CASCADE,
+                FOREIGN KEY(work_item_id) REFERENCES memory_work_items(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS memory_work_item_relations (
+                source_work_item_id INTEGER NOT NULL,
+                target_work_item_id INTEGER NOT NULL,
+                relation TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(source_work_item_id, target_work_item_id, relation),
+                FOREIGN KEY(source_work_item_id) REFERENCES memory_work_items(id) ON DELETE CASCADE,
+                FOREIGN KEY(target_work_item_id) REFERENCES memory_work_items(id) ON DELETE CASCADE
+            );
+
             CREATE TABLE IF NOT EXISTS memory_topic_actionable_item_mapping (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 topic_state_id INTEGER NOT NULL,
@@ -494,11 +645,24 @@ class SessionDB:
             ON memory_entity_claim_events(target_claim_id, effective_at DESC, id DESC);
             CREATE INDEX IF NOT EXISTS idx_memory_entity_claim_events_trigger
             ON memory_entity_claim_events(trigger_claim_id, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_memory_facts_intent_execution_processing
+            ON memory_facts(processed_for_memory_intent_execution, created_at);
+            CREATE INDEX IF NOT EXISTS idx_memory_goals_owner_status
+            ON memory_goals(world_owner_entity_id, owner_entity_id, status);
+            CREATE INDEX IF NOT EXISTS idx_memory_plans_actor_status_time
+            ON memory_plans(world_owner_entity_id, actor_entity_id, status, start_at);
+            CREATE INDEX IF NOT EXISTS idx_memory_work_items_responsible_status_due
+            ON memory_work_items(world_owner_entity_id, responsible_entity_id, status, due_at);
+            CREATE INDEX IF NOT EXISTS idx_memory_intent_evidence_object
+            ON memory_intent_evidence(object_type, object_id, role);
+            CREATE INDEX IF NOT EXISTS idx_memory_intent_events_object
+            ON memory_intent_events(object_type, object_id, effective_at DESC, id DESC);
             """
         )
         self._ensure_entity_ids_schema()
         self._ensure_memory_facts_processing_schema()
         self._ensure_memory_entity_claim_processing_schema()
+        self._ensure_memory_intent_execution_processing_schema()
         self._ensure_memory_entity_claims_schema()
         self._ensure_memory_states_scope_schema()
         self._ensure_memory_states_time_line_schema()
@@ -624,6 +788,22 @@ class SessionDB:
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_memory_episodes_entity_claim_induction "
             "ON memory_episodes(processed_for_memory_entity_claim_induction, created_at)"
+        )
+
+    def _ensure_memory_intent_execution_processing_schema(self) -> None:
+        """Give Intent & Execution its own fact cursor during schema upgrades."""
+        columns = {
+            str(row["name"])
+            for row in self._conn.execute("PRAGMA table_info(memory_facts)").fetchall()
+        }
+        if "processed_for_memory_intent_execution" not in columns:
+            self._conn.execute(
+                "ALTER TABLE memory_facts ADD COLUMN "
+                "processed_for_memory_intent_execution INTEGER NOT NULL DEFAULT 0"
+            )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_memory_facts_intent_execution_processing "
+            "ON memory_facts(processed_for_memory_intent_execution, created_at)"
         )
 
     def _ensure_memory_entity_claims_schema(self) -> None:
@@ -1136,7 +1316,7 @@ class SessionDB:
     def get_unprocessed_facts(
         self,
         *,
-        processing_target: str = "state",
+        processing_target: str = "entity_claim",
         reference_timestamp: Any,
         source_types: Optional[Sequence[str]] = None,
         limit: int = 100,
@@ -1145,13 +1325,15 @@ class SessionDB:
         processing_columns = {
             "actionable_item": "processed_for_memory_actionable_item",
             "entity_claim": "processed_for_memory_entity_claim",
+            "intent_execution": "processed_for_memory_intent_execution",
         }
         target = str(processing_target or "entity_claim").strip().lower()
         try:
             processing_column = processing_columns[target]
         except KeyError as exc:
             raise ValueError(
-                "processing_target must be 'actionable_item' or 'entity_claim'"
+                "processing_target must be 'actionable_item', 'entity_claim', "
+                "or 'intent_execution'"
             ) from exc
 
         clauses: List[str] = [f"{processing_column} = 0"]
@@ -1413,13 +1595,15 @@ class SessionDB:
         processing_columns = {
             "actionable_item": "processed_for_memory_actionable_item",
             "entity_claim": "processed_for_memory_entity_claim",
+            "intent_execution": "processed_for_memory_intent_execution",
         }
         target = str(processing_target or "").strip().lower()
         try:
             processing_column = processing_columns[target]
         except KeyError as exc:
             raise ValueError(
-                "processing_target must be 'actionable_item' or 'entity_claim'"
+                "processing_target must be 'actionable_item', 'entity_claim', "
+                "or 'intent_execution'"
             ) from exc
         ids = [int(value) for value in fact_ids if value is not None]
         if not ids:
@@ -1628,6 +1812,256 @@ class SessionDB:
                     now,
                 ),
             )
+        return True
+
+    @staticmethod
+    def _intent_object_spec(object_type: str) -> tuple[str, tuple[str, ...]]:
+        normalized = str(object_type or "").strip().lower()
+        specs = {
+            "goal": ("memory_goals", (
+                "world_owner_entity_id", "owner_entity_id", "canonical_key", "summary",
+                "desired_outcome", "success_criteria", "status", "target_at",
+                "confidence", "metadata",
+            )),
+            "plan": ("memory_plans", (
+                "world_owner_entity_id", "actor_entity_id", "canonical_key", "summary",
+                "event_or_activity", "status", "start_at", "end_at", "time_precision",
+                "location_entity_id", "location_text", "confidence", "metadata",
+            )),
+            "work_item": ("memory_work_items", (
+                "world_owner_entity_id", "responsible_entity_id", "canonical_key", "summary",
+                "action_text", "deliverable", "responsibility_type", "status", "due_at",
+                "start_at", "priority", "confidence", "completed_at", "extractor_version",
+                "prompt_version", "metadata",
+            )),
+        }
+        try:
+            return specs[normalized]
+        except KeyError as exc:
+            raise ValueError("object_type must be goal, plan, or work_item") from exc
+
+    def create_intent_object(self, *, object_type: str, payload: Dict[str, Any]) -> int:
+        """Persist one normalized Goal, Plan, or Work item candidate."""
+        table, columns = self._intent_object_spec(object_type)
+        now = local_now_text()
+        values: List[Any] = []
+        for column in columns:
+            value = payload.get(column)
+            if column == "metadata":
+                value = _json_dumps(value if isinstance(value, dict) else {})
+            elif column == "confidence":
+                value = float(value or 0.0)
+            elif column.endswith("_entity_id"):
+                value = int(value) if value not in (None, "", 0) else None
+            else:
+                value = str(value or "")
+            values.append(value)
+        placeholders = ", ".join("?" for _ in columns)
+        cur = self._conn.execute(
+            f"INSERT INTO {table} ({', '.join(columns)}, created_at, updated_at) "
+            f"VALUES ({placeholders}, ?, ?)",
+            (*values, now, now),
+        )
+        self._commit_if_needed()
+        return int(cur.lastrowid)
+
+    def update_intent_object(
+        self, *, object_type: str, object_id: int, payload: Dict[str, Any]
+    ) -> bool:
+        """Update a known object without erasing fields absent from an event."""
+        table, allowed_columns = self._intent_object_spec(object_type)
+        assignments: List[str] = []
+        values: List[Any] = []
+        for column in allowed_columns:
+            if column not in payload:
+                continue
+            value = payload[column]
+            if column == "metadata":
+                value = _json_dumps(value if isinstance(value, dict) else {})
+            elif column == "confidence":
+                value = float(value or 0.0)
+            elif column.endswith("_entity_id"):
+                value = int(value) if value not in (None, "", 0) else None
+            else:
+                value = str(value or "")
+            assignments.append(f"{column} = ?")
+            values.append(value)
+        if not assignments:
+            return False
+        assignments.append("updated_at = ?")
+        values.extend([local_now_text(), int(object_id)])
+        cur = self._conn.execute(
+            f"UPDATE {table} SET {', '.join(assignments)} WHERE id = ?", values
+        )
+        self._commit_if_needed()
+        return bool(cur.rowcount)
+
+    def get_intent_objects(
+        self,
+        *,
+        object_type: str,
+        world_owner_entity_id: Optional[int] = None,
+        statuses: Optional[Sequence[str]] = None,
+        limit: int = 120,
+    ) -> List[Dict[str, Any]]:
+        table, _columns = self._intent_object_spec(object_type)
+        clauses: List[str] = []
+        params: List[Any] = []
+        if world_owner_entity_id is not None:
+            clauses.append("world_owner_entity_id = ?")
+            params.append(int(world_owner_entity_id))
+        if statuses:
+            placeholders = ", ".join("?" for _ in statuses)
+            clauses.append(f"status IN ({placeholders})")
+            params.extend(str(status) for status in statuses)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        rows = self._conn.execute(
+            f"SELECT * FROM {table}{where} ORDER BY updated_at DESC, id DESC LIMIT ?",
+            (*params, max(1, int(limit or 120))),
+        ).fetchall()
+        return [self._row_to_dict(row) for row in rows]
+
+    def get_intent_object(
+        self, *, object_type: str, object_id: int
+    ) -> Optional[Dict[str, Any]]:
+        table, _columns = self._intent_object_spec(object_type)
+        row = self._conn.execute(
+            f"SELECT * FROM {table} WHERE id = ?", (int(object_id),)
+        ).fetchone()
+        return self._row_to_dict(row) if row else None
+
+    def upsert_intent_evidence(self, evidence: Sequence[Dict[str, Any]]) -> int:
+        now = local_now_text()
+        changed = 0
+        for item in evidence or []:
+            object_type = str(item.get("object_type") or "").strip().lower()
+            evidence_type = str(item.get("evidence_type") or "fact").strip().lower()
+            role = str(item.get("role") or "support").strip().lower()
+            try:
+                object_id = int(item["object_id"])
+                evidence_id = int(item["evidence_id"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if (
+                object_type not in {"goal", "plan", "work_item"}
+                or evidence_type not in {"fact", "episode"}
+                or object_id <= 0 or evidence_id <= 0
+            ):
+                continue
+            self._conn.execute(
+                """
+                INSERT INTO memory_intent_evidence (
+                    object_type, object_id, evidence_type, evidence_id, role,
+                    observed_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(object_type, object_id, evidence_type, evidence_id, role)
+                DO UPDATE SET observed_at = excluded.observed_at, updated_at = excluded.updated_at
+                """,
+                (object_type, object_id, evidence_type, evidence_id, role,
+                 str(item.get("observed_at") or ""), now, now),
+            )
+            changed += 1
+        self._commit_if_needed()
+        return changed
+
+    def insert_intent_event(
+        self,
+        *,
+        object_type: str,
+        object_id: int,
+        event_type: str,
+        previous_status: str = "",
+        new_status: str = "",
+        previous_payload: Optional[Dict[str, Any]] = None,
+        new_payload: Optional[Dict[str, Any]] = None,
+        evidence_fact_ids: Optional[Sequence[int]] = None,
+        effective_at: str = "",
+        decision_source: str = "",
+        reason: str = "",
+    ) -> int:
+        normalized_type = str(object_type or "").strip().lower()
+        if normalized_type not in {"goal", "plan", "work_item"}:
+            return 0
+        fact_ids = [int(value) for value in (evidence_fact_ids or []) if str(value).strip().isdigit()]
+        cur = self._conn.execute(
+            """
+            INSERT INTO memory_intent_events (
+                object_type, object_id, event_type, previous_status, new_status,
+                previous_payload, new_payload, evidence_fact_ids, effective_at,
+                decision_source, reason, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (normalized_type, int(object_id), str(event_type or "update"),
+             str(previous_status or ""), str(new_status or ""),
+             _json_dumps(previous_payload or {}), _json_dumps(new_payload or {}),
+             _json_dumps(list(dict.fromkeys(fact_ids))), str(effective_at or ""),
+             str(decision_source or ""), str(reason or ""), local_now_text()),
+        )
+        self._commit_if_needed()
+        return int(cur.lastrowid)
+
+    def upsert_intent_entities(
+        self,
+        *,
+        object_type: str,
+        object_id: int,
+        entities: Sequence[Dict[str, Any]],
+    ) -> int:
+        normalized_type = str(object_type or "").strip().lower()
+        table = {"plan": "memory_plan_entities", "work_item": "memory_work_item_entities"}.get(normalized_type)
+        id_column = "plan_id" if normalized_type == "plan" else "work_item_id"
+        if not table or int(object_id or 0) <= 0:
+            return 0
+        now = local_now_text()
+        changed = 0
+        for entity in entities or []:
+            try:
+                entity_id = int(entity["entity_id"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            role = str(entity.get("role") or "").strip().lower()
+            if entity_id <= 0 or not role:
+                continue
+            self._conn.execute(
+                f"""
+                INSERT INTO {table} ({id_column}, entity_id, role, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT({id_column}, entity_id, role) DO UPDATE SET updated_at = excluded.updated_at
+                """,
+                (int(object_id), entity_id, role, now, now),
+            )
+            changed += 1
+        self._commit_if_needed()
+        return changed
+
+    def upsert_goal_work_item_mapping(self, *, goal_id: int, work_item_id: int, relation: str) -> bool:
+        if int(goal_id or 0) <= 0 or int(work_item_id or 0) <= 0:
+            return False
+        now = local_now_text()
+        self._conn.execute(
+            """
+            INSERT INTO memory_goal_work_item_mappings (goal_id, work_item_id, relation, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(goal_id, work_item_id, relation) DO UPDATE SET updated_at = excluded.updated_at
+            """,
+            (int(goal_id), int(work_item_id), str(relation or "advances"), now, now),
+        )
+        self._commit_if_needed()
+        return True
+
+    def upsert_plan_work_item_mapping(self, *, plan_id: int, work_item_id: int, relation: str) -> bool:
+        if int(plan_id or 0) <= 0 or int(work_item_id or 0) <= 0:
+            return False
+        now = local_now_text()
+        self._conn.execute(
+            """
+            INSERT INTO memory_plan_work_item_mappings (plan_id, work_item_id, relation, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(plan_id, work_item_id, relation) DO UPDATE SET updated_at = excluded.updated_at
+            """,
+            (int(plan_id), int(work_item_id), str(relation or "prepares"), now, now),
+        )
+        self._commit_if_needed()
         return True
 
     def get_entity_claim_events(
@@ -2683,6 +3117,8 @@ class SessionDB:
             "participants",
             "metadata",
             "details",
+            "previous_payload",
+            "new_payload",
             "evidence_fact_ids",
             "time_line",
             "fact_ids",

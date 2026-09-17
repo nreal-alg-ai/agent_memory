@@ -99,8 +99,8 @@ UNIFIED_MEMORY_EXTRACTION_PROMPT_ZH = """你是 AI 眼镜长期记忆系统的�
 - fact：从一批连续证据中提炼出的可追溯、自包含、可独立召回的 narrative fact，是记忆提炼的基本证据单元。
 - episode：由独立模块根据一段连续时间内新增的、已经生成的 facts 汇总出的更高层事件；它不是每个输入批次或每条 fact 的简单副本。
 - memory_topic_items：由已落库 facts 与 episodes 提供的可复用主题命名词表。它包含 canonical topic 和 fact aspect topic，但不保存主题进展、总结或历史事实。
-- state：reflection 根据 facts 形成的实体属性投影，目前仅包括 `entity_state`（实体的偏好、画像、习惯、关系、约束或风险）。state 不是当前对话的直接证据。
-- actionable_item：从 facts 中筛选出的可能需要后续跟进的任务、承诺、决定、开放问题或风险。
+- entity_claim：由独立 reflection 模块从 facts 中形成的、可回溯证据的实体主张；它不是当前对话的直接证据。
+- goal / plan / work_item：由独立 Intent & Execution 模块从已落库 facts 提取的未来目标、明确安排和可闭环责任事项；本 prompt 不输出这些对象。
 
 你现在需要从下面按时间顺序排列的对话/转写证据批次中提取 Hindsight 风格的高质量 narrative facts。episode summary、episode canonical_topics 将由独立模块根据已生成 facts 负责，不要在本 prompt 中输出 episode 级字段。
 
@@ -112,14 +112,10 @@ UNIFIED_MEMORY_EXTRACTION_PROMPT_ZH = """你是 AI 眼镜长期记忆系统的�
 - 优先保留：用户明确的稳定身份、偏好、习惯、关系或约束；带具体对象及时间/地点的个人事件或计划；明确决定、承诺、长期指令；用户确认的项目结果、风险或重要问题。
 - 可以保留用户明确表达的持续兴趣、困难或目标，但只记录用户事实。助手给出的建议、教程、解释或方案，只有被用户明确接受、选择、执行或成为后续讨论的约束时才可写入。
 - 丢弃：唤醒词和寒暄、礼貌确认、浏览或展示过程、重复确认、泛知识讲解、一次模糊提问、未被采纳的建议、纯对话修复、无后续价值的感叹，以及不能独立解释的 ASR 碎片。
-- 如果当前证据只是重复已有 memory_state 或其中已知事实，且没有新增属性、变化、时间进展、明确决定或新的约束，不要生成重复 fact。
 - 不要输出被丢弃内容的解释、占位 fact 或低优先级 fact；只返回通过门槛的 facts。
 
-memory_states 使用规则：
-- 当前只提供 `entity_state` 作为实体属性背景；它不能作为 episode topic 或 fact 的 `fact_root_topic` 命名参考。
-- state 只是历史背景，不是当前 episode 的事实证据。当前对话没有明确支持的内容不能写入 fact；当前对话与历史 state 冲突时，以当前对话为准。
-- fact 的 `fact_root_topic` 必须由当前证据中的主要稳定议题产生；`fact_aspect_topic` 应保留该 fact 在根主题下的具体讨论方面。没有充分依据时使用当前证据中的保守、具体 topic，不得借用历史 state 名称。
-- 如果当前批次只是重复已有 entity_state 已记录的同一事实，且没有新增属性、变化、时间进展、明确决定或新的约束，不要生成重复 fact。
+topic 和实体使用规则：
+- fact 的 `fact_root_topic` 必须由当前证据中的主要稳定议题产生；`fact_aspect_topic` 应保留该 fact 在根主题下的具体讨论方面。没有充分依据时使用当前证据中的保守、具体 topic。
 - `entities` 保留所有与 fact 直接相关的实体，用于完整召回；`primary_entity` 表示这条 fact 主要描述、影响或归属的单一实体，必须来自 `entities`。对于用户自己的偏好、习惯、约束或风险，优先将“用户”作为 primary_entity；对于助手自己的动作或建议，优先将“助手”作为 primary_entity。
 
 memory_topic_items 使用规则：
@@ -178,14 +174,6 @@ entity_claim_signal 输出规则：
 - 只有当前 fact 对某个实体主张或未来规律归纳有实际证据价值时才输出。普通一次性背景、临时建议、助手猜测、寒暄和低价值信息输出空数组。
 - 每条 fact 最多输出 3 个 signal。每个 signal 必须包含 entity、signal_kind、claim_type_hint、claim_anchor、evidence_basis、confidence；其中 evidence_basis 必须引用当前 fact 的具体证据，不要引用历史 claim。
 
-action_signal 输出规则：
-- `action_signal` 只是候选线索，不是最终的 actionable_item。它允许有少量误报，后续 actionable 提取模块会重新核验。
-- 只有当前 fact 明显涉及未来行动、执行承诺、未完成决定或明确提醒/跟进时才输出；没有未来导向时输出空数组。不要根据上下文推断责任人、截止时间、完成状态或最终结论。
-- `action_strength` 只能是 `assigned`、`committed`、`pending_decision` 或 `follow_up`，表示粗粒度候选类型，不代表最终判断；`item_type=decision` 仅可搭配 `pending_decision`。
-- 每条 fact 最多输出 1 个 signal。每个 signal 只保留 `item_type`、`action_strength`、`evidence_basis` 和 `confidence`，可选填写证据明确的 `due_at`；不要生成 action_summary、owner 或 status。
-- `evidence_basis` 必须来自当前 fact 的直接证据，不要拼接多个事实或补充未出现的责任人、时间和结论。
-- `item_type` 只能是 task、commitment、decision、follow_up、open_question、risk、reminder、recommendation、constraint。
-
 输出格式：
 {
   "facts": [
@@ -211,22 +199,10 @@ action_signal 输出规则：
           "evidence_basis": "当前 fact 中支持该 signal 的具体证据",
           "confidence": 0.8
         }
-      ],
-      "action_signal": [
-        {
-          "item_type": "task|commitment|decision|follow_up|open_question|risk|reminder|recommendation|constraint",
-          "action_strength": "assigned|committed|pending_decision|follow_up",
-          "due_at": "",
-          "evidence_basis": "当前 fact 中支持该 signal 的具体证据",
-          "confidence": 0.8
-        }
       ]
     }
   ]
 }
-
-已有长期 memory_states 参考：
-{existing_memory_states}
 
 已有 memory_topic_items 命名候选：
 {existing_memory_topic_items}
@@ -234,6 +210,90 @@ action_signal 输出规则：
 对话/转写证据批次：
 {dialogue_batch}
 """
+
+INTENT_EXECUTION_EXTRACTION_PROMPT_ZH = """你负责从已落库、可追溯的 narrative facts 中提取个人世界模型的 Intent & Execution 对象。
+
+只允许输出三类对象：
+- goal：主体明确、跨越多个动作的持续性期望结果；一次性愿望或单次动作不是 goal。
+- plan：明确的未来安排、行程、会议、活动或事件；它不是待办。
+- work_item：责任人明确，且有具体动作、交付物或可判定完成条件的事项。它可以是 personal_action、commitment、assigned 或 external_commitment。
+
+严格限制：
+- 只能使用输入 facts 的直接证据。assistant 的建议、推测、行为规律和 prediction 不得自动落库。
+- “也许”“如果”“要不要”“考虑一下”等弱假设默认不输出对象。
+- goal 或 plan 不得自动拆出 work_item；只有文本明确表达下一步、交付、承诺或分配时才输出 work_item。
+- 计划发生是 `occurred`，事项完成是 `completed`，二者不能混淆。
+- 不要为同一证据创建重复对象；当事实明显表示完成、取消、改期、阻塞或确认时，输出相应 operation。
+
+world owner：{world_owner_name}
+当前时间：{reference_timestamp}
+输入 facts：
+{facts}
+
+输出 JSON：
+{
+  "candidates": [
+    {
+      "object_type": "goal|plan|work_item",
+      "operation": "create|confirm|update|complete|cancel|reschedule|block",
+      "summary": "完整、可展示的对象描述",
+      "canonical_key": "用于同义对象匹配的简短稳定名称",
+      "owner_entity": "goal 的归属实体；没有明确证据时填 world owner",
+      "desired_outcome": "goal 才填写",
+      "success_criteria": "goal 才填写，证据不足时为空",
+      "target_at": "goal 的目标时间，证据不足为空",
+      "actor_entity": "plan 的行动/参与主体",
+      "event_or_activity": "plan 的未来事件或活动",
+      "start_at": "plan 开始时间，保留已解析时间或原始明确时间",
+      "end_at": "plan 结束时间",
+      "time_precision": "exact|day|week|relative|unknown",
+      "location": "plan 地点",
+      "participants": ["plan 其他参与者"],
+      "responsible_entity": "work_item 负责人",
+      "beneficiary_entities": ["交付/受益对象"],
+      "delegator_entities": ["分配或委托对象"],
+      "collaborator_entities": ["协作者"],
+      "responsibility_type": "personal_action|commitment|assigned|external_commitment",
+      "action_text": "work_item 具体动作",
+      "deliverable": "work_item 交付物或完成结果",
+      "due_at": "work_item 截止时间",
+      "start_at": "work_item 可填写开始时间；plan 时表示事件开始时间",
+      "priority": "仅文本明确表达时填写",
+      "related_goal_key": "只有当前证据明确说明该事项推进某 goal 时填写",
+      "related_plan_key": "只有当前证据明确说明该事项服务于某 plan 时填写",
+      "confidence": 0.0,
+      "evidence_fact_ids": [1]
+    }
+  ]
+}
+
+每个 candidate 必须至少引用一个输入 fact id。没有合格对象时返回 {"candidates": []}。只返回 JSON。"""
+
+
+INTENT_EXECUTION_RECONCILIATION_PROMPT_ZH = """你只判断新的 Intent & Execution candidate 与已有对象之间的关系，不生成新事实，不修改字段。
+
+对于每个 candidate，若它与某个同类 existing object 是同一目标、同一计划或同一事项，请选择最合适的目标对象，并输出 operation：confirm、update、complete、cancel、reschedule、block 或 create。没有可靠对应关系时使用 create。Plan 的 occurred 表示活动已发生；Work item 的 completed 表示责任已完成。
+
+不要因为主题相近就合并；主体、核心活动/交付物与时间关系必须相容。只返回 JSON：
+{
+  "decisions": [
+    {
+      "candidate_index": 0,
+      "operation": "create|confirm|update|complete|cancel|reschedule|block",
+      "target_object_type": "goal|plan|work_item",
+      "target_object_id": 0,
+      "reason": "简短的证据性理由"
+    }
+  ]
+}
+
+candidates：
+{candidates}
+
+existing objects：
+{existing_objects}
+"""
+
 
 EXPLICIT_ENTITY_CLAIM_EXTRACTION_PROMPT_ZH = """你是个人世界模型的显式主张（explicit claim）更新模块。
 
