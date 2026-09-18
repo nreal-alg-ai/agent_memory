@@ -151,6 +151,16 @@ entity_claim_signal rules:
 - Output signals only when this fact has concrete evidence value for an entity claim or later pattern induction. Use an empty array for one-off background, temporary suggestions, assistant speculation, pleasantries, and low-value content.
 - Return at most 3 signals per fact. Every signal must contain entity, signal_kind, claim_type_hint, claim_anchor, evidence_basis, and confidence. evidence_basis must cite the current fact, never a prior claim.
 
+prospective_signals rules:
+- `prospective_signals` are structured hints that this fact is evidence about the user's future world. They are not final goals, plans, or work items, and must not directly create, update, or override an existing object.
+- Output a signal only when this fact directly supports a user's future-facing goal, arrangement, responsibility, or a lifecycle change such as completion, cancellation, rescheduling, or blockage. Otherwise output an empty array.
+- `evidence_kind` must be one of goal, plan, responsibility, or lifecycle_update. `candidate_object_types` may contain only goal, plan, and work_item. A goal may be signalled only by the user's own explicit durable goal expression.
+- `user_role` must be owner, participant, or responsible: the user respectively owns the goal, participates in the arrangement, or bears the responsibility. Do not output a signal when the user is merely mentioned.
+- `assertion_source` must be self_statement, third_party_report, or observed_event; `explicitness` must be direct, reported, or tentative. Assistant suggestions or restatements, open hypotheticals, conditional discussion, and speculation never create signals.
+- `prospective_anchor` is a short, stable grouping label for the goal, event, or responsibility, such as "Tianjin client meeting", "half-marathon training goal", or "client report delivery". It is not a full sentence or the final object description.
+- `operation_hint` must be create, confirm, update, complete, cancel, reschedule, or block. Use a non-create value only when the fact directly states that lifecycle change.
+- Return at most 2 signals per fact. Every signal must include subject_entity, evidence_kind, candidate_object_types, operation_hint, user_role, prospective_anchor, assertion_source, explicitness, evidence_basis, and confidence. evidence_basis must be concrete evidence in this fact.
+
 Output schema:
 {
   "facts": [
@@ -176,6 +186,20 @@ Output schema:
           "evidence_basis": "specific evidence from this fact supporting the signal",
           "confidence": 0.8
         }
+      ],
+      "prospective_signals": [
+        {
+          "subject_entity": "the entity whose future is involved; use the world owner for the user",
+          "evidence_kind": "goal|plan|responsibility|lifecycle_update",
+          "candidate_object_types": ["goal|plan|work_item"],
+          "operation_hint": "create|confirm|update|complete|cancel|reschedule|block",
+          "user_role": "owner|participant|responsible",
+          "prospective_anchor": "a stable label for grouping the goal, arrangement, or responsibility",
+          "assertion_source": "self_statement|third_party_report|observed_event",
+          "explicitness": "direct|reported|tentative",
+          "evidence_basis": "concrete evidence from this fact supporting the signal",
+          "confidence": 0.8
+        }
       ]
     }
   ]
@@ -185,7 +209,7 @@ Dialogue/transcript evidence batch:
 {dialogue_batch}
 """
 
-INTENT_EXECUTION_EXTRACTION_PROMPT_EN = """Extract Intent & Execution objects from stored, traceable narrative facts for a personal world model.
+INTENT_EXTRACTION_PROMPT_EN = """Extract Intent & Execution objects from stored, traceable narrative facts for a personal world model.
 
 Only output:
 - goal: an explicit, durable desired outcome that spans more than one action;
@@ -237,7 +261,7 @@ Return JSON only:
 Every candidate needs at least one input fact id. Return {"candidates": []} when none qualify."""
 
 
-INTENT_EXECUTION_RECONCILIATION_PROMPT_EN = """Decide only the relationship between new Intent & Execution candidates and existing objects. Do not invent facts or modify object fields.
+INTENT_RECONCILIATION_PROMPT_EN = """Decide only the relationship between new Intent & Execution candidates and existing objects. Do not invent facts or modify object fields.
 
 For each candidate, choose a matching existing object only when it represents the same goal, plan, or work item with compatible subject, core activity/deliverable, and time. Return create when no reliable match exists. Plan `occurred` means the event happened; work_item `completed` means the responsibility was fulfilled.
 

@@ -114,6 +114,11 @@ class MemoryRuntime:
             or allday_segmentation_config.get("max_time_gap_seconds")
             or 60.0
         )
+        self._interaction_episode_source_type = "assistant_wakeup"
+        self._interaction_episode_tags: List[str] = []
+        self._interaction_episode_prompt_language = "zh"
+        self._interaction_has_pending_episode_facts = False
+
         self._transcript_previous_segment_end: Optional[datetime] = None
         self._transcript_episode_source_type = "allday_recording"
         self._transcript_episode_tags: List[str] = []
@@ -277,7 +282,7 @@ class MemoryRuntime:
             or self._transcript_unit_assembler.has_pending_segments()
             or self._transcript_has_pending_episode_facts
         ):
-            gap_summary_report = self._finalize_transcript_episode_summary(reason="time_gap")
+            gap_summary_report = self.trigger_memory_episode_summary(reason="time_gap")
         else:
             gap_summary_report = None
 
@@ -303,7 +308,7 @@ class MemoryRuntime:
         if completed_unit is None:
             final_summary_report = None
             if is_last_segment:
-                final_summary_report = self._finalize_transcript_episode_summary(reason="last_segment")
+                final_summary_report = self.trigger_memory_episode_summary(reason="last_segment")
             return {
                 "queued": queued or bool((final_summary_report or {}).get("queued")),
                 "reason": "threshold_not_reached",
@@ -317,7 +322,7 @@ class MemoryRuntime:
                 "reason": str(append_report.get("reason") or "queue_rejected"),
             }
         if is_last_segment:
-            final_summary_report = self._finalize_transcript_episode_summary(reason="last_segment")
+            final_summary_report = self.trigger_memory_episode_summary(reason="last_segment")
             queued = queued or bool(final_summary_report.get("queued"))
         else:
             final_summary_report = None
@@ -363,17 +368,82 @@ class MemoryRuntime:
         except (TypeError, ValueError):
             return None
 
-    def _finalize_transcript_episode_summary(self, *, reason: str) -> Dict[str, Any]:
-        flush_report = self._flush_pending_transcript_segments(reason=reason)
-        report = self._memory_manager.submit_memory_episode_summary_task(
-            source_type=self._transcript_episode_source_type,
-            tags=self._transcript_episode_tags,
-            prompt_language=self._transcript_episode_prompt_language,
+    def trigger_memory_episode_summary(
+        self,
+        *,
+        reason: str = "explicit",
+        source_type: Optional[str] = None,
+        tags: Optional[List[str]] = None,
+        prompt_language: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Queue one completed source episode and its prospective update.
+
+        The manager's single FIFO queue preserves the submission order: any
+        pending store task, then episode summary, then prospective update.
+        """
+        resolved_source_type = str(
+            source_type or self._transcript_episode_source_type
+        ).strip() or "allday_recording"
+        is_transcript_episode = (
+            resolved_source_type == self._transcript_episode_source_type
         )
-        self._transcript_has_pending_episode_facts = False
-        self._transcript_episode_tags = []
+        is_interaction_episode = (
+            resolved_source_type == self._interaction_episode_source_type
+        )
+        default_tags = (
+            self._transcript_episode_tags
+            if is_transcript_episode
+            else self._interaction_episode_tags
+        )
+        default_prompt_language = (
+            self._transcript_episode_prompt_language
+            if is_transcript_episode
+            else self._interaction_episode_prompt_language
+        )
+        resolved_tags = list(default_tags if tags is None else tags or [])
+        resolved_prompt_language = str(
+            prompt_language or default_prompt_language
+        ).strip() or "zh"
+
+        if resolved_source_type == self._transcript_episode_source_type:
+            flush_report = self._flush_pending_transcript_segments(reason=reason)
+            has_pending_episode_facts = self._transcript_has_pending_episode_facts
+        elif is_interaction_episode:
+            flush_report = self._flush_pending_interaction_turns()
+            has_pending_episode_facts = self._interaction_has_pending_episode_facts
+        else:
+            flush_report = {"queued": False, "reason": "no_runtime_input_flush"}
+            has_pending_episode_facts = False
+
+        if not has_pending_episode_facts:
+            return {
+                "queued": False,
+                "reason": "no_pending_episode_facts",
+                "trigger_reason": reason,
+                "input_flush": flush_report,
+            }
+        report = self._memory_manager.submit_memory_episode_summary_task(
+            source_type=resolved_source_type,
+            tags=resolved_tags,
+            prompt_language=resolved_prompt_language,
+        )
+        if bool(report.get("queued")):
+            report["prospective_update"] = (
+                self._memory_manager.submit_memory_prospective_update_task()
+            )
+            if is_transcript_episode:
+                self._transcript_has_pending_episode_facts = False
+                self._transcript_episode_tags = []
+            elif is_interaction_episode:
+                self._interaction_has_pending_episode_facts = False
+                self._interaction_episode_tags = []
+        else:
+            report["prospective_update"] = {
+                "queued": False,
+                "reason": "episode_summary_not_queued",
+            }
         report["trigger_reason"] = reason
-        report["transcript_flush"] = flush_report
+        report["input_flush"] = flush_report
         return report
 
     def _append_transcript_semantic_unit(
@@ -629,15 +699,6 @@ class MemoryRuntime:
         transcript_flush_report = self._flush_pending_transcript_segments(
             reason="reflect",
         )
-        if transcript_flush_report.get("queued") or self._transcript_has_pending_episode_facts:
-            transcript_flush_report["episode_summary"] = self._memory_manager.submit_memory_episode_summary_task(
-                source_type=self._transcript_episode_source_type,
-                tags=self._transcript_episode_tags,
-                prompt_language=self._transcript_episode_prompt_language,
-            )
-            self._transcript_has_pending_episode_facts = False
-            self._transcript_episode_tags = []
-
         report = self._memory_manager.submit_memory_reflect_task(*args, **kwargs) or {}
         report["pending_interaction_flush"] = interaction_flush_report
         report["pending_transcript_flush"] = transcript_flush_report
@@ -715,12 +776,25 @@ class MemoryRuntime:
                 "segments": raw_segments,
             },
         )
-        return self._memory_manager.submit_memory_store_task(
+        queue_report = self._memory_manager.submit_memory_store_task(
             raw_segments=raw_segments,
             source_type="assistant_wakeup",
             tags=tags,
             prompt_language=prompt_language,
         )
+        queued = bool(queue_report.get("queued"))
+        if queued:
+            self._interaction_has_pending_episode_facts = True
+            self._interaction_episode_tags = sorted(
+                set(self._interaction_episode_tags).union(tags)
+            )
+            self._interaction_episode_prompt_language = prompt_language
+        return {
+            "queued": queued,
+            "reason": (
+                "" if queued else str(queue_report.get("reason") or "queue_rejected")
+            ),
+        }
 
     def _resolve_prompt_language_from_segments(
         self,

@@ -192,7 +192,7 @@ memory_runtime:
 memory_manager:
   memory_enabled: true
   enable_memory_entity_claim_update: true
-  enable_memory_intent_execution: true
+  enable_memory_prospective_update: true
   llm:
     llm_provider: deepseek
     llm_name: deepseek-v4-flash
