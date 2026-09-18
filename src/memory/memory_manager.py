@@ -463,6 +463,14 @@ class MemoryNodeManager:
             1.0,
             0.72,
         )
+        self._entity_claim_induction_min_support_facts = max(
+            3,
+            int(
+                self._memory_cfg.get(
+                    "entity_claim_induction_min_support_facts", 3,
+                ) or 3
+            ),
+        )
         self._entity_claim_induction_min_episodes = max(
             3,
             int(self._memory_cfg.get("entity_claim_induction_min_episodes", 3) or 3),
@@ -470,6 +478,10 @@ class MemoryNodeManager:
         self._entity_claim_induction_min_time_windows = max(
             2,
             int(self._memory_cfg.get("entity_claim_induction_min_time_windows", 2) or 2),
+        )
+        self._entity_claim_induction_evidence_limit = max(
+            self._entity_claim_induction_min_support_facts,
+            int(self._memory_cfg.get("entity_claim_induction_evidence_limit", 16) or 16),
         )
         self._initialize_recall_config()
         self._embedding_client: Optional[EmbeddingClient] = None
@@ -1574,9 +1586,7 @@ class MemoryNodeManager:
         if max_items <= 0:
             return []
         allowed_types = self._entity_claim_types()
-        allowed_kinds = {
-            "explicit_assertion", "pattern_observation", "counterexample",
-        }
+        allowed_kinds = {"explicit_assertion", "pattern_observation"}
         normalized: List[Dict[str, Any]] = []
         seen: set[Tuple[str, str, str, str]] = set()
         for raw in value:
@@ -1592,7 +1602,7 @@ class MemoryNodeManager:
             ):
                 continue
             if (
-                signal_kind in {"pattern_observation", "counterexample"}
+                signal_kind == "pattern_observation"
                 and claim_type_hint not in {"preference", "behavior_pattern"}
             ):
                 continue
@@ -2156,6 +2166,7 @@ class MemoryNodeManager:
     ) -> Dict[str, Any]:
         fact_ids: List[int] = []
         topic_item_updates: List[Dict[str, Any]] = []
+        entity_claim_signal_mapping_updates: List[Dict[str, Any]] = []
         normalized_entity_info = {
             str(entity_name): int(entity_id)
             for entity_name, entity_id in (entity_info or {}).items()
@@ -2202,7 +2213,6 @@ class MemoryNodeManager:
             fact_metadata = {
                 **metadata,
                 "tags": tags,
-                "entity_claim_signal": fact.get("entity_claim_signal") or [],
                 "episode_context_topics": list(episode_context_topics or []),
                 "episode_context_entities": list(episode_context_entities or []),
             }
@@ -2226,6 +2236,9 @@ class MemoryNodeManager:
                 identity_text=identity_text,
             )
             fact_ids.append(fact_id)
+            entity_claim_signal_mapping_updates.extend(
+                self._fact_entity_claim_signal_mapping_updates(fact_id, fact)
+            )
             topic_item_updates.extend(
                 self._build_memory_topic_item_updates(
                     canonical_topics=[fact_root_topic],
@@ -2233,6 +2246,9 @@ class MemoryNodeManager:
                     fact_id=fact_id,
                 )
             )
+        self._db.upsert_fact_entity_claim_signal_mappings(
+            entity_claim_signal_mapping_updates
+        )
         return {
             "fact_ids": fact_ids,
             "topic_item_updates": topic_item_updates,
@@ -2297,7 +2313,7 @@ class MemoryNodeManager:
                 "ok"
                 if (
                     claim_report.get("explicit", {}).get("fact_count", 0)
-                    or claim_report.get("inductive", {}).get("episode_count", 0)
+                    or claim_report.get("inductive", {}).get("seed_fact_count", 0)
                 )
                 else "empty"
             ),
@@ -2310,8 +2326,8 @@ class MemoryNodeManager:
             "facts_marked_processed_for_memory_entity_claim": int(
                 claim_report.get("explicit", {}).get("facts_marked_processed", 0) or 0
             ),
-            "episodes_marked_processed_for_entity_claim_induction": int(
-                claim_report.get("inductive", {}).get("episodes_marked_processed", 0) or 0
+            "facts_marked_processed_for_entity_claim_induction": int(
+                claim_report.get("inductive", {}).get("facts_marked_processed", 0) or 0
             ),
             "intent_execution_task": intent_execution_task,
             "total_elapsed_ms": round(
@@ -2765,7 +2781,6 @@ class MemoryNodeManager:
         """Project facts and completed episodes into traceable claim records."""
         disabled = {
             "enabled": 0, "updated": 0, "facts_marked_processed": 0,
-            "episodes_marked_processed": 0,
         }
         if not self._enable_memory_entity_claim_update:
             return {"explicit": dict(disabled), "inductive": dict(disabled)}
@@ -2786,18 +2801,23 @@ class MemoryNodeManager:
         else:
             explicit_report["facts_marked_processed"] = 0
 
-        episodes = self._db.get_unprocessed_episodes_for_entity_claim_induction(
-            limit=max(1, min(limit, 24)),
+        induction_seed_facts = self._db.get_unprocessed_facts(
+            processing_target="entity_claim_induction",
+            reference_timestamp=reference_timestamp,
+            limit=max(1, min(limit, 100)),
+            restrict_to_today=False,
+            require_episode=True,
         )
-        inductive_report = self._update_inductive_entity_claims_from_episodes(episodes)
+        inductive_report = self._update_inductive_entity_claims_from_facts(
+            induction_seed_facts,
+        )
         if inductive_report.pop("completed", False):
-            inductive_report["episodes_marked_processed"] = (
-                self._db.mark_episodes_processed_for_entity_claim_induction(
-                    [episode.get("id") for episode in episodes]
-                )
+            inductive_report["facts_marked_processed"] = self._db.mark_facts_processed(
+                processing_target="entity_claim_induction",
+                fact_ids=[fact.get("id") for fact in induction_seed_facts],
             )
         else:
-            inductive_report["episodes_marked_processed"] = 0
+            inductive_report["facts_marked_processed"] = 0
         self._log_info("memory_reflect", "entity_claim_update_finish", {
             "explicit": explicit_report,
             "inductive": inductive_report,
@@ -2813,14 +2833,8 @@ class MemoryNodeManager:
             "entities": fact.get("entities") or [],
             "primary_entity": fact.get("primary_entity") or metadata.get("primary_entity"),
             "keywords": fact.get("keywords") or [],
-            "entity_claim_signal": (
-                fact.get("entity_claim_signal")
-                or metadata.get("entity_claim_signal")
-                or []
-            ),
             "event_time": fact.get("event_time_key") or "",
             "dialogue_time": fact.get("dialogue_time_key") or "",
-            "episode_id": fact.get("episode_id"),
         }
 
     def _claim_entity_name_to_id(self, facts: Sequence[Dict[str, Any]]) -> Dict[str, int]:
@@ -2845,25 +2859,18 @@ class MemoryNodeManager:
             key: value
             for key, value in candidate.items()
             if key not in {
-                "evidence_fact_ids", "support_fact_ids", "counterexample_fact_ids",
+                "evidence_fact_ids", "support_fact_ids",
             }
         }
 
     @staticmethod
-    def _entity_claim_evidence_ids(
+    def _entity_claim_support_ids(
         candidate: Dict[str, Any],
-    ) -> Tuple[List[int], List[int]]:
+    ) -> List[int]:
         support_ids = candidate.get("support_fact_ids")
         if support_ids is None:
             support_ids = candidate.get("evidence_fact_ids") or []
-        return (
-            [int(value) for value in support_ids if str(value).strip().isdigit()],
-            [
-                int(value)
-                for value in candidate.get("counterexample_fact_ids") or []
-                if str(value).strip().isdigit()
-            ],
-        )
+        return [int(value) for value in support_ids if str(value).strip().isdigit()]
 
     def _retrieve_related_entity_claims(
         self,
@@ -2877,11 +2884,11 @@ class MemoryNodeManager:
             limit=80,
         )
         predicate = str(candidate.get("predicate") or "")
-        normalized_value = str(candidate.get("normalized_value") or "")
+        object_entity_id = int(candidate.get("object_entity_id") or 0)
         rows.sort(
             key=lambda row: (
                 str(row.get("predicate") or "") != predicate,
-                str(row.get("normalized_value") or "") != normalized_value,
+                int(row.get("object_entity_id") or 0) != object_entity_id,
                 -self._entity_claim_origin_priority(row.get("claim_origin")),
                 -float(row.get("confidence") or 0.0),
             )
@@ -3060,29 +3067,24 @@ class MemoryNodeManager:
         *,
         claim_id: int,
         support_ids: Sequence[int],
-        counterexample_ids: Sequence[int],
         facts_by_id: Dict[int, Dict[str, Any]],
         confidence: float,
         support_role: str = "support",
     ) -> None:
         evidence: List[Dict[str, Any]] = []
-        for role, fact_ids in (
-            (support_role, support_ids),
-            ("counterexample", counterexample_ids),
-        ):
-            for fact_id in fact_ids:
-                fact = facts_by_id.get(int(fact_id))
-                if not fact:
-                    continue
-                evidence.append({
-                    "claim_id": claim_id,
-                    "evidence_type": "fact",
-                    "evidence_id": int(fact_id),
-                    "role": role,
-                    "weight": confidence,
-                    "observed_at": fact.get("event_time_key")
-                    or fact.get("dialogue_time_key") or "",
-                })
+        for fact_id in support_ids:
+            fact = facts_by_id.get(int(fact_id))
+            if not fact:
+                continue
+            evidence.append({
+                "claim_id": claim_id,
+                "evidence_type": "fact",
+                "evidence_id": int(fact_id),
+                "role": support_role,
+                "weight": confidence,
+                "observed_at": fact.get("event_time_key")
+                or fact.get("dialogue_time_key") or "",
+            })
         self._db.upsert_entity_claim_evidence(evidence)
 
     @staticmethod
@@ -3090,7 +3092,6 @@ class MemoryNodeManager:
         candidate: Dict[str, Any],
         *,
         support_ids: Sequence[int],
-        counterexample_ids: Sequence[int],
         facts_by_id: Dict[int, Dict[str, Any]],
     ) -> str:
         """Use the candidate's own temporal assertion, then its newest fact."""
@@ -3101,7 +3102,7 @@ class MemoryNodeManager:
             _compact_whitespace(
                 fact.get("event_time_key") or fact.get("dialogue_time_key") or ""
             )
-            for fact_id in [*support_ids, *counterexample_ids]
+            for fact_id in support_ids
             for fact in [facts_by_id.get(int(fact_id))]
             if fact
         ]
@@ -3174,7 +3175,7 @@ class MemoryNodeManager:
             key = (
                 candidate.get("subject_entity_id"), candidate.get("claim_type"),
                 candidate.get("predicate"), candidate.get("object_entity_id") or 0,
-                candidate.get("normalized_value"), candidate.get("claim_origin"),
+                candidate.get("claim_text"), candidate.get("claim_origin"),
             )
             if key in seen:
                 continue
@@ -3191,11 +3192,10 @@ class MemoryNodeManager:
         for index, candidate in enumerate(unique_candidates):
             candidate_decisions = decisions[index]
             candidate_origin = str(candidate.get("claim_origin") or "")
-            support_ids, counterexample_ids = self._entity_claim_evidence_ids(candidate)
+            support_ids = self._entity_claim_support_ids(candidate)
             effective_at = self._entity_claim_transition_effective_at(
                 candidate,
                 support_ids=support_ids,
-                counterexample_ids=counterexample_ids,
                 facts_by_id=facts_by_id,
             )
             candidate_status = str(candidate.get("status") or "candidate")
@@ -3249,7 +3249,6 @@ class MemoryNodeManager:
                         self._write_entity_claim_evidence(
                             claim_id=int(target["id"]),
                             support_ids=support_ids,
-                            counterexample_ids=counterexample_ids,
                             facts_by_id=facts_by_id,
                             confidence=float(candidate.get("confidence") or 0.0),
                             support_role=target_evidence_role,
@@ -3267,7 +3266,6 @@ class MemoryNodeManager:
             self._write_entity_claim_evidence(
                 claim_id=claim_id,
                 support_ids=support_ids,
-                counterexample_ids=counterexample_ids,
                 facts_by_id=facts_by_id,
                 confidence=float(candidate.get("confidence") or 0.0),
             )
@@ -3291,7 +3289,6 @@ class MemoryNodeManager:
                     self._write_entity_claim_evidence(
                         claim_id=int(target["id"]),
                         support_ids=support_ids,
-                        counterexample_ids=counterexample_ids,
                         facts_by_id=facts_by_id,
                         confidence=float(candidate.get("confidence") or 0.0),
                         support_role=target_evidence_role,
@@ -3398,22 +3395,22 @@ class MemoryNodeManager:
             return None
         object_name = _compact_whitespace(raw.get("object_entity") or "")
         object_id = entity_ids.get(object_name) if object_name else None
-        normalized_value = _compact_whitespace(raw.get("normalized_value") or "")[:160]
-        if not object_id and not normalized_value:
+        raw_claim_text = _compact_whitespace(raw.get("claim_text") or "")
+        if not object_id and not raw_claim_text:
             return None
         confidence = self._clamp_float(raw.get("confidence"), 0.0, 1.0, 0.7)
         claim_text = self._normalize_entity_claim_text(
-            raw.get("claim_text"),
+            raw_claim_text,
             subject=subject,
             predicate=predicate,
             object_name=object_name,
-            normalized_value=normalized_value,
         )
+        if not claim_text:
+            return None
         return {
             "subject_entity_id": subject_id,
             "predicate": predicate,
             "object_entity_id": object_id,
-            "normalized_value": normalized_value,
             "claim_text": claim_text,
             "claim_type": claim_type,
             "claim_origin": "explicit",
@@ -3427,63 +3424,49 @@ class MemoryNodeManager:
             "evidence_fact_ids": evidence_ids,
         }
 
-    def _update_inductive_entity_claims_from_episodes(
+    def _update_inductive_entity_claims_from_facts(
         self,
-        episodes: Sequence[Dict[str, Any]],
+        seed_facts: Sequence[Dict[str, Any]],
     ) -> Dict[str, Any]:
+        """Use new facts to trigger bounded, exact-group evidence expansion."""
         report: Dict[str, Any] = {
-            "enabled": 1, "episode_count": len(episodes), "candidate_count": 0,
+            "enabled": 1, "seed_fact_count": len(seed_facts), "candidate_count": 0,
             "updated": 0, "created": 0, "completed": True,
         }
-        if not episodes:
+        if not seed_facts:
             return report
-        seed_facts = self._db.memory_facts_by_episode_ids(
-            [episode.get("id") for episode in episodes], limit=360,
-        )
         groups: Dict[Tuple[int, str, str], Dict[str, Any]] = {}
         for fact in seed_facts:
-            for signal in self._entity_claim_signals_from_fact(fact):
-                claim_type_hint = str(signal.get("claim_type_hint") or "").lower()
-                if claim_type_hint not in {"preference", "behavior_pattern"}:
-                    continue
-                if str(signal.get("signal_kind") or "") not in {
-                    "explicit_assertion", "pattern_observation", "counterexample",
-                }:
-                    continue
-                names = self._entities_for_entity_claim_signal(signal, fact)
-                mapping = self._db.add_entity_names(names)
-                if not names or names[0] not in mapping:
-                    continue
-                claim_anchor = _compact_whitespace(signal.get("claim_anchor") or "")
-                if not claim_anchor:
-                    continue
+            fact_id = int(fact.get("id") or 0)
+            if fact_id <= 0:
+                continue
+            for signal_mapping in self._entity_claim_signals_from_fact(fact):
                 key = (
-                    int(mapping[names[0]]),
-                    claim_type_hint,
-                    self._generate_topic_name_key(claim_anchor),
+                    int(signal_mapping["subject_entity_id"]),
+                    str(signal_mapping["claim_type_hint"]),
+                    str(signal_mapping["claim_anchor_key"]),
                 )
-                groups.setdefault(key, {
-                    "subject": names[0], "subject_entity_id": int(mapping[names[0]]),
-                    "claim_type_hint": claim_type_hint,
-                    "claim_anchor": claim_anchor,
+                group = groups.setdefault(key, {
+                    "subject": signal_mapping["subject"],
+                    "subject_entity_id": int(signal_mapping["subject_entity_id"]),
+                    "claim_type_hint": signal_mapping["claim_type_hint"],
+                    "claim_anchor": signal_mapping["claim_anchor"],
+                    "claim_anchor_key": signal_mapping["claim_anchor_key"],
+                    "seed_facts_by_id": {},
                 })
+                group["seed_facts_by_id"][fact_id] = fact
         report["candidate_count"] = len(groups)
         for group in list(groups.values())[:12]:
-            all_entity_facts = self._db.memory_episode_facts_for_entity_id(
-                group["subject_entity_id"], limit=240,
+            historical_facts = self._db.memory_facts_for_entity_claim_signal_group(
+                subject_entity_id=int(group["subject_entity_id"]),
+                claim_type_hint=str(group["claim_type_hint"]),
+                claim_anchor_key=str(group["claim_anchor_key"]),
+                limit=max(64, self._entity_claim_induction_evidence_limit * 4),
             )
-            evidence_facts = [
-                fact for fact in all_entity_facts
-                if any(
-                    str(signal.get("claim_type_hint") or "").lower()
-                    == group["claim_type_hint"]
-                    and self._generate_topic_name_key(signal.get("claim_anchor") or "")
-                    == self._generate_topic_name_key(group["claim_anchor"])
-                    and group["subject"]
-                    in self._entities_for_entity_claim_signal(signal, fact)
-                    for signal in self._entity_claim_signals_from_fact(fact)
-                )
-            ]
+            evidence_facts = self._select_inductive_entity_claim_evidence_facts(
+                group=group,
+                historical_facts=historical_facts,
+            )
             distinct_episodes = {
                 int(fact["episode_id"]) for fact in evidence_facts
                 if str(fact.get("episode_id") or "").strip().isdigit()
@@ -3494,7 +3477,8 @@ class MemoryNodeManager:
                 if str(fact.get("event_time_key") or fact.get("dialogue_time_key") or "")
             }
             if (
-                len(distinct_episodes) < self._entity_claim_induction_min_episodes
+                len(evidence_facts) < self._entity_claim_induction_min_support_facts
+                or len(distinct_episodes) < self._entity_claim_induction_min_episodes
                 or len(time_windows) < self._entity_claim_induction_min_time_windows
             ):
                 continue
@@ -3502,8 +3486,6 @@ class MemoryNodeManager:
                 group=group, facts=evidence_facts,
             )
             if outcome is None:
-                # Do not mark the episode cursor on a transport/format error:
-                # the same completed evidence must remain eligible for retry.
                 report["completed"] = False
                 report["error"] = "invalid_llm_induction_response"
                 return report
@@ -3513,28 +3495,123 @@ class MemoryNodeManager:
                 claim = item["claim"]
                 if item["effective_origin"] != "inductive":
                     continue
-                support_ids, counterexample_ids = self._entity_claim_evidence_ids(claim)
+                support_ids = self._entity_claim_support_ids(claim)
                 if not support_ids:
                     continue
                 claim_id = int(item["claim_id"])
+                support_summary = self._db.get_entity_claim_support_fact_summary(
+                    claim_id
+                )
+                if int(support_summary["support_count"]) <= 0:
+                    continue
                 self._db.upsert_entity_claim_induction(
                     claim_id=claim_id,
                     condition_text=str(claim.get("metadata", {}).get("condition_text") or ""),
-                    behavior_or_outcome_text=str(claim.get("metadata", {}).get("behavior_or_outcome_text") or ""),
-                    support_count=len(support_ids),
-                    counterexample_count=len(counterexample_ids),
-                    first_observed_at=min(
-                        (by_id[item].get("event_time_key") or by_id[item].get("dialogue_time_key") or "")
-                        for item in support_ids
-                    ),
-                    last_observed_at=max(
-                        (by_id[item].get("event_time_key") or by_id[item].get("dialogue_time_key") or "")
-                        for item in support_ids
-                    ),
+                    support_count=int(support_summary["support_count"]),
+                    first_observed_at=str(support_summary["first_observed_at"]),
+                    last_observed_at=str(support_summary["last_observed_at"]),
                 )
             report["updated"] += len(applied)
             report["created"] += sum(int(item["created"]) for item in applied)
         return report
+
+    def _fact_entity_claim_signal_mapping_updates(
+        self,
+        fact_id: int,
+        fact: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        """Project one fact's induction-eligible signals into exact group keys."""
+        updates: List[Dict[str, Any]] = []
+        fallback_entity = fact.get("primary_entity")
+        raw_signals = self._normalize_entity_claim_signal(
+            fact.get("entity_claim_signal"),
+            fallback_entity=fallback_entity,
+        )
+        for signal in raw_signals:
+            claim_type_hint = str(signal.get("claim_type_hint") or "").lower()
+            signal_kind = str(signal.get("signal_kind") or "").lower()
+            if claim_type_hint not in {"preference", "behavior_pattern"}:
+                continue
+            if signal_kind not in {"explicit_assertion", "pattern_observation"}:
+                continue
+            names = self._entities_for_entity_claim_signal(signal, fact)
+            entity_mapping = self._db.add_entity_names(names)
+            if not names or names[0] not in entity_mapping:
+                continue
+            claim_anchor = _compact_whitespace(signal.get("claim_anchor") or "")
+            if not claim_anchor:
+                continue
+            claim_anchor_key = self._generate_topic_name_key(claim_anchor)
+            if not claim_anchor_key:
+                continue
+            updates.append({
+                "fact_id": int(fact_id),
+                "subject": names[0],
+                "subject_entity_id": int(entity_mapping[names[0]]),
+                "claim_type_hint": claim_type_hint,
+                "signal_kind": signal_kind,
+                "claim_anchor": claim_anchor,
+                "claim_anchor_key": claim_anchor_key,
+                "confidence": float(signal.get("confidence") or 0.0),
+            })
+        return updates
+
+    def _select_inductive_entity_claim_evidence_facts(
+        self,
+        *,
+        group: Dict[str, Any],
+        historical_facts: Sequence[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Keep new group facts, then add bounded episode-diverse history."""
+        seed_by_id = dict(group.get("seed_facts_by_id") or {})
+        candidates_by_id = {
+            int(fact["id"]): fact
+            for fact in [*seed_by_id.values(), *historical_facts]
+            if str(fact.get("id") or "").strip().isdigit()
+        }
+        seed_ids = set(seed_by_id)
+
+        ordered = sorted(
+            candidates_by_id.values(),
+            key=lambda fact: (
+                str(fact.get("event_time_key") or fact.get("dialogue_time_key") or ""),
+                int(fact.get("id") or 0),
+            ),
+            reverse=True,
+        )
+        ordered.sort(
+            key=lambda fact: int(fact.get("id") or 0) not in seed_ids
+        )
+        selected: List[Dict[str, Any]] = []
+        selected_ids: set[int] = set()
+        selected_episodes: set[int] = set()
+        for fact in ordered:
+            fact_id = int(fact["id"])
+            episode_id = int(fact.get("episode_id") or 0)
+            if episode_id > 0 and episode_id in selected_episodes:
+                continue
+            selected.append(fact)
+            selected_ids.add(fact_id)
+            if episode_id > 0:
+                selected_episodes.add(episode_id)
+            if len(selected) >= self._entity_claim_induction_evidence_limit:
+                break
+        if len(selected) < self._entity_claim_induction_evidence_limit:
+            for fact in ordered:
+                fact_id = int(fact["id"])
+                if fact_id in selected_ids:
+                    continue
+                selected.append(fact)
+                selected_ids.add(fact_id)
+                if len(selected) >= self._entity_claim_induction_evidence_limit:
+                    break
+        return sorted(
+            selected,
+            key=lambda fact: (
+                str(fact.get("event_time_key") or fact.get("dialogue_time_key") or ""),
+                int(fact.get("id") or 0),
+            ),
+        )
 
     def _extract_inductive_entity_claims(
         self,
@@ -3595,10 +3672,6 @@ class MemoryNodeManager:
             int(value) for value in (raw.get("support_fact_ids") or [])
             if str(value).strip().isdigit() and int(value) in facts_by_id
         ))[:24]
-        counterexample_ids = list(dict.fromkeys(
-            int(value) for value in (raw.get("counterexample_fact_ids") or [])
-            if str(value).strip().isdigit() and int(value) in facts_by_id
-        ))[:24]
         episode_ids = {
             int(facts_by_id[fact_id]["episode_id"]) for fact_id in support_ids
             if str(facts_by_id[fact_id].get("episode_id") or "").strip().isdigit()
@@ -3608,35 +3681,32 @@ class MemoryNodeManager:
             for fact_id in support_ids
         } - {""}
         if (
-            len(episode_ids) < self._entity_claim_induction_min_episodes
+            len(support_ids) < self._entity_claim_induction_min_support_facts
+            or len(episode_ids) < self._entity_claim_induction_min_episodes
             or len(windows) < self._entity_claim_induction_min_time_windows
         ):
             return None
-        normalized_value = _compact_whitespace(raw.get("normalized_value") or "")[:160]
-        if not normalized_value:
+        raw_claim_text = _compact_whitespace(raw.get("claim_text") or "")
+        if not raw_claim_text:
             return None
         confidence = self._clamp_float(raw.get("confidence"), 0.0, 1.0, 0.7)
         claim_text = self._normalize_entity_claim_text(
-            raw.get("claim_text") or raw.get("behavior_or_outcome_text"),
+            raw_claim_text,
             subject=group["subject"],
             predicate=predicate,
-            normalized_value=normalized_value,
         )
         return {
             "subject_entity_id": group["subject_entity_id"], "predicate": predicate,
-            "normalized_value": normalized_value,
             "claim_text": claim_text,
             "claim_type": claim_type, "claim_origin": "inductive",
-            "status": "weakened" if counterexample_ids else "active",
+            "status": "active",
             "confidence": confidence,
             "extractor_version": "entity_claim_induction_v1", "prompt_version": "v1",
             "metadata": {
                 "condition_text": _compact_whitespace(raw.get("condition_text") or ""),
-                "behavior_or_outcome_text": _compact_whitespace(raw.get("behavior_or_outcome_text") or ""),
                 "claim_anchor": group["claim_anchor"],
             },
             "support_fact_ids": support_ids,
-            "counterexample_fact_ids": counterexample_ids,
         }
 
     @staticmethod
@@ -3646,13 +3716,12 @@ class MemoryNodeManager:
         subject: str,
         predicate: str,
         object_name: str = "",
-        normalized_value: str = "",
     ) -> str:
-        """Keep a readable proposition separate from the compact merge key."""
+        """Return the claim's complete, reader-facing semantic proposition."""
         text = _compact_whitespace(value or "")[:480]
         if text:
             return text
-        target = _compact_whitespace(object_name or normalized_value)
+        target = _compact_whitespace(object_name)
         return _compact_whitespace(f"{subject} {predicate} {target}")[:480]
 
     def _log_reflect_facts_loaded(
@@ -4037,11 +4106,11 @@ class MemoryNodeManager:
         return events
 
     def _entity_claim_signals_from_fact(self, fact: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Read claim-level extraction signals from a stored fact."""
-        metadata = fact.get("metadata") if isinstance(fact.get("metadata"), dict) else {}
-        raw = fact.get("entity_claim_signal") or metadata.get("entity_claim_signal")
-        fallback_entity = fact.get("primary_entity")
-        return self._normalize_entity_claim_signal(raw, fallback_entity=fallback_entity)
+        """Read claim-level signals from their normalized fact mapping rows."""
+        fact_id = int(fact.get("id") or 0)
+        if fact_id <= 0:
+            return []
+        return self._db.get_fact_entity_claim_signal_mappings(fact_id)
 
     def _entities_for_entity_claim_signal(
         self,

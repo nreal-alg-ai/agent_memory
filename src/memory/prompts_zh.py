@@ -158,9 +158,9 @@ fact_type 判别规则：
 
 entity_claim_signal 输出规则：
 - `entity_claim_signal` 是当前 fact 对个人世界模型中 entity claim 的结构化证据提示，不是最终 claim，也不能直接决定与已有 claim 的关系。
-- `signal_kind` 只能是：`explicit_assertion`（实体明确陈述或可靠记录直接确认的稳定主张）、`pattern_observation`（可在未来与其他 episode 共同支持或反驳规律的观察）、`counterexample`（可能削弱已有偏好或规律的观察）。
+- `signal_kind` 只能是：`explicit_assertion`（实体明确陈述或可靠记录直接确认的稳定主张）、`pattern_observation`（可在未来与其他 episode 共同支持一个方向明确的规律的观察）。
 - `claim_type_hint` 只能是 identity_profile、affiliation、relationship、preference、constraint、behavior_pattern。单次行为不得作为 explicit_assertion 直接生成 behavior_pattern；它至多是 pattern_observation。
-- `claim_anchor` 是简短、稳定的聚合标签，用于把不同 episode 中可能描述同一主张或规律的 facts 收拢，例如“安静旅行偏好”“游泳活动习惯”。它不是完整句子，也不是最终 normalized_value。
+- `claim_anchor` 是简短、稳定的聚合标签，用于把不同 episode 中可能描述同一主张或规律的 facts 收拢，例如“安静旅行偏好”“游泳活动习惯”。它不是完整句子，也不是最终 entity claim。
 - 只有当前 fact 对某个实体主张或未来规律归纳有实际证据价值时才输出。普通一次性背景、临时建议、助手猜测、寒暄和低价值信息输出空数组。
 - 每条 fact 最多输出 3 个 signal。每个 signal 必须包含 entity、signal_kind、claim_type_hint、claim_anchor、evidence_basis、confidence；其中 evidence_basis 必须引用当前 fact 的具体证据，不要引用历史 claim。
 
@@ -183,7 +183,7 @@ entity_claim_signal 输出规则：
       "entity_claim_signal": [
         {
           "entity": {"name": "明确受影响的实体", "type": "PERSON|ORGANIZATION|LOCATION|PRODUCT|PROJECT|TECHNOLOGY|CONCEPT|TOPIC|PREFERENCE|OTHER"},
-          "signal_kind": "explicit_assertion|pattern_observation|counterexample",
+          "signal_kind": "explicit_assertion|pattern_observation",
           "claim_type_hint": "identity_profile|affiliation|relationship|preference|constraint|behavior_pattern",
           "claim_anchor": "用于跨 fact 聚合的具体主张或规律标签",
           "evidence_basis": "当前 fact 中支持该 signal 的具体证据",
@@ -301,8 +301,8 @@ EXPLICIT_ENTITY_CLAIM_EXTRACTION_PROMPT_ZH = """你是个人世界模型的显�
 1. subject_entity、object_entity（如有）必须来自输入 facts 的 entities；不能凭空造实体。
 2. evidence_fact_ids 必须只引用输入 fact_id。每条 claim 至少引用一个直接支持它的 fact。
 3. predicate 使用简短、稳定的小写英文键，例如 has_role、works_with、member_of、located_in、prefers、dislikes、requires、cannot、has_constraint。
-4. normalized_value 是可比较的简短规范值，不是完整句子；关系型主张优先使用 object_entity，非关系主张写入 normalized_value。
-5. claim_text 是给人阅读的完整、自包含陈述，必须明确主语、关系/属性和值，例如“用户明确偏好安静、节奏较慢的旅行方式”。不要只重复 normalized_value。
+4. 关系型主张使用 object_entity；非关系主张的属性、值和限定条件必须完整写入 claim_text。
+5. claim_text 是给人阅读的完整、自包含陈述，必须明确主语、关系/属性和值，例如“用户明确偏好安静、节奏较慢的旅行方式”。
 6. 否定语义必须写入 predicate 与 claim_text，例如 dislikes、cannot、is_not_member_of；不要输出独立的正负字段。没有直接明示时不要输出。
 7. 不要输出一次行程、临时任务、单次建议、待办、开放问题；它们属于 fact / intent 层，而不是 claim。
 8. 输出空数组是正确结果。只返回 JSON。
@@ -315,7 +315,6 @@ EXPLICIT_ENTITY_CLAIM_EXTRACTION_PROMPT_ZH = """你是个人世界模型的显�
       "claim_type": "identity_profile|affiliation|relationship|preference|constraint",
       "predicate": "",
       "object_entity": "",
-      "normalized_value": "",
       "claim_text": "包含主体和完整语义的陈述",
       "valid_from": "",
       "valid_to": "",
@@ -332,16 +331,16 @@ facts：
 
 INDUCTIVE_ENTITY_CLAIM_EXTRACTION_PROMPT_ZH = """你是个人世界模型的规律归纳（inductive claim）模块。
 
-输入是同一实体、同一 claim_anchor 下，来自多个已完成 episode 的可追溯 facts。claim_anchor 只用于召集候选证据，不是结论；你的任务是保守地判断这些独立经历是否支持一条规律，而不是重新复述 facts。
+输入是同一实体、同一 claim_anchor 下、来自已完成 episode 的可追溯 facts。claim_anchor 只用于召集候选证据，不是结论；你的任务是保守地判断这些证据是否支持一条规律，而不是重新复述 facts。
 
 只允许输出：preference 或 behavior_pattern，claim_origin 固定由系统写为 inductive。
 
 硬规则：
-1. 一条 claim 至少需要 3 个不同 episode 的 support_fact_ids，且至少覆盖 2 个不同日期/时间窗口。
+1. 一条 claim 至少需要 3 个不同的 support_fact_ids，且每个 ID 都必须直接支持当前规律。
 2. 单次表达、一次事件、计划、任务、助手建议不能归纳为规律。
-3. 有明显反例时在 counterexample_fact_ids 中列出；反例存在时宁可不输出。不要把偶然行为升级为偏好。
+3. 不要把偶然行为升级为偏好。只引用直接支持当前规律的 support_fact_ids；其他事实不需要标注为反例。
 4. subject_entity 必须是输入给定实体。predicate 使用 prefers、dislikes、usually_does、avoids、has_routine 之一。
-5. normalized_value 必须短、可比较；claim_text 必须是一条带实体主体的完整规律陈述；condition_text 为空或简短条件；behavior_or_outcome_text 用一句话说明规律。
+5. claim_text 必须是一条带实体主体、属性和值的完整规律陈述；condition_text 为空或简短条件。
 6. evidence IDs 必须来自输入。输出空数组是正确结果。只返回 JSON。
 
 输出：
@@ -351,12 +350,9 @@ INDUCTIVE_ENTITY_CLAIM_EXTRACTION_PROMPT_ZH = """你是个人世界模型的规�
       "subject_entity": "",
       "claim_type": "preference|behavior_pattern",
       "predicate": "prefers|dislikes|usually_does|avoids|has_routine",
-      "normalized_value": "",
       "claim_text": "包含主体和完整规律语义的陈述",
       "condition_text": "",
-      "behavior_or_outcome_text": "",
       "support_fact_ids": [1, 2, 3],
-      "counterexample_fact_ids": [],
       "confidence": 0.8
     }
   ]

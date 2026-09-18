@@ -245,7 +245,6 @@ class SessionDB:
                 started_at TEXT,
                 ended_at TEXT,
                 metadata TEXT NOT NULL DEFAULT '{}',
-                processed_for_memory_entity_claim_induction INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -267,6 +266,7 @@ class SessionDB:
                 confidence REAL NOT NULL DEFAULT 0.85,
                 importance REAL NOT NULL DEFAULT 0.5,
                 processed_for_memory_entity_claim INTEGER NOT NULL DEFAULT 0,
+                processed_for_memory_entity_claim_induction INTEGER NOT NULL DEFAULT 0,
                 processed_for_memory_intent_execution INTEGER NOT NULL DEFAULT 0,
                 metadata TEXT NOT NULL DEFAULT '{}',
                 identity_text_embedding BLOB,
@@ -281,6 +281,23 @@ class SessionDB:
                 name TEXT NOT NULL UNIQUE,
                 type TEXT NOT NULL DEFAULT 'OTHER',
                 created_at TEXT NOT NULL DEFAULT ''
+            );
+
+            CREATE TABLE IF NOT EXISTS memory_fact_entity_claim_signal_mapping (
+                fact_id INTEGER NOT NULL,
+                subject_entity_id INTEGER NOT NULL,
+                claim_type_hint TEXT NOT NULL,
+                signal_kind TEXT NOT NULL,
+                claim_anchor TEXT NOT NULL,
+                claim_anchor_key TEXT NOT NULL,
+                confidence REAL NOT NULL DEFAULT 0.0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(
+                    fact_id, subject_entity_id, claim_type_hint, claim_anchor_key
+                ),
+                FOREIGN KEY(fact_id) REFERENCES memory_facts(id) ON DELETE CASCADE,
+                FOREIGN KEY(subject_entity_id) REFERENCES memory_entity_nodes(id) ON DELETE CASCADE
             );
 
             CREATE TABLE IF NOT EXISTS memory_entity_mapping (
@@ -330,7 +347,6 @@ class SessionDB:
                 subject_entity_id INTEGER NOT NULL,
                 predicate TEXT NOT NULL,
                 object_entity_id INTEGER NOT NULL DEFAULT 0,
-                normalized_value TEXT NOT NULL DEFAULT '',
                 claim_text TEXT NOT NULL DEFAULT '',
                 claim_type TEXT NOT NULL,
                 claim_origin TEXT NOT NULL,
@@ -344,8 +360,6 @@ class SessionDB:
                 metadata TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
-                UNIQUE(subject_entity_id, predicate, object_entity_id,
-                       normalized_value, claim_type, claim_origin),
                 FOREIGN KEY(subject_entity_id) REFERENCES memory_entity_nodes(id) ON DELETE CASCADE,
                 FOREIGN KEY(source_actor_entity_id) REFERENCES memory_entity_nodes(id) ON DELETE SET NULL
             );
@@ -366,9 +380,7 @@ class SessionDB:
             CREATE TABLE IF NOT EXISTS memory_entity_claim_induction (
                 claim_id INTEGER PRIMARY KEY,
                 condition_text TEXT NOT NULL DEFAULT '',
-                behavior_or_outcome_text TEXT NOT NULL DEFAULT '',
                 support_count INTEGER NOT NULL DEFAULT 0,
-                counterexample_count INTEGER NOT NULL DEFAULT 0,
                 first_observed_at TEXT NOT NULL DEFAULT '',
                 last_observed_at TEXT NOT NULL DEFAULT '',
                 consolidation_version TEXT NOT NULL DEFAULT '',
@@ -557,6 +569,10 @@ class SessionDB:
             ON memory_entity_claims(subject_entity_id, claim_type, claim_origin, status);
             CREATE INDEX IF NOT EXISTS idx_memory_entity_claim_evidence_claim
             ON memory_entity_claim_evidence(claim_id, role, evidence_type);
+            CREATE INDEX IF NOT EXISTS idx_memory_fact_entity_claim_signal_group
+            ON memory_fact_entity_claim_signal_mapping(
+                subject_entity_id, claim_type_hint, claim_anchor_key, fact_id
+            );
             CREATE INDEX IF NOT EXISTS idx_memory_entity_claim_events_target
             ON memory_entity_claim_events(target_claim_id, effective_at DESC, id DESC);
             CREATE INDEX IF NOT EXISTS idx_memory_entity_claim_events_trigger
@@ -579,6 +595,7 @@ class SessionDB:
         self._ensure_memory_entity_claim_processing_schema()
         self._ensure_memory_intent_execution_processing_schema()
         self._ensure_memory_entity_claims_schema()
+        self._ensure_memory_entity_claim_induction_schema()
         self._backfill_fact_episode_mappings()
         self._init_identity_fts()
         self._commit_if_needed()
@@ -665,22 +682,30 @@ class SessionDB:
                 "ALTER TABLE memory_facts ADD COLUMN "
                 "processed_for_memory_entity_claim INTEGER NOT NULL DEFAULT 0"
             )
+        if "processed_for_memory_entity_claim_induction" not in fact_columns:
+            self._conn.execute(
+                "ALTER TABLE memory_facts ADD COLUMN "
+                "processed_for_memory_entity_claim_induction INTEGER NOT NULL DEFAULT 0"
+            )
         episode_columns = {
             str(row["name"])
             for row in self._conn.execute("PRAGMA table_info(memory_episodes)").fetchall()
         }
-        if "processed_for_memory_entity_claim_induction" not in episode_columns:
+        if "processed_for_memory_entity_claim_induction" in episode_columns:
             self._conn.execute(
-                "ALTER TABLE memory_episodes ADD COLUMN "
-                "processed_for_memory_entity_claim_induction INTEGER NOT NULL DEFAULT 0"
+                "DROP INDEX IF EXISTS idx_memory_episodes_entity_claim_induction"
+            )
+            self._conn.execute(
+                "ALTER TABLE memory_episodes DROP COLUMN "
+                "processed_for_memory_entity_claim_induction"
             )
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_memory_facts_entity_claim_processing "
             "ON memory_facts(processed_for_memory_entity_claim, created_at)"
         )
         self._conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_memory_episodes_entity_claim_induction "
-            "ON memory_episodes(processed_for_memory_entity_claim_induction, created_at)"
+            "CREATE INDEX IF NOT EXISTS idx_memory_facts_entity_claim_induction "
+            "ON memory_facts(processed_for_memory_entity_claim_induction, created_at)"
         )
 
     def _ensure_memory_intent_execution_processing_schema(self) -> None:
@@ -700,18 +725,86 @@ class SessionDB:
         )
 
     def _ensure_memory_entity_claims_schema(self) -> None:
-        """Keep claim rows readable without overloading their canonical key."""
+        """Migrate legacy claim rows away from the retired normalized value."""
         columns = {
             str(row["name"])
             for row in self._conn.execute(
                 "PRAGMA table_info(memory_entity_claims)"
             ).fetchall()
         }
+        if "normalized_value" not in columns:
+            return
         if "claim_text" not in columns:
             self._conn.execute(
                 "ALTER TABLE memory_entity_claims "
                 "ADD COLUMN claim_text TEXT NOT NULL DEFAULT ''"
             )
+        self._rebuild_memory_entity_claims_without_normalized_value()
+
+    def _ensure_memory_entity_claim_induction_schema(self) -> None:
+        """Remove retired induction fields while preserving its support history."""
+        columns = {
+            str(row["name"])
+            for row in self._conn.execute(
+                "PRAGMA table_info(memory_entity_claim_induction)"
+            ).fetchall()
+        }
+        for column in ("behavior_or_outcome_text", "counterexample_count"):
+            if column in columns:
+                self._conn.execute(
+                    "ALTER TABLE memory_entity_claim_induction "
+                    f"DROP COLUMN {column}"
+                )
+
+    def _rebuild_memory_entity_claims_without_normalized_value(self) -> None:
+        """Drop the legacy key while preserving claim IDs and dependents."""
+        self._conn.commit()
+        self._conn.execute("PRAGMA foreign_keys = OFF")
+        try:
+            self._conn.executescript(
+                """
+                CREATE TABLE memory_entity_claims_rebuilt (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    subject_entity_id INTEGER NOT NULL,
+                    predicate TEXT NOT NULL,
+                    object_entity_id INTEGER NOT NULL DEFAULT 0,
+                    claim_text TEXT NOT NULL DEFAULT '',
+                    claim_type TEXT NOT NULL,
+                    claim_origin TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'candidate',
+                    confidence REAL NOT NULL DEFAULT 0.7,
+                    valid_from TEXT NOT NULL DEFAULT '',
+                    valid_to TEXT NOT NULL DEFAULT '',
+                    source_actor_entity_id INTEGER,
+                    extractor_version TEXT NOT NULL DEFAULT '',
+                    prompt_version TEXT NOT NULL DEFAULT '',
+                    metadata TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(subject_entity_id) REFERENCES memory_entity_nodes(id) ON DELETE CASCADE,
+                    FOREIGN KEY(source_actor_entity_id) REFERENCES memory_entity_nodes(id) ON DELETE SET NULL
+                );
+
+                INSERT INTO memory_entity_claims_rebuilt (
+                    id, subject_entity_id, predicate, object_entity_id, claim_text,
+                    claim_type, claim_origin, status, confidence, valid_from, valid_to,
+                    source_actor_entity_id, extractor_version, prompt_version, metadata,
+                    created_at, updated_at
+                )
+                SELECT id, subject_entity_id, predicate, object_entity_id, claim_text,
+                       claim_type, claim_origin, status, confidence, valid_from, valid_to,
+                       source_actor_entity_id, extractor_version, prompt_version, metadata,
+                       created_at, updated_at
+                FROM memory_entity_claims;
+
+                DROP TABLE memory_entity_claims;
+                ALTER TABLE memory_entity_claims_rebuilt RENAME TO memory_entity_claims;
+                CREATE INDEX IF NOT EXISTS idx_memory_entity_claims_subject
+                ON memory_entity_claims(subject_entity_id, claim_type, claim_origin, status);
+                """
+            )
+        finally:
+            self._conn.execute("PRAGMA foreign_keys = ON")
 
     def _backfill_fact_episode_mappings(self) -> None:
         """Mirror legacy fact episode references into the relation table."""
@@ -990,9 +1083,11 @@ class SessionDB:
         source_types: Optional[Sequence[str]] = None,
         limit: int = 100,
         restrict_to_today: bool = True,
+        require_episode: bool = False,
     ) -> List[Dict[str, Any]]:
         processing_columns = {
             "entity_claim": "processed_for_memory_entity_claim",
+            "entity_claim_induction": "processed_for_memory_entity_claim_induction",
             "intent_execution": "processed_for_memory_intent_execution",
         }
         target = str(processing_target or "entity_claim").strip().lower()
@@ -1000,7 +1095,8 @@ class SessionDB:
             processing_column = processing_columns[target]
         except KeyError as exc:
             raise ValueError(
-                "processing_target must be 'entity_claim' or 'intent_execution'"
+                "processing_target must be 'entity_claim', "
+                "'entity_claim_induction', or 'intent_execution'"
             ) from exc
 
         clauses: List[str] = [f"{processing_column} = 0"]
@@ -1009,6 +1105,8 @@ class SessionDB:
             placeholders = ",".join("?" for _ in source_types)
             clauses.append(f"source_type IN ({placeholders})")
             params.extend(source_types)
+        if require_episode:
+            clauses.append("episode_id IS NOT NULL")
         if restrict_to_today:
             local_now = _coerce_reference_datetime(reference_timestamp).astimezone()
             event_date = local_now.date().isoformat()
@@ -1188,6 +1286,7 @@ class SessionDB:
     ) -> int:
         processing_columns = {
             "entity_claim": "processed_for_memory_entity_claim",
+            "entity_claim_induction": "processed_for_memory_entity_claim_induction",
             "intent_execution": "processed_for_memory_intent_execution",
         }
         target = str(processing_target or "").strip().lower()
@@ -1195,7 +1294,8 @@ class SessionDB:
             processing_column = processing_columns[target]
         except KeyError as exc:
             raise ValueError(
-                "processing_target must be 'entity_claim' or 'intent_execution'"
+                "processing_target must be 'entity_claim', "
+                "'entity_claim_induction', or 'intent_execution'"
             ) from exc
         ids = [int(value) for value in fact_ids if value is not None]
         if not ids:
@@ -1213,42 +1313,107 @@ class SessionDB:
         self._commit_if_needed()
         return int(cur.rowcount or 0)
 
-    def get_unprocessed_episodes_for_entity_claim_induction(
+    def upsert_fact_entity_claim_signal_mappings(
+        self,
+        mappings: Sequence[Dict[str, Any]],
+    ) -> int:
+        """Index fact-level claim signals for exact induction-group expansion."""
+        now = local_now_text()
+        changed = 0
+        for mapping in mappings or []:
+            try:
+                fact_id = int(mapping["fact_id"])
+                subject_entity_id = int(mapping["subject_entity_id"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            claim_type_hint = str(mapping.get("claim_type_hint") or "").strip()
+            signal_kind = str(mapping.get("signal_kind") or "").strip()
+            claim_anchor = str(mapping.get("claim_anchor") or "").strip()
+            claim_anchor_key = str(mapping.get("claim_anchor_key") or "").strip()
+            if (
+                fact_id <= 0
+                or subject_entity_id <= 0
+                or not claim_type_hint
+                or not signal_kind
+                or not claim_anchor
+                or not claim_anchor_key
+            ):
+                continue
+            self._conn.execute(
+                """
+                INSERT INTO memory_fact_entity_claim_signal_mapping (
+                    fact_id, subject_entity_id, claim_type_hint, signal_kind,
+                    claim_anchor, claim_anchor_key, confidence, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(
+                    fact_id, subject_entity_id, claim_type_hint, claim_anchor_key
+                ) DO UPDATE SET
+                    signal_kind = excluded.signal_kind,
+                    claim_anchor = excluded.claim_anchor,
+                    confidence = MAX(
+                        memory_fact_entity_claim_signal_mapping.confidence,
+                        excluded.confidence
+                    ),
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    fact_id, subject_entity_id, claim_type_hint, signal_kind,
+                    claim_anchor, claim_anchor_key,
+                    float(mapping.get("confidence") or 0.0), now, now,
+                ),
+            )
+            changed += 1
+        self._commit_if_needed()
+        return changed
+
+    def memory_facts_for_entity_claim_signal_group(
         self,
         *,
-        limit: int = 24,
+        subject_entity_id: int,
+        claim_type_hint: str,
+        claim_anchor_key: str,
+        limit: int = 64,
     ) -> List[Dict[str, Any]]:
-        """Return completed episodes that have not yet entered induction."""
+        """Load bounded historical facts for one exact induction group."""
         rows = self._conn.execute(
             """
-            SELECT * FROM memory_episodes
-            WHERE processed_for_memory_entity_claim_induction = 0
-            ORDER BY replace(substr(created_at, 1, 19), 'T', ' ') ASC, id ASC
+            SELECT fact.*
+            FROM memory_fact_entity_claim_signal_mapping AS signal
+            JOIN memory_facts AS fact ON fact.id = signal.fact_id
+            WHERE signal.subject_entity_id = ?
+              AND signal.claim_type_hint = ?
+              AND signal.claim_anchor_key = ?
+              AND fact.episode_id IS NOT NULL
+            ORDER BY fact.dialogue_time_key DESC, fact.id DESC
             LIMIT ?
             """,
-            (max(1, int(limit or 24)),),
+            (
+                int(subject_entity_id), str(claim_type_hint or ""),
+                str(claim_anchor_key or ""), max(1, int(limit or 64)),
+            ),
         ).fetchall()
         return [self._row_to_dict(row) for row in rows]
 
-    def mark_episodes_processed_for_entity_claim_induction(
+    def get_fact_entity_claim_signal_mappings(
         self,
-        episode_ids: Sequence[int],
-    ) -> int:
-        ids = [int(value) for value in episode_ids if str(value).strip().isdigit()]
-        if not ids:
-            return 0
-        placeholders = ",".join("?" for _ in ids)
-        cur = self._conn.execute(
-            f"""
-            UPDATE memory_episodes
-            SET processed_for_memory_entity_claim_induction = 1,
-                updated_at = ?
-            WHERE id IN ({placeholders})
+        fact_id: int,
+    ) -> List[Dict[str, Any]]:
+        """Load the normalized claim signals persisted for one stored fact."""
+        if int(fact_id or 0) <= 0:
+            return []
+        rows = self._conn.execute(
+            """
+            SELECT signal.*, entity.name AS subject
+            FROM memory_fact_entity_claim_signal_mapping AS signal
+            JOIN memory_entity_nodes AS entity
+                ON entity.id = signal.subject_entity_id
+            WHERE signal.fact_id = ?
+            ORDER BY signal.claim_type_hint ASC,
+                     signal.claim_anchor_key ASC
             """,
-            (local_now_text(), *ids),
-        )
-        self._commit_if_needed()
-        return int(cur.rowcount or 0)
+            (int(fact_id),),
+        ).fetchall()
+        return [self._row_to_dict(row) for row in rows]
 
     def upsert_entity_claim(
         self,
@@ -1256,7 +1421,6 @@ class SessionDB:
         subject_entity_id: int,
         predicate: str,
         object_entity_id: Optional[int] = None,
-        normalized_value: str = "",
         claim_text: str = "",
         claim_type: str,
         claim_origin: str,
@@ -1274,15 +1438,14 @@ class SessionDB:
         object_id = int(object_entity_id or 0)
         subject_id = int(subject_entity_id)
         predicate = str(predicate or "").strip()
-        normalized_value = str(normalized_value or "").strip()
-        claim_text = str(claim_text or "").strip()
+        claim_text = re.sub(r"\s+", " ", str(claim_text or "")).strip()
         existing = self._conn.execute(
             """
             SELECT id, confidence, status FROM memory_entity_claims
             WHERE subject_entity_id = ? AND predicate = ? AND object_entity_id = ?
-              AND normalized_value = ? AND claim_type = ? AND claim_origin = ?
+              AND claim_text = ? AND claim_type = ? AND claim_origin = ?
             """,
-            (subject_id, predicate, object_id, normalized_value, claim_type, claim_origin),
+            (subject_id, predicate, object_id, claim_text, claim_type, claim_origin),
         ).fetchone()
         if existing:
             claim_id = int(existing["id"])
@@ -1306,14 +1469,14 @@ class SessionDB:
         cur = self._conn.execute(
             """
             INSERT INTO memory_entity_claims (
-                subject_entity_id, predicate, object_entity_id, normalized_value, claim_text,
+                subject_entity_id, predicate, object_entity_id, claim_text,
                 claim_type, claim_origin, status, confidence, valid_from, valid_to,
                 source_actor_entity_id, extractor_version, prompt_version, metadata,
                 created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                subject_id, predicate, object_id, normalized_value, claim_text,
+                subject_id, predicate, object_id, claim_text,
                 claim_type, claim_origin, status, float(confidence or 0.0),
                 valid_from, valid_to, source_actor_entity_id, extractor_version,
                 prompt_version, _json_dumps(metadata or {}), now, now,
@@ -1736,14 +1899,31 @@ class SessionDB:
         self._commit_if_needed()
         return changed
 
+    def get_entity_claim_support_fact_summary(self, claim_id: int) -> Dict[str, Any]:
+        """Aggregate unique support facts so incremental induction never shrinks counts."""
+        row = self._conn.execute(
+            """
+            SELECT
+                COUNT(DISTINCT evidence_id) AS support_count,
+                MIN(NULLIF(observed_at, '')) AS first_observed_at,
+                MAX(NULLIF(observed_at, '')) AS last_observed_at
+            FROM memory_entity_claim_evidence
+            WHERE claim_id = ? AND evidence_type = 'fact' AND role = 'support'
+            """,
+            (int(claim_id),),
+        ).fetchone()
+        return {
+            "support_count": int(row["support_count"] or 0) if row else 0,
+            "first_observed_at": str(row["first_observed_at"] or "") if row else "",
+            "last_observed_at": str(row["last_observed_at"] or "") if row else "",
+        }
+
     def upsert_entity_claim_induction(
         self,
         *,
         claim_id: int,
         condition_text: str,
-        behavior_or_outcome_text: str,
         support_count: int,
-        counterexample_count: int,
         first_observed_at: str,
         last_observed_at: str,
         consolidation_version: str = "v1",
@@ -1752,22 +1932,20 @@ class SessionDB:
         self._conn.execute(
             """
             INSERT INTO memory_entity_claim_induction (
-                claim_id, condition_text, behavior_or_outcome_text, support_count,
-                counterexample_count, first_observed_at, last_observed_at,
+                claim_id, condition_text, support_count,
+                first_observed_at, last_observed_at,
                 consolidation_version, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(claim_id) DO UPDATE SET
                 condition_text = excluded.condition_text,
-                behavior_or_outcome_text = excluded.behavior_or_outcome_text,
                 support_count = excluded.support_count,
-                counterexample_count = excluded.counterexample_count,
                 first_observed_at = excluded.first_observed_at,
                 last_observed_at = excluded.last_observed_at,
                 consolidation_version = excluded.consolidation_version,
                 updated_at = excluded.updated_at
             """,
-            (int(claim_id), str(condition_text or ""), str(behavior_or_outcome_text or ""),
-             max(0, int(support_count or 0)), max(0, int(counterexample_count or 0)),
+            (int(claim_id), str(condition_text or ""),
+             max(0, int(support_count or 0)),
              str(first_observed_at or ""), str(last_observed_at or ""),
              str(consolidation_version or "v1"), now, now),
         )

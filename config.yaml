@@ -217,8 +217,10 @@ memory_manager:
   reflect_limit: 100
   entity_claim_explicit_min_confidence: 0.72
   entity_claim_signal_max_per_fact: 3
+  entity_claim_induction_min_support_facts: 3
   entity_claim_induction_min_episodes: 3
   entity_claim_induction_min_time_windows: 2
+  entity_claim_induction_evidence_limit: 16
   
   recall:  
     recall_top_k: 8

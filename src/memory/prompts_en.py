@@ -145,9 +145,9 @@ Rules:
 
 entity_claim_signal rules:
 - `entity_claim_signal` is a structured evidence hint from this fact for entity claims in the personal world model. It is not a final claim and must not decide its relation to existing claims.
-- `signal_kind` must be one of: `explicit_assertion` (a durable proposition directly stated by an entity or confirmed by a reliable record), `pattern_observation` (an observation that may support or refute a pattern together with other episodes), or `counterexample` (an observation that may weaken an existing preference or pattern).
+- `signal_kind` must be one of: `explicit_assertion` (a durable proposition directly stated by an entity or confirmed by a reliable record), or `pattern_observation` (an observation that may later support one directionally specific pattern together with other episodes).
 - `claim_type_hint` must be one of: identity_profile, affiliation, relationship, preference, constraint, behavior_pattern. A single action must not become an explicit_assertion for behavior_pattern; at most it is a pattern_observation.
-- `claim_anchor` is a short, stable grouping label that can collect facts from different episodes about one possible claim or pattern, such as "quiet travel preference" or "swimming routine". It is neither a sentence nor the final normalized_value.
+- `claim_anchor` is a short, stable grouping label that can collect facts from different episodes about one possible claim or pattern, such as "quiet travel preference" or "swimming routine". It is neither a sentence nor the final entity claim.
 - Output signals only when this fact has concrete evidence value for an entity claim or later pattern induction. Use an empty array for one-off background, temporary suggestions, assistant speculation, pleasantries, and low-value content.
 - Return at most 3 signals per fact. Every signal must contain entity, signal_kind, claim_type_hint, claim_anchor, evidence_basis, and confidence. evidence_basis must cite the current fact, never a prior claim.
 
@@ -170,7 +170,7 @@ Output schema:
       "entity_claim_signal": [
         {
           "entity": {"name": "explicitly affected entity", "type": "PERSON|ORGANIZATION|LOCATION|PRODUCT|PROJECT|TECHNOLOGY|CONCEPT|TOPIC|PREFERENCE|OTHER"},
-          "signal_kind": "explicit_assertion|pattern_observation|counterexample",
+          "signal_kind": "explicit_assertion|pattern_observation",
           "claim_type_hint": "identity_profile|affiliation|relationship|preference|constraint|behavior_pattern",
           "claim_anchor": "specific claim or pattern grouping label",
           "evidence_basis": "specific evidence from this fact supporting the signal",
@@ -272,8 +272,8 @@ Rules:
 1. subject_entity and object_entity, if present, must occur in input fact entities.
 2. evidence_fact_ids must cite only input fact IDs and each claim needs direct evidence.
 3. Use concise stable lowercase predicates, such as has_role, works_with, member_of, located_in, prefers, dislikes, requires, cannot, has_constraint.
-4. normalized_value is a short canonical comparison key, not a full sentence. Use object_entity for relational claims and normalized_value for comparable non-relational values.
-5. claim_text is a complete, self-contained, reader-facing proposition with its subject, predicate, and value. Do not merely repeat normalized_value.
+4. Use object_entity for relational claims. For non-relational claims, express the attribute, value, and relevant qualification completely in claim_text.
+5. claim_text is a complete, self-contained, reader-facing proposition with its subject, predicate, and value.
 6. Encode negation in predicate and claim_text, such as dislikes, cannot, or is_not_member_of; do not output a standalone positive/negative field. Return no claim without direct evidence.
 7. Do not output a one-time trip, task, plan, recommendation, or open question. An empty list is correct. Return JSON only.
 
@@ -284,7 +284,6 @@ Output:
     "claim_type": "identity_profile|affiliation|relationship|preference|constraint",
     "predicate": "",
     "object_entity": "",
-    "normalized_value": "",
     "claim_text": "complete proposition with subject and meaning",
     "valid_from": "",
     "valid_to": "",
@@ -300,16 +299,16 @@ facts:
 
 INDUCTIVE_ENTITY_CLAIM_EXTRACTION_PROMPT_EN = """You conservatively consolidate inductive claims for a personal world model.
 
-Input facts are traceable observations for one entity and one claim_anchor, drawn from completed episodes. The claim_anchor only gathers candidate evidence; it is not a conclusion. Decide whether independent evidence supports a pattern; do not summarize facts.
+Input facts are traceable observations for one entity and one claim_anchor, drawn from completed episodes. The claim_anchor only gathers candidate evidence; it is not a conclusion. Decide whether the evidence supports a pattern; do not summarize facts.
 
 Only preference and behavior_pattern claims are allowed.
 
 Hard rules:
-1. A claim requires support_fact_ids from at least three distinct episodes and two different date/time windows.
+1. A claim requires at least three distinct support_fact_ids, and every cited ID must directly support the proposed pattern.
 2. A single statement, event, plan, task, or assistant recommendation is not a pattern.
-3. List clear contradictions in counterexample_fact_ids; when meaningful counterexamples exist, prefer no output.
+3. Do not turn an isolated behavior into a preference. Cite only facts that directly support the proposed pattern in support_fact_ids; other facts need not be labeled as counterexamples.
 4. subject_entity must equal the given subject. predicate is one of prefers, dislikes, usually_does, avoids, has_routine.
-5. normalized_value is a compact comparison key; claim_text is a complete reader-facing pattern proposition with its subject.
+5. claim_text is a complete reader-facing pattern proposition with its subject, property, and value.
 6. Evidence IDs must be input IDs. An empty list is correct. Return JSON only.
 
 Output:
@@ -318,12 +317,9 @@ Output:
     "subject_entity": "",
     "claim_type": "preference|behavior_pattern",
     "predicate": "prefers|dislikes|usually_does|avoids|has_routine",
-    "normalized_value": "",
     "claim_text": "complete pattern proposition with subject and meaning",
     "condition_text": "",
-    "behavior_or_outcome_text": "",
     "support_fact_ids": [1, 2, 3],
-    "counterexample_fact_ids": [],
     "confidence": 0.8
   }]
 }
