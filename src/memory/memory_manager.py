@@ -496,9 +496,6 @@ class MemoryNodeManager:
         self._task_worker_lock = threading.Lock()
         self._task_shutdown_event = threading.Event()
         self._memory_operation_lock = threading.RLock()
-        # Kept by the serialized task worker: advance only after an episode and
-        # its fact links have both been persisted successfully.
-        self._episode_summary_last_fact_id_by_source: Dict[str, int] = {}
 
     def _initialize_recall_config(self) -> None:
         """Parse nested recall settings and keep legacy flat overrides working."""
@@ -1060,15 +1057,34 @@ class MemoryNodeManager:
         tags: List[str],
         prompt_language: str,
     ) -> Dict[str, Any]:
-        cursor_key = str(source_type or "")
-        fact_id_after = self._episode_summary_last_fact_id_by_source.get(cursor_key, 0)
-        facts = self._db.get_memory_facts_after_id(
-            fact_id=fact_id_after,
+        source_segments = self._db.get_unassigned_memory_source_segments(
             source_type=source_type,
-            only_unassigned=True,
+            limit=240,
+        )
+        if not source_segments:
+            return {
+                "status": "empty",
+                "reason": "no_unassigned_source_segments",
+                "new_episode_count": 0,
+                "fact_count": 0,
+                "source_segment_count": 0,
+            }
+        source_started_at = _compact_whitespace(
+            source_segments[0].get("started_at") or ""
+        )
+        source_ended_at = _compact_whitespace(
+            source_segments[-1].get("ended_at")
+            or source_segments[-1].get("started_at")
+            or source_started_at
+        )
+        facts = self._db.get_unassigned_memory_facts_in_time_window(
+            source_type=source_type,
+            started_at=source_started_at,
+            ended_at=source_ended_at,
             limit=80,
         )
-        episode_info = self.generate_episode_from_facts(
+        episode_info = self.generate_episode_from_source_segments(
+            source_segments=source_segments,
             facts=facts,
             prompt_language=prompt_language,
         )
@@ -1085,7 +1101,13 @@ class MemoryNodeManager:
                 ended_at=episode_info.get("ended_at") or episode_info.get("started_at") or _now_text(),
                 canonical_topics=episode_info.get("canonical_topics") or [],
                 entity_ids=episode_info.get("entity_ids") or [],
-                metadata={"tags": list(tags or []), "fact_count": len(facts), "generated_from_facts": True},
+                metadata={
+                    "tags": list(tags or []),
+                    "fact_count": len(facts),
+                    "source_segment_count": len(source_segments),
+                    "generated_from_source_segments": True,
+                    "evidence_fact_ids": list(episode_info.get("fact_ids") or []),
+                },
             )
             topic_report = self._db.upsert_memory_topic_items(
                 self._build_memory_topic_item_updates(
@@ -1096,25 +1118,22 @@ class MemoryNodeManager:
             attached = self._db.update_facts_episode_id(
                 fact_ids=episode_info.get("fact_ids") or [], episode_id=episode_id,
             )
-        fact_ids = [int(fact_id) for fact_id in (episode_info.get("fact_ids") or [])]
-        last_fact_id = fact_id_after
-        if attached and fact_ids:
-            last_fact_id = max(fact_ids)
-            self._episode_summary_last_fact_id_by_source[cursor_key] = last_fact_id
+            attached_source_segments = self._db.update_memory_source_segments_episode_id(
+                source_segment_ids=episode_info.get("source_segment_ids") or [],
+                episode_id=episode_id,
+            )
         episode_info.update({
             "episode_id": episode_id,
             "fact_count": attached,
+            "source_segment_count": attached_source_segments,
             "new_episode_count": 1,
             "topic_items_created": int(topic_report.get("created_count", 0) or 0),
             "topic_items_updated": int(topic_report.get("updated_count", 0) or 0),
-            "fact_id_after": fact_id_after,
-            "last_fact_id": last_fact_id,
         })
         self._log_info("memory_store", "episode_summary_generated", {
             "episode_id": episode_id,
             "fact_count": attached,
-            "fact_id_after": fact_id_after,
-            "last_fact_id": last_fact_id,
+            "source_segment_count": attached_source_segments,
             "source_type": source_type,
             "title": episode_info.get("title") or "",
             "topic_items_created": episode_info.get("topic_items_created", 0),
@@ -1153,6 +1172,11 @@ class MemoryNodeManager:
                 "new_fact_count": 0,
                 "total_elapsed_ms": elapsed_ms,
             }
+        with self._db.transaction():
+            source_segment_ids = self._db.insert_memory_source_segments(
+                source_type=source_type,
+                segments=raw_segments,
+            )
         extracted_info = self._extract_memory_fact_from_raw_segments(
             raw_segments,
             prompt_language=prompt_language,
@@ -1179,6 +1203,8 @@ class MemoryNodeManager:
             "new_episode_count": 0,
             "new_fact_count": len(list(save_fact_info.get("fact_ids") or [])),
             "fact_ids": list(save_fact_info.get("fact_ids") or []),
+            "source_segment_ids": source_segment_ids,
+            "source_segment_count": len(source_segment_ids),
             "topic_items_created": int(topic_report.get("created_count", 0) or 0),
             "topic_items_updated": int(topic_report.get("updated_count", 0) or 0),
             "total_elapsed_ms": round((time.monotonic() - store_started_at) * 1000, 2),
@@ -1186,7 +1212,6 @@ class MemoryNodeManager:
         self._log_info("memory_store", "finish", {
             **report,
             "source_type": source_type,
-            "source_segment_count": len(raw_segments),
         })
         return report
 
@@ -1264,18 +1289,39 @@ class MemoryNodeManager:
             return data
         return {"facts": []}
 
-    def generate_episode_from_facts(
+    def generate_episode_from_source_segments(
         self,
         *,
+        source_segments: Sequence[Dict[str, Any]],
         facts: Sequence[Dict[str, Any]],
         prompt_language: str = "zh",
     ) -> Dict[str, Any]:
-        """Summarize a logical episode from facts already persisted by extraction."""
-        fact_list = [item for item in facts if isinstance(item, dict) and _compact_whitespace(item.get("summary") or item.get("text") or "")]
-        if not fact_list:
-            return {"status": "empty", "new_episode_count": 0, "fact_count": 0}
-        payload = [
+        """Generate an experience-level episode from source evidence.
+
+        Facts remain compact coverage anchors, but the chronological source
+        segments are the authoritative narrative material. This prevents an
+        episode from degrading into a sentence-by-sentence fact concatenation.
+        """
+        segment_list = [
+            item for item in source_segments or []
+            if isinstance(item, dict)
+            and _compact_whitespace(item.get("text") or "")
+        ]
+        if not segment_list:
+            return {
+                "status": "empty",
+                "new_episode_count": 0,
+                "fact_count": 0,
+                "source_segment_count": 0,
+            }
+        fact_list = [
+            item for item in facts or []
+            if isinstance(item, dict)
+            and _compact_whitespace(item.get("summary") or item.get("text") or "")
+        ]
+        fact_payload = [
             {
+                "id": item.get("id"),
                 "summary": _compact_whitespace(item.get("summary") or item.get("text") or ""),
                 "fact_kind": item.get("fact_kind") or "",
                 "fact_root_topic": item.get("fact_root_topic") or "",
@@ -1285,8 +1331,20 @@ class MemoryNodeManager:
             }
             for item in fact_list
         ]
-        prompt_template = EPISODE_SUMMARY_PROMPT_EN if prompt_language == "en" else EPISODE_SUMMARY_PROMPT_ZH
-        prompt = prompt_template.replace("{facts}", json.dumps(payload, ensure_ascii=False))
+        source_text = self._build_memory_segments_for_prompt(
+            segment_list,
+            prompt_language=prompt_language,
+        )
+        prompt_template = (
+            EPISODE_SUMMARY_PROMPT_EN
+            if prompt_language == "en"
+            else EPISODE_SUMMARY_PROMPT_ZH
+        )
+        prompt = (
+            prompt_template
+            .replace("{source_segments}", source_text)
+            .replace("{evidence_facts}", json.dumps(fact_payload, ensure_ascii=False))
+        )
         parsed: Dict[str, Any] = {}
         for _ in range(2):
             parsed = self._parse_json_object_from_llm_text(self._call_llm(prompt) or "") or {}
@@ -1294,36 +1352,44 @@ class MemoryNodeManager:
                 break
         summary = _compact_whitespace(parsed.get("summary") or "")
         if not summary:
-            summary = "；".join(item["summary"] for item in payload)[:2000]
+            summary = self._fallback_generate_episode_summary_from_raw_segments(segment_list)
         title = _compact_whitespace(parsed.get("title") or "")
         if not title:
-            title = _compact_whitespace(payload[0].get("fact_root_topic") or "本次对话")[:80]
+            title = self._fallback_generate_episode_title_from_raw_segments(segment_list)
+        source_text_for_topics = " ".join(
+            _compact_whitespace(item.get("text") or "") for item in segment_list
+        )
         topics = self._normalize_episode_canonical_topics(
-            parsed.get("canonical_topics"), fallback_text=" ".join(item["summary"] for item in payload), limit=3,
+            parsed.get("canonical_topics"),
+            fallback_text=source_text_for_topics,
+            limit=3,
         )
         if not topics:
-            topics = self._normalize_unique_labels([item.get("fact_root_topic") for item in payload if item.get("fact_root_topic")])[:3] or self._topic_candidates(summary)[:3]
-        participants = self._normalize_unique_labels([
-            entity
-            for item in fact_list
-            for entity in (item.get("entities") or [])
-            if isinstance(entity, str)
-            and entity.strip().lower() in {"user", "assistant", "用户", "助手", "speaker_1", "speaker_2"}
-        ])[:20]
-        episode_entity_ids = sorted({
-            int(entity_id)
-            for item in fact_list
-            for entity_id in (item.get("entity_ids") or [])
-            if str(entity_id).strip().isdigit()
-        })
-        dialogue_times = [
-            _compact_whitespace(item.get("dialogue_time_key") or "")
-            for item in fact_list
-            if _compact_whitespace(item.get("dialogue_time_key") or "")
-        ]
-        start = dialogue_times[0] if dialogue_times else _now_text()
-        end = dialogue_times[-1] if dialogue_times else start
-        fact_ids = [int(item["id"]) for item in fact_list if str(item.get("id", "")).isdigit()]
+            topics = (
+                self._normalize_unique_labels([
+                    item.get("fact_root_topic")
+                    for item in fact_payload
+                    if item.get("fact_root_topic")
+                ])[:3]
+                or self._topic_candidates(summary)[:3]
+            )
+        participants = self._parse_participants_from_raw_segments(segment_list)
+        entity_names = self._episode_entity_names(
+            participants=participants,
+            segments=segment_list,
+            facts=fact_list,
+            summary=summary,
+        )
+        episode_entity_ids = self._entity_ids_from_names_and_facts(
+            names=entity_names,
+            facts=fact_list,
+        )
+        start = _compact_whitespace(segment_list[0].get("started_at") or "") or _now_text()
+        end = (
+            _compact_whitespace(segment_list[-1].get("ended_at") or "")
+            or _compact_whitespace(segment_list[-1].get("started_at") or "")
+            or start
+        )
         return {
             "status": "ok",
             "new_episode_count": 0,
@@ -1332,7 +1398,16 @@ class MemoryNodeManager:
             "canonical_topics": topics,
             "participants": participants,
             "entity_ids": episode_entity_ids,
-            "fact_ids": fact_ids,
+            "fact_ids": [
+                int(item["id"])
+                for item in fact_list
+                if str(item.get("id", "")).isdigit()
+            ],
+            "source_segment_ids": [
+                int(item["id"])
+                for item in segment_list
+                if str(item.get("id", "")).isdigit()
+            ],
             "started_at": start,
             "ended_at": end,
         }

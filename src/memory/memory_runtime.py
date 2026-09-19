@@ -117,13 +117,13 @@ class MemoryRuntime:
         self._interaction_episode_source_type = "assistant_wakeup"
         self._interaction_episode_tags: List[str] = []
         self._interaction_episode_prompt_language = "zh"
-        self._interaction_has_pending_episode_facts = False
+        self._interaction_has_pending_episode_sources = False
 
         self._transcript_previous_segment_end: Optional[datetime] = None
         self._transcript_episode_source_type = "allday_recording"
         self._transcript_episode_tags: List[str] = []
         self._transcript_episode_prompt_language = "zh"
-        self._transcript_has_pending_episode_facts = False
+        self._transcript_has_pending_episode_sources = False
 
     def close(self, timeout: Optional[float] = 30.0) -> None:
         """Drain owned tasks and release resources created by this runtime."""
@@ -280,7 +280,7 @@ class MemoryRuntime:
         if gap_trigger and (
             self._transcript_segmenter.has_pending_units()
             or self._transcript_unit_assembler.has_pending_segments()
-            or self._transcript_has_pending_episode_facts
+            or self._transcript_has_pending_episode_sources
         ):
             gap_summary_report = self.trigger_memory_episode_summary(reason="time_gap")
         else:
@@ -405,20 +405,20 @@ class MemoryRuntime:
             prompt_language or default_prompt_language
         ).strip() or "zh"
 
-        if resolved_source_type == self._transcript_episode_source_type:
+        if is_transcript_episode:
             flush_report = self._flush_pending_transcript_segments(reason=reason)
-            has_pending_episode_facts = self._transcript_has_pending_episode_facts
+            has_pending_episode_sources = self._transcript_has_pending_episode_sources
         elif is_interaction_episode:
             flush_report = self._flush_pending_interaction_turns()
-            has_pending_episode_facts = self._interaction_has_pending_episode_facts
+            has_pending_episode_sources = self._interaction_has_pending_episode_sources
         else:
             flush_report = {"queued": False, "reason": "no_runtime_input_flush"}
-            has_pending_episode_facts = False
+            has_pending_episode_sources = False
 
-        if not has_pending_episode_facts:
+        if not has_pending_episode_sources:
             return {
                 "queued": False,
-                "reason": "no_pending_episode_facts",
+                "reason": "no_pending_episode_sources",
                 "trigger_reason": reason,
                 "input_flush": flush_report,
             }
@@ -432,10 +432,10 @@ class MemoryRuntime:
                 self._memory_manager.submit_memory_prospective_update_task()
             )
             if is_transcript_episode:
-                self._transcript_has_pending_episode_facts = False
+                self._transcript_has_pending_episode_sources = False
                 self._transcript_episode_tags = []
             elif is_interaction_episode:
-                self._interaction_has_pending_episode_facts = False
+                self._interaction_has_pending_episode_sources = False
                 self._interaction_episode_tags = []
         else:
             report["prospective_update"] = {
@@ -567,7 +567,7 @@ class MemoryRuntime:
         self._transcript_episode_prompt_language = prompt_language
         queued = bool(queue_report.get("queued"))
         if queued:
-            self._transcript_has_pending_episode_facts = True
+            self._transcript_has_pending_episode_sources = True
             self._logger.info(
                 "transcript episode queued reason=%s raw_segment_count=%s semantic_unit_count=%s",
                 reason,
@@ -784,7 +784,7 @@ class MemoryRuntime:
         )
         queued = bool(queue_report.get("queued"))
         if queued:
-            self._interaction_has_pending_episode_facts = True
+            self._interaction_has_pending_episode_sources = True
             self._interaction_episode_tags = sorted(
                 set(self._interaction_episode_tags).union(tags)
             )

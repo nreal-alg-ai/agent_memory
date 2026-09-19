@@ -51,25 +51,28 @@ Entities must come from explicit conversation content or be directly determined 
 Each retained memory fact should usually include a subject entity, such as user/assistant/speaker, plus 1-4 core semantic anchors."""
 
 
-EPISODE_SUMMARY_PROMPT_EN = """You are the episode aggregation module for a long-term memory system. The input contains narrative facts already extracted by the fact-extraction module, ordered by time and belonging to one continuous interval. Do not re-extract facts; organize them into one higher-level, faithful, self-contained event summary.
+EPISODE_SUMMARY_PROMPT_EN = """You are the episode aggregation module for a long-term memory system. The input contains raw interaction/transcript segments from one continuous interval and high-value facts extracted from the same evidence. Generate a narrative summary of one reviewable experience.
+
+Input roles:
+- `source_segments` are chronological source evidence and the sole primary basis for the episode's content, ordering, and stance.
+- `evidence_facts` are durable coverage anchors selected from those segments. Use them only to check that important information is not missed; never rewrite, concatenate, or expand them one by one.
 
 Conceptual boundaries:
-- A fact is an independently retrievable evidence unit containing details about one event or issue.
-- An episode is the higher-level narrative of what happened across related facts in one continuous interaction/transcript interval.
-- An episode is not a long-term state, user profile, durable preference, risk assessment, or actionable item. Never generalize one episode into a cross-episode conclusion.
+- A fact is an independently retrievable atomic evidence unit containing precise details.
+- An episode is a higher-level narrative of what happened during one continuous experience: what unfolded, what it centered on, and what conclusion or open point remained.
+- An episode is not a long-term state, user profile, cross-experience pattern, risk assessment, or actionable item. Never generalize one episode into a durable conclusion.
 
-Aggregation procedure:
-1. Determine whether facts belong to one event or shared issue. Merge facts about the same object, goal, response chain, or causal chain; do not mechanically concatenate one sentence per fact.
-2. Reconstruct progression in time: context/problem -> discussion or proposal -> user stance (accepted, rejected, hesitant) -> constraints/reasons -> decision, result, or unresolved point. Omit unsupported stages.
-3. If unrelated but co-located facts genuinely belong to the same episode, connect them in one structured paragraph without inventing causal links or dropping high-value facts merely to force one topic.
-4. Preserve future-answerable details: objects, people, setting, time anchors, quantities, plans, choices, refusals, constraints, commitments, outcomes, and open questions. Ignore greetings, repetition, generic explanations, and courtesy closings.
-5. Preserve ordering, contrast, and conditionality. Do not turn a suggestion not accepted into a decision, a plan or possibility into completion, or a pending confirmation into confirmation.
-6. When facts contain a conflict or state change, describe the change or current conclusion explicitly. Do not silently resolve a conflict or erase valuable earlier context.
-7. summary must be one self-contained narrative paragraph understandable without reading the facts; do not write only "discussed a topic".
-8. title is a retrieval-oriented episode title: short, concrete, and distinguishable from other episodes on the same topic. Prefer "object + core event/decision/problem" over broad labels such as "health management" or "project discussion".
-9. canonical_topics must contain only 1-3 stable topics. Prefer consolidating and reusing the facts' `fact_root_topic`; merge synonymous aspects, but never use an aspect, action, conclusion, or isolated keyword as a topic. When evidence is weak, output fewer topics rather than inventing a parent topic.
-10. Use only the supplied facts. Do not import raw dialogue, historical state, outside knowledge, inferred owners/deadlines, or unsupported completion status.
-11. Return JSON matching the schema exactly. No markdown, explanation, or extra fields.
+Generation rules:
+1. Reconstruct the experience from source segments: context/trigger -> discussion, observation, or action -> meaningful turn or stance -> result, decision, or unresolved point. Omit any unsupported step.
+2. Abstract related expressions, but do not replay every turn or write one sentence per fact. The summary must be more coherent and contextual than the facts, not a longer fact list.
+3. Ignore wake words, greetings, courtesy closings, repetitions, empty acknowledgements, and templated assistant language. Retain only the people/objects, setting, issue, user concern, key response, decision, constraint, outcome, or open question needed to understand the experience.
+4. Cover high-value information in `evidence_facts` where it agrees with source segments. If facts conflict with, overstate, or leave ambiguity in the source, follow the source and preserve uncertainty.
+5. Preserve chronology, conditions, and speaker stance. Do not turn advice into a decision, a possibility or plan into completion, an assistant view into a user belief, or invent causality, owners, deadlines, or outcomes.
+6. If the continuous interval contains several unrelated but valuable topics, connect them with a structured summary without forcing a causal link or omitting important content.
+7. summary must be one concise, self-contained experience narrative: understandable without source segments and clear about the central people/objects, progression, and conclusion/open point.
+8. title is a short, concrete, distinguishable retrieval title. Prefer "object + core event/problem/decision" over broad labels.
+9. canonical_topics contains only 1-3 stable topics. Prefer `fact_root_topic` values from evidence facts; never use an action, one-off conclusion, emotion, or isolated keyword as a topic.
+10. Return JSON matching the schema exactly. No markdown, explanation, or extra fields.
 
 Output schema:
 {
@@ -78,8 +81,11 @@ Output schema:
   "canonical_topics": ["stable topic 1", "stable topic 2"]
 }
 
-Extracted facts:
-{facts}
+Raw source segments:
+{source_segments}
+
+High-value evidence facts (coverage checks only; do not concatenate):
+{evidence_facts}
 """
 
 
@@ -87,12 +93,12 @@ UNIFIED_MEMORY_EXTRACTION_PROMPT_EN = """You are the memory extraction module fo
 
 Current memory structure:
 - fact: a traceable, self-contained, independently retrievable narrative evidence unit extracted from a continuous evidence batch. Facts are persisted first and may be assigned to an episode later.
-- episode: a higher-level event summary generated by a separate module from newly generated facts in one continuous time interval; it is not a copy of each input batch or fact.
+- episode: a higher-level experience summary generated by a separate module from persisted raw interaction/transcript segments in one continuous interval; newly generated facts are coverage anchors only, so it is not a copy of each input batch or fact.
 - memory_topic_items: a reusable topic naming registry populated from stored facts and episodes. It contains canonical topics and fact aspects, not a topic summary or state.
 - entity_claim: a traceable entity proposition projected from facts by a separate reflection task; it is not direct evidence from the current dialogue.
 - goal / plan / work_item: future desired outcomes, explicit arrangements, and closed-loop responsibilities extracted by a separate Intent & Execution task after facts are stored. Do not output them here.
 
-Your task now is to extract Hindsight-style high-quality narrative facts from the chronological dialogue/transcript evidence batch below. Episode summary and episode canonical_topics are generated by a separate module from the extracted facts; do not output episode-level fields in this prompt.
+Your task now is to extract Hindsight-style high-quality narrative facts from the chronological dialogue/transcript evidence batch below. Episode summary and episode canonical_topics are generated by a separate module from persisted source segments with extracted facts as coverage anchors; do not output episode-level fields in this prompt.
 
 Topic and entity rules:
 - A fact's `fact_root_topic` must be grounded in the main durable issue in current evidence, while `fact_aspect_topic` keeps the concrete aspect under that root. Use a conservative, specific topic when evidence is limited.

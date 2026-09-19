@@ -3,7 +3,8 @@
 
 The schema defines the current unified memory line:
 
-    memory_episodes -> memory_facts -> entity_claims / intent-execution
+    memory_source_segments -> memory_episodes <- memory_facts
+                                             -> entity_claims / intent-execution
 
 `memory_index_entries` is the MemPalace-style directory layer: every retrievable
 memory object writes one index card that points back to its source row.
@@ -245,6 +246,21 @@ class SessionDB:
                 metadata TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS memory_source_segments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                episode_id INTEGER,
+                source_type TEXT NOT NULL,
+                speaker TEXT NOT NULL DEFAULT '',
+                text TEXT NOT NULL,
+                started_at TEXT NOT NULL DEFAULT '',
+                ended_at TEXT NOT NULL DEFAULT '',
+                tags TEXT NOT NULL DEFAULT '[]',
+                metadata TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(episode_id) REFERENCES memory_episodes(id) ON DELETE CASCADE
             );
 
             CREATE TABLE IF NOT EXISTS memory_facts (
@@ -579,6 +595,10 @@ class SessionDB:
             CREATE INDEX IF NOT EXISTS idx_memory_facts_event_time ON memory_facts(event_time_key);
             CREATE INDEX IF NOT EXISTS idx_memory_facts_dialogue_time ON memory_facts(dialogue_time_key);
             CREATE INDEX IF NOT EXISTS idx_memory_facts_source ON memory_facts(source_type);
+            CREATE INDEX IF NOT EXISTS idx_memory_source_segments_unassigned
+            ON memory_source_segments(source_type, episode_id, id);
+            CREATE INDEX IF NOT EXISTS idx_memory_source_segments_episode
+            ON memory_source_segments(episode_id, id);
             CREATE INDEX IF NOT EXISTS idx_memory_fact_episode_episode
             ON memory_fact_episode_mapping(episode_id, updated_at);
             CREATE INDEX IF NOT EXISTS idx_memory_topic_items_kind_seen
@@ -752,6 +772,102 @@ class SessionDB:
         ])
         self._commit_if_needed()
         return episode_id
+
+    def insert_memory_source_segments(
+        self,
+        *,
+        source_type: str,
+        segments: Sequence[Dict[str, Any]],
+    ) -> List[int]:
+        """Persist normalized interaction or transcript evidence for episode use."""
+        now = local_now_text()
+        inserted_ids: List[int] = []
+        for segment in segments or []:
+            if not isinstance(segment, dict):
+                continue
+            text = str(segment.get("text") or "").strip()
+            if not text:
+                continue
+            tags = [
+                str(tag).strip()
+                for tag in (segment.get("tags") or [])
+                if str(tag).strip()
+            ]
+            metadata = dict(
+                segment.get("metadata")
+                if isinstance(segment.get("metadata"), dict)
+                else {}
+            )
+            for key in ("turn_index", "segment_index"):
+                if key in segment and key not in metadata:
+                    metadata[key] = segment[key]
+            cur = self._conn.execute(
+                """
+                INSERT INTO memory_source_segments (
+                    source_type, speaker, text, started_at, ended_at,
+                    tags, metadata, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(source_type or "").strip() or "assistant_wakeup",
+                    str(segment.get("speaker") or "").strip(),
+                    text,
+                    str(segment.get("started_at") or "").strip(),
+                    str(segment.get("ended_at") or segment.get("started_at") or "").strip(),
+                    _json_dumps(tags),
+                    _json_dumps(metadata),
+                    now,
+                    now,
+                ),
+            )
+            inserted_ids.append(int(cur.lastrowid))
+        self._commit_if_needed()
+        return inserted_ids
+
+    def get_unassigned_memory_source_segments(
+        self,
+        *,
+        source_type: str,
+        limit: int = 240,
+    ) -> List[Dict[str, Any]]:
+        """Return source evidence waiting to be summarized into one episode."""
+        rows = self._conn.execute(
+            """
+            SELECT *
+            FROM memory_source_segments
+            WHERE source_type = ? AND episode_id IS NULL
+            ORDER BY id ASC
+            LIMIT ?
+            """,
+            (str(source_type or "").strip() or "assistant_wakeup", max(1, int(limit or 240))),
+        ).fetchall()
+        return [self._row_to_dict(row) for row in rows]
+
+    def update_memory_source_segments_episode_id(
+        self,
+        *,
+        source_segment_ids: Sequence[int],
+        episode_id: int,
+    ) -> int:
+        """Attach persisted source evidence to its generated episode."""
+        normalized_ids = [
+            int(value)
+            for value in source_segment_ids or []
+            if str(value).strip().isdigit() and int(value) > 0
+        ]
+        if not normalized_ids:
+            return 0
+        placeholders = ",".join("?" for _ in normalized_ids)
+        cur = self._conn.execute(
+            f"""
+            UPDATE memory_source_segments
+            SET episode_id = ?, updated_at = ?
+            WHERE id IN ({placeholders})
+            """,
+            (int(episode_id), local_now_text(), *normalized_ids),
+        )
+        self._commit_if_needed()
+        return int(cur.rowcount or 0)
 
     def upsert_memory_topic_items(
         self,
@@ -991,26 +1107,36 @@ class SessionDB:
         ).fetchall()
         return [self._row_to_dict(row) for row in rows]
 
-    def get_memory_facts_after_id(
+    def get_unassigned_memory_facts_in_time_window(
         self,
         *,
-        fact_id: int = 0,
-        source_type: Optional[str] = None,
-        only_unassigned: bool = False,
-        limit: int = 500,
+        source_type: str,
+        started_at: str,
+        ended_at: str,
+        limit: int = 80,
     ) -> List[Dict[str, Any]]:
-        """Return facts newer than a runtime cursor in insertion order."""
-        clauses = ["id > ?"]
-        params: List[Any] = [int(fact_id or 0)]
-        if source_type:
-            clauses.append("source_type = ?")
-            params.append(str(source_type))
-        if only_unassigned:
-            clauses.append("episode_id IS NULL")
+        """Load unassigned facts whose dialogue time belongs to one source window."""
+        start = str(started_at or "").strip()
+        end = str(ended_at or started_at or "").strip()
+        if not start or not end:
+            return []
         rows = self._conn.execute(
-            f"SELECT * FROM memory_facts WHERE {' AND '.join(clauses)} "
-            "ORDER BY id ASC LIMIT ?",
-            (*params, max(1, int(limit or 500))),
+            """
+            SELECT *
+            FROM memory_facts
+            WHERE source_type = ?
+              AND episode_id IS NULL
+              AND dialogue_time_key >= ?
+              AND dialogue_time_key <= ?
+            ORDER BY dialogue_time_key ASC, id ASC
+            LIMIT ?
+            """,
+            (
+                str(source_type or "").strip() or "assistant_wakeup",
+                start,
+                end,
+                max(1, int(limit or 80)),
+            ),
         ).fetchall()
         return [self._row_to_dict(row) for row in rows]
 
@@ -2637,6 +2763,7 @@ class SessionDB:
             "entity_ids",
             "canonical_topics",
             "participants",
+            "tags",
             "metadata",
             "details",
             "previous_payload",
