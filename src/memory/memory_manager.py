@@ -1109,6 +1109,21 @@ class MemoryNodeManager:
                     "evidence_fact_ids": list(episode_info.get("fact_ids") or []),
                 },
             )
+            self._upsert_episode_recall_document(
+                episode_id=episode_id,
+                source_type=source_type,
+                title=episode_info["title"],
+                summary=episode_info["summary"],
+                participants=episode_info.get("participants") or [],
+                entity_ids=episode_info.get("entity_ids") or [],
+                canonical_topics=episode_info.get("canonical_topics") or [],
+                started_at=episode_info.get("started_at") or _now_text(),
+                ended_at=(
+                    episode_info.get("ended_at")
+                    or episode_info.get("started_at")
+                    or _now_text()
+                ),
+            )
             topic_report = self._db.upsert_memory_topic_items(
                 self._build_memory_topic_item_updates(
                     canonical_topics=episode_info.get("canonical_topics") or [],
@@ -1236,6 +1251,127 @@ class MemoryNodeManager:
             for entity_name, entity_id in mapping.items()
             if str(entity_name).strip() and str(entity_id).strip().isdigit()
         }
+
+    def _upsert_memory_recall_document(
+        self,
+        *,
+        object_type: str,
+        object_id: int,
+        identity_lines: Sequence[str],
+        source_type: str = "",
+        title: str = "",
+        summary: str = "",
+        entity_ids: Optional[Sequence[int]] = None,
+        topic_keys: Optional[Sequence[str]] = None,
+        time_start: str = "",
+        time_end: str = "",
+        status: str = "",
+        confidence: float = 0.0,
+        importance: float = 0.0,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> int:
+        """Write one canonical retrieval projection without ranking it.
+
+        The source tables own domain state. This helper owns only the stable
+        textual representation shared by lexical search and embeddings.
+        """
+        identity_text = "\n".join(
+            _compact_whitespace(line)
+            for line in identity_lines
+            if _compact_whitespace(line)
+        )
+        return self._db.upsert_memory_recall_document(
+            object_type=object_type,
+            object_id=object_id,
+            identity_text=identity_text,
+            identity_text_embedding=self._generate_embedding_vector(identity_text),
+            source_type=source_type,
+            title=title,
+            summary=summary,
+            entity_ids=entity_ids,
+            topic_keys=topic_keys,
+            time_start=time_start,
+            time_end=time_end,
+            status=status,
+            confidence=confidence,
+            importance=importance,
+            metadata=metadata,
+        )
+
+    def _upsert_fact_recall_document(
+        self,
+        *,
+        fact_id: int,
+        source_type: str,
+        summary: str,
+        keywords: Sequence[str],
+        entities: Sequence[str],
+        entity_ids: Sequence[int],
+        fact_root_topic: str,
+        fact_aspect_topic: str,
+        event_time_key: str,
+        dialogue_time_key: str,
+        confidence: float,
+        importance: float,
+    ) -> int:
+        """Project one atomic fact into the shared recall-document store."""
+        keyword_text = " ".join(str(value) for value in keywords or [] if value)
+        return self._upsert_memory_recall_document(
+            object_type="fact",
+            object_id=fact_id,
+            source_type=source_type,
+            title=_compact_whitespace(summary)[:120],
+            summary=summary,
+            identity_lines=[
+                f"summary: {_compact_whitespace(summary)}",
+                f"keywords: {keyword_text}",
+                f"entities: {', '.join(entities or [])}",
+                f"fact_root_topic: {fact_root_topic}",
+                f"fact_aspect_topic: {fact_aspect_topic}",
+            ],
+            entity_ids=entity_ids,
+            topic_keys=[fact_root_topic, fact_aspect_topic],
+            time_start=event_time_key or dialogue_time_key,
+            time_end=event_time_key or dialogue_time_key,
+            confidence=confidence,
+            importance=importance,
+            metadata={"projection_version": "v1"},
+        )
+
+    def _upsert_episode_recall_document(
+        self,
+        *,
+        episode_id: int,
+        source_type: str,
+        title: str,
+        summary: str,
+        participants: Sequence[str],
+        entity_ids: Sequence[int],
+        canonical_topics: Sequence[str],
+        started_at: str,
+        ended_at: str,
+    ) -> int:
+        """Project one experience-level summary without exposing raw segments."""
+        return self._upsert_memory_recall_document(
+            object_type="episode",
+            object_id=episode_id,
+            source_type=source_type,
+            title=title,
+            summary=summary,
+            identity_lines=[
+                f"title: {_compact_whitespace(title)}",
+                f"summary: {_compact_whitespace(summary)}",
+                f"participants: {', '.join(participants or [])}",
+                f"canonical_topics: {', '.join(canonical_topics or [])}",
+            ],
+            entity_ids=entity_ids,
+            topic_keys=canonical_topics,
+            time_start=started_at,
+            time_end=ended_at,
+            confidence=0.85,
+            importance=0.6,
+            metadata={"projection_version": "v1"},
+        )
 
     def _log_extracted_fact_info(
         self,
@@ -2379,7 +2515,6 @@ class MemoryNodeManager:
             )
             if not keywords:
                 keywords = self._keywords(fact.get("summary") or "", limit=18)
-            keyword_text = " ".join(keywords)
             entities = self._normalize_entity_names(fact.get("entities"))
             raw_metadata = fact.get("metadata")
             metadata = dict(raw_metadata) if isinstance(raw_metadata, dict) else {}
@@ -2394,15 +2529,6 @@ class MemoryNodeManager:
                 fact.get("fact_aspect_topic")
                 or fact_root_topic
             ) or fact_root_topic
-            identity_text = "\n".join([
-                f"summary: {_compact_whitespace(fact['summary'])}",
-                f"keywords: {keyword_text}",
-                f"entities: {', '.join(entities)}",
-                f"primary_entity: {(fact.get('primary_entity') or {}).get('name', '') if isinstance(fact.get('primary_entity'), dict) else ''}",
-                f"fact_root_topic: {fact_root_topic}",
-                f"fact_aspect_topic: {fact_aspect_topic}",
-            ])
-            identity_text_embedding = self._generate_embedding_vector(identity_text)
             fact_entities = self._fact_entity_names(fact, entities=entities)
             entity_ids = [
                 normalized_entity_info[entity_name]
@@ -2431,8 +2557,20 @@ class MemoryNodeManager:
                 confidence=fact["confidence"],
                 importance=fact["importance"],
                 metadata=fact_metadata,
-                identity_text_embedding=identity_text_embedding,
-                identity_text=identity_text,
+            )
+            self._upsert_fact_recall_document(
+                fact_id=fact_id,
+                source_type=source_type,
+                summary=fact["summary"],
+                keywords=keywords,
+                entities=entities,
+                entity_ids=entity_ids,
+                fact_root_topic=fact_root_topic,
+                fact_aspect_topic=fact_aspect_topic,
+                event_time_key=fact.get("event_time_key") or "",
+                dialogue_time_key=fact.get("dialogue_time_key") or "",
+                confidence=float(fact["confidence"]),
+                importance=float(fact["importance"]),
             )
             fact_ids.append(fact_id)
             entity_claim_signal_mapping_updates.extend(
@@ -3009,6 +3147,85 @@ class MemoryNodeManager:
             field: item.get(field) or "" for field in fields
         }}
 
+    def _sync_prospective_recall_document(
+        self,
+        *,
+        object_type: str,
+        item: Dict[str, Any],
+    ) -> None:
+        """Refresh the retrieval projection for one goal, plan, or work item."""
+        normalized_type = str(object_type or "").strip().lower()
+        object_id = int(item.get("id") or 0)
+        if normalized_type not in {"goal", "plan", "work_item"} or object_id <= 0:
+            return
+        entity_fields = {
+            "goal": ("world_owner_entity_id", "owner_entity_id"),
+            "plan": ("world_owner_entity_id", "actor_entity_id", "location_entity_id"),
+            "work_item": ("world_owner_entity_id", "responsible_entity_id"),
+        }[normalized_type]
+        entity_ids = [
+            int(item.get(field) or 0)
+            for field in entity_fields
+            if int(item.get(field) or 0) > 0
+        ]
+        names_by_id = self._db.get_entity_names_by_ids(entity_ids)
+        if normalized_type == "goal":
+            time_start = time_end = str(item.get("target_at") or "")
+            identity_lines = [
+                f"owner: {names_by_id.get(int(item.get('owner_entity_id') or 0), '')}",
+                f"summary: {_compact_whitespace(item.get('summary') or '')}",
+                f"desired_outcome: {_compact_whitespace(item.get('desired_outcome') or '')}",
+                f"success_criteria: {_compact_whitespace(item.get('success_criteria') or '')}",
+                f"canonical_key: {item.get('canonical_key') or ''}",
+                f"status: {item.get('status') or ''}",
+                f"target_at: {item.get('target_at') or ''}",
+            ]
+        elif normalized_type == "plan":
+            time_start = str(item.get("start_at") or "")
+            time_end = str(item.get("end_at") or time_start)
+            identity_lines = [
+                f"actor: {names_by_id.get(int(item.get('actor_entity_id') or 0), '')}",
+                f"summary: {_compact_whitespace(item.get('summary') or '')}",
+                f"event_or_activity: {_compact_whitespace(item.get('event_or_activity') or '')}",
+                f"location: {_compact_whitespace(item.get('location_text') or '')}",
+                f"canonical_key: {item.get('canonical_key') or ''}",
+                f"status: {item.get('status') or ''}",
+                f"start_at: {item.get('start_at') or ''}",
+                f"end_at: {item.get('end_at') or ''}",
+            ]
+        else:
+            time_start = str(item.get("start_at") or "")
+            time_end = str(item.get("due_at") or time_start)
+            identity_lines = [
+                f"responsible: {names_by_id.get(int(item.get('responsible_entity_id') or 0), '')}",
+                f"summary: {_compact_whitespace(item.get('summary') or '')}",
+                f"action: {_compact_whitespace(item.get('action_text') or '')}",
+                f"deliverable: {_compact_whitespace(item.get('deliverable') or '')}",
+                f"canonical_key: {item.get('canonical_key') or ''}",
+                f"status: {item.get('status') or ''}",
+                f"due_at: {item.get('due_at') or ''}",
+                f"priority: {item.get('priority') or ''}",
+            ]
+        self._upsert_memory_recall_document(
+            object_type=normalized_type,
+            object_id=object_id,
+            source_type="prospective",
+            title=_compact_whitespace(item.get("summary") or "")[:120],
+            summary=_compact_whitespace(item.get("summary") or ""),
+            identity_lines=identity_lines,
+            entity_ids=entity_ids,
+            topic_keys=[str(item.get("canonical_key") or "")],
+            time_start=time_start,
+            time_end=time_end,
+            status=str(item.get("status") or ""),
+            confidence=float(item.get("confidence") or 0.0),
+            importance=0.7,
+            metadata={
+                "prospective_object_type": normalized_type,
+                "projection_version": "v1",
+            },
+        )
+
     def _apply_intent_candidates(
         self,
         candidates: Sequence[Dict[str, Any]],
@@ -3042,6 +3259,15 @@ class MemoryNodeManager:
                 }
                 self._db.update_intent_object(
                     object_type=object_type, object_id=object_id, payload=update_payload,
+                )
+            stored_object = self._db.get_intent_object(
+                object_type=object_type,
+                object_id=object_id,
+            )
+            if stored_object:
+                self._sync_prospective_recall_document(
+                    object_type=object_type,
+                    item=stored_object,
                 )
             evidence_role = {
                 "create": "creation", "confirm": "confirmation", "complete": "completion",
@@ -3213,6 +3439,63 @@ class MemoryNodeManager:
             for name in self._normalize_entity_names(fact.get("entities") or [], limit=24)
         ]
         return self._db.add_entity_names(names)
+
+    def _sync_entity_claim_recall_documents(
+        self,
+        claim_ids: Sequence[int],
+    ) -> None:
+        """Refresh projections for claims created, merged, or transitioned."""
+        claims = self._db.get_entity_claims_by_ids(claim_ids)
+        entity_ids = [
+            int(entity_id)
+            for claim in claims
+            for entity_id in (
+                claim.get("subject_entity_id"),
+                claim.get("object_entity_id"),
+                claim.get("source_actor_entity_id"),
+            )
+            if str(entity_id or "").strip().isdigit() and int(entity_id) > 0
+        ]
+        names_by_id = self._db.get_entity_names_by_ids(entity_ids)
+        for claim in claims:
+            subject_id = int(claim.get("subject_entity_id") or 0)
+            object_id = int(claim.get("object_entity_id") or 0)
+            source_actor_id = int(claim.get("source_actor_entity_id") or 0)
+            claim_entity_ids = [
+                entity_id for entity_id in (subject_id, object_id, source_actor_id)
+                if entity_id > 0
+            ]
+            self._upsert_memory_recall_document(
+                object_type="entity_claim",
+                object_id=int(claim["id"]),
+                source_type="entity_claim",
+                title=_compact_whitespace(claim.get("claim_text") or "")[:120],
+                summary=_compact_whitespace(claim.get("claim_text") or ""),
+                identity_lines=[
+                    f"subject: {names_by_id.get(subject_id, '')}",
+                    f"claim: {_compact_whitespace(claim.get('claim_text') or '')}",
+                    f"predicate: {claim.get('predicate') or ''}",
+                    f"object: {names_by_id.get(object_id, '')}",
+                    f"claim_type: {claim.get('claim_type') or ''}",
+                    f"claim_origin: {claim.get('claim_origin') or ''}",
+                    f"status: {claim.get('status') or ''}",
+                ],
+                entity_ids=claim_entity_ids,
+                topic_keys=[
+                    str(claim.get("claim_type") or ""),
+                    str(claim.get("predicate") or ""),
+                ],
+                time_start=str(claim.get("valid_from") or ""),
+                time_end=str(claim.get("valid_to") or ""),
+                status=str(claim.get("status") or ""),
+                confidence=float(claim.get("confidence") or 0.0),
+                importance=0.65,
+                metadata={
+                    "claim_origin": str(claim.get("claim_origin") or ""),
+                    "claim_type": str(claim.get("claim_type") or ""),
+                    "projection_version": "v1",
+                },
+            )
 
     @staticmethod
     def _entity_claim_origin_priority(origin: Any) -> int:
@@ -3686,6 +3969,21 @@ class MemoryNodeManager:
                 for item in applied
             ],
         })
+        recall_document_claim_ids = {
+            int(item["claim_id"])
+            for item in applied
+            if int(item.get("claim_id") or 0) > 0
+        }
+        recall_document_claim_ids.update(
+            int(decision["existing_claim_id"])
+            for item in applied
+            for decision in item.get("relations") or []
+            if str(decision.get("existing_claim_id") or "").strip().isdigit()
+            and int(decision["existing_claim_id"]) > 0
+        )
+        self._sync_entity_claim_recall_documents(
+            sorted(recall_document_claim_ids)
+        )
         return applied
 
     def _update_explicit_entity_claims_from_facts(

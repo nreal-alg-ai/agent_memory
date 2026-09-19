@@ -6,8 +6,8 @@ The schema defines the current unified memory line:
     memory_source_segments -> memory_episodes <- memory_facts
                                              -> entity_claims / intent-execution
 
-`memory_index_entries` is the MemPalace-style directory layer: every retrievable
-memory object writes one index card that points back to its source row.
+`memory_recall_documents` is a derived retrieval projection. Every retrievable
+memory object writes one document there; source tables retain only domain data.
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ except ImportError:  # pragma: no cover - exercised only in minimal installs
     jieba = None
 
 _IDENTITY_FTS_TABLES = {
-    "memory_facts": "memory_facts_identity_fts",
+    "memory_recall_documents": "memory_recall_documents_identity_fts",
 }
 
 _LEXICAL_DATE_PATTERNS = (
@@ -40,7 +40,7 @@ _LEXICAL_DATE_PATTERNS = (
 def _lexical_index_text(identity_text: Any) -> str:
     """Convert display identity text into deterministic FTS search tokens.
 
-    The source tables keep the original ``identity_text`` for embeddings and
+    Recall documents keep the original ``identity_text`` for embeddings and
     display. FTS receives a separate token stream so Chinese text can be
     searched by words instead of relying on SQLite's default tokenizer.
     Dates are excluded here because fact time is filtered through structured
@@ -280,11 +280,31 @@ class SessionDB:
                 confidence REAL NOT NULL DEFAULT 0.85,
                 importance REAL NOT NULL DEFAULT 0.5,
                 metadata TEXT NOT NULL DEFAULT '{}',
-                identity_text_embedding BLOB,
-                identity_text TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 FOREIGN KEY(episode_id) REFERENCES memory_episodes(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS memory_recall_documents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                object_type TEXT NOT NULL,
+                object_id INTEGER NOT NULL,
+                source_type TEXT NOT NULL DEFAULT '',
+                title TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '',
+                identity_text TEXT NOT NULL DEFAULT '',
+                identity_text_embedding BLOB,
+                entity_ids TEXT NOT NULL DEFAULT '[]',
+                topic_keys TEXT NOT NULL DEFAULT '[]',
+                time_start TEXT NOT NULL DEFAULT '',
+                time_end TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT '',
+                confidence REAL NOT NULL DEFAULT 0.0,
+                importance REAL NOT NULL DEFAULT 0.0,
+                metadata TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(object_type, object_id)
             );
 
             CREATE TABLE IF NOT EXISTS memory_entity_nodes (
@@ -595,6 +615,10 @@ class SessionDB:
             CREATE INDEX IF NOT EXISTS idx_memory_facts_event_time ON memory_facts(event_time_key);
             CREATE INDEX IF NOT EXISTS idx_memory_facts_dialogue_time ON memory_facts(dialogue_time_key);
             CREATE INDEX IF NOT EXISTS idx_memory_facts_source ON memory_facts(source_type);
+            CREATE INDEX IF NOT EXISTS idx_memory_recall_documents_object
+            ON memory_recall_documents(object_type, object_id);
+            CREATE INDEX IF NOT EXISTS idx_memory_recall_documents_type_status_time
+            ON memory_recall_documents(object_type, status, time_end, updated_at);
             CREATE INDEX IF NOT EXISTS idx_memory_source_segments_unassigned
             ON memory_source_segments(source_type, episode_id, id);
             CREATE INDEX IF NOT EXISTS idx_memory_source_segments_episode
@@ -647,7 +671,7 @@ class SessionDB:
         self._commit_if_needed()
     
     def _init_identity_fts(self) -> None:
-        """Create and populate one tokenized BM25 index per memory table."""
+        """Create and populate the tokenized BM25 index for recall documents."""
         for source_table, fts_table in _IDENTITY_FTS_TABLES.items():
             self._conn.execute(
                 f"""
@@ -691,6 +715,108 @@ class SessionDB:
             f"INSERT INTO {fts_table} (rowid, lexical_index_text) VALUES (?, ?)",
             (int(row_id), _lexical_index_text(identity_text)),
         )
+
+    def upsert_memory_recall_document(
+        self,
+        *,
+        object_type: str,
+        object_id: int,
+        identity_text: str,
+        identity_text_embedding: Optional[np.ndarray],
+        source_type: str = "",
+        title: str = "",
+        summary: str = "",
+        entity_ids: Optional[Sequence[int]] = None,
+        topic_keys: Optional[Sequence[str]] = None,
+        time_start: str = "",
+        time_end: str = "",
+        status: str = "",
+        confidence: float = 0.0,
+        importance: float = 0.0,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> int:
+        """Create or refresh one derived retrieval document.
+
+        ``object_type`` and ``object_id`` identify the authoritative row in a
+        domain table. This projection deliberately has no foreign key because
+        it spans several source tables; callers own its lifecycle alongside
+        the corresponding source-object write.
+        """
+        normalized_type = str(object_type or "").strip().lower()
+        normalized_id = int(object_id or 0)
+        if not normalized_type or normalized_id <= 0:
+            raise ValueError("object_type and a positive object_id are required")
+        now = local_now_text()
+        normalized_entity_ids = list(dict.fromkeys(
+            int(value)
+            for value in entity_ids or []
+            if str(value).strip().isdigit() and int(value) > 0
+        ))
+        normalized_topic_keys = list(dict.fromkeys(
+            str(value).strip()
+            for value in topic_keys or []
+            if str(value).strip()
+        ))
+        self._conn.execute(
+            """
+            INSERT INTO memory_recall_documents (
+                object_type, object_id, source_type, title, summary,
+                identity_text, identity_text_embedding, entity_ids, topic_keys,
+                time_start, time_end, status, confidence, importance, metadata,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(object_type, object_id) DO UPDATE SET
+                source_type = excluded.source_type,
+                title = excluded.title,
+                summary = excluded.summary,
+                identity_text = excluded.identity_text,
+                identity_text_embedding = excluded.identity_text_embedding,
+                entity_ids = excluded.entity_ids,
+                topic_keys = excluded.topic_keys,
+                time_start = excluded.time_start,
+                time_end = excluded.time_end,
+                status = excluded.status,
+                confidence = excluded.confidence,
+                importance = excluded.importance,
+                metadata = excluded.metadata,
+                updated_at = excluded.updated_at
+            """,
+            (
+                normalized_type,
+                normalized_id,
+                str(source_type or ""),
+                str(title or ""),
+                str(summary or ""),
+                str(identity_text or ""),
+                _embedding_to_blob(identity_text_embedding),
+                _json_dumps(normalized_entity_ids),
+                _json_dumps(normalized_topic_keys),
+                str(time_start or ""),
+                str(time_end or ""),
+                str(status or ""),
+                float(confidence or 0.0),
+                float(importance or 0.0),
+                _json_dumps(metadata or {}),
+                now,
+                now,
+            ),
+        )
+        row = self._conn.execute(
+            """
+            SELECT id FROM memory_recall_documents
+            WHERE object_type = ? AND object_id = ?
+            """,
+            (normalized_type, normalized_id),
+        ).fetchone()
+        assert row is not None
+        document_id = int(row["id"])
+        self._sync_identity_fts(
+            source_table="memory_recall_documents",
+            row_id=document_id,
+            identity_text=str(identity_text or ""),
+        )
+        self._commit_if_needed()
+        return document_id
 
     @staticmethod
     def _terms_to_fts_query(terms: Sequence[str]) -> str:
@@ -2046,6 +2172,84 @@ class SessionDB:
         ).fetchall()
         return [self._row_to_dict(row) for row in rows]
 
+    def get_entity_claims_by_ids(
+        self,
+        claim_ids: Sequence[int],
+    ) -> List[Dict[str, Any]]:
+        """Load claims in caller-specified order for projection refreshes."""
+        ids = list(dict.fromkeys(
+            int(value)
+            for value in claim_ids or []
+            if str(value).strip().isdigit() and int(value) > 0
+        ))
+        if not ids:
+            return []
+        placeholders = ",".join("?" for _ in ids)
+        rows = self._conn.execute(
+            f"SELECT * FROM memory_entity_claims WHERE id IN ({placeholders})",
+            ids,
+        ).fetchall()
+        by_id = {int(row["id"]): self._row_to_dict(row) for row in rows}
+        return [by_id[claim_id] for claim_id in ids if claim_id in by_id]
+
+    def get_entity_names_by_ids(
+        self,
+        entity_ids: Sequence[int],
+    ) -> Dict[int, str]:
+        """Return stable entity display names for recall-document projection."""
+        ids = list(dict.fromkeys(
+            int(value)
+            for value in entity_ids or []
+            if str(value).strip().isdigit() and int(value) > 0
+        ))
+        if not ids:
+            return {}
+        placeholders = ",".join("?" for _ in ids)
+        rows = self._conn.execute(
+            f"SELECT id, name FROM memory_entity_nodes WHERE id IN ({placeholders})",
+            ids,
+        ).fetchall()
+        return {
+            int(row["id"]): str(row["name"] or "")
+            for row in rows
+            if str(row["name"] or "").strip()
+        }
+
+    def get_memory_recall_documents(
+        self,
+        *,
+        object_type: Optional[str] = None,
+        object_ids: Optional[Sequence[int]] = None,
+        limit: int = 200,
+    ) -> List[Dict[str, Any]]:
+        """Read derived recall documents without applying recall ranking."""
+        clauses: List[str] = []
+        params: List[Any] = []
+        if object_type:
+            clauses.append("object_type = ?")
+            params.append(str(object_type).strip().lower())
+        if object_ids is not None:
+            ids = list(dict.fromkeys(
+                int(value)
+                for value in object_ids
+                if str(value).strip().isdigit() and int(value) > 0
+            ))
+            if not ids:
+                return []
+            placeholders = ",".join("?" for _ in ids)
+            clauses.append(f"object_id IN ({placeholders})")
+            params.extend(ids)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        rows = self._conn.execute(
+            f"""
+            SELECT * FROM memory_recall_documents{where}
+            ORDER BY updated_at DESC, id DESC
+            LIMIT ?
+            """,
+            (*params, max(1, int(limit or 200))),
+        ).fetchall()
+        return [self._row_to_dict(row) for row in rows]
+
     def upsert_entity_claim_evidence(self, evidence: Sequence[Dict[str, Any]]) -> int:
         now = local_now_text()
         changed = 0
@@ -2146,8 +2350,6 @@ class SessionDB:
         confidence: float,
         importance: float,
         metadata: Optional[Dict[str, Any]],
-        identity_text_embedding: Optional[np.ndarray],
-        identity_text: str,
     ) -> int:
         now = local_now_text()
         keyword_values = (
@@ -2169,9 +2371,8 @@ class SessionDB:
                 episode_id, source_type, fact_type, fact_kind,
                 summary, keywords, entities, entity_ids, fact_root_topic,
                 fact_aspect_topic, event_time_key, dialogue_time_key,
-                confidence, importance, metadata, identity_text_embedding, identity_text,
-                created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                confidence, importance, metadata, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 episode_id,
@@ -2189,18 +2390,11 @@ class SessionDB:
                 float(confidence),
                 float(importance),
                 _json_dumps(metadata or {}),
-                _embedding_to_blob(identity_text_embedding),
-                identity_text,
                 now,
                 now,
             ),
         )
         fact_id = int(cur.lastrowid)
-        self._sync_identity_fts(
-            source_table="memory_facts",
-            row_id=fact_id,
-            identity_text=str(identity_text or ""),
-        )
         if episode_id is not None:
             self.insert_fact_episode_mappings([
                 {
@@ -2399,7 +2593,7 @@ class SessionDB:
         self,
         *,
         table: str,
-        identity_fts_table: str,
+        object_type: str,
         time_fields: Optional[Sequence[str]] = None,
         terms: Optional[Sequence[str]],
         source_types: Optional[Sequence[str]],
@@ -2408,19 +2602,18 @@ class SessionDB:
         limit: int,
         strict_time_filter: bool = False,
     ) -> List[Dict[str, Any]]:
-        """Return raw rows ranked by BM25 over their identity text.
+        """Return source rows ranked by their recall-document identity text.
 
         Table and field names are internal constants supplied by the public
-        fact-search wrapper; user input is only ever bound as SQL values.
-        Only identity-text lexical hits are returned. BM25 results are merged
-        with the LIKE fallback when FTS5 is unavailable, while time filtering
-        remains controlled by the caller.
+        source-table wrapper; user input is only ever bound as SQL values.
+        The derived recall document owns the lexical/embedding representation,
+        while the source row remains the returned domain object.
         """
-        base_clauses: List[str] = []
-        base_params: List[Any] = []
+        base_clauses: List[str] = ["document.object_type = ?"]
+        base_params: List[Any] = [str(object_type or "").strip().lower()]
         if source_types:
             placeholders = ",".join("?" for _ in source_types)
-            base_clauses.append(f"source_type IN ({placeholders})")
+            base_clauses.append(f"source.source_type IN ({placeholders})")
             base_params.extend(source_types)
         selected_time_fields = [
             str(field).strip()
@@ -2428,15 +2621,15 @@ class SessionDB:
             if str(field).strip()
         ]
         time_expressions = [
-            f"substr({field}, 1, 19)"
+            f"substr(source.{field}, 1, 19)"
             if field.endswith("_time_key")
-            else field
+            else f"source.{field}"
             for field in selected_time_fields
         ]
         time_expression = (
             time_expressions[0]
             if len(time_expressions) == 1
-            else "updated_at"
+            else "source.updated_at"
             if not time_expressions
             else "COALESCE(" + ", ".join(time_expressions) + ")"
         )
@@ -2477,6 +2670,8 @@ class SessionDB:
                     except (TypeError, ValueError):
                         pass
 
+        identity_fts_table = _IDENTITY_FTS_TABLES["memory_recall_documents"]
+
         def add_bm25_matches(
             *,
             where: str,
@@ -2493,7 +2688,10 @@ class SessionDB:
                     f"""
                     SELECT source.id, bm25({identity_fts_table}) AS bm25_score
                     FROM {identity_fts_table}
-                    JOIN {table} source ON source.id = {identity_fts_table}.rowid
+                    JOIN memory_recall_documents AS document
+                        ON document.id = {identity_fts_table}.rowid
+                    JOIN {table} source
+                        ON source.id = document.object_id
                     WHERE {where} AND {identity_fts_table} MATCH ?
                     ORDER BY bm25({identity_fts_table}) ASC,
                              {time_expression} DESC, source.id DESC
@@ -2516,7 +2714,7 @@ class SessionDB:
             if not normalized_terms:
                 return
             like_clauses = [
-                "LOWER(COALESCE(source.identity_text, '')) LIKE ?"
+                "LOWER(COALESCE(document.identity_text, '')) LIKE ?"
                 for _term in normalized_terms[:12]
             ]
             if not like_clauses:
@@ -2525,6 +2723,8 @@ class SessionDB:
                 f"""
                 SELECT source.id
                 FROM {table} source
+                JOIN memory_recall_documents AS document
+                    ON document.object_id = source.id
                 WHERE {where} AND ({" OR ".join(like_clauses)})
                 ORDER BY {time_expression} DESC, source.id DESC
                 LIMIT ?
@@ -2567,8 +2767,16 @@ class SessionDB:
             return []
         placeholders = ",".join("?" for _ in selected_ids)
         rows = self._conn.execute(
-            f"SELECT * FROM {table} WHERE id IN ({placeholders})",
-            selected_ids,
+            f"""
+            SELECT source.*, document.identity_text,
+                   document.identity_text_embedding
+            FROM {table} AS source
+            JOIN memory_recall_documents AS document
+                ON document.object_id = source.id
+            WHERE document.object_type = ?
+              AND source.id IN ({placeholders})
+            """,
+            (str(object_type or "").strip().lower(), *selected_ids),
         ).fetchall()
         by_id = {int(row["id"]): self._row_to_dict(row) for row in rows}
         out: List[Dict[str, Any]] = []
@@ -2602,7 +2810,7 @@ class SessionDB:
             time_fields = ["dialogue_time_key"]
         return self._search_memory_rows(
             table="memory_facts",
-            identity_fts_table="memory_facts_identity_fts",
+            object_type="fact",
             time_fields=time_fields or ["dialogue_time_key"],
             terms=terms,
             source_types=source_types,
@@ -2618,7 +2826,14 @@ class SessionDB:
             return []
         placeholders = ",".join("?" for _ in ids)
         rows = self._conn.execute(
-            f"SELECT * FROM memory_facts WHERE id IN ({placeholders})",
+            f"""
+            SELECT fact.*, document.identity_text,
+                   document.identity_text_embedding
+            FROM memory_facts AS fact
+            LEFT JOIN memory_recall_documents AS document
+                ON document.object_type = 'fact' AND document.object_id = fact.id
+            WHERE fact.id IN ({placeholders})
+            """,
             ids,
         ).fetchall()
         by_id = {int(row["id"]): self._row_to_dict(row) for row in rows}
@@ -2630,15 +2845,23 @@ class SessionDB:
         source_types: Optional[Sequence[str]] = None,
     ) -> List[Dict[str, Any]]:
         """Load every embeddable fact for bounded in-process vector ranking."""
-        clauses = ["identity_text_embedding IS NOT NULL"]
+        clauses = ["document.identity_text_embedding IS NOT NULL"]
         params: List[Any] = []
         if source_types:
             placeholders = ",".join("?" for _ in source_types)
-            clauses.append(f"source_type IN ({placeholders})")
+            clauses.append(f"fact.source_type IN ({placeholders})")
             params.extend(source_types)
         where = " WHERE " + " AND ".join(clauses)
         rows = self._conn.execute(
-            f"SELECT * FROM memory_facts{where} ORDER BY id ASC",
+            f"""
+            SELECT fact.*, document.identity_text,
+                   document.identity_text_embedding
+            FROM memory_facts AS fact
+            INNER JOIN memory_recall_documents AS document
+                ON document.object_type = 'fact' AND document.object_id = fact.id
+            {where}
+            ORDER BY fact.id ASC
+            """,
             params,
         ).fetchall()
         return [self._row_to_dict(row) for row in rows]
@@ -2672,9 +2895,13 @@ class SessionDB:
         placeholders = ",".join("?" for _ in ids)
         rows = self._conn.execute(
             f"""
-            SELECT * FROM memory_facts
-            WHERE episode_id IN ({placeholders})
-            ORDER BY dialogue_time_key ASC, id ASC
+            SELECT fact.*, document.identity_text,
+                   document.identity_text_embedding
+            FROM memory_facts AS fact
+            LEFT JOIN memory_recall_documents AS document
+                ON document.object_type = 'fact' AND document.object_id = fact.id
+            WHERE fact.episode_id IN ({placeholders})
+            ORDER BY fact.dialogue_time_key ASC, fact.id ASC
             LIMIT ?
             """,
             (*ids, max(1, int(limit or 200))),
@@ -2691,10 +2918,14 @@ class SessionDB:
         entity_token = f"%,{int(entity_id)},%"
         rows = self._conn.execute(
             """
-            SELECT * FROM memory_facts
-            WHERE episode_id IS NOT NULL
-              AND (',' || replace(replace(replace(replace(entity_ids, ' ', ''), '\n', ''), '[', ''), ']', '') || ',') LIKE ?
-            ORDER BY dialogue_time_key ASC, id ASC
+            SELECT fact.*, document.identity_text,
+                   document.identity_text_embedding
+            FROM memory_facts AS fact
+            LEFT JOIN memory_recall_documents AS document
+                ON document.object_type = 'fact' AND document.object_id = fact.id
+            WHERE fact.episode_id IS NOT NULL
+              AND (',' || replace(replace(replace(replace(fact.entity_ids, ' ', ''), '\n', ''), '[', ''), ']', '') || ',') LIKE ?
+            ORDER BY fact.dialogue_time_key ASC, fact.id ASC
             LIMIT ?
             """,
             (entity_token, max(1, int(limit or 240))),
@@ -2763,6 +2994,7 @@ class SessionDB:
             "entity_ids",
             "canonical_topics",
             "participants",
+            "topic_keys",
             "tags",
             "metadata",
             "details",
