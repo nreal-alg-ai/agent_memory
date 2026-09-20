@@ -202,33 +202,61 @@ class MemoryRuntime:
         if not turn["user_message"] and not turn["assistant_response"]:
             return {"queued": False, "reason": "empty_turn"}
 
-        queued = False
-        reason = "threshold_not_reached"
         pending_units = self._interaction_segmenter.pending_unit_snapshot()
         incoming_unit = convert_interaction_turn_to_online_unit(
             turn,
             len(pending_units) + 1,
         )
+        append_report = self._append_interaction_turn_unit(incoming_unit)
+        return {
+            "queued": bool(append_report.get("queued")),
+            "reason": str(append_report.get("reason") or ""),
+        }
+
+    def _append_interaction_turn_unit(
+        self,
+        unit: OnlineSegmentUnit,
+    ) -> Dict[str, Any]:
+        """Append one interaction unit, flushing the prior batch at a boundary."""
+        queued = False
+        reason = "threshold_not_reached"
+        pending_units = self._interaction_segmenter.pending_unit_snapshot()
         incoming_embedding = self._interaction_segmenter.embed_unit(
-            incoming_unit,
+            unit,
         ).embedding
         if pending_units:
-            should_finalize, boundary_decision = self._interaction_segmenter.should_finalize_pending_units(
-                incoming_unit,
-                incoming_embedding,
+            should_finalize, boundary_decision = (
+                self._interaction_segmenter.should_finalize_pending_units(
+                    unit,
+                    incoming_embedding,
+                )
             )
             if should_finalize:
                 flush_report = self._flush_pending_interaction_turns()
                 queued = bool(flush_report.get("queued")) or queued
-                reason = "" if queued else str(flush_report.get("reason") or boundary_decision.reason)
+                reason = (
+                    ""
+                    if queued
+                    else str(
+                        flush_report.get("reason") or boundary_decision.reason
+                    )
+                )
                 if self._interaction_segmenter.has_pending_units():
-                    return {"queued": queued, "reason": reason}
+                    return {
+                        "accepted": False,
+                        "queued": queued,
+                        "reason": reason,
+                    }
 
         self._interaction_segmenter.append_pending_unit(
-            incoming_unit,
+            unit,
             incoming_embedding,
         )
-        return {"queued": queued, "reason": "" if queued else reason}
+        return {
+            "accepted": True,
+            "queued": queued,
+            "reason": "" if queued else reason,
+        }
 
     def _flush_pending_interaction_turns(self) -> Dict[str, Any]:
         """Submit the buffered interaction turns and clear them when queued."""

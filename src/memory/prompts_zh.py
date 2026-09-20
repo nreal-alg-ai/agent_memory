@@ -1,7 +1,7 @@
 """Chinese prompt templates for the unified memory prototype."""
 
 MEMORY_RETRIEVED_FORMAT_PROMPT_ZH = """[统一记忆]
-系统说明：当前召回只提供可追溯的 fact 证据。
+系统说明：召回结果可包含可追溯的 fact 证据、entity claim，以及当前有效的 goal、plan、work item。claim 和 prospective object 是由 facts 支撑的派生记忆，不得将其表述为未经证据支持的新事实。
 时间字段说明：对于 fact，dialogue_time 表示对话/转写讨论该 fact 的时间；event_time 表示 fact 描述的现实事件发生时间。二者含义不同；event_time 未知时，不要用 dialogue_time 推断它。
 {memory_sections}"""
 
@@ -10,6 +10,26 @@ MEMORY_RETRIEVED_SECTION_SPECS_ZH = (
         "[检索事实]",
         "这些是直接从 memory_facts 检索出的、按相关性排序的叙事事实。",
         "fact",
+    ),
+    (
+        "[实体知识]",
+        "这些是当前有效的 entity claim；应结合其支撑事实理解，不要忽略状态或来源。",
+        "entity_claim",
+    ),
+    (
+        "[当前目标]",
+        "这些是当前有效的 goal，状态和目标时间优先于旧的相关事实。",
+        "goal",
+    ),
+    (
+        "[当前计划]",
+        "这些是当前有效的 plan，注意计划不等于已经完成。",
+        "plan",
+    ),
+    (
+        "[当前事项]",
+        "这些是当前未关闭的 work item，注意其责任人、截止时间和状态。",
+        "work_item",
     ),
 )
 
@@ -440,13 +460,17 @@ RECALL_QUERY_ANALYSIS_PROMPT_ZH = """你是 AI 眼镜长期记忆系统中的 re
 请先理解当前记忆结构，再分析用户查询的检索方式。
 
 记忆结构：
-1. `memory_facts` / fact：从一次 episode 的对话或全天候转写中提炼出的、可追溯且自包含的 narrative fact。它保留具体发生了什么、谁参与、时间、地点/场景、原因、观点变化、建议、接受/拒绝、约束、结论和未解决问题等证据。fact 可能是一次事件、一次讨论结论，也可能是用户明确表达的偏好、习惯、画像、风险或约束；但它仍然是当前对话证据，不等于跨多次对话融合后的长期状态。fact 通常带有 `fact_type`、`fact_kind`、`primary_entity`、`summary`、`keywords`、`entities`、`fact_root_topic`、`fact_aspect_topic`、`event_time_key` 和 `dialogue_time_key`。
-episode 是原始对话/转写批次的存储容器，包含 title、summary、参与者和时间范围；当前 recall 只检索 `fact`，episode 仅用于在事实之间建立关联。
+1. `fact`：从一次 episode 的对话或全天候转写中提炼出的、可追溯且自包含的 narrative evidence。它保留具体发生了什么、谁参与、时间、地点/场景、原因、观点变化、建议、接受/拒绝、约束、结论和未解决问题等证据。fact 通常带有 `summary`、`keywords`、`entities`、`fact_root_topic`、`fact_aspect_topic`、`event_time_key` 和 `dialogue_time_key`。
+2. `entity_claim`：从多个 facts 反思得到、具有状态和置信度且可回溯支撑 facts 的实体主张，例如稳定偏好、习惯、关系、背景、约束或特征。
+3. `goal`、`plan`、`work_item`：从 facts 中提炼出的未来导向对象，分别表示期望结果、明确安排和可闭环责任事项；其 status 和目标/开始/截止时间具有重要语义。
+4. `episode`：连续原始片段的经历摘要，只用于在 facts 之间建立关联，绝不作为 direct recall object。
 
 判断准则：
 - 只有当 query 明确指向用户与助手的主动对话，才偏向 `assistant_wakeup`；明确指向全天录音、会议、旁听、多人数对话，才偏向 `allday_recording`；不确定时两者都保留。
+- `recall_object_types` 是本次可直接检索的对象类型。必须始终包含 `fact`；仅在 query 明确需要稳定实体知识时加入 `entity_claim`；仅在 query 询问未来目标、安排、责任、截止、未完成事项或其状态变化时加入相应的 `goal`、`plan`、`work_item`。绝不能输出 `episode`。
 - 具体发生了什么、日期、地点、人名、原话语义、事件先后和可追溯证据，优先 `fact`。
-- 稳定偏好、长期约束、习惯/流程、关系画像、个人背景、任务或承诺等查询，也从支撑它们的具体 `fact` 中检索证据。
+- 稳定偏好、长期约束、习惯/流程、关系画像或个人背景，除 `fact` 外可加入 `entity_claim`；仍需保留 `fact` 以提供证据。
+- 任务、承诺、未来安排、目标、截止与未完成事项，除 `fact` 外可加入对应 prospective object；仍需保留 `fact` 以提供证据。
 - 不确定时保持宽检索，漏掉证据比少取几个候选更糟。
 - `keywords` 输出 2-8 个短检索词，优先保留具体人物、组织、产品、项目、主题、动作、结果和约束；不要输出完整句子、寒暄、泛化词或普通时间表达。
 - `entities` 输出对语义检索有帮助的实体名称及类型。实体可以是人物、组织、地点、产品、项目、技术或具体概念；普通的“今天/昨天/上周”等时间表达不要作为实体。
@@ -456,8 +480,9 @@ episode 是原始对话/转写批次的存储容器，包含 title、summary、�
 只返回 JSON：
 {
   "source_types": ["assistant_wakeup", "allday_recording"],
+  "recall_object_types": ["fact"],
   "needs_broad_evidence": false,
-  "query_rewrite": "面向原始记忆表检索的改写",
+  "query_rewrite": "面向统一记忆检索的改写",
   "keywords": ["关键词1", "关键词2"],
   "entities": [{"name": "实体名", "type": "PERSON|ORGANIZATION|LOCATION|PRODUCT|PROJECT|TECHNOLOGY|CONCEPT|OTHER"}],
   "temporal_bounds": {"start": "YYYY-MM-DD HH:MM:SS|null", "end": "YYYY-MM-DD HH:MM:SS|null"},

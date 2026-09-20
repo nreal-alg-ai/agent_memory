@@ -252,7 +252,6 @@ class SessionDB:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 episode_id INTEGER,
                 source_type TEXT NOT NULL,
-                speaker TEXT NOT NULL DEFAULT '',
                 text TEXT NOT NULL,
                 started_at TEXT NOT NULL DEFAULT '',
                 ended_at TEXT NOT NULL DEFAULT '',
@@ -905,9 +904,15 @@ class SessionDB:
         source_type: str,
         segments: Sequence[Dict[str, Any]],
     ) -> List[int]:
-        """Persist normalized interaction or transcript evidence for episode use."""
+        """Persist one submitted source-segment batch as one physical row.
+
+        The table records batch lifecycle (unassigned / attached episode),
+        while ``metadata.segments`` preserves the ordered logical segments
+        needed by episode generation.  Returning a one-item list preserves
+        the existing caller contract of ``source_segment_ids``.
+        """
         now = local_now_text()
-        inserted_ids: List[int] = []
+        normalized_segments: List[Dict[str, Any]] = []
         for segment in segments or []:
             if not isinstance(segment, dict):
                 continue
@@ -927,28 +932,65 @@ class SessionDB:
             for key in ("turn_index", "segment_index"):
                 if key in segment and key not in metadata:
                     metadata[key] = segment[key]
-            cur = self._conn.execute(
-                """
-                INSERT INTO memory_source_segments (
-                    source_type, speaker, text, started_at, ended_at,
-                    tags, metadata, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    str(source_type or "").strip() or "assistant_wakeup",
-                    str(segment.get("speaker") or "").strip(),
-                    text,
-                    str(segment.get("started_at") or "").strip(),
-                    str(segment.get("ended_at") or segment.get("started_at") or "").strip(),
-                    _json_dumps(tags),
-                    _json_dumps(metadata),
-                    now,
-                    now,
+            started_at = str(segment.get("started_at") or "").strip()
+            ended_at = str(
+                segment.get("ended_at") or segment.get("started_at") or ""
+            ).strip()
+            normalized_segments.append({
+                "speaker": str(segment.get("speaker") or "").strip(),
+                "text": text,
+                "started_at": started_at,
+                "ended_at": ended_at,
+                "tags": tags,
+                "metadata": metadata,
+            })
+        if not normalized_segments:
+            return []
+
+        batch_tags = list(dict.fromkeys(
+            tag
+            for item in normalized_segments
+            for tag in item["tags"]
+        ))
+        batch_started_at = next(
+            (item["started_at"] for item in normalized_segments if item["started_at"]),
+            "",
+        )
+        batch_ended_at = next(
+            (
+                item["ended_at"] or item["started_at"]
+                for item in reversed(normalized_segments)
+                if item["ended_at"] or item["started_at"]
+            ),
+            batch_started_at,
+        )
+        cur = self._conn.execute(
+            """
+            INSERT INTO memory_source_segments (
+                source_type, text, started_at, ended_at,
+                tags, metadata, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(source_type or "").strip() or "assistant_wakeup",
+                "\n".join(
+                    f"{item['speaker'] or 'unknown'}: {item['text']}"
+                    for item in normalized_segments
                 ),
-            )
-            inserted_ids.append(int(cur.lastrowid))
+                batch_started_at,
+                batch_ended_at,
+                _json_dumps(batch_tags),
+                _json_dumps({
+                    "storage_format": "segment_batch_v1",
+                    "segment_count": len(normalized_segments),
+                    "segments": normalized_segments,
+                }),
+                now,
+                now,
+            ),
+        )
         self._commit_if_needed()
-        return inserted_ids
+        return [int(cur.lastrowid)]
 
     def get_unassigned_memory_source_segments(
         self,
@@ -956,7 +998,13 @@ class SessionDB:
         source_type: str,
         limit: int = 240,
     ) -> List[Dict[str, Any]]:
-        """Return source evidence waiting to be summarized into one episode."""
+        """Return logical source evidence waiting to be summarized.
+
+        New rows are physical batches and are expanded from
+        ``metadata.segments``.  Legacy one-segment rows remain readable as a
+        single logical segment, so already stored evidence can still be
+        summarized without a migration.
+        """
         rows = self._conn.execute(
             """
             SELECT *
@@ -967,7 +1015,46 @@ class SessionDB:
             """,
             (str(source_type or "").strip() or "assistant_wakeup", max(1, int(limit or 240))),
         ).fetchall()
-        return [self._row_to_dict(row) for row in rows]
+        source_segments: List[Dict[str, Any]] = []
+        for row in rows:
+            batch_row = self._row_to_dict(row)
+            batch_metadata = (
+                batch_row.get("metadata")
+                if isinstance(batch_row.get("metadata"), dict)
+                else {}
+            )
+            batch_segments = batch_metadata.get("segments")
+            if not isinstance(batch_segments, list):
+                source_segments.append(batch_row)
+                continue
+            for segment_index, raw_segment in enumerate(batch_segments):
+                if not isinstance(raw_segment, dict):
+                    continue
+                text = str(raw_segment.get("text") or "").strip()
+                if not text:
+                    continue
+                segment_metadata = (
+                    raw_segment.get("metadata")
+                    if isinstance(raw_segment.get("metadata"), dict)
+                    else {}
+                )
+                source_segments.append({
+                    "id": batch_row["id"],
+                    "source_segment_row_id": batch_row["id"],
+                    "source_type": batch_row.get("source_type") or "",
+                    "speaker": str(raw_segment.get("speaker") or "").strip(),
+                    "text": text,
+                    "started_at": str(raw_segment.get("started_at") or "").strip(),
+                    "ended_at": str(
+                        raw_segment.get("ended_at")
+                        or raw_segment.get("started_at")
+                        or ""
+                    ).strip(),
+                    "tags": list(raw_segment.get("tags") or []),
+                    "metadata": dict(segment_metadata),
+                    "batch_segment_index": segment_index,
+                })
+        return source_segments
 
     def update_memory_source_segments_episode_id(
         self,
@@ -976,11 +1063,11 @@ class SessionDB:
         episode_id: int,
     ) -> int:
         """Attach persisted source evidence to its generated episode."""
-        normalized_ids = [
+        normalized_ids = list(dict.fromkeys(
             int(value)
             for value in source_segment_ids or []
             if str(value).strip().isdigit() and int(value) > 0
-        ]
+        ))
         if not normalized_ids:
             return 0
         placeholders = ",".join("?" for _ in normalized_ids)
@@ -2249,6 +2336,249 @@ class SessionDB:
             (*params, max(1, int(limit or 200))),
         ).fetchall()
         return [self._row_to_dict(row) for row in rows]
+
+    def memory_recall_documents_with_identity_embeddings(
+        self,
+        *,
+        object_type: str,
+        statuses: Optional[Sequence[str]] = None,
+        source_types: Optional[Sequence[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Load embeddable recall projections for one direct object type.
+
+        Callers own type-specific status and temporal policies.  Keeping this
+        method projection-only lets Stage 2 use the same full-embedding
+        retrieval source for facts and all derived memory objects.
+        """
+        normalized_type = str(object_type or "").strip().lower()
+        if not normalized_type:
+            return []
+        clauses = [
+            "object_type = ?",
+            "identity_text_embedding IS NOT NULL",
+        ]
+        params: List[Any] = [normalized_type]
+        if statuses:
+            normalized_statuses = [
+                str(value).strip()
+                for value in statuses
+                if str(value).strip()
+            ]
+            if not normalized_statuses:
+                return []
+            placeholders = ",".join("?" for _ in normalized_statuses)
+            clauses.append(f"status IN ({placeholders})")
+            params.extend(normalized_statuses)
+        if source_types:
+            normalized_source_types = [
+                str(value).strip()
+                for value in source_types
+                if str(value).strip()
+            ]
+            if not normalized_source_types:
+                return []
+            placeholders = ",".join("?" for _ in normalized_source_types)
+            clauses.append(f"source_type IN ({placeholders})")
+            params.extend(normalized_source_types)
+        rows = self._conn.execute(
+            f"""
+            SELECT *
+            FROM memory_recall_documents
+            WHERE {' AND '.join(clauses)}
+            ORDER BY updated_at DESC, id DESC
+            """,
+            params,
+        ).fetchall()
+        return [self._row_to_dict(row) for row in rows]
+
+    def search_memory_recall_documents(
+        self,
+        *,
+        object_type: str,
+        terms: Optional[Sequence[str]] = None,
+        statuses: Optional[Sequence[str]] = None,
+        source_types: Optional[Sequence[str]] = None,
+        limit: int = 120,
+    ) -> List[Dict[str, Any]]:
+        """Lexically retrieve one direct-recall object type from its projection.
+
+        Episodes intentionally remain valid projection rows but callers choose
+        whether they are a direct-recall type.  This method does not impose
+        that product policy itself.
+        """
+        normalized_type = str(object_type or "").strip().lower()
+        if not normalized_type:
+            return []
+        row_limit = max(1, int(limit or 120))
+        clauses = ["document.object_type = ?"]
+        params: List[Any] = [normalized_type]
+        if statuses:
+            normalized_statuses = [
+                str(value).strip()
+                for value in statuses
+                if str(value).strip()
+            ]
+            if not normalized_statuses:
+                return []
+            placeholders = ",".join("?" for _ in normalized_statuses)
+            clauses.append(f"document.status IN ({placeholders})")
+            params.extend(normalized_statuses)
+        if source_types:
+            normalized_source_types = [
+                str(value).strip()
+                for value in source_types
+                if str(value).strip()
+            ]
+            if not normalized_source_types:
+                return []
+            placeholders = ",".join("?" for _ in normalized_source_types)
+            clauses.append(f"document.source_type IN ({placeholders})")
+            params.extend(normalized_source_types)
+        where = " AND ".join(clauses)
+        normalized_terms = self._normalize_search_terms(terms)
+        fts_table = _IDENTITY_FTS_TABLES["memory_recall_documents"]
+        rows: List[sqlite3.Row] = []
+        if normalized_terms:
+            match_query = self._terms_to_fts_query(normalized_terms)
+            if match_query:
+                try:
+                    rows = self._conn.execute(
+                        f"""
+                        SELECT document.*, bm25({fts_table}) AS bm25_score
+                        FROM {fts_table}
+                        JOIN memory_recall_documents AS document
+                            ON document.id = {fts_table}.rowid
+                        WHERE {where} AND {fts_table} MATCH ?
+                        ORDER BY bm25({fts_table}) ASC,
+                                 document.updated_at DESC, document.id DESC
+                        LIMIT ?
+                        """,
+                        (*params, match_query, row_limit),
+                    ).fetchall()
+                except sqlite3.Error:
+                    like_clauses = [
+                        "LOWER(COALESCE(document.identity_text, '')) LIKE ?"
+                        for _term in normalized_terms[:12]
+                    ]
+                    rows = self._conn.execute(
+                        f"""
+                        SELECT document.*
+                        FROM memory_recall_documents AS document
+                        WHERE {where} AND ({" OR ".join(like_clauses)})
+                        ORDER BY document.updated_at DESC, document.id DESC
+                        LIMIT ?
+                        """,
+                        (
+                            *params,
+                            *[f"%{term}%" for term in normalized_terms[:12]],
+                            row_limit,
+                        ),
+                    ).fetchall()
+        else:
+            rows = self._conn.execute(
+                f"""
+                SELECT document.*
+                FROM memory_recall_documents AS document
+                WHERE {where}
+                ORDER BY NULLIF(document.time_end, '') DESC,
+                         document.updated_at DESC, document.id DESC
+                LIMIT ?
+                """,
+                (*params, row_limit),
+            ).fetchall()
+        result = [self._row_to_dict(row) for row in rows]
+        for item, row in zip(result, rows):
+            if "bm25_score" in row.keys():
+                item["_bm25_score"] = row["bm25_score"]
+        return result
+
+    def get_entity_claim_evidence_fact_ids(
+        self,
+        claim_ids: Sequence[int],
+        *,
+        limit: int = 120,
+    ) -> Dict[int, List[int]]:
+        """Return support-fact IDs for bounded claim candidates."""
+        ids = list(dict.fromkeys(
+            int(value)
+            for value in claim_ids or []
+            if str(value).strip().isdigit() and int(value) > 0
+        ))
+        if not ids:
+            return {}
+        placeholders = ",".join("?" for _ in ids)
+        rows = self._conn.execute(
+            f"""
+            SELECT claim_id, evidence_id
+            FROM memory_entity_claim_evidence
+            WHERE claim_id IN ({placeholders})
+              AND evidence_type = 'fact'
+              AND role = 'support'
+            ORDER BY claim_id ASC, weight DESC, observed_at DESC, evidence_id DESC
+            LIMIT ?
+            """,
+            (*ids, max(1, int(limit or 120))),
+        ).fetchall()
+        result: Dict[int, List[int]] = {claim_id: [] for claim_id in ids}
+        for row in rows:
+            claim_id = int(row["claim_id"])
+            fact_id = int(row["evidence_id"])
+            if fact_id not in result.setdefault(claim_id, []):
+                result[claim_id].append(fact_id)
+        return result
+
+    def get_intent_evidence_fact_ids(
+        self,
+        objects: Sequence[Tuple[str, int]],
+        *,
+        limit: int = 120,
+    ) -> Dict[Tuple[str, int], List[int]]:
+        """Return fact evidence for bounded goal, plan, and work-item rows."""
+        normalized: List[Tuple[str, int]] = []
+        seen: set[Tuple[str, int]] = set()
+        for object_type, object_id in objects or []:
+            normalized_type = str(object_type or "").strip().lower()
+            if normalized_type not in {"goal", "plan", "work_item"}:
+                continue
+            try:
+                normalized_id = int(object_id)
+            except (TypeError, ValueError):
+                continue
+            key = (normalized_type, normalized_id)
+            if normalized_id <= 0 or key in seen:
+                continue
+            seen.add(key)
+            normalized.append(key)
+        if not normalized:
+            return {}
+        object_clauses = " OR ".join(
+            "(object_type = ? AND object_id = ?)" for _item in normalized
+        )
+        params: List[Any] = [
+            value
+            for object_type, object_id in normalized
+            for value in (object_type, object_id)
+        ]
+        rows = self._conn.execute(
+            f"""
+            SELECT object_type, object_id, evidence_id
+            FROM memory_intent_evidence
+            WHERE evidence_type = 'fact'
+              AND ({object_clauses})
+            ORDER BY object_type ASC, object_id ASC, observed_at DESC, evidence_id DESC
+            LIMIT ?
+            """,
+            (*params, max(1, int(limit or 120))),
+        ).fetchall()
+        result: Dict[Tuple[str, int], List[int]] = {
+            item: [] for item in normalized
+        }
+        for row in rows:
+            key = (str(row["object_type"]), int(row["object_id"]))
+            fact_id = int(row["evidence_id"])
+            if fact_id not in result.setdefault(key, []):
+                result[key].append(fact_id)
+        return result
 
     def upsert_entity_claim_evidence(self, evidence: Sequence[Dict[str, Any]]) -> int:
         now = local_now_text()

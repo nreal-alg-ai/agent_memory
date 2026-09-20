@@ -1,7 +1,7 @@
 """English prompt templates for the unified memory prototype."""
 
 MEMORY_RETRIEVED_FORMAT_PROMPT_EN = """[Unified Memory]
-System note: Current recall provides only traceable fact evidence.
+System note: Recall may contain traceable fact evidence, entity claims, and active goals, plans, or work items. Claims and prospective objects are derived memories supported by facts; do not present them as unsupported new facts.
 System note: For facts, dialogue_time is when the conversation/transcript discussed the fact, while event_time is when the real-world event described by the fact occurred. They are different fields; an unknown event_time must not be inferred from dialogue_time.
 {memory_sections}"""
 
@@ -10,6 +10,26 @@ MEMORY_RETRIEVED_SECTION_SPECS_EN = (
         "[Retrieved Facts]",
         "These are ranked narrative facts retrieved directly from memory_facts.",
         "fact",
+    ),
+    (
+        "[Entity Knowledge]",
+        "These are active entity claims. Interpret them with their supporting facts and status.",
+        "entity_claim",
+    ),
+    (
+        "[Active Goals]",
+        "These are active goals; their current status and target time take precedence over older related facts.",
+        "goal",
+    ),
+    (
+        "[Active Plans]",
+        "These are active plans. A plan must not be treated as already completed.",
+        "plan",
+    ),
+    (
+        "[Open Work Items]",
+        "These are not-closed work items. Respect their responsible party, due time, and status.",
+        "work_item",
     ),
 )
 
@@ -402,13 +422,17 @@ RECALL_QUERY_ANALYSIS_PROMPT_EN = """You are the recall query analyzer for the A
 Understand the memory structure before analyzing the query. 
 
 Memory structure:
-1. `memory_facts` / fact: traceable, self-contained narrative facts extracted from one conversation episode or all-day transcript. They preserve what happened, participants, time, place or scene, reasons, viewpoint changes, suggestions, acceptance or rejection, constraints, conclusions, and unresolved questions. A fact may contain an explicitly stated preference, routine, profile detail, risk, or constraint, but it remains current conversational evidence rather than a cross-episode long-term summary. Facts usually include `fact_type`, `fact_kind`, `primary_entity`, `summary`, `keywords`, `entities`, `fact_root_topic`, `fact_aspect_topic`, `event_time_key`, and `dialogue_time_key`.
-An episode is the storage container for a conversation or transcript batch with a title, summary, participants, and time range. Current recall retrieves only `fact`; episodes only establish associations between facts.
+1. `fact`: traceable, self-contained narrative evidence extracted from one conversation episode or all-day transcript. It preserves what happened, participants, time, place or scene, reasons, viewpoint changes, suggestions, acceptance or rejection, constraints, conclusions, and unresolved questions. Facts usually include `summary`, `keywords`, `entities`, `fact_root_topic`, `fact_aspect_topic`, `event_time_key`, and `dialogue_time_key`.
+2. `entity_claim`: a statusful, confidence-weighted entity proposition reflected from facts, such as a stable preference, routine, relationship, background, constraint, or characteristic. It remains traceable to supporting facts.
+3. `goal`, `plan`, and `work_item`: future-oriented objects extracted from facts, respectively representing a desired outcome, an explicit arrangement, and a closed-loop responsibility. Their status and target/start/due times are meaningful.
+4. `episode`: a continuous-experience summary used only as an association boundary between facts. It must never be a direct recall object.
 
 Guidance:
 - Use `source_types` only when the query clearly points to assistant_wakeup interactions or allday_recording transcripts. Otherwise use both.
+- `recall_object_types` lists object types eligible for direct retrieval. It must always include `fact`; add `entity_claim` only for explicit stable-entity-knowledge questions; add the relevant `goal`, `plan`, or `work_item` only for future goals, arrangements, responsibilities, deadlines, unfinished work, or their lifecycle. Never output `episode`.
 - Prefer `fact` for what happened, dates, places, people, exact evidence, event order, and traceable details.
-- Retrieve stable preferences, durable constraints, routines, relationships, profiles, tasks, commitments, and next steps from the concrete facts that support them.
+- For stable preferences, durable constraints, routines, relationships, or profiles, add `entity_claim` alongside the supporting facts.
+- For tasks, commitments, future arrangements, goals, deadlines, or unfinished work, add the relevant prospective object alongside the supporting facts.
 - Keep the plan broad when unsure. Missing evidence is worse than retrieving a few extra candidates.
 - Extract 2-8 short retrieval keywords, prioritizing concrete people, organizations, products, projects, topics, actions, outcomes, and constraints. Do not output full sentences, pleasantries, generic words, or ordinary time expressions.
 - Extract useful semantic entities with names and types. Entities may be people, organizations, locations, products, projects, technologies, or concrete concepts; ordinary time expressions such as today, yesterday, or last week are not entities.
@@ -418,8 +442,9 @@ Guidance:
 Return JSON only:
 {
   "source_types": ["assistant_wakeup", "allday_recording"],
+  "recall_object_types": ["fact"],
   "needs_broad_evidence": false,
-  "query_rewrite": "retrieval-focused rewrite over raw memory tables",
+  "query_rewrite": "retrieval-focused rewrite over the unified memory projection",
   "keywords": ["keyword1", "keyword2"],
   "entities": [{"name": "entity name", "type": "PERSON|ORGANIZATION|LOCATION|PRODUCT|PROJECT|TECHNOLOGY|CONCEPT|OTHER"}],
   "temporal_bounds": {"start": "YYYY-MM-DD HH:MM:SS|null", "end": "YYYY-MM-DD HH:MM:SS|null"},
