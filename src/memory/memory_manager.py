@@ -4896,7 +4896,7 @@ class MemoryNodeManager:
         return fact_kind in {"decision", "action", "instruction"} and any(
             marker in text for marker in decision_markers
         )
-        
+
     @staticmethod
     def _is_low_value_followup_question(text: str) -> bool:
         lower = str(text or "").lower()
@@ -5648,11 +5648,16 @@ class MemoryNodeManager:
                 if object_type == "fact" and any(temporal_bounds or (None, None))
                 else candidate_limit
             )
+            document_time_start, document_time_end = (
+                temporal_bounds or (None, None)
+            ) if object_type != "fact" else (None, None)
             rows = db.search_memory_recall_documents(
                 object_type=object_type,
                 terms=terms,
                 statuses=self._recall_stage1_direct_document_statuses(object_type),
                 source_types=source_types if object_type == "fact" else None,
+                time_start=document_time_start,
+                time_end=document_time_end,
                 limit=retrieval_limit,
             )
             # Time-focused prospective questions are often phrased entirely
@@ -5671,7 +5676,10 @@ class MemoryNodeManager:
                     statuses=self._recall_stage1_direct_document_statuses(
                         object_type,
                     ),
+                    time_start=(temporal_bounds or (None, None))[0],
+                    time_end=(temporal_bounds or (None, None))[1],
                     limit=candidate_limit,
+                    strict_time_filter=True,
                 )
                 seen_document_ids = {
                     int(row.get("id") or 0)
@@ -8198,7 +8206,10 @@ class MemoryNodeManager:
         hydrated["entity_names"] = list(entities)
         metadata = dict(row.get("metadata") or {})
         metadata["_matched_via"] = [candidate_source]
-        return {
+        temporal_match = str(row.get("_recall_temporal_match") or "").strip()
+        if temporal_match:
+            metadata["_recall_temporal_match"] = temporal_match
+        candidate = {
             "source_type": str(row.get("source_type") or object_type),
             "target_table": target_table,
             "target_id": target_id,
@@ -8220,6 +8231,9 @@ class MemoryNodeManager:
             "_bm25_score": row.get("_bm25_score"),
             "_recall_candidate_source": candidate_source,
         }
+        if temporal_match:
+            candidate["_recall_temporal_match"] = temporal_match
+        return candidate
 
     @staticmethod
     def _normalize_recall_candidate_bm25_scores(
@@ -8245,133 +8259,6 @@ class MemoryNodeManager:
                 4,
             )
             candidate["_recall_bm25_rank"] = position + 1
-
-    def _retrieve_recall_full_embedding_candidates(
-        self,
-        *,
-        query_embedding: Optional[np.ndarray],
-        candidate_source_prefix: str,
-        source_types: Optional[Sequence[str]],
-        temporal_bounds: RecallTimeBounds,
-        temporal_mode: str,
-        candidate_limits: Dict[str, int],
-        database: Optional[SessionDB] = None,
-    ) -> List[Dict[str, Any]]:
-        """Rank all local fact embeddings and retain Stage 2 seeds.
-
-        Stage 2 currently runs against a bounded personal-memory corpus, so
-        this intentionally evaluates every persisted identity embedding rather
-        than restricting semantic retrieval to lexical hits first.
-        """
-        if query_embedding is None:
-            return []
-        db = database or self._db
-        candidates: List[Dict[str, Any]] = []
-        for row in db.memory_facts_with_identity_embeddings(
-            source_types=source_types,
-        ):
-            candidate = self._make_recall_memory_candidate(
-                level="fact",
-                row=row,
-                candidate_source=(
-                    f"{str(candidate_source_prefix).strip()}_embedding"
-                ),
-                temporal_bounds=temporal_bounds,
-                temporal_mode=temporal_mode,
-            )
-            if not candidate:
-                continue
-            similarity = max(0.0, _cal_embedding_cosine_similarity(
-                query_embedding,
-                candidate.get("embedding"),
-            ))
-            if similarity < self._recall_stage2_fact_min_embedding_similarity:
-                continue
-            candidate["_recall_embedding_seed_similarity"] = round(
-                float(similarity),
-                4,
-            )
-            candidates.append(candidate)
-        candidates.sort(
-            key=lambda item: (
-                float(item.get("_recall_embedding_seed_similarity") or 0.0),
-                str(item.get("time_start") or ""),
-                int(item.get("target_id") or 0),
-            ),
-            reverse=True,
-        )
-        return candidates[: max(0, int(candidate_limits.get("fact", 0) or 0))]
-
-    def _retrieve_recall_raw_candidates_lexical_search(
-        self,
-        *,
-        terms: List[str],
-        candidate_source_prefix: str,
-        source_types: Optional[Sequence[str]],
-        temporal_bounds: RecallTimeBounds,
-        temporal_mode: str,
-        candidate_limits: Dict[str, int],
-        database: Optional[SessionDB] = None,
-    ) -> List[Dict[str, Any]]:
-        """Build raw fact candidates before direct scoring.
-
-        This intentionally bypasses `memory_index_entries` for the default
-        path. Each candidate still points to its source row; relationship
-        expansion is handled by the Stage 1/Stage 2 merge layer.
-        """
-        db = database or self._db
-        time_start, time_end = temporal_bounds or (None, None)
-        rows = db.search_memory_facts(
-            terms=terms,
-            source_types=source_types,
-            time_start=time_start,
-            time_end=time_end,
-            temporal_mode=temporal_mode,
-            limit=max(1, int(candidate_limits.get("fact", 1) or 1)),
-        )
-        candidates: List[Dict[str, Any]] = []
-        for row in rows:
-            candidate = self._make_recall_memory_candidate(
-                level="fact",
-                row=row,
-                candidate_source=(
-                    f"{str(candidate_source_prefix).strip()}_lexical"
-                ),
-                temporal_bounds=temporal_bounds,
-                temporal_mode=temporal_mode,
-            )
-            if candidate:
-                candidates.append(candidate)
-
-        # SQLite FTS5 BM25 returns lower (normally negative) values for more
-        # relevant documents. Its magnitude is table-dependent, so normalize
-        # only among the BM25 hits in each returned memory layer.
-        scored_candidates: List[Tuple[float, Dict[str, Any]]] = []
-        for candidate in candidates:
-            try:
-                raw_bm25_score = float(candidate.get("_bm25_score"))
-            except (TypeError, ValueError):
-                candidate["_recall_bm25_score"] = 0.0
-                continue
-            if not math.isfinite(raw_bm25_score):
-                candidate["_recall_bm25_score"] = 0.0
-                continue
-            scored_candidates.append((raw_bm25_score, candidate))
-        scored_candidates.sort(key=lambda item: item[0])
-        count = len(scored_candidates)
-        for position, (_raw_bm25_score, candidate) in enumerate(scored_candidates):
-            normalized_bm25_score = (
-                0.80
-                if count == 1
-                else 0.42 + 0.50 * (1.0 - position / (count - 1))
-            )
-            candidate["_recall_bm25_score"] = round(normalized_bm25_score, 4)
-            candidate["_recall_bm25_rank"] = position + 1
-        self._logger.debug(
-            "Direct recall fact candidates: %d",
-            len(candidates),
-        )
-        return candidates
 
     def _recall_stage2_calculate_single_candidate_matching_score(
         self,

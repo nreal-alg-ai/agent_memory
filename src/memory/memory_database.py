@@ -668,7 +668,7 @@ class SessionDB:
         )
         self._init_identity_fts()
         self._commit_if_needed()
-    
+
     def _init_identity_fts(self) -> None:
         """Create and populate the tokenized BM25 index for recall documents."""
         for source_table, fts_table in _IDENTITY_FTS_TABLES.items():
@@ -1447,42 +1447,6 @@ class SessionDB:
             changed_count += 1
         self._commit_if_needed()
         return changed_count
-
-    def update_episode(
-        self,
-        *,
-        episode_id: int,
-        title: Optional[str] = None,
-        summary: Optional[str] = None,
-        canonical_topics: Optional[Sequence[str]] = None,
-        started_at: Optional[str] = None,
-        ended_at: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> bool:
-        """Update generated episode-level fields after fact aggregation."""
-        assignments: List[str] = []
-        params: List[Any] = []
-        for column, value in (
-            ("title", title),
-            ("summary", summary),
-            ("canonical_topics", _json_dumps(list(canonical_topics or [])) if canonical_topics is not None else None),
-            ("started_at", started_at),
-            ("ended_at", ended_at),
-            ("metadata", _json_dumps(dict(metadata or {})) if metadata is not None else None),
-        ):
-            if value is not None:
-                assignments.append(f"{column} = ?")
-                params.append(value)
-        if not assignments:
-            return False
-        assignments.append("updated_at = ?")
-        params.extend([local_now_text(), int(episode_id)])
-        cur = self._conn.execute(
-            f"UPDATE memory_episodes SET {', '.join(assignments)} WHERE id = ?",
-            params,
-        )
-        self._commit_if_needed()
-        return bool(cur.rowcount)
 
     def mark_facts_processed(
         self,
@@ -2302,41 +2266,6 @@ class SessionDB:
             if str(row["name"] or "").strip()
         }
 
-    def get_memory_recall_documents(
-        self,
-        *,
-        object_type: Optional[str] = None,
-        object_ids: Optional[Sequence[int]] = None,
-        limit: int = 200,
-    ) -> List[Dict[str, Any]]:
-        """Read derived recall documents without applying recall ranking."""
-        clauses: List[str] = []
-        params: List[Any] = []
-        if object_type:
-            clauses.append("object_type = ?")
-            params.append(str(object_type).strip().lower())
-        if object_ids is not None:
-            ids = list(dict.fromkeys(
-                int(value)
-                for value in object_ids
-                if str(value).strip().isdigit() and int(value) > 0
-            ))
-            if not ids:
-                return []
-            placeholders = ",".join("?" for _ in ids)
-            clauses.append(f"object_id IN ({placeholders})")
-            params.extend(ids)
-        where = " WHERE " + " AND ".join(clauses) if clauses else ""
-        rows = self._conn.execute(
-            f"""
-            SELECT * FROM memory_recall_documents{where}
-            ORDER BY updated_at DESC, id DESC
-            LIMIT ?
-            """,
-            (*params, max(1, int(limit or 200))),
-        ).fetchall()
-        return [self._row_to_dict(row) for row in rows]
-
     def memory_recall_documents_with_identity_embeddings(
         self,
         *,
@@ -2398,13 +2327,21 @@ class SessionDB:
         terms: Optional[Sequence[str]] = None,
         statuses: Optional[Sequence[str]] = None,
         source_types: Optional[Sequence[str]] = None,
+        time_start: Optional[str] = None,
+        time_end: Optional[str] = None,
         limit: int = 120,
+        strict_time_filter: bool = False,
     ) -> List[Dict[str, Any]]:
-        """Lexically retrieve one direct-recall object type from its projection.
+        """Lexically retrieve one object type from the recall projection.
 
         Episodes intentionally remain valid projection rows but callers choose
         whether they are a direct-recall type.  This method does not impose
-        that product policy itself.
+        that product policy itself.  A requested time range first retrieves
+        documents whose stored interval overlaps the range.  When
+        ``strict_time_filter`` is false, a bounded lexical fallback fills a
+        short result set; fallback rows are annotated so callers can apply a
+        time penalty during ranking instead of silently treating them as exact
+        temporal matches.
         """
         normalized_type = str(object_type or "").strip().lower()
         if not normalized_type:
@@ -2434,33 +2371,63 @@ class SessionDB:
             placeholders = ",".join("?" for _ in normalized_source_types)
             clauses.append(f"document.source_type IN ({placeholders})")
             params.extend(normalized_source_types)
-        where = " AND ".join(clauses)
+        base_where = " AND ".join(clauses)
+        normalized_time_start = str(time_start or "").strip()
+        normalized_time_end = str(time_end or "").strip()
+        time_clauses: List[str] = []
+        time_params: List[Any] = []
+        # A recall document represents either a point-in-time item or a time
+        # interval.  Treat missing time as unknown rather than as a match.
+        # This keeps a time-bounded first pass precise; the optional fallback
+        # below is the explicit recovery path for coarse or missing metadata.
+        if normalized_time_start:
+            time_clauses.append(
+                "COALESCE(NULLIF(document.time_end, ''), "
+                "NULLIF(document.time_start, '')) >= ?"
+            )
+            time_params.append(normalized_time_start)
+        if normalized_time_end:
+            time_clauses.append(
+                "COALESCE(NULLIF(document.time_start, ''), "
+                "NULLIF(document.time_end, '')) <= ?"
+            )
+            time_params.append(normalized_time_end)
+        timed_where = " AND ".join([base_where, *time_clauses])
+        has_time_filter = bool(time_clauses)
         normalized_terms = self._normalize_search_terms(terms)
         fts_table = _IDENTITY_FTS_TABLES["memory_recall_documents"]
-        rows: List[sqlite3.Row] = []
-        if normalized_terms:
-            match_query = self._terms_to_fts_query(normalized_terms)
-            if match_query:
-                try:
-                    rows = self._conn.execute(
-                        f"""
-                        SELECT document.*, bm25({fts_table}) AS bm25_score
-                        FROM {fts_table}
-                        JOIN memory_recall_documents AS document
-                            ON document.id = {fts_table}.rowid
-                        WHERE {where} AND {fts_table} MATCH ?
-                        ORDER BY bm25({fts_table}) ASC,
-                                 document.updated_at DESC, document.id DESC
-                        LIMIT ?
-                        """,
-                        (*params, match_query, row_limit),
-                    ).fetchall()
-                except sqlite3.Error:
-                    like_clauses = [
-                        "LOWER(COALESCE(document.identity_text, '')) LIKE ?"
-                        for _term in normalized_terms[:12]
-                    ]
-                    rows = self._conn.execute(
+
+        def query_rows(
+            *,
+            where: str,
+            query_params: Sequence[Any],
+            query_limit: int,
+        ) -> List[sqlite3.Row]:
+            if normalized_terms:
+                match_query = self._terms_to_fts_query(normalized_terms)
+                if match_query:
+                    try:
+                        return self._conn.execute(
+                            f"""
+                            SELECT document.*, bm25({fts_table}) AS bm25_score
+                            FROM {fts_table}
+                            JOIN memory_recall_documents AS document
+                                ON document.id = {fts_table}.rowid
+                            WHERE {where} AND {fts_table} MATCH ?
+                            ORDER BY bm25({fts_table}) ASC,
+                                     document.updated_at DESC, document.id DESC
+                            LIMIT ?
+                            """,
+                            (*query_params, match_query, query_limit),
+                        ).fetchall()
+                    except sqlite3.Error:
+                        pass
+                like_clauses = [
+                    "LOWER(COALESCE(document.identity_text, '')) LIKE ?"
+                    for _term in normalized_terms[:12]
+                ]
+                if like_clauses:
+                    return self._conn.execute(
                         f"""
                         SELECT document.*
                         FROM memory_recall_documents AS document
@@ -2469,13 +2436,12 @@ class SessionDB:
                         LIMIT ?
                         """,
                         (
-                            *params,
+                            *query_params,
                             *[f"%{term}%" for term in normalized_terms[:12]],
-                            row_limit,
+                            query_limit,
                         ),
                     ).fetchall()
-        else:
-            rows = self._conn.execute(
+            return self._conn.execute(
                 f"""
                 SELECT document.*
                 FROM memory_recall_documents AS document
@@ -2484,12 +2450,38 @@ class SessionDB:
                          document.updated_at DESC, document.id DESC
                 LIMIT ?
                 """,
-                (*params, row_limit),
+                (*query_params, query_limit),
             ).fetchall()
-        result = [self._row_to_dict(row) for row in rows]
-        for item, row in zip(result, rows):
+
+        ranked_rows: List[Tuple[sqlite3.Row, str]] = [
+            (row, "strict")
+            for row in query_rows(
+                where=timed_where,
+                query_params=[*params, *time_params],
+                query_limit=row_limit,
+            )
+        ]
+        if has_time_filter and not strict_time_filter and len(ranked_rows) < row_limit:
+            seen_ids = {int(row["id"]) for row, _match in ranked_rows}
+            fallback_rows = query_rows(
+                where=base_where,
+                query_params=params,
+                query_limit=row_limit,
+            )
+            ranked_rows.extend(
+                (row, "fallback")
+                for row in fallback_rows
+                if int(row["id"]) not in seen_ids
+            )
+
+        result: List[Dict[str, Any]] = []
+        for row, temporal_match in ranked_rows[:row_limit]:
+            item = self._row_to_dict(row)
             if "bm25_score" in row.keys():
                 item["_bm25_score"] = row["bm25_score"]
+            if has_time_filter:
+                item["_recall_temporal_match"] = temporal_match
+            result.append(item)
         return result
 
     def get_entity_claim_evidence_fact_ids(
@@ -2918,238 +2910,7 @@ class SessionDB:
             changed_count += 1
         self._commit_if_needed()
         return changed_count
-
-    def _search_memory_rows(
-        self,
-        *,
-        table: str,
-        object_type: str,
-        time_fields: Optional[Sequence[str]] = None,
-        terms: Optional[Sequence[str]],
-        source_types: Optional[Sequence[str]],
-        time_start: Optional[str],
-        time_end: Optional[str],
-        limit: int,
-        strict_time_filter: bool = False,
-    ) -> List[Dict[str, Any]]:
-        """Return source rows ranked by their recall-document identity text.
-
-        Table and field names are internal constants supplied by the public
-        source-table wrapper; user input is only ever bound as SQL values.
-        The derived recall document owns the lexical/embedding representation,
-        while the source row remains the returned domain object.
-        """
-        base_clauses: List[str] = ["document.object_type = ?"]
-        base_params: List[Any] = [str(object_type or "").strip().lower()]
-        if source_types:
-            placeholders = ",".join("?" for _ in source_types)
-            base_clauses.append(f"source.source_type IN ({placeholders})")
-            base_params.extend(source_types)
-        selected_time_fields = [
-            str(field).strip()
-            for field in (time_fields or [])
-            if str(field).strip()
-        ]
-        time_expressions = [
-            f"substr(source.{field}, 1, 19)"
-            if field.endswith("_time_key")
-            else f"source.{field}"
-            for field in selected_time_fields
-        ]
-        time_expression = (
-            time_expressions[0]
-            if len(time_expressions) == 1
-            else "source.updated_at"
-            if not time_expressions
-            else "COALESCE(" + ", ".join(time_expressions) + ")"
-        )
-        time_clauses: List[str] = []
-        time_params: List[Any] = []
-        for field_expression in time_expressions:
-            field_clauses: List[str] = []
-            field_params: List[str] = []
-            if time_start:
-                field_clauses.append(f"{field_expression} >= ?")
-                field_params.append(str(time_start))
-            if time_end:
-                field_clauses.append(f"{field_expression} <= ?")
-                field_params.append(str(time_end))
-            if field_clauses:
-                time_clauses.append("(" + " AND ".join(field_clauses) + ")")
-                time_params.extend(field_params)
-        if len(time_clauses) > 1:
-            time_filter = "(" + " OR ".join(time_clauses) + ")"
-            time_clauses = [time_filter]
-        base_where = " AND ".join(base_clauses) if base_clauses else "1=1"
-        timed_where = " AND ".join([base_where, *time_clauses]) if time_clauses else base_where
-        row_limit = int(limit)
-        if row_limit <= 0:
-            return []
-        normalized_terms = self._normalize_search_terms(terms)
-        row_ids: List[int] = []
-        bm25_scores: Dict[int, float] = {}
-
-        def add_ids(rows: Sequence[sqlite3.Row]) -> None:
-            for row in rows:
-                row_id = int(row["id"])
-                if row_id not in row_ids:
-                    row_ids.append(row_id)
-                if "bm25_score" in row.keys():
-                    try:
-                        bm25_scores[row_id] = float(row["bm25_score"])
-                    except (TypeError, ValueError):
-                        pass
-
-        identity_fts_table = _IDENTITY_FTS_TABLES["memory_recall_documents"]
-
-        def add_bm25_matches(
-            *,
-            where: str,
-            params: Sequence[Any],
-            limit_value: int,
-        ) -> bool:
-            if not normalized_terms:
-                return True
-            match_query = self._terms_to_fts_query(normalized_terms)
-            if not match_query:
-                return True
-            try:
-                rows = self._conn.execute(
-                    f"""
-                    SELECT source.id, bm25({identity_fts_table}) AS bm25_score
-                    FROM {identity_fts_table}
-                    JOIN memory_recall_documents AS document
-                        ON document.id = {identity_fts_table}.rowid
-                    JOIN {table} source
-                        ON source.id = document.object_id
-                    WHERE {where} AND {identity_fts_table} MATCH ?
-                    ORDER BY bm25({identity_fts_table}) ASC,
-                             {time_expression} DESC, source.id DESC
-                    LIMIT ?
-                    """,
-                    (*params, match_query, limit_value),
-                ).fetchall()
-            except sqlite3.Error:
-                return False
-            add_ids(rows)
-            return True
-
-        def add_identity_like_matches(
-            *,
-            where: str,
-            params: Sequence[Any],
-            limit_value: int,
-        ) -> None:
-            """Fallback for SQLite builds without FTS5 support."""
-            if not normalized_terms:
-                return
-            like_clauses = [
-                "LOWER(COALESCE(document.identity_text, '')) LIKE ?"
-                for _term in normalized_terms[:12]
-            ]
-            if not like_clauses:
-                return
-            rows = self._conn.execute(
-                f"""
-                SELECT source.id
-                FROM {table} source
-                JOIN memory_recall_documents AS document
-                    ON document.object_id = source.id
-                WHERE {where} AND ({" OR ".join(like_clauses)})
-                ORDER BY {time_expression} DESC, source.id DESC
-                LIMIT ?
-                """,
-                (*params, *[f"%{term}%" for term in normalized_terms[:12]], limit_value),
-            ).fetchall()
-            add_ids(rows)
-
-        timed_params = [*base_params, *time_params]
-        bm25_available = add_bm25_matches(
-            where=timed_where,
-            params=timed_params,
-            limit_value=row_limit * 2,
-        )
-        if not bm25_available:
-            add_identity_like_matches(
-                where=timed_where,
-                params=timed_params,
-                limit_value=row_limit * 2,
-            )
-        if time_clauses and len(row_ids) < row_limit and not strict_time_filter:
-            # Time range is a strong preference, not a brittle hard stop. Pad
-            # with broader lexical candidates so downstream reranking can
-            # still recover facts with coarse or slightly shifted times.
-            if bm25_available:
-                add_bm25_matches(
-                    where=base_where,
-                    params=base_params,
-                    limit_value=row_limit * 2,
-                )
-            else:
-                add_identity_like_matches(
-                    where=base_where,
-                    params=base_params,
-                    limit_value=row_limit * 2,
-                )
-
-        selected_ids = row_ids[: row_limit * 3]
-        if not selected_ids:
-            return []
-        placeholders = ",".join("?" for _ in selected_ids)
-        rows = self._conn.execute(
-            f"""
-            SELECT source.*, document.identity_text,
-                   document.identity_text_embedding
-            FROM {table} AS source
-            JOIN memory_recall_documents AS document
-                ON document.object_id = source.id
-            WHERE document.object_type = ?
-              AND source.id IN ({placeholders})
-            """,
-            (str(object_type or "").strip().lower(), *selected_ids),
-        ).fetchall()
-        by_id = {int(row["id"]): self._row_to_dict(row) for row in rows}
-        out: List[Dict[str, Any]] = []
-        for row_id in selected_ids:
-            item = by_id.get(row_id)
-            if not item:
-                continue
-            if row_id in bm25_scores:
-                item["_bm25_score"] = bm25_scores[row_id]
-            out.append(item)
-        return out
-
-    def search_memory_facts(
-        self,
-        *,
-        terms: Optional[Sequence[str]] = None,
-        source_types: Optional[Sequence[str]] = None,
-        time_start: Optional[str] = None,
-        time_end: Optional[str] = None,
-        temporal_mode: str = "dialogue_time",
-        limit: int = 200,
-    ) -> List[Dict[str, Any]]:
-        temporal_mode = str(temporal_mode or "dialogue_time").strip().lower()
-        if temporal_mode == "event_time":
-            time_fields = ["event_time_key"]
-        elif temporal_mode == "both":
-            time_fields = ["event_time_key", "dialogue_time_key"]
-        elif temporal_mode == "none":
-            time_fields = []
-        else:
-            time_fields = ["dialogue_time_key"]
-        return self._search_memory_rows(
-            table="memory_facts",
-            object_type="fact",
-            time_fields=time_fields or ["dialogue_time_key"],
-            terms=terms,
-            source_types=source_types,
-            time_start=time_start if temporal_mode != "none" else None,
-            time_end=time_end if temporal_mode != "none" else None,
-            limit=limit,
-            strict_time_filter=True,
-        )
-
+    
     def memory_facts_by_ids(self, fact_ids: Sequence[int]) -> List[Dict[str, Any]]:
         ids = [int(value) for value in fact_ids if value is not None]
         if not ids:
@@ -3168,33 +2929,6 @@ class SessionDB:
         ).fetchall()
         by_id = {int(row["id"]): self._row_to_dict(row) for row in rows}
         return [by_id[item] for item in ids if item in by_id]
-
-    def memory_facts_with_identity_embeddings(
-        self,
-        *,
-        source_types: Optional[Sequence[str]] = None,
-    ) -> List[Dict[str, Any]]:
-        """Load every embeddable fact for bounded in-process vector ranking."""
-        clauses = ["document.identity_text_embedding IS NOT NULL"]
-        params: List[Any] = []
-        if source_types:
-            placeholders = ",".join("?" for _ in source_types)
-            clauses.append(f"fact.source_type IN ({placeholders})")
-            params.extend(source_types)
-        where = " WHERE " + " AND ".join(clauses)
-        rows = self._conn.execute(
-            f"""
-            SELECT fact.*, document.identity_text,
-                   document.identity_text_embedding
-            FROM memory_facts AS fact
-            INNER JOIN memory_recall_documents AS document
-                ON document.object_type = 'fact' AND document.object_id = fact.id
-            {where}
-            ORDER BY fact.id ASC
-            """,
-            params,
-        ).fetchall()
-        return [self._row_to_dict(row) for row in rows]
 
     def memory_episodes_by_ids(self, episode_ids: Sequence[int]) -> List[Dict[str, Any]]:
         ids = [int(value) for value in episode_ids if value is not None]
