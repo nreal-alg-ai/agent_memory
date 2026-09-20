@@ -2911,7 +2911,7 @@ class SessionDB:
         self._commit_if_needed()
         return changed_count
     
-    def memory_facts_by_ids(self, fact_ids: Sequence[int]) -> List[Dict[str, Any]]:
+    def get_memory_facts_by_ids(self, fact_ids: Sequence[int]) -> List[Dict[str, Any]]:
         ids = [int(value) for value in fact_ids if value is not None]
         if not ids:
             return []

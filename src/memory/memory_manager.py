@@ -5499,6 +5499,7 @@ class MemoryNodeManager:
                     original_query=query,
                     time_stripped_query=time_stripped_query,
                     temporal_bounds=temporal_bounds,
+                    reference_time=reference_time,
                     memory_source_override=memory_source_override,
                     temporal_mode=temporal_mode,
                     prompt_language=prompt_language,
@@ -5520,6 +5521,7 @@ class MemoryNodeManager:
                     original_query=query,
                     time_stripped_query=time_stripped_query,
                     temporal_bounds=temporal_bounds,
+                    reference_time=reference_time,
                     memory_source_override=memory_source_override,
                     temporal_mode=temporal_mode,
                     prompt_language=prompt_language,
@@ -5580,13 +5582,14 @@ class MemoryNodeManager:
         terms: Sequence[str],
         query_entity_names: Sequence[str],
         direct_object_types: Sequence[str],
+        prospective_query_profile: Dict[str, Any],
         source_types: Optional[Sequence[str]],
         temporal_bounds: RecallTimeBounds,
         temporal_mode: str,
         candidate_limits: Dict[str, int],
         database: Optional[SessionDB] = None,
     ) -> List[Dict[str, Any]]:
-        """Retrieve Stage 1 lexical seeds for permitted direct object types.
+        """Retrieve Stage 1 direct seeds for permitted object types.
 
         Episode documents are intentionally not permitted here. They remain a
         stored projection but only participate later as fact-association
@@ -5599,6 +5602,7 @@ class MemoryNodeManager:
         return self._retrieve_recall_document_lexical_seed_candidates(
             terms=seed_search_terms,
             direct_object_types=direct_object_types,
+            prospective_query_profile=prospective_query_profile,
             source_types=source_types,
             temporal_bounds=temporal_bounds,
             temporal_mode=temporal_mode,
@@ -5617,14 +5621,17 @@ class MemoryNodeManager:
         temporal_mode: str,
         candidate_limits: Dict[str, int],
         candidate_source: str,
+        prospective_query_profile: Optional[Dict[str, Any]] = None,
         database: Optional[SessionDB] = None,
     ) -> List[Dict[str, Any]]:
-        """Retrieve lexical direct seeds from the shared document projection.
+        """Retrieve direct seeds from the shared document projection.
 
         Fact documents are hydrated back to ``memory_facts`` before they are
         returned, while derived-memory projections can become candidates
-        directly.  Episode is deliberately excluded because it is only a
-        fact-association boundary.
+        directly.  For an explicit prospective time-slot query, prospective
+        object types use a strict time browse instead of lexical terms.
+        Episode is deliberately excluded because it is only a fact-association
+        boundary.
         """
         direct_types = list(dict.fromkeys(
             str(value or "").strip().lower()
@@ -5633,6 +5640,9 @@ class MemoryNodeManager:
             in {"fact", "entity_claim", "goal", "plan", "work_item"}
         ))
         db = database or self._db
+        is_prospective_time_slot_query = bool(
+            (prospective_query_profile or {}).get("is_prospective_query")
+        )
         candidates: List[Dict[str, Any]] = []
         for object_type in direct_types:
             candidate_limit = max(
@@ -5651,48 +5661,34 @@ class MemoryNodeManager:
             document_time_start, document_time_end = (
                 temporal_bounds or (None, None)
             ) if object_type != "fact" else (None, None)
+            use_prospective_time_slot_browse = bool(
+                is_prospective_time_slot_query
+                and object_type in {"goal", "plan", "work_item"}
+            )
+            object_terms = () if use_prospective_time_slot_browse else terms
+            if not object_terms and not use_prospective_time_slot_browse:
+                # An empty query is meaningful only for an explicitly routed
+                # prospective time-slot browse.  It must not turn fact or
+                # claim retrieval into an unrelated "most recent" scan.
+                continue
+            object_candidate_source = (
+                candidate_source.removesuffix("_lexical") + "_prospective_query"
+                if use_prospective_time_slot_browse
+                else candidate_source
+            )
             rows = db.search_memory_recall_documents(
                 object_type=object_type,
-                terms=terms,
+                terms=object_terms,
                 statuses=self._recall_stage1_direct_document_statuses(object_type),
                 source_types=source_types if object_type == "fact" else None,
                 time_start=document_time_start,
                 time_end=document_time_end,
                 limit=retrieval_limit,
+                strict_time_filter=use_prospective_time_slot_browse,
             )
-            # Time-focused prospective questions are often phrased entirely
-            # as question words after time-expression stripping (for example,
-            # "明天有什么安排？").  Their plan need not literally contain
-            # "安排".  Supplement lexical hits with recent active objects;
-            # `_make_recall_document_candidate` then applies the structured
-            # temporal-bound check before a candidate can be scored.
-            if (
-                object_type in {"goal", "plan", "work_item"}
-                and any(temporal_bounds or (None, None))
-            ):
-                temporal_rows = db.search_memory_recall_documents(
-                    object_type=object_type,
-                    terms=(),
-                    statuses=self._recall_stage1_direct_document_statuses(
-                        object_type,
-                    ),
-                    time_start=(temporal_bounds or (None, None))[0],
-                    time_end=(temporal_bounds or (None, None))[1],
-                    limit=candidate_limit,
-                    strict_time_filter=True,
-                )
-                seen_document_ids = {
-                    int(row.get("id") or 0)
-                    for row in rows
-                    if int(row.get("id") or 0) > 0
-                }
-                rows.extend(
-                    row for row in temporal_rows
-                    if int(row.get("id") or 0) not in seen_document_ids
-                )
             candidates.extend(self._make_recall_document_candidates(
                 rows=rows,
-                candidate_source=candidate_source,
+                candidate_source=object_candidate_source,
                 temporal_bounds=temporal_bounds,
                 temporal_mode=temporal_mode,
                 source_types=source_types,
@@ -5747,6 +5743,163 @@ class MemoryNodeManager:
         ):
             modes.append("prospective")
         return modes
+
+    @staticmethod
+    def _recall_query_has_explicit_temporal_expression(query: str) -> bool:
+        """Return whether the user text itself states a calendar/time window."""
+        text = str(query or "")
+        return bool(re.search(
+            r"今天|今日|明天|后天|本周|这周|下周|下星期|本月|这个月|下个月|"
+            r"今晚|明早|下午|上午|月底|月底前|未来|接下来|"
+            r"\d{4}\s*(?:年|[-/.])\s*\d{1,2}|\d{1,2}\s*月\s*\d{1,2}|"
+            r"\b(?:today|tomorrow|the day after tomorrow|this week|next week|"
+            r"this month|next month|tonight|this afternoon|this morning|"
+            r"upcoming|in the next)\b",
+            text,
+            re.IGNORECASE,
+        ))
+
+    def _recall_stage1_prospective_query_profile(
+        self,
+        *,
+        original_query: str,
+        temporal_bounds: RecallTimeBounds,
+        reference_time: str,
+    ) -> Dict[str, Any]:
+        """Conservatively identify a current/future personal time-slot query.
+
+        The profile gates the no-term prospective browse only.  It does not
+        decide whether goals, plans, or work items may participate in normal
+        lexical recall; a concrete query such as ``明天去天津的计划`` can still
+        retrieve those objects through its text terms.
+        """
+        text = _compact_whitespace(original_query).lower()
+        time_start, time_end = temporal_bounds or (None, None)
+        reference = self._recall_stage1_parse_datetime(reference_time)
+        window_start = self._recall_stage1_parse_datetime(time_start)
+        window_end = self._recall_stage1_parse_datetime(time_end)
+        has_time_window = bool(window_start or window_end)
+        has_explicit_time_expression = (
+            self._recall_query_has_explicit_temporal_expression(original_query)
+        )
+        current_or_future_window = bool(
+            has_explicit_time_expression
+            and has_time_window
+            and (
+                (window_end is not None and (reference is None or window_end >= reference))
+                or (window_end is None and window_start is not None and (
+                    reference is None or window_start >= reference
+                ))
+            )
+        )
+        slot_markers = (
+            "安排", "计划", "日程", "行程", "待办", "任务", "事项", "提醒",
+            "截止", "未完成", "还要", "剩下", "下一步", "要做", "需要做",
+            "schedule", "agenda", "plan", "todo", "to do", "task",
+            "deadline", "upcoming", "remaining", "what's next",
+        )
+        inventory_markers = (
+            "有什么", "有哪些", "有没有", "什么安排", "什么计划", "做什么",
+            "需要做什么", "要做什么", "还剩什么", "下一步", "几件",
+            "what do i have", "what's on", "what is on", "what should i do",
+            "any plans", "any tasks", "what remains", "what's next",
+        )
+        excluded_markers = (
+            "怎么", "如何", "推荐", "建议", "天气", "新闻", "电影", "股价",
+            "航班", "路线", "how to", "recommend", "weather", "news", "movie",
+            "stock", "flight", "route",
+        )
+        command_markers = (
+            "提醒我", "创建日程", "帮我创建", "帮我安排", "设置提醒",
+            "remind me", "create a reminder", "schedule for me",
+        )
+        has_slot_marker = any(marker in text for marker in slot_markers)
+        has_inventory_marker = any(marker in text for marker in inventory_markers)
+        has_excluded_marker = any(marker in text for marker in excluded_markers)
+        has_command_marker = any(marker in text for marker in command_markers)
+        is_prospective_query = bool(
+            current_or_future_window
+            and has_slot_marker
+            and has_inventory_marker
+            and not has_excluded_marker
+            and not has_command_marker
+        )
+        if not has_explicit_time_expression:
+            reason = "no_explicit_time_expression"
+        elif not has_time_window:
+            reason = "no_time_window"
+        elif not current_or_future_window:
+            reason = "historical_time_window"
+        elif has_command_marker:
+            reason = "immediate_command"
+        elif has_excluded_marker:
+            reason = "external_or_advice_query"
+        elif not has_slot_marker:
+            reason = "no_prospective_slot_marker"
+        elif not has_inventory_marker:
+            reason = "not_inventory_query"
+        else:
+            reason = "current_or_future_prospective_time_slot"
+        return {
+            "is_prospective_query": is_prospective_query,
+            "reason": reason,
+            "has_explicit_time_expression": has_explicit_time_expression,
+            "has_time_window": has_time_window,
+            "current_or_future_window": current_or_future_window,
+            "has_slot_marker": has_slot_marker,
+            "has_inventory_marker": has_inventory_marker,
+        }
+
+    def _recall_stage2_prospective_query_profile(
+        self,
+        *,
+        original_query: str,
+        llm_value: Any,
+        temporal_bounds: RecallTimeBounds,
+        reference_time: str,
+    ) -> Dict[str, Any]:
+        """Validate the LLM's prospective time-slot routing decision."""
+        if isinstance(llm_value, bool):
+            llm_is_prospective = llm_value
+        else:
+            llm_is_prospective = str(llm_value or "").strip().lower() in {
+                "1", "true", "yes",
+            }
+        time_start, time_end = temporal_bounds or (None, None)
+        reference = self._recall_stage1_parse_datetime(reference_time)
+        window_start = self._recall_stage1_parse_datetime(time_start)
+        window_end = self._recall_stage1_parse_datetime(time_end)
+        has_time_window = bool(window_start or window_end)
+        has_explicit_time_expression = (
+            self._recall_query_has_explicit_temporal_expression(original_query)
+        )
+        current_or_future_window = bool(
+            has_explicit_time_expression
+            and has_time_window
+            and (
+                (window_end is not None and (reference is None or window_end >= reference))
+                or (window_end is None and window_start is not None and (
+                    reference is None or window_start >= reference
+                ))
+            )
+        )
+        is_prospective_query = bool(
+            llm_is_prospective and current_or_future_window
+        )
+        return {
+            "is_prospective_query": is_prospective_query,
+            "reason": (
+                "llm_prospective_time_slot"
+                if is_prospective_query
+                else "llm_declined_prospective_time_slot"
+                if not llm_is_prospective
+                else "invalid_or_historical_time_window"
+            ),
+            "llm_is_prospective_query": llm_is_prospective,
+            "has_explicit_time_expression": has_explicit_time_expression,
+            "has_time_window": has_time_window,
+            "current_or_future_window": current_or_future_window,
+        }
 
     @staticmethod
     def _recall_stage1_direct_object_types(
@@ -5805,6 +5958,7 @@ class MemoryNodeManager:
         original_query: str,
         time_stripped_query: str,
         temporal_bounds: RecallTimeBounds,
+        reference_time: str,
         memory_source_override: Optional[Sequence[str]] = None,
         temporal_mode: str = "dialogue_time",
         prompt_language: str = "zh",
@@ -5831,6 +5985,11 @@ class MemoryNodeManager:
         )
         direct_object_types = self._recall_stage1_direct_object_types(
             query_modes,
+        )
+        prospective_query_profile = self._recall_stage1_prospective_query_profile(
+            original_query=original_query,
+            temporal_bounds=temporal_bounds,
+            reference_time=reference_time,
         )
 
         candidate_limits = self._recall_stage1_candidate_limits(
@@ -5862,12 +6021,14 @@ class MemoryNodeManager:
             "query_entity_names": query_entity_names,
             "query_modes": query_modes,
             "direct_object_types": direct_object_types,
+            "prospective_query_profile": prospective_query_profile,
         })
         # direct recall
         seed_candidates = self._retrieve_recall_stage1_seed_candidates(
             terms=terms,
             query_entity_names=query_entity_names,
             direct_object_types=direct_object_types,
+            prospective_query_profile=prospective_query_profile,
             source_types=source_types,
             temporal_bounds=temporal_bounds,
             temporal_mode=temporal_mode,
@@ -6259,7 +6420,7 @@ class MemoryNodeManager:
 
         allowed_sources = set(source_types or [])
         expanded: List[Dict[str, Any]] = []
-        for fact in database.memory_facts_by_ids(list(related_scores)):
+        for fact in database.get_memory_facts_by_ids(list(related_scores)):
             fact_id = int(fact.get("id") or 0)
             relation_info = related_scores.get(fact_id)
             if not relation_info:
@@ -6267,9 +6428,9 @@ class MemoryNodeManager:
             if allowed_sources and fact.get("source_type") not in allowed_sources:
                 continue
             relation, propagated_score = relation_info
-            candidate = self._make_recall_memory_candidate(
-                level="fact",
+            candidate = self._make_recall_document_candidate(
                 row=fact,
+                object_type="fact",
                 candidate_source=(
                     f"{candidate_source_prefix}_episode_association"
                 ),
@@ -6374,7 +6535,7 @@ class MemoryNodeManager:
 
         allowed_sources = set(source_types or [])
         candidates: List[Dict[str, Any]] = []
-        for fact in database.memory_facts_by_ids(list(evidence_by_fact_id)):
+        for fact in database.get_memory_facts_by_ids(list(evidence_by_fact_id)):
             fact_id = int(fact.get("id") or 0)
             relation_info = evidence_by_fact_id.get(fact_id)
             if not relation_info:
@@ -6382,9 +6543,9 @@ class MemoryNodeManager:
             if allowed_sources and fact.get("source_type") not in allowed_sources:
                 continue
             relation, propagated_score = relation_info
-            candidate = self._make_recall_memory_candidate(
-                level="fact",
+            candidate = self._make_recall_document_candidate(
                 row=fact,
+                object_type="fact",
                 candidate_source=f"{candidate_source_prefix}_{relation}",
                 # An evidence fact can describe the creation or update of a
                 # future object before its scheduled time, so it must not be
@@ -7619,6 +7780,7 @@ class MemoryNodeManager:
         *,
         stage1_lexical_candidates: Sequence[Dict[str, Any]],
         direct_object_types: Sequence[str],
+        prospective_query_profile: Dict[str, Any],
         search_terms: Sequence[str],
         query_embedding: Optional[np.ndarray],
         source_types: Optional[Sequence[str]],
@@ -7629,9 +7791,10 @@ class MemoryNodeManager:
     ) -> List[Dict[str, Any]]:
         """Retrieve and deduplicate all direct Stage 2 seed channels.
 
-        Stage 1 contributes only its original lexical seeds. Stage 2 adds
-        lexical candidates retrieved with its expanded search terms and the
-        top full-corpus document embeddings. Association
+        Stage 1 contributes its existing direct seeds. Stage 2 adds candidates
+        retrieved with its expanded search terms (using the same type-aware
+        prospective time-slot strategy) and top full-corpus document
+        embeddings. Association
         expansion is intentionally performed by the caller after direct
         scoring.
         """
@@ -7650,9 +7813,12 @@ class MemoryNodeManager:
                 temporal_mode=temporal_mode,
                 candidate_limits=lexical_candidate_limits,
                 candidate_source="stage2_lexical",
+                prospective_query_profile=prospective_query_profile,
                 database=database,
             )
-            if search_terms
+            if search_terms or prospective_query_profile.get(
+                "is_prospective_query"
+            )
             else []
         )
         embedding_candidates = self._retrieve_recall_document_embedding_seed_candidates(
@@ -7778,7 +7944,9 @@ class MemoryNodeManager:
             )
             for source in (
                 "stage1_lexical",
+                "stage1_prospective_query",
                 "stage2_lexical",
+                "stage2_prospective_query",
                 "stage2_embedding",
             )
         }
@@ -7788,7 +7956,13 @@ class MemoryNodeManager:
                 seed_candidates
             ),
             "stage1_lexical_seed_count": source_counts["stage1_lexical"],
+            "stage1_prospective_seed_count": source_counts[
+                "stage1_prospective_query"
+            ],
             "stage2_lexical_seed_count": source_counts["stage2_lexical"],
+            "stage2_prospective_seed_count": source_counts[
+                "stage2_prospective_query"
+            ],
             "stage2_embedding_seed_count": source_counts["stage2_embedding"],
             "candidates": self._recall_log_candidate_items(
                 seed_candidates,
@@ -7869,6 +8043,14 @@ class MemoryNodeManager:
         direct_object_types = self._normalize_recall_object_types(
             query_analysis_info.get("recall_object_types"),
         )
+        prospective_query_profile = self._recall_stage2_prospective_query_profile(
+            original_query=original_query,
+            llm_value=query_analysis_info.get(
+                "is_prospective_time_slot_query"
+            ),
+            temporal_bounds=temporal_bounds,
+            reference_time=analysis_reference_time,
+        )
         query_entity_names = self._normalize_entity_names(
             [
                 *llm_entities,
@@ -7886,7 +8068,7 @@ class MemoryNodeManager:
             (temporal_bounds or (None, None))[1]
             or analysis_reference_time
         )
-        # Stage 1 contributes its direct lexical seeds as one Stage 2 source.
+        # Stage 1 contributes its existing direct seeds as one Stage 2 source.
         # The Stage 2 lexical source itself is reserved for LLM-derived terms.
         supplement_terms = self._build_recall_search_terms(
             "",
@@ -7932,6 +8114,7 @@ class MemoryNodeManager:
             "keywords": llm_keywords,
             "entities": llm_entities,
             "direct_object_types": direct_object_types,
+            "prospective_query_profile": prospective_query_profile,
             "query_entity_names": query_entity_names,
             "is_contextual_query": is_contextual_query,
             "reference_time": reference_time,
@@ -7954,6 +8137,7 @@ class MemoryNodeManager:
         seed_candidates = self._retrieve_recall_stage2_seed_candidates(
             stage1_lexical_candidates=stage1_lexical_seed_candidates,
             direct_object_types=direct_object_types,
+            prospective_query_profile=prospective_query_profile,
             search_terms=search_terms,
             query_embedding=query_identity_embedding,
             source_types=preferred_source_types,
@@ -8021,74 +8205,6 @@ class MemoryNodeManager:
         })
         return memory_text
 
-    def _make_recall_memory_candidate(
-        self,
-        *,
-        level: str,
-        row: Dict[str, Any],
-        candidate_source: str,
-        temporal_bounds: RecallTimeBounds = None,
-        temporal_mode: str = "dialogue_time",
-    ) -> Optional[Dict[str, Any]]:
-        """Convert a memory row into the shared recall candidate shape."""
-        if level != "fact":
-            return None
-        target_table = "memory_facts"
-        try:
-            target_id = int(row.get("id"))
-        except (TypeError, ValueError):
-            return None
-        source_type = row.get("source_type")
-        title = _compact_whitespace(row.get("summary") or "")[:120]
-        summary = _compact_whitespace(row.get("summary") or "")
-        fact_times = self._fact_time_values(row, temporal_mode)
-        if not self._fact_matches_time_bounds(
-            row,
-            temporal_mode=temporal_mode,
-            temporal_bounds=temporal_bounds,
-        ):
-            return None
-        time_value = fact_times[0] if fact_times else ""
-        entities = row.get("entities") or []
-        keywords = row.get("keywords") or ""
-        time_end_value = fact_times[-1] if fact_times else ""
-        time_start, time_end = temporal_bounds or (None, None)
-        if time_start and time_end_value and time_end_value < str(time_start):
-            return None
-        if time_end and time_value and time_value > str(time_end):
-            return None
-
-        hydrated = dict(row)
-        hydrated.pop("episode_id", None)
-        hydrated.pop("embedding", None)
-        hydrated.pop("identity_text_embedding", None)
-        hydrated.pop("canonical_name_embedding", None)
-        metadata = dict(row.get("metadata") or {})
-        metadata["_matched_via"] = [candidate_source]
-        candidate = {
-            "source_type": source_type,
-            "target_table": target_table,
-            "target_id": target_id,
-            "index_level": level,
-            "memory_path": f"{source_type}/{level}",
-            "title": title,
-            "summary_for_retrieval": summary,
-            "identity_text": _compact_whitespace(row.get("identity_text") or ""),
-            "keywords": keywords,
-            "entities": entities,
-            "participants": row.get("participants") or [],
-            "time_start": time_value,
-            "time_end": time_end_value,
-            "importance": row.get("importance") or 0.5,
-            "confidence": row.get("confidence") or 0.8,
-            "embedding": row.get("identity_text_embedding"),
-            "metadata": metadata,
-            "_hydrated": hydrated,
-            "_bm25_score": row.get("_bm25_score"),
-            "_recall_candidate_source": candidate_source,
-        }
-        return candidate
-
     def _make_recall_document_candidates(
         self,
         *,
@@ -8100,61 +8216,20 @@ class MemoryNodeManager:
         per_type_limit: int,
         database: SessionDB,
     ) -> List[Dict[str, Any]]:
-        """Hydrate one recall-document type into shared candidates.
-
-        Facts use the projection only as the lexical index.  Their matched
-        document IDs are then hydrated from ``memory_facts`` so the candidate
-        retains fact-specific topics, keywords, source type, and temporal
-        semantics.  Derived-memory documents are already self-contained.
-        """
+        """Build and normalize candidates from one recall-document result set."""
         rows = list(rows or [])
         if not rows:
             return []
-        object_type = str(rows[0].get("object_type") or "").strip().lower()
         limit = max(1, int(per_type_limit or 1))
-        if object_type == "fact":
-            document_by_fact_id: Dict[int, Dict[str, Any]] = {}
-            for row in rows:
-                try:
-                    fact_id = int(row.get("object_id"))
-                except (TypeError, ValueError):
-                    continue
-                if fact_id > 0:
-                    document_by_fact_id.setdefault(fact_id, row)
-            allowed_sources = set(source_types or [])
-            candidates: List[Dict[str, Any]] = []
-            for fact in database.memory_facts_by_ids(document_by_fact_id):
-                if allowed_sources and fact.get("source_type") not in allowed_sources:
-                    continue
-                candidate = self._make_recall_memory_candidate(
-                    level="fact",
-                    row=fact,
-                    candidate_source=candidate_source,
-                    temporal_bounds=temporal_bounds,
-                    temporal_mode=temporal_mode,
-                )
-                if not candidate:
-                    continue
-                document = document_by_fact_id.get(int(fact.get("id") or 0), {})
-                candidate["_bm25_score"] = document.get("_bm25_score")
-                candidates.append(candidate)
-            self._normalize_recall_candidate_bm25_scores(candidates)
-            return candidates[:limit]
-
-        entity_ids = [
-            int(entity_id)
-            for row in rows
-            for entity_id in row.get("entity_ids") or []
-            if str(entity_id).strip().isdigit() and int(entity_id) > 0
-        ]
-        entity_names_by_id = database.get_entity_names_by_ids(entity_ids)
         candidates: List[Dict[str, Any]] = []
         for row in rows:
             candidate = self._make_recall_document_candidate(
                 row=row,
                 candidate_source=candidate_source,
                 temporal_bounds=temporal_bounds,
-                entity_names_by_id=entity_names_by_id,
+                temporal_mode=temporal_mode,
+                source_types=source_types,
+                database=database,
             )
             if candidate:
                 candidates.append(candidate)
@@ -8165,12 +8240,91 @@ class MemoryNodeManager:
         self,
         *,
         row: Dict[str, Any],
+        object_type: Optional[str] = None,
         candidate_source: str,
         temporal_bounds: RecallTimeBounds,
-        entity_names_by_id: Dict[int, str],
+        temporal_mode: str = "dialogue_time",
+        entity_names_by_id: Optional[Dict[int, str]] = None,
+        source_types: Optional[Sequence[str]] = None,
+        database: Optional[SessionDB] = None,
     ) -> Optional[Dict[str, Any]]:
-        """Convert a non-episode recall document into a direct candidate."""
-        object_type = str(row.get("object_type") or "").strip().lower()
+        """Convert a hydrated recall object into the shared candidate shape."""
+        object_type = str(
+            object_type or row.get("object_type") or ""
+        ).strip().lower()
+        if object_type == "fact":
+            is_recall_document = (
+                str(row.get("object_type") or "").strip().lower() == "fact"
+            )
+            if is_recall_document:
+                if database is None:
+                    return None
+                try:
+                    fact_id = int(row.get("object_id"))
+                except (TypeError, ValueError):
+                    return None
+                fact_rows = database.get_memory_facts_by_ids([fact_id])
+                if not fact_rows:
+                    return None
+                fact_row = dict(fact_rows[0])
+                fact_row["_bm25_score"] = row.get("_bm25_score")
+                row = fact_row
+            allowed_sources = set(source_types or [])
+            if allowed_sources and row.get("source_type") not in allowed_sources:
+                return None
+            try:
+                target_id = int(row.get("id"))
+            except (TypeError, ValueError):
+                return None
+            if not self._fact_matches_time_bounds(
+                row,
+                temporal_mode=temporal_mode,
+                temporal_bounds=temporal_bounds,
+            ):
+                return None
+            fact_times = self._fact_time_values(row, temporal_mode)
+            time_start = fact_times[0] if fact_times else ""
+            time_end = fact_times[-1] if fact_times else ""
+            query_start, query_end = temporal_bounds or (None, None)
+            if query_start and time_end and time_end < str(query_start):
+                return None
+            if query_end and time_start and time_start > str(query_end):
+                return None
+            source_type = row.get("source_type")
+            hydrated = dict(row)
+            hydrated.pop("episode_id", None)
+            hydrated.pop("embedding", None)
+            hydrated.pop("identity_text_embedding", None)
+            hydrated.pop("canonical_name_embedding", None)
+            metadata = dict(row.get("metadata") or {})
+            metadata["_matched_via"] = [candidate_source]
+            return {
+                "source_type": source_type,
+                "target_table": "memory_facts",
+                "target_id": target_id,
+                "index_level": "fact",
+                "memory_path": f"{source_type}/fact",
+                "title": _compact_whitespace(row.get("summary") or "")[:120],
+                "summary_for_retrieval": _compact_whitespace(
+                    row.get("summary") or ""
+                ),
+                "identity_text": _compact_whitespace(
+                    row.get("identity_text") or ""
+                ),
+                "keywords": row.get("keywords") or "",
+                "entities": row.get("entities") or [],
+                "participants": row.get("participants") or [],
+                "time_start": time_start,
+                "time_end": time_end,
+                "importance": row.get("importance") or 0.5,
+                "confidence": row.get("confidence") or 0.8,
+                "embedding": row.get("identity_text_embedding"),
+                "metadata": metadata,
+                "_hydrated": hydrated,
+                "_bm25_score": row.get("_bm25_score"),
+                "_recall_candidate_source": candidate_source,
+            }
+
         target_table_by_type = {
             "entity_claim": "memory_entity_claims",
             "goal": "memory_goals",
@@ -8197,6 +8351,9 @@ class MemoryNodeManager:
             for entity_id in row.get("entity_ids") or []
             if str(entity_id).strip().isdigit() and int(entity_id) > 0
         ]
+        if entity_names_by_id is None and database is not None:
+            entity_names_by_id = database.get_entity_names_by_ids(entity_ids)
+        entity_names_by_id = entity_names_by_id or {}
         entities = [
             entity_names_by_id[entity_id]
             for entity_id in entity_ids

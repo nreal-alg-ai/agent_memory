@@ -476,6 +476,7 @@ RECALL_QUERY_ANALYSIS_PROMPT_ZH = """你是 AI 眼镜长期记忆系统中的 re
 - `entities` 输出对语义检索有帮助的实体名称及类型。实体可以是人物、组织、地点、产品、项目、技术或具体概念；普通的“今天/昨天/上周”等时间表达不要作为实体。
 - `temporal_mode` 表示时间范围应该匹配哪一种 fact 时间：`event_time` 表示事实描述的现实事件时间，`dialogue_time` 表示对话/转写发生时间，`both` 表示任一时间命中即可，`none` 表示不做时间硬过滤。询问“做了什么/发生了什么/买过什么”优先使用 `event_time`；询问“讨论了什么/提到过什么/问过什么”优先使用 `dialogue_time`；无法判断时使用 `none`。
 - `temporal_bounds` 由你根据原始 query 和参考时间解析；`start` / `end` 使用 `YYYY-MM-DD HH:MM:SS` 或 `null`，至少提供一个边界。`end` 是排他上界。没有时间约束时输出 `null`。
+- `is_prospective_time_slot_query` 仅在用户询问自己在当前或未来某个时间窗口内“有什么安排/计划/待办/未完成事项”这类集合或状态时为 true。出行建议、天气新闻等外部信息、单一事实确认、纯预测，以及“提醒我/帮我创建日程”等即时指令均为 false。
 
 只返回 JSON：
 {
@@ -486,7 +487,8 @@ RECALL_QUERY_ANALYSIS_PROMPT_ZH = """你是 AI 眼镜长期记忆系统中的 re
   "keywords": ["关键词1", "关键词2"],
   "entities": [{"name": "实体名", "type": "PERSON|ORGANIZATION|LOCATION|PRODUCT|PROJECT|TECHNOLOGY|CONCEPT|OTHER"}],
   "temporal_bounds": {"start": "YYYY-MM-DD HH:MM:SS|null", "end": "YYYY-MM-DD HH:MM:SS|null"},
-  "temporal_mode": "event_time|dialogue_time|both|none"
+  "temporal_mode": "event_time|dialogue_time|both|none",
+  "is_prospective_time_slot_query": false
 }
 
 原始用户查询：

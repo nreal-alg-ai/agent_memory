@@ -438,6 +438,7 @@ Guidance:
 - Extract useful semantic entities with names and types. Entities may be people, organizations, locations, products, projects, technologies, or concrete concepts; ordinary time expressions such as today, yesterday, or last week are not entities.
 - `temporal_mode` selects which fact timestamp should be used for a time range: `event_time` means the real-world event time described by the fact, `dialogue_time` means when the conversation/transcript occurred, `both` means either timestamp may match, and `none` means no hard time filter. Prefer `event_time` for queries asking what happened, was done, bought, or visited; prefer `dialogue_time` for queries asking what was discussed, mentioned, or asked; use `none` when the temporal intent is unclear.
 - Parse `temporal_bounds` from the original query using the reference time. Use `YYYY-MM-DD HH:MM:SS` or `null` for `start` / `end`, and provide at least one bound. `end` is exclusive. Output `null` when no time constraint applies.
+- Set `is_prospective_time_slot_query` to true only when the user asks for the set or status of their own current/future arrangements, plans, to-dos, or unfinished responsibilities in a time window. It is false for external information, advice, a single-fact confirmation, a prediction, or an immediate command such as creating a reminder.
 
 Return JSON only:
 {
@@ -448,7 +449,8 @@ Return JSON only:
   "keywords": ["keyword1", "keyword2"],
   "entities": [{"name": "entity name", "type": "PERSON|ORGANIZATION|LOCATION|PRODUCT|PROJECT|TECHNOLOGY|CONCEPT|OTHER"}],
   "temporal_bounds": {"start": "YYYY-MM-DD HH:MM:SS|null", "end": "YYYY-MM-DD HH:MM:SS|null"},
-  "temporal_mode": "event_time|dialogue_time|both|none"
+  "temporal_mode": "event_time|dialogue_time|both|none",
+  "is_prospective_time_slot_query": false
 }
 
 Original user query:
