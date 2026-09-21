@@ -302,7 +302,7 @@ def load_test_turns(
 def iter_stored_nodes(db: Any, start_id: int) -> Iterable[Dict[str, Any]]:
     rows = db._conn.execute(
         """SELECT id, episode_id, source_type, event_time_key, dialogue_time_key, summary, keywords,
-                  fact_type, fact_kind, entities,
+                  fact_type, entities,
                   fact_root_topic, fact_aspect_topic,
                   confidence, importance, metadata, created_at, updated_at
              FROM memory_facts

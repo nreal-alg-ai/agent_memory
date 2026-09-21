@@ -150,10 +150,8 @@ Hindsight 风格 narrative fact 的核心要求：
 - 对一个 5 轮左右的对话批次或一段多人转写片段，通常输出 1-3 条 facts；只有当批次中确实存在多个互不相关的事件/议题时才拆开。绝大多数情况下不要超过 5 条。
 
 fact_type 判别规则：
-- `semantic` 表示不依赖某一次具体经历也能复用的稳定知识或长期信息，例如项目结构、概念定义、系统约定、常识、用户长期偏好、长期指令或长期约束。它描述“通常是什么/长期怎样”，重点是跨多次对话仍成立的稳定认识。
-- `episodic` 表示某次具体发生过的经历或事件，例如用户在某轮提出请求、助手执行修改或测试、一次失败或通过、某个时间点的决定、状态变化或情绪反应。它描述“某次发生了什么”，即使事件涉及一个长期项目，也仍然可以是 episodic。
-- 判断核心是该 fact 是否依赖一次具体经历才能成立，而不是主题是否长期存在、内容是否重要，或是否可能影响未来。一次性的请求、建议、修改、测试结果、决定或风险事件默认标为 `episodic`；只有证据明确支持跨场景、跨时间可复用的稳定知识或长期模式时才标为 `semantic`。
-- 不要因为 fact 使用了“偏好”“风险”“决定”等 fact_kind 就自动标为 `semantic`：一次具体场景中的偏好表达、临时风险、单次决定仍应标为 `episodic`；反复出现或明确声明长期有效的偏好、约束、指令才可以标为 `semantic`。
+- `fact_type` 描述当前 fact 的主要语义作用，只能是 preference、decision、request、recommendation、action、commitment、open_question、risk、error、context、instruction、other。
+- 选择最能表达该 fact 对后续记忆价值的一个类别；不要仅因助手未回答或用户表述模糊而使用 `open_question`。
 
 时间保真要求：
 - 必须保留影响语义的顺序词和先后关系：first、first time、second、previous、next、later、earlier、before、after、once、again、subsequent、prior、last、most recent，以及“第一次/首次/第二次/之前/之后/此前/随后/后来/更早/最近一次/上一次”等。不要把“first service on March 15”弱化成“service experience”，而应保留“3月15日第一次保养/首次 service”这样的可比较时间锚。
@@ -177,10 +175,9 @@ fact_type 判别规则：
 6. 只有真正互不相关且各自通过写入资格门槛的事件才拆开；时间推理需要比较先后/间隔的事件可以拆成多条，但每条仍必须保留完整背景和时间锚点。
 7. 只使用输入证据，不要编造完成状态、意图、原因或用户属性；尤其不要把助手声称的用户爱好、性格、经历或偏好当作用户事实，除非当前批次中用户明确确认。
 8. priority 为 0-100。仅输出 priority >= 80 的 fact：90-100 用于稳定身份/偏好/约束、明确决定或重要计划；80-89 用于带明确对象的近期事件、有效计划、用户确认的结果或风险；低于 80 直接丢弃，不要输出。
-9. fact_type 只能是 semantic 或 episodic，并严格按照上面的稳定知识/长期信息与单次事件边界判断。
-10. fact_kind 只能是 preference、decision、request、recommendation、action、commitment、open_question、risk、error、context、instruction、other；不要仅因助手未回答或用户表述模糊而使用 `open_question`。
-11. keywords 只能包含用于检索的短实体、主题、症状、方案、约束、决定和关键时间/顺序锚，通常每个关键词 2-8 个汉字或一个短英文短语；对带时间锚的事件，必须加入原始或补全后的时间词，例如“March 15 2023”“first service”“3/22”“last Saturday”“two months ago”“上周六”“两个月前”。不要把完整句子、寒暄、礼貌话、语气词、泛化表达或“希望这个方法能帮到您”这类文本放入 keywords。
-12. 只返回 JSON，不要 markdown。
+9. fact_type 只能是 preference、decision、request、recommendation、action、commitment、open_question、risk、error、context、instruction、other；不要仅因助手未回答或用户表述模糊而使用 `open_question`。
+10. keywords 只能包含用于检索的短实体、主题、症状、方案、约束、决定和关键时间/顺序锚，通常每个关键词 2-8 个汉字或一个短英文短语；对带时间锚的事件，必须加入原始或补全后的时间词，例如“March 15 2023”“first service”“3/22”“last Saturday”“two months ago”“上周六”“两个月前”。不要把完整句子、寒暄、礼貌话、语气词、泛化表达或“希望这个方法能帮到您”这类文本放入 keywords。
+11. 只返回 JSON，不要 markdown。
 
 entity_claim_signal 输出规则：
 - `entity_claim_signal` 是当前 fact 对个人世界模型中 entity claim 的结构化证据提示，不是最终 claim，也不能直接决定与已有 claim 的关系。
@@ -210,8 +207,7 @@ prospective_signals 输出规则：
       "primary_entity": {"name": "这条 fact 主要描述、影响或归属的单一实体", "type": "PERSON|ORGANIZATION|LOCATION|PRODUCT|PROJECT|TECHNOLOGY|CONCEPT|TOPIC|PREFERENCE|OTHER"},
       "fact_root_topic": "稳定的产品/项目/长期议题根主题",
       "fact_aspect_topic": "当前 fact 讨论的具体方面",
-      "fact_type": "semantic|episodic；semantic=可跨多次对话复用的稳定知识或长期信息，episodic=依赖某次具体经历的事件或状态变化",
-      "fact_kind": "preference|decision|request|recommendation|action|commitment|open_question|risk|error|context|instruction|other",
+      "fact_type": "preference|decision|request|recommendation|action|commitment|open_question|risk|error|context|instruction|other",
       "priority": 80,
       "event_time_key": "根据对话时间锚点和 fact 内容推导出的事件实际发生时间或代表性时间锚点；无法判断时为空字符串",
       "time_confidence": "explicit|inferred_from_turn|unknown；分别表示原文明确给出、结合当前片段 Time 和相对表达推断、无法判断",
@@ -413,6 +409,46 @@ INDUCTIVE_ENTITY_CLAIM_EXTRACTION_PROMPT_ZH = """你是个人世界模型的规�
 
 episode evidence facts：
 {facts}
+"""
+
+
+DERIVED_ENTITY_CLAIM_EXTRACTION_PROMPT_ZH = """你是个人世界模型中的直接推导（derived claim）模块。
+
+输入分为两部分：`changed_explicit_claims` 是当前 subject 在本轮新接收事实后发生变化的 explicit claims；`related_active_explicit_claims` 是从数据库读取的、与该 subject 或其直接关联实体相关的历史 active explicit claims。你的任务是仅根据这两部分 claims 的文本和结构，找出能够被直接逻辑推出的新结论。
+
+这里的 derived claim 不是规律归纳、常识补全或可能性猜测。它必须可以写成“因为 premise A（以及 premise B），所以 conclusion C”。例如：
+- “张三 reports_to 李四”可以推出“李四 manages 张三”；
+- “小王 member_of 团队 Alpha”与“团队 Alpha affiliated_with 公司 X”可以谨慎推出“小王 affiliated_with 公司 X”。
+
+硬规则：
+1. 只能基于输入 premise_claim_ids 推导；不得使用外部常识、未给出的背景或自由猜测。
+2. 每个 candidate 的 premise_claim_ids 至少包含一个 `changed_explicit_claims` 中的 claim id，且所有 ID 都必须来自输入。
+3. 只允许 claim_type 为 affiliation、relationship 或 constraint；禁止输出 identity_profile、preference、behavior_pattern、目标、计划、待办、人格或风险判断。
+4. subject_entity_id 和 object_entity_id（0 表示无 object）必须来自输入中出现的实体 ID；不能创建新实体。
+5. predicate 使用简短、稳定的小写英文键；claim_text 必须是完整、自包含、面向阅读者的结论。
+6. 不要重复或改写某个 premise 本身；没有严格成立的新结论时返回空数组。
+7. confidence 表示“在给定 premise 下该结论成立”的把握，不表示 premise 本身的真实性。只返回 JSON。
+
+输出：
+{
+  "claims": [
+    {
+      "subject_entity_id": 0,
+      "claim_type": "affiliation|relationship|constraint",
+      "predicate": "",
+      "object_entity_id": 0,
+      "claim_text": "完整、自包含的推导结论",
+      "premise_claim_ids": [1, 2],
+      "confidence": 0.8
+    }
+  ]
+}
+
+changed explicit claims：
+{changed_claims}
+
+related active explicit claims：
+{related_claims}
 """
 
 

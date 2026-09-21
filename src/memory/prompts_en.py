@@ -135,10 +135,8 @@ Core Hindsight-style narrative fact requirements:
 - For a roughly five-turn dialogue batch or a coherent multi-speaker transcript segment, usually produce 1-3 facts. Only split when the batch truly contains multiple unrelated events/topics. In most cases, do not exceed 5 facts.
 
 fact_type classification:
-- `semantic` is reusable stable knowledge or long-term information that does not depend on one particular experience, such as project structure, concept definitions, system conventions, common knowledge, a user's long-term preference, a persistent instruction, or a durable constraint. It describes what is generally true or remains valid across conversations.
-- `episodic` is a concrete experience or event that happened at a particular time, such as the user making a request in one turn, the assistant modifying or testing something, one failure or success, a decision made at a point in time, a state change, or an emotional reaction. It describes what happened on that occasion; it can still be episodic even when it concerns a long-running project.
-- The key test is whether the fact depends on one particular experience to be true, not whether its topic is long-running, important, or potentially useful later. One-off requests, recommendations, modifications, test results, decisions, and risk events are `episodic` by default. Use `semantic` only when the evidence supports knowledge or a pattern that is stable and reusable across contexts and time.
-- Do not label a fact `semantic` merely because its fact_kind is preference, risk, or decision. A preference expressed in one situation, a temporary risk, or a single decision remains `episodic`; a repeatedly observed or explicitly long-term preference, constraint, or instruction may be `semantic`.
+- `fact_type` describes the fact's primary semantic role. It must be one of preference, decision, request, recommendation, action, commitment, open_question, risk, error, context, instruction, or other.
+- Choose the one category that best represents the fact's memory value. Do not use `open_question` merely because the assistant did not answer or the user's wording is vague.
 
 Temporal fidelity requirements:
 - Preserve sequence and ordering expressions exactly when they affect meaning: first, first time, second, previous, next, later, earlier, before, after, once, again, subsequent, prior, last, most recent, and similar wording. Do not paraphrase away order. For example, keep "serviced for the first time on March 15" rather than reducing it to "had a good service experience".
@@ -162,12 +160,11 @@ Rules:
 6. Use only the dialogue evidence. Do not invent completion, intent, or reasons.
 7. Keep assistant recommendations that contain concrete future-answerable items inside the relevant exchange narrative, and include whether the user accepted, rejected, hesitated, or added constraints when supported.
 8. priority is 0-100. Keep only facts worth at least 60.
-9. fact_type must be semantic or episodic, using the stable-knowledge/long-term-information versus one-specific-event boundary above.
-10. fact_kind must be preference, decision, request, recommendation, action, commitment, open_question, risk, error, context, instruction, or other.
-11. Do not output short facts like "the user said X" or "the assistant suggested Y". If deleting the topic background, reason, disagreement, or conclusion would make the text a vague short note, add those details back; if the dialogue does not support them, omit the fact.
-12. Do not store assistant pleasantries, generic closings, or low-information encouragement as standalone facts, e.g. "hope this helps", "let me know if you have other questions", "okay", or "you're welcome", unless they explicitly change a decision, commitment, or next step.
-13. keywords must be short retrieval terms: entities, topics, symptoms, plans, constraints, decisions, and important time/order anchors. For time-sensitive facts, include the original or resolved time phrase such as "March 15 2023", "first service", "3/22", "last Saturday", or "two months ago". Do not put full sentences, pleasantries, filler, generic encouragement, or phrases like "hope this method helps you" into keywords.
-14. Return JSON only. No markdown.
+9. fact_type must be preference, decision, request, recommendation, action, commitment, open_question, risk, error, context, instruction, or other.
+10. Do not output short facts like "the user said X" or "the assistant suggested Y". If deleting the topic background, reason, disagreement, or conclusion would make the text a vague short note, add those details back; if the dialogue does not support them, omit the fact.
+11. Do not store assistant pleasantries, generic closings, or low-information encouragement as standalone facts, e.g. "hope this helps", "let me know if you have other questions", "okay", or "you're welcome", unless they explicitly change a decision, commitment, or next step.
+12. keywords must be short retrieval terms: entities, topics, symptoms, plans, constraints, decisions, and important time/order anchors. For time-sensitive facts, include the original or resolved time phrase such as "March 15 2023", "first service", "3/22", "last Saturday", or "two months ago". Do not put full sentences, pleasantries, filler, generic encouragement, or phrases like "hope this method helps you" into keywords.
+13. Return JSON only. No markdown.
 
 entity_claim_signal rules:
 - `entity_claim_signal` is a structured evidence hint from this fact for entity claims in the personal world model. It is not a final claim and must not decide its relation to existing claims.
@@ -197,8 +194,7 @@ Output schema:
       "primary_entity": {"name": "the single primary entity of this fact", "type": "PERSON|ORGANIZATION|LOCATION|PRODUCT|PROJECT|TECHNOLOGY|CONCEPT|TOPIC|PREFERENCE|OTHER"},
       "fact_root_topic": "stable product/project/long-running issue root topic",
       "fact_aspect_topic": "specific aspect discussed by this fact",
-      "fact_type": "semantic|episodic; semantic=reusable stable knowledge or long-term information, episodic=an event or state change tied to a specific experience",
-      "fact_kind": "preference|decision|request|recommendation|action|commitment|open_question|risk|error|context|instruction|other",
+      "fact_type": "preference|decision|request|recommendation|action|commitment|open_question|risk|error|context|instruction|other",
       "priority": 80,
       "event_time_key": "real-world event occurrence time or representative temporal anchor derived from the dialogue time anchor and fact content; empty when it cannot be determined",
       "time_confidence": "explicit|inferred_from_turn|unknown; explicit evidence, resolved from the segment Time and a relative expression, or undetermined",
@@ -379,6 +375,42 @@ candidate entity and claim grouping hint:
 
 episode evidence facts:
 {facts}
+"""
+
+
+DERIVED_ENTITY_CLAIM_EXTRACTION_PROMPT_EN = """You produce direct derived claims for a personal world model.
+
+The input has two sections. `changed_explicit_claims` are explicit claims for the current subject that changed after this incoming fact batch. `related_active_explicit_claims` are historical active explicit claims loaded from the database because they concern this subject or its directly linked entities. Produce only conclusions that follow directly and necessarily from those claims.
+
+A derived claim is not pattern induction, common-sense completion, or a plausible guess. It must be explainable as “because premise A (and premise B), conclusion C.” For example, “Alice reports_to Bob” can imply “Bob manages Alice”; “Alice member_of Team Alpha” plus “Team Alpha affiliated_with Company X” can cautiously imply “Alice affiliated_with Company X.”
+
+Rules:
+1. Use only the supplied premise_claim_ids; do not use external knowledge or unstated background.
+2. Every candidate must cite at least one premise from `changed_explicit_claims`, and every cited ID must be in the input.
+3. Only affiliation, relationship, and constraint claim types are allowed. Never create identity_profile, preference, behavior_pattern, goals, plans, work items, personality labels, or risk judgments.
+4. subject_entity_id and object_entity_id (0 means no object) must be entity IDs appearing in the input. Never create an entity.
+5. Use concise stable lowercase predicates and a complete, self-contained reader-facing claim_text.
+6. Do not repeat or merely paraphrase a premise. Return an empty list when no strictly entailed new conclusion exists.
+7. confidence is confidence that the conclusion follows given the premises, not confidence that the premises are true. Return JSON only.
+
+Output:
+{
+  "claims": [{
+    "subject_entity_id": 0,
+    "claim_type": "affiliation|relationship|constraint",
+    "predicate": "",
+    "object_entity_id": 0,
+    "claim_text": "complete self-contained derived conclusion",
+    "premise_claim_ids": [1, 2],
+    "confidence": 0.8
+  }]
+}
+
+changed explicit claims:
+{changed_claims}
+
+related active explicit claims:
+{related_claims}
 """
 
 
