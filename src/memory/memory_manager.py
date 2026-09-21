@@ -4157,7 +4157,7 @@ class MemoryNodeManager:
             "enabled": 1,
             "affected_claim_count": len(affected_ids),
             "seed_claim_count": 0,
-            "subject_group_count": 0,
+            "entity_group_count": 0,
             "input_claim_count": 0,
             "candidate_count": 0,
             "updated": 0,
@@ -4185,15 +4185,22 @@ class MemoryNodeManager:
         if not seed_claims:
             return report
 
-        changed_by_subject: Dict[int, List[Dict[str, Any]]] = {}
+        changed_by_entity: Dict[int, List[Dict[str, Any]]] = {}
         for claim in seed_claims:
-            subject_entity_id = int(claim.get("subject_entity_id") or 0)
-            if subject_entity_id > 0:
-                changed_by_subject.setdefault(subject_entity_id, []).append(claim)
-        report["subject_group_count"] = len(changed_by_subject)
-        for subject_entity_id, changed_claims in changed_by_subject.items():
+            endpoint_entity_ids = {
+                int(entity_id)
+                for entity_id in (
+                    claim.get("subject_entity_id"),
+                    claim.get("object_entity_id"),
+                )
+                if str(entity_id or "").strip().isdigit() and int(entity_id) > 0
+            }
+            for entity_id in endpoint_entity_ids:
+                changed_by_entity.setdefault(entity_id, []).append(claim)
+        report["entity_group_count"] = len(changed_by_entity)
+        for entity_id, changed_claims in changed_by_entity.items():
             related_claims = self._retrieve_related_derived_explicit_claims(
-                subject_entity_id=subject_entity_id,
+                entity_id=entity_id,
                 changed_claims=changed_claims,
             )
             report["input_claim_count"] += len(changed_claims) + len(related_claims)
@@ -4204,7 +4211,7 @@ class MemoryNodeManager:
             if outcome is None:
                 report["completed"] = False
                 report["error"] = "invalid_llm_derived_claim_response"
-                report["failed_subject_entity_id"] = subject_entity_id
+                report["failed_entity_id"] = entity_id
                 return report
             report["candidate_count"] += len(outcome)
             if not outcome:
@@ -4246,35 +4253,25 @@ class MemoryNodeManager:
     def _retrieve_related_derived_explicit_claims(
         self,
         *,
-        subject_entity_id: int,
+        entity_id: int,
         changed_claims: Sequence[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
-        """Load only historical active explicit claims relevant to one subject."""
+        """Load historical active explicit claims touching the anchor entity."""
         changed_claim_ids = {
             int(claim["id"])
             for claim in changed_claims
             if str(claim.get("id") or "").strip().isdigit()
         }
-        linked_entity_ids = {int(subject_entity_id)}
-        linked_entity_ids.update({
-            int(entity_id)
-            for claim in changed_claims
-            for entity_id in (
-                claim.get("object_entity_id"),
-            )
-            if str(entity_id or "").strip().isdigit() and int(entity_id) > 0
-        })
         claims_by_id: Dict[int, Dict[str, Any]] = {}
-        for entity_id in linked_entity_ids:
-            for claim in self._db.get_entity_claims(
-                subject_entity_id=entity_id,
-                claim_origin="explicit",
-                statuses=["active"],
-                limit=16,
-            ):
-                claim_id = int(claim["id"])
-                if claim_id not in changed_claim_ids:
-                    claims_by_id[claim_id] = claim
+        for claim in self._db.get_entity_claims(
+            entity_id=entity_id,
+            claim_origin="explicit",
+            statuses=["active"],
+            limit=32,
+        ):
+            claim_id = int(claim["id"])
+            if claim_id not in changed_claim_ids:
+                claims_by_id[claim_id] = claim
         return sorted(
             claims_by_id.values(),
             key=lambda claim: -int(claim.get("id") or 0),

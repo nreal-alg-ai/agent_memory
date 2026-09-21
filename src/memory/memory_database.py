@@ -2223,6 +2223,7 @@ class SessionDB:
     def get_entity_claims(
         self,
         *,
+        entity_id: Optional[int] = None,
         subject_entity_id: Optional[int] = None,
         claim_type: Optional[str] = None,
         claim_origin: Optional[str] = None,
@@ -2232,6 +2233,9 @@ class SessionDB:
     ) -> List[Dict[str, Any]]:
         clauses: List[str] = []
         params: List[Any] = []
+        if entity_id is not None:
+            clauses.append("(subject_entity_id = ? OR object_entity_id = ?)")
+            params.extend((int(entity_id), int(entity_id)))
         for column, value in (
             ("subject_entity_id", subject_entity_id),
             ("claim_type", claim_type),
