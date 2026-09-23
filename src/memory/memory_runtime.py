@@ -761,7 +761,7 @@ class MemoryRuntime:
         units: Sequence[MemoryUnit],
     ) -> Tuple[List[Dict[str, Any]], str]:
         """Expand buffered units into normalized raw segments for storage."""
-        normalized: List[Dict[str, Any]] = []
+        normalized: List[Tuple[Dict[str, Any], int]] = []
         raw_segments = [
             dict(segment)
             for unit in units
@@ -779,16 +779,46 @@ class MemoryRuntime:
                 fallback_index=index,
             )
             if normalized_segment is not None:
-                normalized.append(normalized_segment)
-        normalized = sorted(
-            normalized,
-            key=lambda item: (
-                str(item.get("started_at") or ""),
-                str(item.get("ended_at") or ""),
-                str(item.get("speaker") or ""),
+                normalized.append((normalized_segment, index))
+        normalized.sort(
+            key=lambda entry: self._memory_raw_segment_time_order_key(
+                entry[0],
+                stable_index=entry[1],
             ),
         )
-        return normalized, self._resolve_prompt_language_from_segments(normalized)
+        ordered_segments = [item for item, _stable_index in normalized]
+        return ordered_segments, self._resolve_prompt_language_from_segments(
+            ordered_segments,
+        )
+
+    @staticmethod
+    def _memory_raw_segment_time_order_key(
+        segment: Dict[str, Any],
+        *,
+        stable_index: int,
+    ) -> Tuple[int, float, int, float, int]:
+        """Order source segments by absolute time, preserving equal-time input order.
+
+        An ambient ASR batch generally uses UTC timestamps while Realtime
+        interaction turns use local-offset timestamps.  Their strings cannot
+        be compared lexically: ``09:46+00:00`` and ``17:46+08:00`` denote the
+        same time.  Use the context manager's canonical parser and retain the
+        flattened unit order as the tie breaker, which also preserves a turn's
+        user-before-assistant source order.
+        """
+        started_at = MemoryContextManager._parse_timestamp(
+            segment.get("started_at"),
+        )
+        ended_at = MemoryContextManager._parse_timestamp(
+            segment.get("ended_at"),
+        )
+        return (
+            0 if started_at is not None else 1,
+            started_at.timestamp() if started_at is not None else float("inf"),
+            0 if ended_at is not None else 1,
+            ended_at.timestamp() if ended_at is not None else float("inf"),
+            stable_index,
+        )
 
     def _normalize_transcript_segments_for_input(
         self,

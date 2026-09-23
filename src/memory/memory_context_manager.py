@@ -1078,21 +1078,15 @@ class MemoryContextManager:
             cls.unit_timestamp(incoming_unit),
         )
 
-    @staticmethod
+    @classmethod
     def timestamp_gap_seconds(
+        cls,
         previous_end: Any,
         current_start: Any,
     ) -> Optional[float]:
         """Return the gap between two timestamp values, if both are valid."""
-        if not previous_end or not current_start:
-            return None
-        try:
-            previous = datetime.fromisoformat(
-                str(previous_end).replace("Z", "+00:00"),
-            )
-            current = datetime.fromisoformat(
-                str(current_start).replace("Z", "+00:00"),
-            )
-        except ValueError:
+        previous = cls._parse_timestamp(previous_end)
+        current = cls._parse_timestamp(current_start)
+        if previous is None or current is None:
             return None
         return (current - previous).total_seconds()
