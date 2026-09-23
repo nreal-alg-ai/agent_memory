@@ -195,6 +195,18 @@ class MemoryRuntime:
             ambient_recording_enabled=ambient_recording_enabled,
         )
 
+    def update_ambient_asr_watermark(
+        self,
+        value: Any,
+        *,
+        evaluate_episode_summary: bool = True,
+    ) -> Dict[str, Any]:
+        """Advance ambient ASR coverage and process newly released input units."""
+        self._memory_context_manager.update_ambient_asr_watermark(value)
+        return self._process_awaiting_ambient_units(
+            evaluate_episode_summary=evaluate_episode_summary,
+        )
+
     def _accept_interaction_memory_input(
         self,
         interaction_turn: Dict[str, Any],
@@ -227,10 +239,7 @@ class MemoryRuntime:
             turn["user_message"],
             turn["assistant_response"],
         )
-        unit = convert_interaction_turn_to_online_unit(
-            turn,
-            len(self._memory_context_manager.pending_unit_snapshot()) + 1,
-        )
+        unit = convert_interaction_turn_to_online_unit(turn)
         append_report = self._append_memory_input_unit(
             unit,
             ambient_recording_enabled=ambient_recording_enabled,
@@ -254,12 +263,6 @@ class MemoryRuntime:
         )
         if not normalized_segments:
             return {"queued": False, "reason": "empty_transcript_batch"}
-        for normalized_segment in normalized_segments:
-            self._memory_context_manager.update_ambient_asr_watermark(
-                normalized_segment.get("ended_at")
-                or normalized_segment.get("started_at"),
-            )
-
         self._transcript_ambient_recording_enabled = bool(
             ambient_recording_enabled
         )
@@ -299,6 +302,21 @@ class MemoryRuntime:
                 return {
                     "queued": queued,
                     "reason": str(append_report.get("reason") or "queue_rejected"),
+                }
+        if ambient_recording_enabled:
+            for normalized_segment in normalized_segments:
+                self._memory_context_manager.update_ambient_asr_watermark(
+                    normalized_segment.get("ended_at")
+                    or normalized_segment.get("started_at"),
+                )
+            drain_report = self._process_awaiting_ambient_units(
+                evaluate_episode_summary=True,
+            )
+            queued = bool(drain_report.get("queued")) or queued
+            if not drain_report.get("accepted"):
+                return {
+                    "queued": queued,
+                    "reason": str(drain_report.get("reason") or "queue_rejected"),
                 }
 
         return {
@@ -358,15 +376,68 @@ class MemoryRuntime:
         evaluate_episode_summary: bool = True,
     ) -> Dict[str, Any]:
         """Append one normalized input unit to the shared semantic buffer."""
-        decision, finalized_units = (
-            self._memory_context_manager.insert_incoming_unit(
-                unit,
-                ambient_recording_enabled,
-            )
+        decision, finalized_units = self._memory_context_manager.insert_incoming_unit(
+            unit,
+            ambient_recording_enabled,
         )
+        return self._handle_memory_context_boundary(
+            unit,
+            decision=decision,
+            finalized_units=finalized_units,
+            evaluate_episode_summary=evaluate_episode_summary,
+        )
+
+    def _process_awaiting_ambient_units(
+        self,
+        *,
+        evaluate_episode_summary: bool,
+        force: bool = False,
+    ) -> Dict[str, Any]:
+        """Submit boundary results released after ambient ASR coverage advances."""
+        queued = False
+        last_reason = ""
+        for unit, decision, finalized_units in (
+            self._memory_context_manager.process_awaiting_ambient_units(
+                force=force,
+            )
+        ):
+            append_report = self._handle_memory_context_boundary(
+                unit,
+                decision=decision,
+                finalized_units=finalized_units,
+                evaluate_episode_summary=evaluate_episode_summary,
+            )
+            queued = bool(append_report.get("queued")) or queued
+            if not append_report.get("accepted"):
+                return {
+                    "accepted": False,
+                    "queued": queued,
+                    "reason": str(append_report.get("reason") or "queue_rejected"),
+                }
+            if append_report.get("queued"):
+                last_reason = str(append_report.get("reason") or "")
+        return {
+            "accepted": True,
+            "queued": queued,
+            "reason": last_reason,
+        }
+
+    def _handle_memory_context_boundary(
+        self,
+        unit: MemoryUnit,
+        *,
+        decision: Any,
+        finalized_units: Sequence[MemoryUnit],
+        evaluate_episode_summary: bool,
+    ) -> Dict[str, Any]:
+        """Log one boundary decision and submit its finalized prefix, if any."""
         self._log_memory_context_manager_decision(unit, decision=decision)
         if not decision.should_finalize:
-            return {"accepted": True, "queued": False, "reason": ""}
+            return {
+                "accepted": True,
+                "queued": False,
+                "reason": str(decision.reason or ""),
+            }
         store_report = self._submit_memory_input_units(
             finalized_units,
             reason=decision.reason,
@@ -405,6 +476,16 @@ class MemoryRuntime:
                     "queued": queued,
                     "reason": str(append_report.get("reason") or "queue_rejected"),
                 }
+        drain_report = self._process_awaiting_ambient_units(
+            evaluate_episode_summary=evaluate_episode_summary,
+            force=True,
+        )
+        queued = bool(drain_report.get("queued")) or queued
+        if not drain_report.get("accepted"):
+            return {
+                "queued": queued,
+                "reason": str(drain_report.get("reason") or "queue_rejected"),
+            }
         store_report = self._trigger_memory_store_task_for_pending_memory_input(
             reason=reason,
             evaluate_episode_summary=evaluate_episode_summary,
@@ -519,11 +600,12 @@ class MemoryRuntime:
         speaker_labels = raw.get("speaker_labels") or []
         resolved_reason = str(reason or getattr(decision, "reason", "append"))
         self._logger.info(
-            "transcript segmentation decision unit=%s reason=%s raw_segment_count=%s "
+            "memory context decision started_at=%s ended_at=%s reason=%s raw_segment_count=%s "
             "token_count=%s speakers=%s cut_probability=%s score=%s "
             "semantic_surprise=%s cohesion_drop=%s time_gap_seconds=%s "
             "scoring_mode=%s rolling_tail_units=%s rolling_tail_tokens=%s text=%s",
-            unit.index,
+            self._memory_context_manager.unit_timestamp(unit),
+            self._memory_context_manager.unit_end_timestamp(unit),
             resolved_reason,
             len(raw_segments),
             unit.token_count,

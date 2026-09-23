@@ -344,6 +344,8 @@ def replay_context_into_memory(
     reflect_runs = 0
     reflect_reports: List[Dict[str, Any]] = []
     last_reflected_day = 0
+    last_turn_timestamp: Optional[datetime] = None
+    ambient_watermark_updates = 0
     every_days = max(1, int(reflect_every_days or 1))
 
     for day_index, day in enumerate(days, 1):
@@ -365,7 +367,12 @@ def replay_context_into_memory(
                     f"date:{day['date_text']}",
                     f"day_index:{day_index}",
                 ],
+                # Exercise the delayed-ASR path: each interaction stays in
+                # the context manager's awaiting buffer until this benchmark
+                # advances the simulated ambient-ASR watermark.
+                ambient_recording_enabled=True,
             )
+            last_turn_timestamp = turn_timestamp
             if store_report.get("queued"):
                 store_batches += 1
 
@@ -373,6 +380,16 @@ def replay_context_into_memory(
             day_index % every_days == 0 or day_index == len(days)
         )
         if should_reflect:
+            # Reflection creates an explicit partial boundary.  Advance
+            # coverage through the final turn of this day before flushing, so
+            # the flush does not need to force-release delayed input.
+            watermark_report = runtime.update_ambient_asr_watermark(
+                last_turn_timestamp,
+                evaluate_episode_summary=False,
+            )
+            ambient_watermark_updates += 1
+            if watermark_report.get("queued"):
+                store_batches += 1
             # Facts are filtered by their local DB created_at date. Keep this
             # wall-clock timestamp separate from the benchmark dialogue time.
             reflect_timestamp = datetime.now().astimezone().isoformat()
@@ -405,10 +422,21 @@ def replay_context_into_memory(
             reflect_reports.append({
                 "day_index": day_index,
                 "date": day["date_text"],
+                "ambient_watermark": watermark_report,
                 "episode_summary": episode_summary_submit,
                 "report": reflect_submit,
             })
 
+    # The normal benchmark path reaches this point only after every
+    # interaction has entered the runtime.  One final watermark advance
+    # releases all remaining delayed input through the same append path.
+    if last_turn_timestamp is not None:
+        watermark_report = runtime.update_ambient_asr_watermark(
+            last_turn_timestamp,
+        )
+        ambient_watermark_updates += 1
+        if watermark_report.get("queued"):
+            store_batches += 1
     runtime.flush_pending_memory_inputs()
 
     return {
@@ -416,6 +444,7 @@ def replay_context_into_memory(
         "turn_pairs": pair_count,
         "store_batches": store_batches,
         "reflect_runs": reflect_runs,
+        "ambient_watermark_updates": ambient_watermark_updates,
         "last_reflected_day": last_reflected_day,
         "reflect_reports": reflect_reports,
         "db_counts": db_counts(db),

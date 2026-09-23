@@ -18,7 +18,6 @@ INTERACTION_TOKEN_RE = re.compile(r"[\u4e00-\u9fff]|[A-Za-z0-9_.$'-]+|[^\s]")
 
 @dataclass
 class FactExtractionBoundaryDecision:
-    unit_index: int
     reason: str
     should_finalize: bool = False
     cut_probability: Optional[float] = None
@@ -43,7 +42,6 @@ class FactExtractionBoundaryDecision:
 
 @dataclass
 class MemoryUnit:
-    index: int
     text: str
     token_count: int
     timestamp: str = ""
@@ -323,7 +321,6 @@ def build_transcript_aggregation_config(
 
 def convert_interaction_turn_to_online_unit(
     turn: Dict[str, Any],
-    index: int,
 ) -> MemoryUnit:
     """Normalize one interaction turn into one storable segmenter unit."""
     user_message = _compact_whitespace(turn.get("user_message") or "")
@@ -346,7 +343,6 @@ def convert_interaction_turn_to_online_unit(
             "started_at": timestamp,
             "ended_at": timestamp,
             "tags": tags,
-            "turn_index": index,
         })
     if assistant_response:
         raw_segments.append({
@@ -355,10 +351,8 @@ def convert_interaction_turn_to_online_unit(
             "started_at": timestamp,
             "ended_at": timestamp,
             "tags": tags,
-            "turn_index": index,
         })
     return MemoryUnit(
-        index=index,
         text=text,
         token_count=_estimate_interaction_token_count(text),
         timestamp=timestamp,
@@ -380,7 +374,6 @@ class TranscriptUnitAssembler:
         self.config = config or TranscriptAggregationConfig()
         self._current_segments: List[Dict[str, Any]] = []
         self._current_token_count = 0
-        self._next_unit_index = 1
 
     def append_new_segment(self, segment: Dict[str, Any]) -> Optional[MemoryUnit]:
         """Append one transcript span and return the prior completed unit."""
@@ -433,7 +426,6 @@ class TranscriptUnitAssembler:
             )
         )
         unit = MemoryUnit(
-            index=self._next_unit_index,
             text=text,
             token_count=max(1, self._current_token_count),
             timestamp=self._segment_started_at(raw_segments[0]),
@@ -443,7 +435,6 @@ class TranscriptUnitAssembler:
                 "speaker_labels": speaker_labels,
             },
         )
-        self._next_unit_index += 1
         self._current_segments = []
         self._current_token_count = 0
         return unit
@@ -555,6 +546,7 @@ class MemoryContextManager:
             maxlen=max(1, self.config.surprise_history_window),
         )
         self._pending_buffer: List[ActiveUnit] = []
+        self._awaiting_ambient_buffer: List[MemoryUnit] = []
         self._ambient_asr_watermark: Optional[datetime] = None
         self.episode_summary_config = episode_summary_config or EpisodeSummaryConfig()
         self._episode_started_at: Optional[datetime] = None
@@ -575,17 +567,32 @@ class MemoryContextManager:
             key=lambda item: self._unit_time_order_key(item.unit),
         )
 
+    def _insert_awaiting_ambient_unit(self, unit: MemoryUnit) -> None:
+        """Retain one input until ambient ASR has covered its event time."""
+        self._awaiting_ambient_buffer.append(unit)
+        self._awaiting_ambient_buffer.sort(key=self._unit_time_order_key)
+
     def insert_incoming_unit(
         self,
         incoming_unit: MemoryUnit,
         ambient_recording_enabled: bool = False,
     ) -> Tuple[FactExtractionBoundaryDecision, List[MemoryUnit]]:
-        """Atomically evaluate a new unit and retain it in the pending buffer.
+        """Evaluate one unit and retain it in the pending context buffer.
 
-        On a boundary, the returned ``pending_units`` are the completed prefix
-        that existed before ``incoming_unit``.  The incoming unit has already
-        become the first item of the next pending buffer.
+        Ambient input whose event time has not yet been covered by ASR is
+        retained separately.  Once the watermark advances,
+        :meth:`process_awaiting_ambient_units` feeds it back through this
+        same method, preserving one canonical boundary path.
         """
+        if (
+            ambient_recording_enabled
+            and not self._ambient_asr_covers_unit(incoming_unit)
+        ):
+            self._insert_awaiting_ambient_unit(incoming_unit)
+            return FactExtractionBoundaryDecision(
+                reason="awaiting_ambient_asr_watermark",
+            ), []
+
         incoming_embedding = self.embed_unit(incoming_unit).embedding
         decision = self._evaluate_incoming_unit(
             incoming_unit,
@@ -607,13 +614,45 @@ class MemoryContextManager:
         ):
             self._ambient_asr_watermark = parsed
 
+    def process_awaiting_ambient_units(
+        self,
+        *,
+        force: bool = False,
+    ) -> List[Tuple[MemoryUnit, FactExtractionBoundaryDecision, List[MemoryUnit]]]:
+        """Process watermark-covered waiting units through ``insert_incoming_unit``.
+
+        ``force`` is reserved for an explicit runtime flush, when the caller
+        intentionally accepts the remaining ASR-delay risk rather than
+        leaving an input unit unpersisted.
+        """
+        processed: List[
+            Tuple[MemoryUnit, FactExtractionBoundaryDecision, List[MemoryUnit]]
+        ] = []
+        while self._awaiting_ambient_buffer:
+            unit = self._awaiting_ambient_buffer[0]
+            if not force and not self._ambient_asr_covers_unit(unit):
+                break
+            self._awaiting_ambient_buffer.pop(0)
+            decision, finalized_units = self.insert_incoming_unit(
+                unit,
+                ambient_recording_enabled=not force,
+            )
+            processed.append((unit, decision, finalized_units))
+        return processed
+
+    def _ambient_asr_covers_unit(self, unit: MemoryUnit) -> bool:
+        if self._ambient_asr_watermark is None:
+            return False
+        ended_at = self._parse_timestamp(self.unit_end_timestamp(unit))
+        return ended_at is not None and ended_at <= self._ambient_asr_watermark
+
     def pending_unit_snapshot(self) -> List[MemoryUnit]:
         """Return a shallow copy of the current pending online units."""
         return [item.unit for item in self._pending_buffer]
 
     def has_pending_units(self) -> bool:
         """Return whether the segmenter has units waiting for storage."""
-        return bool(self._pending_buffer)
+        return bool(self._pending_buffer or self._awaiting_ambient_buffer)
 
     def clear_pending_units(self) -> None:
         """Clear units after the corresponding memory task was queued."""
@@ -690,7 +729,6 @@ class MemoryContextManager:
         )
         if not active_units:
             decision = FactExtractionBoundaryDecision(
-                unit_index=self.unit_index(incoming_unit),
                 reason="start_segment",
                 prospective_tokens=self.unit_token_count(incoming_unit),
                 prospective_units=1,
@@ -702,7 +740,6 @@ class MemoryContextManager:
             return self._apply_ambient_finalize_gate(
                 should_finalize=True,
                 decision=FactExtractionBoundaryDecision(
-                    unit_index=self.unit_index(incoming_unit),
                     reason=existing_capacity_reason,
                     prospective_tokens=sum(
                         self.unit_token_count(item) for item in active_units
@@ -717,7 +754,6 @@ class MemoryContextManager:
             return self._apply_ambient_finalize_gate(
                 should_finalize=True,
                 decision=FactExtractionBoundaryDecision(
-                    unit_index=self.unit_index(incoming_unit),
                     reason="time_gap",
                     prospective_tokens=sum(
                         self.unit_token_count(item) for item in active_units
@@ -738,7 +774,6 @@ class MemoryContextManager:
             and incoming_token_count < minimum_scoring_tokens
         ):
             return FactExtractionBoundaryDecision(
-                unit_index=self.unit_index(incoming_unit),
                 reason="short_incoming_append",
                 prospective_tokens=(
                     sum(self.unit_token_count(item) for item in active_units)
@@ -757,7 +792,6 @@ class MemoryContextManager:
             item.embedding is None for item in active
         ):
             return FactExtractionBoundaryDecision(
-                unit_index=self.unit_index(incoming_unit),
                 reason="embedding_unavailable",
                 prospective_tokens=sum(
                     self.unit_token_count(item) for item in active_units
@@ -942,7 +976,6 @@ class MemoryContextManager:
         self.surprise_history.append(float(semantic_surprise))
 
         return FactExtractionBoundaryDecision(
-            unit_index=self.unit_index(incoming.unit),
             reason="score",
             cut_probability=cut_probability,
             score=score,
@@ -1002,10 +1035,6 @@ class MemoryContextManager:
         return _estimate_interaction_token_count(MemoryContextManager.unit_text(unit))
 
     @staticmethod
-    def unit_index(unit: Any) -> int:
-        return int(getattr(unit, "index", 0) or 0)
-
-    @staticmethod
     def unit_timestamp(unit: Any) -> str:
         return _to_timestamp_text(getattr(unit, "timestamp", "")) or ""
 
@@ -1023,13 +1052,12 @@ class MemoryContextManager:
             return None
 
     @classmethod
-    def _unit_time_order_key(cls, unit: Any) -> Tuple[int, float, int]:
-        """Sort known timestamps first and preserve index order as fallback."""
+    def _unit_time_order_key(cls, unit: Any) -> Tuple[int, float]:
+        """Sort known timestamps first; stable sorting preserves arrival order."""
         parsed = cls._parse_timestamp(cls.unit_timestamp(unit))
         return (
             0 if parsed is not None else 1,
             parsed.timestamp() if parsed is not None else float("inf"),
-            cls.unit_index(unit),
         )
 
     @classmethod
