@@ -17,7 +17,7 @@ INTERACTION_TOKEN_RE = re.compile(r"[\u4e00-\u9fff]|[A-Za-z0-9_.$'-]+|[^\s]")
 
 
 @dataclass
-class SegmentDecision:
+class FactExtractionBoundaryDecision:
     unit_index: int
     reason: str
     should_finalize: bool = False
@@ -42,7 +42,7 @@ class SegmentDecision:
 
 
 @dataclass
-class OnlineSegmentUnit:
+class MemoryUnit:
     index: int
     text: str
     token_count: int
@@ -58,7 +58,7 @@ class ActiveUnit:
 
 
 @dataclass
-class OnlineSegmentationConfig:
+class MemoryContextMangerConfig:
     threshold: float = 0.60
     bias: float = -1.10
     surprise_history_window: int = 64
@@ -89,7 +89,7 @@ class EpisodeSummaryConfig:
 
 
 @dataclass
-class EpisodeSummaryDecision:
+class EpisodeSummaryBoundaryDecision:
     should_trigger: bool = False
     reason: str = "append"
     accumulated_tokens: int = 0
@@ -146,7 +146,7 @@ def _linear(value: float, start: float, end: float, low: float, high: float) -> 
     return low + ratio * (high - low)
 
 
-def length_pressure(token_count: int, config: OnlineSegmentationConfig) -> float:
+def length_pressure(token_count: int, config: MemoryContextMangerConfig) -> float:
     min_tokens = max(1, int(config.min_pending_tokens))
     max_tokens = max(min_tokens + 1, int(config.max_pending_tokens))
     length = float(max(0, token_count))
@@ -173,18 +173,8 @@ def turn_count_pressure(unit_count: int) -> float:
 
 def _build_online_segmentation_config(
     segmentation_config: Dict[str, Any],
-    *,
-    max_pending_turns_key: str,
-    max_pending_turns_default: int,
-    max_pending_tokens_key: str,
-    max_pending_tokens_default: int,
-    min_pending_tokens_key: str,
-    min_pending_tokens_default: int,
-    min_pending_turns_key: str,
-    min_pending_turns_default: int,
-    enforce_min_pending_tokens: bool = False,
-) -> OnlineSegmentationConfig:
-    """Build one semantic segmenter configuration from a source-specific mapping."""
+) -> MemoryContextMangerConfig:
+    """Build the shared memory-input semantic segmentation configuration."""
     def config_int(key: str, default: int) -> int:
         value = segmentation_config.get(key)
         if value in (None, ""):
@@ -192,7 +182,7 @@ def _build_online_segmentation_config(
         return int(value)
 
     max_gap = segmentation_config.get("max_time_gap_seconds")
-    return OnlineSegmentationConfig(
+    return MemoryContextMangerConfig(
         threshold=float(segmentation_config.get("threshold", 0.60)),
         bias=float(segmentation_config.get("bias", -1.10)),
         surprise_history_window=max(
@@ -218,29 +208,31 @@ def _build_online_segmentation_config(
         ),
         max_pending_turns=max(
             1,
-            config_int(max_pending_turns_key, max_pending_turns_default),
+            config_int("max_pending_units", 40),
         ),
         max_pending_tokens=max(
             1,
-            config_int(max_pending_tokens_key, max_pending_tokens_default),
+            config_int("max_pending_tokens", 1000),
         ),
         max_pending_chars=max(
             0,
-            config_int("max_pending_transcript_chars", 0),
+            config_int("max_pending_chars", 0),
         ),
         min_pending_tokens=max(
             1,
-            config_int(min_pending_tokens_key, min_pending_tokens_default),
+            config_int("min_pending_tokens", 200),
         ),
         min_pending_turns=max(
             1,
-            config_int(min_pending_turns_key, min_pending_turns_default),
+            config_int("min_pending_units", 4),
         ),
         min_segment_override_probability=float(
             segmentation_config.get("min_segment_override_probability", 0.90),
         ),
         max_time_gap_seconds=float(-1.0 if max_gap in (None, "") else max_gap),
-        enforce_min_pending_tokens=bool(enforce_min_pending_tokens),
+        enforce_min_pending_tokens=bool(
+            segmentation_config.get("enforce_min_pending_tokens", True)
+        ),
         rolling_window_enabled=bool(
             segmentation_config.get("rolling_window_enabled", False),
         ),
@@ -257,68 +249,66 @@ def _build_online_segmentation_config(
 
 def build_online_segmentation_config(
     runtime_config: Dict[str, Any],
-) -> OnlineSegmentationConfig:
-    """Build the assistant-wakeup semantic segmentation configuration."""
-    segmentation_config = runtime_config.get("assistant_wakeup_segmentation")
+) -> MemoryContextMangerConfig:
+    """Build the shared semantic segmentation configuration for memory input."""
+    memory_input_config = runtime_config.get("memory_context_manager")
+    if not isinstance(memory_input_config, dict):
+        memory_input_config = {}
+    segmentation_config = memory_input_config.get("fact_extraction")
     if not isinstance(segmentation_config, dict):
         segmentation_config = {}
-    return _build_online_segmentation_config(
-        segmentation_config,
-        max_pending_turns_key="max_pending_interaction_turns",
-        max_pending_turns_default=5,
-        max_pending_tokens_key="max_pending_interaction_tokens",
-        max_pending_tokens_default=500,
-        min_pending_tokens_key="min_pending_interaction_tokens",
-        min_pending_tokens_default=100,
-        min_pending_turns_key="min_pending_interaction_turns",
-        min_pending_turns_default=2,
-    )
+    return _build_online_segmentation_config(segmentation_config)
 
 
-def build_transcript_segmentation_config(
+def build_episode_summary_config(
     runtime_config: Dict[str, Any],
-) -> OnlineSegmentationConfig:
-    """Build the all-day-recording semantic segmentation configuration."""
-    segmentation_config = runtime_config.get("allday_recording_segmentation")
-    if not isinstance(segmentation_config, dict):
-        segmentation_config = {}
-    return _build_online_segmentation_config(
-        segmentation_config,
-        max_pending_turns_key="max_pending_transcript_units",
-        max_pending_turns_default=80,
-        max_pending_tokens_key="max_pending_transcript_tokens",
-        max_pending_tokens_default=2000,
-        min_pending_tokens_key="min_pending_transcript_tokens",
-        min_pending_tokens_default=500,
-        min_pending_turns_key="min_pending_transcript_units",
-        min_pending_turns_default=4,
-        enforce_min_pending_tokens=True,
+) -> EpisodeSummaryConfig:
+    """Build episode-summary limits from the shared memory-input settings."""
+    memory_input_config = runtime_config.get("memory_context_manager")
+    if not isinstance(memory_input_config, dict):
+        memory_input_config = {}
+    episode_summary_config = memory_input_config.get("episode_summary")
+    if not isinstance(episode_summary_config, dict):
+        episode_summary_config = {}
+    return EpisodeSummaryConfig(
+        max_duration_seconds=max(
+            0.0,
+            float(episode_summary_config.get("max_duration_seconds", 1800.0)),
+        ),
+        max_tokens=max(
+            0,
+            int(episode_summary_config.get("max_tokens", 6000)),
+        ),
+        min_tokens_for_duration=max(
+            0,
+            int(episode_summary_config.get("min_tokens_for_duration", 1000)),
+        ),
     )
 
 
 def build_transcript_aggregation_config(
     runtime_config: Dict[str, Any],
 ) -> TranscriptAggregationConfig:
-    """Build VAD-fragment aggregation rules for all-day transcript input."""
-    segmentation_config = runtime_config.get("allday_recording_segmentation")
-    if not isinstance(segmentation_config, dict):
-        segmentation_config = {}
+    """Build transcript VAD-fragment aggregation from shared input settings."""
+    aggregation_config = runtime_config.get("transcript_unit_aggregation")
+    if not isinstance(aggregation_config, dict):
+        aggregation_config = {}
     return TranscriptAggregationConfig(
         max_gap_seconds=float(
-            segmentation_config.get("segment_merge_max_gap_seconds", 1.0)
+            aggregation_config.get("segment_merge_max_gap_seconds", 1.0)
         ),
         min_transcript_unit_tokens=max(
             1,
-            int(segmentation_config.get("min_transcript_unit_tokens", 20)),
+            int(aggregation_config.get("min_transcript_unit_tokens", 20)),
         ),
         max_transcript_unit_tokens=max(
             1,
-            int(segmentation_config.get("max_transcript_unit_tokens", 120)),
+            int(aggregation_config.get("max_transcript_unit_tokens", 120)),
         ),
         max_transcript_unit_duration_seconds=max(
             0.0,
             float(
-                segmentation_config.get(
+                aggregation_config.get(
                     "max_transcript_unit_duration_seconds",
                     20.0,
                 )
@@ -326,7 +316,7 @@ def build_transcript_aggregation_config(
         ),
         short_fragment_max_tokens=max(
             1,
-            int(segmentation_config.get("short_fragment_max_tokens", 8)),
+            int(aggregation_config.get("short_fragment_max_tokens", 8)),
         ),
     )
 
@@ -334,7 +324,7 @@ def build_transcript_aggregation_config(
 def convert_interaction_turn_to_online_unit(
     turn: Dict[str, Any],
     index: int,
-) -> OnlineSegmentUnit:
+) -> MemoryUnit:
     """Normalize one interaction turn into one storable segmenter unit."""
     user_message = _compact_whitespace(turn.get("user_message") or "")
     assistant_response = _compact_whitespace(turn.get("assistant_response") or "")
@@ -367,7 +357,7 @@ def convert_interaction_turn_to_online_unit(
             "tags": tags,
             "turn_index": index,
         })
-    return OnlineSegmentUnit(
+    return MemoryUnit(
         index=index,
         text=text,
         token_count=_estimate_interaction_token_count(text),
@@ -392,7 +382,7 @@ class TranscriptUnitAssembler:
         self._current_token_count = 0
         self._next_unit_index = 1
 
-    def append_new_segment(self, segment: Dict[str, Any]) -> Optional[OnlineSegmentUnit]:
+    def append_new_segment(self, segment: Dict[str, Any]) -> Optional[MemoryUnit]:
         """Append one transcript span and return the prior completed unit."""
         normalized = dict(segment)
         if not self._segment_text(normalized):
@@ -407,7 +397,7 @@ class TranscriptUnitAssembler:
         self._start_unit(normalized)
         return completed
 
-    def flush(self) -> Optional[OnlineSegmentUnit]:
+    def flush(self) -> Optional[MemoryUnit]:
         """Return the final incomplete unit at an explicit input boundary."""
         return self._take_current_unit()
 
@@ -427,7 +417,7 @@ class TranscriptUnitAssembler:
             self._segment_text(segment),
         )
 
-    def _take_current_unit(self) -> Optional[OnlineSegmentUnit]:
+    def _take_current_unit(self) -> Optional[MemoryUnit]:
         if not self._current_segments:
             return None
         raw_segments = [dict(segment) for segment in self._current_segments]
@@ -442,7 +432,7 @@ class TranscriptUnitAssembler:
                 for segment in raw_segments
             )
         )
-        unit = OnlineSegmentUnit(
+        unit = MemoryUnit(
             index=self._next_unit_index,
             text=text,
             token_count=max(1, self._current_token_count),
@@ -462,7 +452,7 @@ class TranscriptUnitAssembler:
         if not self._current_segments:
             return True
         previous = self._current_segments[-1]
-        gap_seconds = OnlineSemanticSegmenter.timestamp_gap_seconds(
+        gap_seconds = MemoryContextManager.timestamp_gap_seconds(
             self._segment_ended_at(previous),
             self._segment_started_at(incoming),
         )
@@ -482,7 +472,7 @@ class TranscriptUnitAssembler:
             > self.config.max_transcript_unit_tokens
         ):
             return False
-        duration_seconds = OnlineSemanticSegmenter.timestamp_gap_seconds(
+        duration_seconds = MemoryContextManager.timestamp_gap_seconds(
             self._segment_started_at(self._current_segments[0]),
             self._segment_ended_at(incoming),
         )
@@ -550,17 +540,17 @@ class TranscriptUnitAssembler:
         return str(text or "").rstrip().endswith(("。", "！", "？", ".", "!", "?"))
 
 
-class OnlineSemanticSegmenter:
+class MemoryContextManager:
     """Embedding-based online semantic boundary detector for dialogue units."""
 
     def __init__(
         self,
         embedding_client: EmbeddingClient,
-        config: Optional[OnlineSegmentationConfig] = None,
+        config: Optional[MemoryContextMangerConfig] = None,
         episode_summary_config: Optional[EpisodeSummaryConfig] = None,
     ) -> None:
         self.embedding_client = embedding_client
-        self.config = config or OnlineSegmentationConfig()
+        self.config = config or MemoryContextMangerConfig()
         self.surprise_history: Deque[float] = deque(
             maxlen=max(1, self.config.surprise_history_window),
         )
@@ -573,7 +563,7 @@ class OnlineSemanticSegmenter:
 
     def _insert_pending_unit(
         self,
-        unit: OnlineSegmentUnit,
+        unit: MemoryUnit,
         embedding: Optional[np.ndarray],
     ) -> None:
         """Insert a unit into the pending buffer in chronological order."""
@@ -587,9 +577,9 @@ class OnlineSemanticSegmenter:
 
     def insert_incoming_unit(
         self,
-        incoming_unit: OnlineSegmentUnit,
+        incoming_unit: MemoryUnit,
         ambient_recording_enabled: bool = False,
-    ) -> Tuple[SegmentDecision, List[OnlineSegmentUnit]]:
+    ) -> Tuple[FactExtractionBoundaryDecision, List[MemoryUnit]]:
         """Atomically evaluate a new unit and retain it in the pending buffer.
 
         On a boundary, the returned ``pending_units`` are the completed prefix
@@ -617,7 +607,7 @@ class OnlineSemanticSegmenter:
         ):
             self._ambient_asr_watermark = parsed
 
-    def pending_unit_snapshot(self) -> List[OnlineSegmentUnit]:
+    def pending_unit_snapshot(self) -> List[MemoryUnit]:
         """Return a shallow copy of the current pending online units."""
         return [item.unit for item in self._pending_buffer]
 
@@ -631,8 +621,8 @@ class OnlineSemanticSegmenter:
 
     def record_stored_units(
         self,
-        units: Sequence[OnlineSegmentUnit],
-    ) -> EpisodeSummaryDecision:
+        units: Sequence[MemoryUnit],
+    ) -> EpisodeSummaryBoundaryDecision:
         """Record successfully queued units and evaluate the episode window."""
         for unit in units:
             token_count = max(0, self.unit_token_count(unit))
@@ -655,17 +645,17 @@ class OnlineSemanticSegmenter:
         self._episode_latest_at = None
         self._episode_token_count = 0
 
-    def _evaluate_episode_summary(self) -> EpisodeSummaryDecision:
+    def _evaluate_episode_summary(self) -> EpisodeSummaryBoundaryDecision:
         token_count = self._episode_token_count
         if token_count <= 0:
-            return EpisodeSummaryDecision(accumulated_tokens=token_count)
+            return EpisodeSummaryBoundaryDecision(accumulated_tokens=token_count)
         if (
             self.episode_summary_config.max_tokens > 0
             and token_count >= self.episode_summary_config.max_tokens
         ):
-            return EpisodeSummaryDecision(True, "max_tokens", token_count)
+            return EpisodeSummaryBoundaryDecision(True, "max_tokens", token_count)
         if self._episode_started_at is None or self._episode_latest_at is None:
-            return EpisodeSummaryDecision(False, "append", token_count)
+            return EpisodeSummaryBoundaryDecision(False, "append", token_count)
         elapsed_seconds = max(
             0.0,
             (self._episode_latest_at - self._episode_started_at).total_seconds(),
@@ -675,10 +665,10 @@ class OnlineSemanticSegmenter:
             and elapsed_seconds >= self.episode_summary_config.max_duration_seconds
             and token_count >= self.episode_summary_config.min_tokens_for_duration
         ):
-            return EpisodeSummaryDecision(
+            return EpisodeSummaryBoundaryDecision(
                 True, "max_duration", token_count, elapsed_seconds,
             )
-        return EpisodeSummaryDecision(False, "append", token_count, elapsed_seconds)
+        return EpisodeSummaryBoundaryDecision(False, "append", token_count, elapsed_seconds)
 
     def embed_unit(self, unit: Any) -> ActiveUnit:
         embedding = self.embedding_client.embed_text(self.unit_text(unit))
@@ -690,7 +680,7 @@ class OnlineSemanticSegmenter:
         incoming_unit: Any,
         incoming_embedding: Optional[np.ndarray],
         ambient_recording_enabled: bool = False,
-    ) -> SegmentDecision:
+    ) -> FactExtractionBoundaryDecision:
         active = list(self._pending_buffer)
         active_units = [item.unit for item in active]
         time_gap_seconds = (
@@ -699,7 +689,7 @@ class OnlineSemanticSegmenter:
             else None
         )
         if not active_units:
-            decision = SegmentDecision(
+            decision = FactExtractionBoundaryDecision(
                 unit_index=self.unit_index(incoming_unit),
                 reason="start_segment",
                 prospective_tokens=self.unit_token_count(incoming_unit),
@@ -711,7 +701,7 @@ class OnlineSemanticSegmenter:
         if existing_capacity_reason:
             return self._apply_ambient_finalize_gate(
                 should_finalize=True,
-                decision=SegmentDecision(
+                decision=FactExtractionBoundaryDecision(
                     unit_index=self.unit_index(incoming_unit),
                     reason=existing_capacity_reason,
                     prospective_tokens=sum(
@@ -726,7 +716,7 @@ class OnlineSemanticSegmenter:
         if self.time_gap_exceeded(time_gap_seconds):
             return self._apply_ambient_finalize_gate(
                 should_finalize=True,
-                decision=SegmentDecision(
+                decision=FactExtractionBoundaryDecision(
                     unit_index=self.unit_index(incoming_unit),
                     reason="time_gap",
                     prospective_tokens=sum(
@@ -747,7 +737,7 @@ class OnlineSemanticSegmenter:
             minimum_scoring_tokens > 0
             and incoming_token_count < minimum_scoring_tokens
         ):
-            return SegmentDecision(
+            return FactExtractionBoundaryDecision(
                 unit_index=self.unit_index(incoming_unit),
                 reason="short_incoming_append",
                 prospective_tokens=(
@@ -766,7 +756,7 @@ class OnlineSemanticSegmenter:
         if incoming.embedding is None or any(
             item.embedding is None for item in active
         ):
-            return SegmentDecision(
+            return FactExtractionBoundaryDecision(
                 unit_index=self.unit_index(incoming_unit),
                 reason="embedding_unavailable",
                 prospective_tokens=sum(
@@ -798,10 +788,10 @@ class OnlineSemanticSegmenter:
         self,
         *,
         should_finalize: bool,
-        decision: SegmentDecision,
+        decision: FactExtractionBoundaryDecision,
         active_units: Sequence[Any],
         ambient_recording_enabled: bool,
-    ) -> SegmentDecision:
+    ) -> FactExtractionBoundaryDecision:
         """Delay a finalized prefix until ambient ASR covers its tail.
 
         The semantic, capacity, and time-gap decision has already been made.
@@ -919,7 +909,7 @@ class OnlineSemanticSegmenter:
         self,
         active: Sequence[ActiveUnit],
         incoming: ActiveUnit,
-    ) -> SegmentDecision:
+    ) -> FactExtractionBoundaryDecision:
         active_embeddings = [item.embedding for item in active]
         active_centroid = _centroid(active_embeddings)
         recent_embedding = active[-1].embedding
@@ -951,7 +941,7 @@ class OnlineSemanticSegmenter:
         cut_probability = _sigmoid(self.config.bias + score)
         self.surprise_history.append(float(semantic_surprise))
 
-        return SegmentDecision(
+        return FactExtractionBoundaryDecision(
             unit_index=self.unit_index(incoming.unit),
             reason="score",
             cut_probability=cut_probability,
@@ -973,7 +963,7 @@ class OnlineSemanticSegmenter:
     def semantic_boundary_allowed(
         self,
         active: Sequence[ActiveUnit],
-        decision: SegmentDecision,
+        decision: FactExtractionBoundaryDecision,
     ) -> bool:
         if (decision.cut_probability or 0.0) < self.config.threshold:
             return False
@@ -1009,7 +999,7 @@ class OnlineSemanticSegmenter:
         value = getattr(unit, "token_count", None)
         if value is not None:
             return max(1, int(value))
-        return _estimate_interaction_token_count(OnlineSemanticSegmenter.unit_text(unit))
+        return _estimate_interaction_token_count(MemoryContextManager.unit_text(unit))
 
     @staticmethod
     def unit_index(unit: Any) -> int:

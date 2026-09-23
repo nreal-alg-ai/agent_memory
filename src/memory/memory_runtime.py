@@ -24,11 +24,11 @@ from .memory_manager import (
     _now_text,
     _to_timestamp_text,
 )
-from .memory_segmentation import (
-    EpisodeSummaryConfig,
-    OnlineSemanticSegmenter,
-    OnlineSegmentUnit,
+from .memory_context_manager import (
+    MemoryContextManager,
+    MemoryUnit,
     TranscriptUnitAssembler,
+    build_episode_summary_config,
     build_online_segmentation_config,
     build_transcript_aggregation_config,
     convert_interaction_turn_to_online_unit,
@@ -86,29 +86,17 @@ class MemoryRuntime:
         )
         if hasattr(self._memory_manager, "set_embedding_client"):
             self._memory_manager.set_embedding_client(self._embedding_client)
-        memory_input_segmentation_config = build_online_segmentation_config(
+        memory_context_manager_config = build_online_segmentation_config(
             runtime_config,
         )
         self._transcript_unit_assembler = TranscriptUnitAssembler(
             build_transcript_aggregation_config(runtime_config),
         )
         self._transcript_ambient_recording_enabled = False
-        episode_summary_config = runtime_config.get("episode_summary")
-        if not isinstance(episode_summary_config, dict):
-            episode_summary_config = {}
-        episode_summary_limits = EpisodeSummaryConfig(
-            max_duration_seconds=max(0.0, float(
-                episode_summary_config.get("max_duration_seconds", 1800.0)
-            )),
-            max_tokens=max(0, int(episode_summary_config.get("max_tokens", 6000))),
-            min_tokens_for_duration=max(0, int(
-                episode_summary_config.get("min_tokens_for_duration", 1000)
-            )),
-        )
-        self._memory_input_segmenter = OnlineSemanticSegmenter(
+        self._memory_context_manager = MemoryContextManager(
             self._embedding_client,
-            memory_input_segmentation_config,
-            episode_summary_limits,
+            memory_context_manager_config,
+            build_episode_summary_config(runtime_config),
         )
         self._transcript_segmentation_log_decisions = bool(
             runtime_config.get("log_segmentation_decisions", False),
@@ -241,7 +229,7 @@ class MemoryRuntime:
         )
         unit = convert_interaction_turn_to_online_unit(
             turn,
-            len(self._memory_input_segmenter.pending_unit_snapshot()) + 1,
+            len(self._memory_context_manager.pending_unit_snapshot()) + 1,
         )
         append_report = self._append_memory_input_unit(
             unit,
@@ -267,7 +255,7 @@ class MemoryRuntime:
         if not normalized_segments:
             return {"queued": False, "reason": "empty_transcript_batch"}
         for normalized_segment in normalized_segments:
-            self._memory_input_segmenter.update_ambient_asr_watermark(
+            self._memory_context_manager.update_ambient_asr_watermark(
                 normalized_segment.get("ended_at")
                 or normalized_segment.get("started_at"),
             )
@@ -353,7 +341,7 @@ class MemoryRuntime:
             )
             self._has_pending_episode_sources = False
             self._episode_tags = []
-            self._memory_input_segmenter.reset_episode_summary_window()
+            self._memory_context_manager.reset_episode_summary_window()
         else:
             report["prospective_update"] = {
                 "queued": False,
@@ -364,19 +352,19 @@ class MemoryRuntime:
 
     def _append_memory_input_unit(
         self,
-        unit: OnlineSegmentUnit,
+        unit: MemoryUnit,
         *,
         ambient_recording_enabled: bool,
         evaluate_episode_summary: bool = True,
     ) -> Dict[str, Any]:
         """Append one normalized input unit to the shared semantic buffer."""
         decision, finalized_units = (
-            self._memory_input_segmenter.insert_incoming_unit(
+            self._memory_context_manager.insert_incoming_unit(
                 unit,
                 ambient_recording_enabled,
             )
         )
-        self._log_memory_input_segmentation_decision(unit, decision=decision)
+        self._log_memory_context_manager_decision(unit, decision=decision)
         if not decision.should_finalize:
             return {"accepted": True, "queued": False, "reason": ""}
         store_report = self._submit_memory_input_units(
@@ -433,7 +421,7 @@ class MemoryRuntime:
         evaluate_episode_summary: bool = True,
     ) -> Dict[str, Any]:
         """Normalize and submit one shared semantic buffer to fact extraction."""
-        pending_units = self._memory_input_segmenter.pending_unit_snapshot()
+        pending_units = self._memory_context_manager.pending_unit_snapshot()
         if not pending_units:
             return {"queued": False, "reason": "no_pending_segments"}
         return self._submit_memory_input_units(
@@ -445,7 +433,7 @@ class MemoryRuntime:
 
     def _submit_memory_input_units(
         self,
-        units: Sequence[OnlineSegmentUnit],
+        units: Sequence[MemoryUnit],
         *,
         reason: str,
         evaluate_episode_summary: bool,
@@ -458,7 +446,7 @@ class MemoryRuntime:
         )
         if not raw_segments:
             if clear_segmenter:
-                self._memory_input_segmenter.clear_pending_units()
+                self._memory_context_manager.clear_pending_units()
             return {"queued": False, "reason": "invalid_pending_segments"}
         tags = {
             str(tag)
@@ -489,7 +477,7 @@ class MemoryRuntime:
             self._has_pending_episode_sources = True
             self._episode_prompt_language = prompt_language
             self._episode_tags = sorted(set(self._episode_tags).union(tags))
-            episode_decision = self._memory_input_segmenter.record_stored_units(
+            episode_decision = self._memory_context_manager.record_stored_units(
                 pending_units,
             )
             self._logger.info(
@@ -499,7 +487,7 @@ class MemoryRuntime:
                 len(pending_units),
             )
             if clear_segmenter:
-                self._memory_input_segmenter.clear_pending_units()
+                self._memory_context_manager.clear_pending_units()
             if evaluate_episode_summary and episode_decision.should_trigger:
                 episode_summary_report = self.trigger_memory_episode_summary(
                     reason=f"episode_{episode_decision.reason}",
@@ -516,9 +504,9 @@ class MemoryRuntime:
             "episode_summary": episode_summary_report,
         }
 
-    def _log_memory_input_segmentation_decision(
+    def _log_memory_context_manager_decision(
         self,
-        unit: OnlineSegmentUnit,
+        unit: MemoryUnit,
         *,
         decision: Optional[Any] = None,
         reason: Optional[str] = None,
@@ -688,7 +676,7 @@ class MemoryRuntime:
 
     def _normalize_units_into_memory_raw_segments(
         self,
-        units: Sequence[OnlineSegmentUnit],
+        units: Sequence[MemoryUnit],
     ) -> Tuple[List[Dict[str, Any]], str]:
         """Expand buffered units into normalized raw segments for storage."""
         normalized: List[Dict[str, Any]] = []

@@ -486,14 +486,15 @@ def prepare_runtime(
     args.recall_mode = str(
         memory_manager_config.get("recall_mode", "normal") or "normal"
     ).strip().lower()
-    segmentation_config = memory_runtime_config.setdefault(
-        "assistant_wakeup_segmentation",
+    memory_input_config = memory_runtime_config.setdefault(
+        "memory_context_manager",
         {},
     )
+    segmentation_config = memory_input_config.setdefault("fact_extraction", {})
     if args.max_pending_interaction_turns is not None:
-        segmentation_config["max_pending_interaction_turns"] = args.max_pending_interaction_turns
+        segmentation_config["max_pending_units"] = args.max_pending_interaction_turns
     if args.max_pending_interaction_tokens is not None:
-        segmentation_config["max_pending_interaction_tokens"] = args.max_pending_interaction_tokens
+        segmentation_config["max_pending_tokens"] = args.max_pending_interaction_tokens
     llm_config["llm_name"] = str(args.llm_model)
     llm_config["llm_base_url"] = str(args.llm_base_url)
     llm_config["llm_api_key"] = str(args.llm_api_key or "")
