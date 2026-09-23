@@ -346,15 +346,6 @@ def replay_context_into_memory(
     last_reflected_day = 0
     every_days = max(1, int(reflect_every_days or 1))
 
-    def flush_pending_store_turns() -> bool:
-        nonlocal store_batches
-        pending_before_flush = len(runtime.get_pending_interaction_turns())
-        stored = bool(pending_before_flush and runtime.flush_pending_memory_inputs())
-        if stored and not runtime.has_pending_interaction_turns():
-            store_batches += 1
-            return True
-        return False
-
     for day_index, day in enumerate(days, 1):
         for pair_index, (user, assistant) in enumerate(day["pairs"]):
             pair_count += 1
@@ -362,16 +353,18 @@ def replay_context_into_memory(
                 day["date"] + timedelta(seconds=pair_index),
                 seen_timestamps,
             )
-            store_report = runtime.accept_single_interaction_turn(
-                user,
-                assistant,
+            store_report = runtime.accept_memory_input(
+                interaction_turn={
+                    "user_message": user,
+                    "assistant_response": assistant,
+                    "turn_timestamp": turn_timestamp,
+                },
                 tags=[
                     "clongeval_conversation",
                     f"context_group:{group_id}",
                     f"date:{day['date_text']}",
                     f"day_index:{day_index}",
                 ],
-                turn_timestamp=turn_timestamp,
             )
             if store_report.get("queued"):
                 store_batches += 1
@@ -388,7 +381,6 @@ def replay_context_into_memory(
             )
             episode_summary_submit = runtime.trigger_memory_episode_summary(
                 reason="clongeval_reflect",
-                source_type="assistant_wakeup",
                 tags=[
                     "clongeval_conversation",
                     f"context_group:{group_id}",
@@ -402,7 +394,7 @@ def replay_context_into_memory(
             )
             if episode_input_flush:
                 store_batches += 1
-            if (reflect_submit.get("pending_interaction_flush") or {}).get("queued"):
+            if (reflect_submit.get("pending_memory_input_flush") or {}).get("queued"):
                 store_batches += 1
             if (
                 episode_summary_submit.get("queued") or reflect_submit.get("queued")
@@ -417,8 +409,7 @@ def replay_context_into_memory(
                 "report": reflect_submit,
             })
 
-    if runtime.has_pending_interaction_turns():
-        flush_pending_store_turns()
+    runtime.flush_pending_memory_inputs()
 
     return {
         "parsed_days": len(days),

@@ -20,6 +20,7 @@ INTERACTION_TOKEN_RE = re.compile(r"[\u4e00-\u9fff]|[A-Za-z0-9_.$'-]+|[^\s]")
 class SegmentDecision:
     unit_index: int
     reason: str
+    should_finalize: bool = False
     cut_probability: Optional[float] = None
     score: Optional[float] = None
     semantic_surprise: Optional[float] = None
@@ -78,6 +79,21 @@ class OnlineSegmentationConfig:
     rolling_window_enabled: bool = False
     rolling_window_tail_units: int = 0
     min_boundary_scoring_incoming_tokens: int = 0
+
+
+@dataclass
+class EpisodeSummaryConfig:
+    max_duration_seconds: float = 1800.0
+    max_tokens: int = 6000
+    min_tokens_for_duration: int = 1000
+
+
+@dataclass
+class EpisodeSummaryDecision:
+    should_trigger: bool = False
+    reason: str = "append"
+    accumulated_tokens: int = 0
+    elapsed_seconds: Optional[float] = None
 
 
 @dataclass
@@ -319,15 +335,48 @@ def convert_interaction_turn_to_online_unit(
     turn: Dict[str, Any],
     index: int,
 ) -> OnlineSegmentUnit:
-    """Normalize one interaction turn into the segmenter's unit format."""
-    text = _unit_text_from_turn(turn)
+    """Normalize one interaction turn into one storable segmenter unit."""
+    user_message = _compact_whitespace(turn.get("user_message") or "")
+    assistant_response = _compact_whitespace(turn.get("assistant_response") or "")
+    text = _unit_text_from_turn({
+        "user_message": user_message,
+        "assistant_response": assistant_response,
+    })
     timestamp = _to_timestamp_text(turn.get("turn_timestamp")) or ""
+    tags = [
+        str(tag).strip()
+        for tag in turn.get("tags") or []
+        if str(tag).strip()
+    ]
+    raw_segments: List[Dict[str, Any]] = []
+    if user_message:
+        raw_segments.append({
+            "speaker": "用户",
+            "text": user_message,
+            "started_at": timestamp,
+            "ended_at": timestamp,
+            "tags": tags,
+            "turn_index": index,
+        })
+    if assistant_response:
+        raw_segments.append({
+            "speaker": "助手",
+            "text": assistant_response,
+            "started_at": timestamp,
+            "ended_at": timestamp,
+            "tags": tags,
+            "turn_index": index,
+        })
     return OnlineSegmentUnit(
         index=index,
         text=text,
         token_count=_estimate_interaction_token_count(text),
         timestamp=timestamp,
-        raw=dict(turn),
+        ended_at=timestamp,
+        raw={
+            "raw_segments": raw_segments,
+            "input_kind": "interaction",
+        },
     )
 
 
@@ -508,50 +557,142 @@ class OnlineSemanticSegmenter:
         self,
         embedding_client: EmbeddingClient,
         config: Optional[OnlineSegmentationConfig] = None,
+        episode_summary_config: Optional[EpisodeSummaryConfig] = None,
     ) -> None:
         self.embedding_client = embedding_client
         self.config = config or OnlineSegmentationConfig()
         self.surprise_history: Deque[float] = deque(
             maxlen=max(1, self.config.surprise_history_window),
         )
-        self._pending_online_units: List[OnlineSegmentUnit] = []
-        self._pending_online_units_embedding: List[Optional[np.ndarray]] = []
+        self._pending_buffer: List[ActiveUnit] = []
+        self._ambient_asr_watermark: Optional[datetime] = None
+        self.episode_summary_config = episode_summary_config or EpisodeSummaryConfig()
+        self._episode_started_at: Optional[datetime] = None
+        self._episode_latest_at: Optional[datetime] = None
+        self._episode_token_count = 0
 
-    def append_pending_unit(
+    def _insert_pending_unit(
         self,
         unit: OnlineSegmentUnit,
         embedding: Optional[np.ndarray],
     ) -> None:
-        """Append an unit to the segmenter's pending online buffer."""
-        self._pending_online_units.append(unit)
-        self._pending_online_units_embedding.append(
-            _as_embedding_vector(embedding),
+        """Insert a unit into the pending buffer in chronological order."""
+        self._pending_buffer.append(ActiveUnit(
+            unit=unit,
+            embedding=_as_embedding_vector(embedding),
+        ))
+        self._pending_buffer.sort(
+            key=lambda item: self._unit_time_order_key(item.unit),
         )
+
+    def insert_incoming_unit(
+        self,
+        incoming_unit: OnlineSegmentUnit,
+        ambient_recording_enabled: bool = False,
+    ) -> Tuple[SegmentDecision, List[OnlineSegmentUnit]]:
+        """Atomically evaluate a new unit and retain it in the pending buffer.
+
+        On a boundary, the returned ``pending_units`` are the completed prefix
+        that existed before ``incoming_unit``.  The incoming unit has already
+        become the first item of the next pending buffer.
+        """
+        incoming_embedding = self.embed_unit(incoming_unit).embedding
+        decision = self._evaluate_incoming_unit(
+            incoming_unit,
+            incoming_embedding,
+            ambient_recording_enabled,
+        )
+        finalized_units = self.pending_unit_snapshot() if decision.should_finalize else []
+        if decision.should_finalize:
+            self.clear_pending_units()
+        self._insert_pending_unit(incoming_unit, incoming_embedding)
+        return decision, finalized_units
+
+    def update_ambient_asr_watermark(self, value: Any) -> None:
+        """Advance the latest event time known to be covered by ambient ASR."""
+        parsed = self._parse_timestamp(value)
+        if parsed is not None and (
+            self._ambient_asr_watermark is None
+            or parsed > self._ambient_asr_watermark
+        ):
+            self._ambient_asr_watermark = parsed
 
     def pending_unit_snapshot(self) -> List[OnlineSegmentUnit]:
         """Return a shallow copy of the current pending online units."""
-        return list(self._pending_online_units)
+        return [item.unit for item in self._pending_buffer]
 
     def has_pending_units(self) -> bool:
         """Return whether the segmenter has units waiting for storage."""
-        return bool(self._pending_online_units)
+        return bool(self._pending_buffer)
 
     def clear_pending_units(self) -> None:
         """Clear units after the corresponding memory task was queued."""
-        self._pending_online_units.clear()
-        self._pending_online_units_embedding.clear()
+        self._pending_buffer.clear()
+
+    def record_stored_units(
+        self,
+        units: Sequence[OnlineSegmentUnit],
+    ) -> EpisodeSummaryDecision:
+        """Record successfully queued units and evaluate the episode window."""
+        for unit in units:
+            token_count = max(0, self.unit_token_count(unit))
+            if token_count <= 0:
+                continue
+            started_at = self._parse_timestamp(self.unit_timestamp(unit))
+            ended_at = self._parse_timestamp(self.unit_end_timestamp(unit))
+            if self._episode_started_at is None and started_at is not None:
+                self._episode_started_at = started_at
+            latest_at = ended_at or started_at
+            if latest_at is not None and (
+                self._episode_latest_at is None or latest_at > self._episode_latest_at
+            ):
+                self._episode_latest_at = latest_at
+            self._episode_token_count += token_count
+        return self._evaluate_episode_summary()
+
+    def reset_episode_summary_window(self) -> None:
+        self._episode_started_at = None
+        self._episode_latest_at = None
+        self._episode_token_count = 0
+
+    def _evaluate_episode_summary(self) -> EpisodeSummaryDecision:
+        token_count = self._episode_token_count
+        if token_count <= 0:
+            return EpisodeSummaryDecision(accumulated_tokens=token_count)
+        if (
+            self.episode_summary_config.max_tokens > 0
+            and token_count >= self.episode_summary_config.max_tokens
+        ):
+            return EpisodeSummaryDecision(True, "max_tokens", token_count)
+        if self._episode_started_at is None or self._episode_latest_at is None:
+            return EpisodeSummaryDecision(False, "append", token_count)
+        elapsed_seconds = max(
+            0.0,
+            (self._episode_latest_at - self._episode_started_at).total_seconds(),
+        )
+        if (
+            self.episode_summary_config.max_duration_seconds > 0
+            and elapsed_seconds >= self.episode_summary_config.max_duration_seconds
+            and token_count >= self.episode_summary_config.min_tokens_for_duration
+        ):
+            return EpisodeSummaryDecision(
+                True, "max_duration", token_count, elapsed_seconds,
+            )
+        return EpisodeSummaryDecision(False, "append", token_count, elapsed_seconds)
 
     def embed_unit(self, unit: Any) -> ActiveUnit:
         embedding = self.embedding_client.embed_text(self.unit_text(unit))
         vector = _as_embedding_vector(embedding)
         return ActiveUnit(unit=unit, embedding=vector)
 
-    def should_finalize_pending_units(
+    def _evaluate_incoming_unit(
         self,
         incoming_unit: Any,
         incoming_embedding: Optional[np.ndarray],
-    ) -> Tuple[bool, SegmentDecision]:
-        active_units = self._pending_online_units
+        ambient_recording_enabled: bool = False,
+    ) -> SegmentDecision:
+        active = list(self._pending_buffer)
+        active_units = [item.unit for item in active]
         time_gap_seconds = (
             self.unit_time_gap_seconds(active_units[-1], incoming_unit)
             if active_units
@@ -565,27 +706,37 @@ class OnlineSemanticSegmenter:
                 prospective_units=1,
                 time_gap_seconds=time_gap_seconds,
             )
-            return False, decision
+            return decision
         existing_capacity_reason = self._pending_capacity_reason(active_units)
         if existing_capacity_reason:
-            return True, SegmentDecision(
-                unit_index=self.unit_index(incoming_unit),
-                reason=existing_capacity_reason,
-                prospective_tokens=sum(
-                    self.unit_token_count(item) for item in active_units
+            return self._apply_ambient_finalize_gate(
+                should_finalize=True,
+                decision=SegmentDecision(
+                    unit_index=self.unit_index(incoming_unit),
+                    reason=existing_capacity_reason,
+                    prospective_tokens=sum(
+                        self.unit_token_count(item) for item in active_units
+                    ),
+                    prospective_units=len(active_units),
+                    time_gap_seconds=time_gap_seconds,
                 ),
-                prospective_units=len(active_units),
-                time_gap_seconds=time_gap_seconds,
+                active_units=active_units,
+                ambient_recording_enabled=ambient_recording_enabled,
             )
         if self.time_gap_exceeded(time_gap_seconds):
-            return True, SegmentDecision(
-                unit_index=self.unit_index(incoming_unit),
-                reason="time_gap",
-                prospective_tokens=sum(
-                    self.unit_token_count(item) for item in active_units
+            return self._apply_ambient_finalize_gate(
+                should_finalize=True,
+                decision=SegmentDecision(
+                    unit_index=self.unit_index(incoming_unit),
+                    reason="time_gap",
+                    prospective_tokens=sum(
+                        self.unit_token_count(item) for item in active_units
+                    ),
+                    prospective_units=len(active_units),
+                    time_gap_seconds=time_gap_seconds,
                 ),
-                prospective_units=len(active_units),
-                time_gap_seconds=time_gap_seconds,
+                active_units=active_units,
+                ambient_recording_enabled=ambient_recording_enabled,
             )
         incoming_token_count = self.unit_token_count(incoming_unit)
         minimum_scoring_tokens = max(
@@ -596,7 +747,7 @@ class OnlineSemanticSegmenter:
             minimum_scoring_tokens > 0
             and incoming_token_count < minimum_scoring_tokens
         ):
-            return False, SegmentDecision(
+            return SegmentDecision(
                 unit_index=self.unit_index(incoming_unit),
                 reason="short_incoming_append",
                 prospective_tokens=(
@@ -613,10 +764,9 @@ class OnlineSemanticSegmenter:
             incoming_embedding,
         )
         if incoming.embedding is None or any(
-            embedding is None
-            for embedding in self._pending_online_units_embedding
+            item.embedding is None for item in active
         ):
-            return False, SegmentDecision(
+            return SegmentDecision(
                 unit_index=self.unit_index(incoming_unit),
                 reason="embedding_unavailable",
                 prospective_tokens=sum(
@@ -628,13 +778,6 @@ class OnlineSemanticSegmenter:
                 rolling_window_tail_units=scoring_context["tail_units"],
                 rolling_window_tail_tokens=scoring_context["tail_tokens"],
             )
-        active = [
-            ActiveUnit(unit=unit, embedding=embedding)
-            for unit, embedding in zip(
-                active_units,
-                self._pending_online_units_embedding,
-            )
-        ]
         decision = self.score_boundary(active, incoming)
         decision.time_gap_seconds = time_gap_seconds
         decision.scoring_mode = scoring_context["scoring_mode"]
@@ -642,9 +785,46 @@ class OnlineSemanticSegmenter:
         decision.rolling_window_tail_tokens = scoring_context["tail_tokens"]
         if self.semantic_boundary_allowed(active, decision):
             decision.reason = "semantic_boundary"
-            return True, decision
+            return self._apply_ambient_finalize_gate(
+                should_finalize=True,
+                decision=decision,
+                active_units=active_units,
+                ambient_recording_enabled=ambient_recording_enabled,
+            )
         decision.reason = "append"
-        return False, decision
+        return decision
+
+    def _apply_ambient_finalize_gate(
+        self,
+        *,
+        should_finalize: bool,
+        decision: SegmentDecision,
+        active_units: Sequence[Any],
+        ambient_recording_enabled: bool,
+    ) -> SegmentDecision:
+        """Delay a finalized prefix until ambient ASR covers its tail.
+
+        The semantic, capacity, and time-gap decision has already been made.
+        Watermark coverage is only a persistence gate, not an alternate
+        boundary decision. Equality is safe: a watermark at the same instant
+        as the pending tail confirms that the tail is already covered.
+        """
+        if not should_finalize or not ambient_recording_enabled or not active_units:
+            decision.should_finalize = should_finalize
+            return decision
+        pending_tail_time = self._parse_timestamp(
+            self.unit_end_timestamp(active_units[-1]),
+        )
+        if (
+            self._ambient_asr_watermark is None
+            or pending_tail_time is None
+            or pending_tail_time > self._ambient_asr_watermark
+        ):
+            decision.reason = "awaiting_ambient_asr_watermark"
+            decision.should_finalize = False
+            return decision
+        decision.should_finalize = True
+        return decision
 
     def _build_boundary_scoring_incoming(
         self,
@@ -838,6 +1018,29 @@ class OnlineSemanticSegmenter:
     @staticmethod
     def unit_timestamp(unit: Any) -> str:
         return _to_timestamp_text(getattr(unit, "timestamp", "")) or ""
+
+    @staticmethod
+    def _parse_timestamp(value: Any) -> Optional[datetime]:
+        text = _to_timestamp_text(value)
+        if not text:
+            return None
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                return parsed.replace(tzinfo=datetime.now().astimezone().tzinfo)
+            return parsed
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _unit_time_order_key(cls, unit: Any) -> Tuple[int, float, int]:
+        """Sort known timestamps first and preserve index order as fallback."""
+        parsed = cls._parse_timestamp(cls.unit_timestamp(unit))
+        return (
+            0 if parsed is not None else 1,
+            parsed.timestamp() if parsed is not None else float("inf"),
+            cls.unit_index(unit),
+        )
 
     @classmethod
     def unit_end_timestamp(cls, unit: Any) -> str:

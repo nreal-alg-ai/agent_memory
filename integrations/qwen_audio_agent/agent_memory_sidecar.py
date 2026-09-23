@@ -216,6 +216,7 @@ class AgentMemoryRuntime:
             item for item in params.get("messages") or [] if isinstance(item, dict)
         ]
         assistants = self._assistant_text_by_turn(messages)
+        ambient_recording_enabled = bool(params.get("ambientRecordingEnabled", False))
         accepted_keys: List[str] = []
         skipped_sensitive = 0
         for message in messages:
@@ -231,11 +232,14 @@ class AgentMemoryRuntime:
             if key in holder.seen:
                 continue
             turn_id = _clean(message.get("turnId"), 240)
-            report = holder.runtime.accept_single_interaction_turn(
-                content,
-                assistants.get(turn_id, ""),
+            report = holder.runtime.accept_memory_input(
+                interaction_turn={
+                    "user_message": content,
+                    "assistant_response": assistants.get(turn_id, ""),
+                    "turn_timestamp": _normalize_turn_timestamp(message.get("createdAt")),
+                },
                 tags=["qwen-audio-agent"],
-                turn_timestamp=_normalize_turn_timestamp(message.get("createdAt")),
+                ambient_recording_enabled=ambient_recording_enabled,
             )
             if report.get("reason") == "memory_disabled":
                 raise RuntimeError("agent_memory is disabled")
@@ -249,12 +253,13 @@ class AgentMemoryRuntime:
         }
         self._logger.info(
             "observe owner=%s session=%s input_messages=%s accepted_users=%s "
-            "skipped_sensitive=%s",
+            "skipped_sensitive=%s ambient_recording_enabled=%s",
             owner_key[:12],
             session_id[:80] or "[none]",
             len(messages),
             result["messages"],
             skipped_sensitive,
+            ambient_recording_enabled,
         )
         return result
 
@@ -294,7 +299,7 @@ class AgentMemoryRuntime:
             "ambient-recording",
             recording_id,
         ]))
-        accepted = 0
+        transcript_segments: List[Dict[str, Any]] = []
         for source in params.get("segments") or []:
             if not isinstance(source, dict):
                 continue
@@ -311,27 +316,28 @@ class AgentMemoryRuntime:
                     if _clean(tag, 120)
                 ],
             ]))
-            report = holder.runtime.accept_single_transcript_segment(
-                segment,
-                source_type="allday_recording",
-                tags=segment["tags"],
+            transcript_segments.append(segment)
+        if transcript_segments:
+            report = holder.runtime.accept_memory_input(
+                transcript_segments=transcript_segments,
+                tags=tags,
+                ambient_recording_enabled=True,
             )
             if report.get("reason") == "memory_disabled":
                 raise RuntimeError("agent_memory is disabled")
-            accepted += 1
         holder.remember([dedupe_key])
         result = {
             "observed": True,
             "recordingId": recording_id,
             "batchId": batch_id,
-            "segments": accepted,
+            "segments": len(transcript_segments),
         }
         self._logger.info(
             "observe_transcript_segments owner=%s recording=%s batch=%s accepted_segments=%s",
             owner_key[:12],
             recording_id[:80],
             batch_id[:120],
-            accepted,
+            len(transcript_segments),
         )
         return result
 
@@ -347,7 +353,6 @@ class AgentMemoryRuntime:
         )
         episode = holder.runtime.trigger_memory_episode_summary(
             reason=f"ambient_recording_finished:{recording_id}",
-            source_type="allday_recording",
             tags=["qwen-audio-agent", "ambient-recording", recording_id],
         )
         reflect = holder.runtime.trigger_memory_reflect()
@@ -392,7 +397,6 @@ class AgentMemoryRuntime:
         if boundary == "session_end":
             episode = holder.runtime.trigger_memory_episode_summary(
                 reason=f"qwen_audio_agent_session_closed:{session_id}",
-                source_type="assistant_wakeup",
                 tags=["qwen-audio-agent", "session-close"],
             )
         # For an explicit session end this always queues after the summary;
