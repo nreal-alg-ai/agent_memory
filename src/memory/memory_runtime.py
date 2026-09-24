@@ -354,14 +354,14 @@ class MemoryRuntime:
             prompt_language=resolved_prompt_language,
         )
         if bool(report.get("queued")):
-            report["prospective_update"] = (
-                self._memory_manager.submit_memory_prospective_update_task()
+            report["future_commitment_update"] = (
+                self._memory_manager.submit_memory_future_commitment_update_task()
             )
             self._has_pending_episode_sources = False
             self._episode_tags = []
             self._memory_context_manager.reset_episode_summary_window()
         else:
-            report["prospective_update"] = {
+            report["future_commitment_update"] = {
                 "queued": False,
                 "reason": "episode_summary_not_queued",
             }
