@@ -390,13 +390,7 @@ def replay_context_into_memory(
             ambient_watermark_updates += 1
             if watermark_report.get("queued"):
                 store_batches += 1
-            # Facts are filtered by their local DB created_at date. Keep this
-            # wall-clock timestamp separate from the benchmark dialogue time.
-            reflect_timestamp = datetime.now().astimezone().isoformat()
-            episode_input_flush = runtime.flush_pending_memory_inputs(
-                evaluate_episode_summary=False,
-            )
-            episode_summary_submit = runtime.trigger_memory_episode_summary(
+            finalization = runtime.finalize_memory_session(
                 reason="clongeval_reflect",
                 tags=[
                     "clongeval_conversation",
@@ -405,13 +399,13 @@ def replay_context_into_memory(
                     f"day_index:{day_index}",
                 ],
             )
-            reflect_submit = runtime.trigger_memory_reflect(
-                limit=max(1, int(reflect_limit or 100)),
-                reflect_timestamp=reflect_timestamp,
+            episode_input_flush = dict(finalization.get("input_flush") or {})
+            episode_summary_submit = dict(
+                finalization.get("episode_summary") or {}
             )
-            if episode_input_flush:
-                store_batches += 1
-            if (reflect_submit.get("pending_memory_input_flush") or {}).get("queued"):
+            derived_tasks = dict(finalization.get("derived_tasks") or {})
+            reflect_submit = dict(derived_tasks.get("reflect") or {})
+            if episode_input_flush.get("queued"):
                 store_batches += 1
             if (
                 episode_summary_submit.get("queued") or reflect_submit.get("queued")

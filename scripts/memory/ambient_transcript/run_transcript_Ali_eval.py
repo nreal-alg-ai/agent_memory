@@ -179,29 +179,18 @@ def main() -> None:
                 len(memory_segments),
             )
 
-    final_input_flush = runtime.flush_pending_memory_inputs(
-        evaluate_episode_summary=False,
-    )
-    queued_memory_store_count += int(final_input_flush)
-    episode_summary_result = runtime.trigger_memory_episode_summary(
+    finalization = runtime.finalize_memory_session(
         reason="ali_eval_complete",
         tags=["Eval_Ali", textgrid_path.stem],
     )
+    final_input_flush = dict(finalization.get("input_flush") or {})
+    episode_summary_result = dict(finalization.get("episode_summary") or {})
+    reflect_submit = dict(
+        (finalization.get("derived_tasks") or {}).get("reflect") or {}
+    )
+    queued_memory_store_count += int(bool(final_input_flush.get("queued")))
 
     reflect_result: Dict[str, Any] = {}
-    reflect_submit: Dict[str, Any] = {}
-    if args.enable_reflect:
-        reflect_timestamp = (
-            memory_segments[-1].get("ended_at")
-            if memory_segments
-            else session_start.isoformat()
-        )
-        reflect_submit = runtime.trigger_memory_reflect(
-            reflect_timestamp=reflect_timestamp,
-        )
-        queued_memory_store_count += int(
-            bool((reflect_submit.get("pending_memory_input_flush") or {}).get("queued"))
-        )
 
     if (
         queued_memory_store_count

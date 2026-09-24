@@ -348,39 +348,43 @@ class AgentMemoryRuntime:
         if not recording_id:
             raise ValueError("recordingId must be non-empty")
         holder = self._owner_runtime(owner_id)
-        input_flushed = holder.runtime.flush_pending_memory_inputs(
-            evaluate_episode_summary=False,
-        )
-        episode = holder.runtime.trigger_memory_episode_summary(
+        finalization = holder.runtime.finalize_memory_session(
             reason=f"ambient_recording_finished:{recording_id}",
             tags=["qwen-audio-agent", "ambient-recording", recording_id],
         )
-        reflect = holder.runtime.trigger_memory_reflect()
+        input_flush = dict(finalization.get("input_flush") or {})
+        episode = dict(finalization.get("episode_summary") or {})
+        derived_tasks = dict(finalization.get("derived_tasks") or {})
+        reflect = dict(derived_tasks.get("reflect") or {})
+        future_commitment = dict(derived_tasks.get("future_commitment") or {})
         result = {
             "finalized": bool((episode or {}).get("queued")),
             "recordingId": recording_id,
-            "inputFlushed": bool(input_flushed),
+            "inputFlushed": bool(input_flush.get("queued")),
             "episodeSummaryQueued": bool((episode or {}).get("queued")),
             "reflectQueued": bool((reflect or {}).get("queued")),
+            "futureCommitmentQueued": bool(future_commitment.get("queued")),
         }
         self._logger.info(
             "finalize_transcript_recording owner=%s recording=%s input_flushed=%s "
-            "episode_summary_queued=%s reflect_queued=%s",
+            "episode_summary_queued=%s reflect_queued=%s future_commitment_queued=%s",
             _owner_key(owner_id)[:12],
             recording_id[:80],
             result["inputFlushed"],
             result["episodeSummaryQueued"],
             result["reflectQueued"],
+            result["futureCommitmentQueued"],
         )
         return result
 
     def finalize(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Flush memory input and optionally close its semantic episode.
 
-        ``checkpoint`` is for a transport-level close: it may flush and
-        reflect, but never treats the reconnect as a conversation boundary.
+        ``checkpoint`` is for a transport-level close: it may flush input but
+        never treats the reconnect as a conversation boundary.
         ``session_end`` is reserved for an explicit user-created new session;
-        it submits store, episode summary, and reflection in that FIFO order.
+        it submits store, episode summary, reflect, and future commitment in
+        that FIFO order.
         """
         owner_id = _clean(params.get("ownerId"), 240)
         session_id = _clean(params.get("sessionId"), 240)
@@ -390,41 +394,49 @@ class AgentMemoryRuntime:
         if boundary == "session_end" and not session_id:
             raise ValueError("sessionId must be non-empty for session_end")
         holder = self._owner_runtime(owner_id)
-        input_flushed = holder.runtime.flush_pending_memory_inputs(
-            evaluate_episode_summary=boundary != "session_end",
-        )
-        episode = None
         if boundary == "session_end":
-            episode = holder.runtime.trigger_memory_episode_summary(
+            finalization = holder.runtime.finalize_memory_session(
                 reason=f"qwen_audio_agent_session_closed:{session_id}",
                 tags=["qwen-audio-agent", "session-close"],
             )
-        # For an explicit session end this always queues after the summary;
-        # for a checkpoint it preserves the existing best-effort reflect.
-        reflect = (
-            holder.runtime.trigger_memory_reflect()
-            if boundary == "session_end" or input_flushed
-            else None
-        )
+            input_flush = dict(finalization.get("input_flush") or {})
+            episode = dict(finalization.get("episode_summary") or {})
+            derived_tasks = dict(finalization.get("derived_tasks") or {})
+            reflect = dict(derived_tasks.get("reflect") or {})
+            future_commitment = dict(
+                derived_tasks.get("future_commitment") or {}
+            )
+        else:
+            input_flushed = holder.runtime.flush_pending_memory_inputs()
+            input_flush = {"queued": bool(input_flushed)}
+            episode = None
+            reflect = None
+            future_commitment = None
         result = {
             "finalized": boundary == "session_end" and bool((episode or {}).get("queued")),
             "boundary": boundary,
             "sessionId": session_id,
             "episodeSummaryQueued": bool((episode or {}).get("queued")),
-            "inputFlushed": bool(input_flushed),
+            "inputFlushed": bool(input_flush.get("queued")),
             "reflectQueued": bool((reflect or {}).get("queued")),
+            "futureCommitmentQueued": bool(
+                (future_commitment or {}).get("queued")
+            ),
             "episode": episode,
             "reflect": reflect,
+            "futureCommitment": future_commitment,
         }
         self._logger.info(
             "finalize owner=%s boundary=%s session=%s input_flushed=%s "
-            "episode_summary_queued=%s reflect_queued=%s reason=%s",
+            "episode_summary_queued=%s reflect_queued=%s "
+            "future_commitment_queued=%s reason=%s",
             _owner_key(owner_id)[:12],
             boundary,
             session_id[:80],
             result["inputFlushed"],
             result["episodeSummaryQueued"],
             result["reflectQueued"],
+            result["futureCommitmentQueued"],
             (episode or {}).get("reason") or "",
         )
         return result

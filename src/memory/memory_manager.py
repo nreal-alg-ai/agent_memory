@@ -24,7 +24,7 @@ import threading
 import time
 from collections import Counter
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import requests
@@ -503,6 +503,10 @@ class MemoryNodeManager:
         self._task_worker_lock = threading.Lock()
         self._task_shutdown_event = threading.Event()
         self._memory_operation_lock = threading.RLock()
+        self._task_completion_listener_lock = threading.Lock()
+        self._task_completion_listeners: List[
+            Callable[[Dict[str, Any]], None]
+        ] = []
 
     def _initialize_recall_config(self) -> None:
         """Parse nested recall settings and keep legacy flat overrides working."""
@@ -828,6 +832,47 @@ class MemoryNodeManager:
         """Share a pre-initialized embedding client with memory runtime callers."""
         self._embedding_client = embedding_client
 
+    def register_task_completion_listener(
+        self,
+        listener: Callable[[Dict[str, Any]], None],
+    ) -> None:
+        """Register a non-blocking observer for completed asynchronous tasks.
+
+        Listeners receive task metadata only after the manager's domain lock has
+        been released.  They must not perform memory work synchronously; the
+        runtime uses this hook only to update its local scheduling state and
+        optionally enqueue follow-up tasks.
+        """
+        with self._task_completion_listener_lock:
+            if listener not in self._task_completion_listeners:
+                self._task_completion_listeners.append(listener)
+
+    def unregister_task_completion_listener(
+        self,
+        listener: Callable[[Dict[str, Any]], None],
+    ) -> None:
+        """Remove a previously registered asynchronous task observer."""
+        with self._task_completion_listener_lock:
+            self._task_completion_listeners = [
+                candidate
+                for candidate in self._task_completion_listeners
+                if candidate != listener
+            ]
+
+    def _emit_task_completion(self, event: Dict[str, Any]) -> None:
+        """Notify observers without allowing an observer failure to stop work."""
+        with self._task_completion_listener_lock:
+            listeners = list(self._task_completion_listeners)
+        for listener in listeners:
+            try:
+                listener(dict(event))
+            except Exception:
+                self._logger.exception(
+                    "Memory task completion listener failed task_kind=%s task_id=%s",
+                    event.get("task_kind"),
+                    event.get("task_id"),
+                )
+
     def _task_worker_loop(self) -> None:
         while not self._task_shutdown_event.is_set() or not self._task_queue.empty():
             try:
@@ -837,6 +882,8 @@ class MemoryNodeManager:
             task_kind = str(task.get("kind") or "")
             task_id = str(task.get("task_id") or "")
             started_at = float(task.get("started_at") or time.monotonic())
+            result: Any = None
+            error: Optional[BaseException] = None
             try:
                 with self._memory_operation_lock:
                     if task_kind == "memory_store":
@@ -856,6 +903,7 @@ class MemoryNodeManager:
                     result=result,
                 )
             except Exception as exc:
+                error = exc
                 self._logger.exception("Async memory %s failed: %s", task.get("kind"), exc)
                 self._operation_reporter.on_task_finished(
                     operation_type=task_kind,
@@ -864,6 +912,19 @@ class MemoryNodeManager:
                     error=exc,
                 )
             finally:
+                self._emit_task_completion({
+                    "task_kind": task_kind,
+                    "task_id": task_id,
+                    "result": result,
+                    "error": error,
+                    "succeeded": error is None and self._operation_reporter._operation_succeeded(
+                        task_kind,
+                        result,
+                    ),
+                    "completion_context": dict(
+                        task.get("completion_context") or {}
+                    ),
+                })
                 self._task_queue.task_done()
 
     def _ensure_task_worker_locked(self) -> None:
@@ -881,6 +942,7 @@ class MemoryNodeManager:
         *,
         task_kind: str,
         payload: Dict[str, Any],
+        completion_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         task_id = self._operation_reporter.next_task_id(task_kind)
         with self._task_worker_lock:
@@ -897,6 +959,7 @@ class MemoryNodeManager:
                     "payload": payload,
                     "task_id": task_id,
                     "started_at": time.monotonic(),
+                    "completion_context": dict(completion_context or {}),
                 })
             except queue.Full:
                 self._logger.warning(
@@ -993,6 +1056,7 @@ class MemoryNodeManager:
         raw_segments: List[Dict[str, Any]],
         tags: List[str],
         prompt_language: str,
+        completion_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Queue one normalized episode for ordered background storage."""
         if not self._memory_enabled or not raw_segments:
@@ -1010,6 +1074,7 @@ class MemoryNodeManager:
                 "tags": tags,
                 "prompt_language": prompt_language,
             },
+            completion_context=completion_context,
         )
 
     def submit_memory_episode_summary_task(
@@ -1196,6 +1261,18 @@ class MemoryNodeManager:
             "new_episode_count": 0,
             "new_fact_count": len(list(save_fact_info.get("fact_ids") or [])),
             "fact_ids": list(save_fact_info.get("fact_ids") or []),
+            "entity_claim_signal_fact_count": int(
+                save_fact_info.get("entity_claim_signal_fact_count") or 0
+            ),
+            "entity_claim_signal_count": int(
+                save_fact_info.get("entity_claim_signal_count") or 0
+            ),
+            "future_commitment_signal_fact_count": int(
+                save_fact_info.get("future_commitment_signal_fact_count") or 0
+            ),
+            "future_commitment_signal_count": int(
+                save_fact_info.get("future_commitment_signal_count") or 0
+            ),
             "source_segment_ids": source_segment_ids,
             "source_segment_count": len(raw_segments),
             "source_segment_row_count": len(source_segment_ids),
@@ -2453,6 +2530,8 @@ class MemoryNodeManager:
         topic_item_updates: List[Dict[str, Any]] = []
         entity_claim_signal_mapping_updates: List[Dict[str, Any]] = []
         future_commitment_signal_mapping_updates: List[Dict[str, Any]] = []
+        entity_claim_signal_fact_ids: List[int] = []
+        future_commitment_signal_fact_ids: List[int] = []
         normalized_entity_info = {
             str(entity_name): int(entity_id)
             for entity_name, entity_id in (entity_info or {}).items()
@@ -2521,12 +2600,24 @@ class MemoryNodeManager:
                 importance=float(fact["importance"]),
             )
             fact_ids.append(fact_id)
-            entity_claim_signal_mapping_updates.extend(
+            entity_claim_updates = (
                 self._fact_entity_claim_signal_mapping_updates(fact_id, fact)
             )
-            future_commitment_signal_mapping_updates.extend(
+            entity_claim_signal_mapping_updates.extend(entity_claim_updates)
+            if any(
+                str(item.get("signal_key") or "") != "__fact__"
+                for item in entity_claim_updates
+            ):
+                entity_claim_signal_fact_ids.append(fact_id)
+            future_commitment_updates = (
                 self._fact_future_commitment_signal_mapping_updates(fact_id, fact)
             )
+            future_commitment_signal_mapping_updates.extend(future_commitment_updates)
+            if any(
+                str(item.get("signal_key") or "") != "__fact__"
+                for item in future_commitment_updates
+            ):
+                future_commitment_signal_fact_ids.append(fact_id)
             topic_item_updates.extend(
                 self._build_memory_topic_item_updates(
                     canonical_topics=[fact_root_topic],
@@ -2543,12 +2634,27 @@ class MemoryNodeManager:
         return {
             "fact_ids": fact_ids,
             "topic_item_updates": topic_item_updates,
+            "entity_claim_signal_fact_count": len(entity_claim_signal_fact_ids),
+            "entity_claim_signal_count": sum(
+                1
+                for item in entity_claim_signal_mapping_updates
+                if str(item.get("signal_key") or "") != "__fact__"
+            ),
+            "future_commitment_signal_fact_count": len(
+                future_commitment_signal_fact_ids
+            ),
+            "future_commitment_signal_count": sum(
+                1
+                for item in future_commitment_signal_mapping_updates
+                if str(item.get("signal_key") or "") != "__fact__"
+            ),
         }
 
     # ── Reflection: facts/episodes -> entity claims ──────────────────────
 
     def submit_memory_reflect_task(self, *_, **kwargs: Any) -> Dict[str, Any]:
         """Queue reflection after all previously accepted memory tasks."""
+        completion_context = kwargs.pop("completion_context", None)
         if not self._memory_enabled:
             task_id = self._operation_reporter.next_task_id("memory_reflect")
             return self._reject_memory_task(
@@ -2559,10 +2665,16 @@ class MemoryNodeManager:
         return self._submit_memory_task(
             task_kind="memory_reflect",
             payload=dict(kwargs),
+            completion_context=(
+                dict(completion_context)
+                if isinstance(completion_context, dict)
+                else None
+            ),
         )
 
     def submit_memory_future_commitment_update_task(self, *_, **kwargs: Any) -> Dict[str, Any]:
-        """Queue a prospective-world-model update after an episode boundary."""
+        """Queue a future-commitment projection after committed fact evidence."""
+        completion_context = kwargs.pop("completion_context", None)
         if not self._memory_enabled or not self._enable_memory_future_commitment_update:
             task_id = self._operation_reporter.next_task_id("memory_future_commitment_update")
             return self._reject_memory_task(
@@ -2573,6 +2685,11 @@ class MemoryNodeManager:
         return self._submit_memory_task(
             task_kind="memory_future_commitment_update",
             payload=dict(kwargs),
+            completion_context=(
+                dict(completion_context)
+                if isinstance(completion_context, dict)
+                else None
+            ),
         )
 
     def _process_memory_reflect_task(
