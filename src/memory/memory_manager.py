@@ -349,24 +349,30 @@ class MemoryOperationReporter:
 
     @staticmethod
     def _operation_succeeded(operation_type: str, result: Any) -> bool:
+        failure_statuses = {
+            "failed",
+            "skipped",
+            "error",
+            "queue_rejected",
+        }
         if operation_type == "memory_store":
             if not isinstance(result, dict):
                 return bool(result)
-            return str(result.get("status") or "ok").strip().lower() not in {
-                "failed",
-                "skipped",
-                "error",
-                "queue_rejected",
-            }
-        if operation_type == "memory_reflect":
+            return (
+                str(result.get("status") or "ok").strip().lower()
+                not in failure_statuses
+            )
+        if operation_type in {
+            "memory_episode_summary",
+            "memory_entity_claim_update",
+            "memory_future_commitment_update",
+        }:
             if not isinstance(result, dict):
                 return False
-            return str(result.get("status") or "ok").strip().lower() not in {
-                "failed",
-                "error",
-                "queue_rejected",
-                "skipped",
-            }
+            return (
+                str(result.get("status") or "ok").strip().lower()
+                not in failure_statuses
+            )
         return True
 
     @staticmethod
@@ -825,7 +831,7 @@ class MemoryNodeManager:
         return self._memory_enabled
 
     def set_logger(self, logger: Optional[logging.Logger]) -> None:
-        """Set the logger used by memory store, reflect, and recall operations."""
+        """Set the logger used by memory store, entity-claim, and recall operations."""
         self._logger = logger or logging.getLogger(__name__)
 
     def set_embedding_client(self, embedding_client: Optional[EmbeddingClient]) -> None:
@@ -890,8 +896,8 @@ class MemoryNodeManager:
                         result = self._process_memory_store_task(**task["payload"])
                     elif task_kind == "memory_episode_summary":
                         result = self._process_memory_episode_summary_task(**task["payload"])
-                    elif task_kind == "memory_reflect":
-                        result = self._process_memory_reflect_task(**task["payload"])
+                    elif task_kind == "memory_entity_claim_update":
+                        result = self._process_memory_entity_claim_update_task(**task["payload"])
                     elif task_kind == "memory_future_commitment_update":
                         result = self._process_memory_future_commitment_update_task(**task["payload"])
                     else:
@@ -1029,7 +1035,7 @@ class MemoryNodeManager:
         When ``wait`` is true, do not report shutdown as successful until every
         queued task has called ``task_done`` and the worker thread has exited.
         This is important because callers close the database immediately after
-        shutdown; closing it while a reflection transaction is still running
+        shutdown; closing it while an entity-claim transaction is still running
         rolls back all state updates made by that transaction.
         """
         with self._task_worker_lock:
@@ -2650,20 +2656,22 @@ class MemoryNodeManager:
             ),
         }
 
-    # ── Reflection: facts/episodes -> entity claims ──────────────────────
+    # ── Entity-claim update: facts/episodes -> entity claims ─────────────
 
-    def submit_memory_reflect_task(self, *_, **kwargs: Any) -> Dict[str, Any]:
-        """Queue reflection after all previously accepted memory tasks."""
+    def submit_memory_entity_claim_update_task(self, *_, **kwargs: Any) -> Dict[str, Any]:
+        """Queue an entity-claim update after accepted memory tasks."""
         completion_context = kwargs.pop("completion_context", None)
         if not self._memory_enabled:
-            task_id = self._operation_reporter.next_task_id("memory_reflect")
+            task_id = self._operation_reporter.next_task_id(
+                "memory_entity_claim_update"
+            )
             return self._reject_memory_task(
-                task_kind="memory_reflect",
+                task_kind="memory_entity_claim_update",
                 task_id=task_id,
                 reason="memory_disabled",
             )
         return self._submit_memory_task(
-            task_kind="memory_reflect",
+            task_kind="memory_entity_claim_update",
             payload=dict(kwargs),
             completion_context=(
                 dict(completion_context)
@@ -2692,25 +2700,28 @@ class MemoryNodeManager:
             ),
         )
 
-    def _process_memory_reflect_task(
+    def _process_memory_entity_claim_update_task(
         self,
         limit: Optional[int] = None,
-        reflect_timestamp: Optional[Any] = None,
+        reference_timestamp: Optional[Any] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         """Project new facts and completed episodes into entity claims."""
-        reflect_started_at = time.monotonic()
-        limit = max(1, int(limit or self._memory_cfg.get("reflect_limit") or 100))
-        if reflect_timestamp is None:
-            reflect_timestamp = kwargs.get("timestamp") or _now_text()
-        self._log_info("memory_reflect", "start", {
+        update_started_at = time.monotonic()
+        limit = max(
+            1,
+            int(limit or self._memory_cfg.get("entity_claim_limit") or 100),
+        )
+        if reference_timestamp is None:
+            reference_timestamp = kwargs.get("timestamp") or _now_text()
+        self._log_info("memory_entity_claim", "start", {
             "limit": limit,
-            "reflect_timestamp": reflect_timestamp,
+            "timestamp": reference_timestamp,
         })
         with self._db.transaction():
             claim_report = self._update_memory_entity_claims(
                 limit=limit,
-                reference_timestamp=reflect_timestamp,
+                reference_timestamp=reference_timestamp,
             )
         report = {
             "status": (
@@ -2738,11 +2749,11 @@ class MemoryNodeManager:
                 claim_report.get("inductive", {}).get("facts_marked_processed", 0) or 0
             ),
             "total_elapsed_ms": round(
-                (time.monotonic() - reflect_started_at) * 1000,
+                (time.monotonic() - update_started_at) * 1000,
                 2,
             ),
         }
-        self._log_info("memory_reflect", "finish", report)
+        self._log_info("memory_entity_claim", "finish", report)
         return report
 
     def _process_memory_future_commitment_update_task(
@@ -2752,7 +2763,10 @@ class MemoryNodeManager:
         reference_timestamp: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """Settle pending future-facing evidence in isolated evidence groups."""
-        limit = max(1, int(limit or self._memory_cfg.get("reflect_limit") or 100))
+        limit = max(
+            1,
+            int(limit or self._memory_cfg.get("future_commitment_limit") or 100),
+        )
         reference_timestamp = reference_timestamp or _now_text()
         facts = self._db.get_unprocessed_facts(
             processing_target="future_commitment_update",
@@ -2772,7 +2786,7 @@ class MemoryNodeManager:
             "facts_marked_processed": 0,
             "failed_group_count": 0,
         }
-        self._log_reflect_facts_loaded(
+        self._log_future_commitment_facts_loaded(
             "future_commitment_update", facts, limit, reference_timestamp,
         )
         if not facts:
@@ -3662,7 +3676,7 @@ class MemoryNodeManager:
             )
         else:
             inductive_report["facts_marked_processed"] = 0
-        self._log_info("memory_reflect", "entity_claim_update_finish", {
+        self._log_info("memory_entity_claim", "entity_claim_update_finish", {
             "explicit": explicit_report,
             "derived": derived_report,
             "inductive": inductive_report,
@@ -4205,7 +4219,7 @@ class MemoryNodeManager:
                 "relations": candidate_decisions,
                 "merged": False,
             })
-        self._log_info("memory_reflect", "entity_claim_reconciled", {
+        self._log_info("memory_entity_claim", "entity_claim_reconciled", {
             "candidate_count": len(unique_candidates),
             "applied_count": len(applied),
             "relations": [
@@ -5123,15 +5137,15 @@ class MemoryNodeManager:
         target = _compact_whitespace(object_name)
         return _compact_whitespace(f"{subject} {predicate} {target}")[:480]
 
-    def _log_reflect_facts_loaded(
+    def _log_future_commitment_facts_loaded(
         self,
         processing_target: str,
         facts: List[Dict[str, Any]],
         limit: int,
         reference_timestamp: Any,
     ) -> None:
-        """Log the independent fact batch consumed by one reflect projection."""
-        self._log_info("memory_reflect", "facts_loaded", {
+        """Log the independent fact batch consumed by future-commitment update."""
+        self._log_info("memory_future_commitment_update", "facts_loaded", {
             "processing_target": processing_target,
             "fact_count": len(facts),
             "fact_ids": [fact.get("id") for fact in facts],
@@ -6080,7 +6094,7 @@ class MemoryNodeManager:
         prompt_language: str = "zh",
     ) -> Dict[str, Any]:
         """Run recall immediately against the latest committed memory snapshot."""
-        # Recall is read-only and must not wait for the store/reflect worker's
+        # Recall is read-only and must not wait for the store/entity-claim worker's
         # long-running LLM or embedding work. A separate WAL reader gives it
         # a consistent committed snapshot without sharing the writer connection.
         with self._db.reader_transaction() as reader_db:

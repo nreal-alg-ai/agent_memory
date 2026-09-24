@@ -355,24 +355,24 @@ class AgentMemoryRuntime:
         input_flush = dict(finalization.get("input_flush") or {})
         episode = dict(finalization.get("episode_summary") or {})
         derived_tasks = dict(finalization.get("derived_tasks") or {})
-        reflect = dict(derived_tasks.get("reflect") or {})
+        entity_claim = dict(derived_tasks.get("entity_claim") or {})
         future_commitment = dict(derived_tasks.get("future_commitment") or {})
         result = {
             "finalized": bool((episode or {}).get("queued")),
             "recordingId": recording_id,
             "inputFlushed": bool(input_flush.get("queued")),
             "episodeSummaryQueued": bool((episode or {}).get("queued")),
-            "reflectQueued": bool((reflect or {}).get("queued")),
+            "entityClaimQueued": bool((entity_claim or {}).get("queued")),
             "futureCommitmentQueued": bool(future_commitment.get("queued")),
         }
         self._logger.info(
             "finalize_transcript_recording owner=%s recording=%s input_flushed=%s "
-            "episode_summary_queued=%s reflect_queued=%s future_commitment_queued=%s",
+            "episode_summary_queued=%s entity_claim_queued=%s future_commitment_queued=%s",
             _owner_key(owner_id)[:12],
             recording_id[:80],
             result["inputFlushed"],
             result["episodeSummaryQueued"],
-            result["reflectQueued"],
+            result["entityClaimQueued"],
             result["futureCommitmentQueued"],
         )
         return result
@@ -383,7 +383,8 @@ class AgentMemoryRuntime:
         ``checkpoint`` is for a transport-level close: it may flush input but
         never treats the reconnect as a conversation boundary.
         ``session_end`` is reserved for an explicit user-created new session;
-        it submits store, episode summary, reflect, and future commitment in
+        it submits store, episode summary, entity-claim update, and future
+        commitment in
         that FIFO order.
         """
         owner_id = _clean(params.get("ownerId"), 240)
@@ -402,7 +403,7 @@ class AgentMemoryRuntime:
             input_flush = dict(finalization.get("input_flush") or {})
             episode = dict(finalization.get("episode_summary") or {})
             derived_tasks = dict(finalization.get("derived_tasks") or {})
-            reflect = dict(derived_tasks.get("reflect") or {})
+            entity_claim = dict(derived_tasks.get("entity_claim") or {})
             future_commitment = dict(
                 derived_tasks.get("future_commitment") or {}
             )
@@ -410,7 +411,7 @@ class AgentMemoryRuntime:
             input_flushed = holder.runtime.flush_pending_memory_inputs()
             input_flush = {"queued": bool(input_flushed)}
             episode = None
-            reflect = None
+            entity_claim = None
             future_commitment = None
         result = {
             "finalized": boundary == "session_end" and bool((episode or {}).get("queued")),
@@ -418,24 +419,24 @@ class AgentMemoryRuntime:
             "sessionId": session_id,
             "episodeSummaryQueued": bool((episode or {}).get("queued")),
             "inputFlushed": bool(input_flush.get("queued")),
-            "reflectQueued": bool((reflect or {}).get("queued")),
+            "entityClaimQueued": bool((entity_claim or {}).get("queued")),
             "futureCommitmentQueued": bool(
                 (future_commitment or {}).get("queued")
             ),
             "episode": episode,
-            "reflect": reflect,
+            "entityClaim": entity_claim,
             "futureCommitment": future_commitment,
         }
         self._logger.info(
             "finalize owner=%s boundary=%s session=%s input_flushed=%s "
-            "episode_summary_queued=%s reflect_queued=%s "
+            "episode_summary_queued=%s entity_claim_queued=%s "
             "future_commitment_queued=%s reason=%s",
             _owner_key(owner_id)[:12],
             boundary,
             session_id[:80],
             result["inputFlushed"],
             result["episodeSummaryQueued"],
-            result["reflectQueued"],
+            result["entityClaimQueued"],
             result["futureCommitmentQueued"],
             (episode or {}).get("reason") or "",
         )

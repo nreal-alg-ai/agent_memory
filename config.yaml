@@ -180,10 +180,10 @@ memory_runtime:
     # derived task still needs multiple committed batches and signal-bearing
     # facts. Signal counts themselves are diagnostic only: one fact may emit
     # several signals in a single extraction result.
-    reflect_min_signal_batches: 4
-    reflect_min_signal_facts: 8
-    interaction_reflect_min_signal_batches: 3
-    interaction_reflect_min_signal_facts: 5
+    entity_claim_min_signal_batches: 4
+    entity_claim_min_signal_facts: 8
+    interaction_entity_claim_min_signal_batches: 3
+    interaction_entity_claim_min_signal_facts: 5
     future_commitment_min_signal_batches: 4
     future_commitment_min_signal_facts: 5
     interaction_future_commitment_min_signal_batches: 3
@@ -215,7 +215,8 @@ memory_manager:
 
   task_queue_maxsize: 100
 
-  reflect_limit: 100
+  entity_claim_limit: 100
+  future_commitment_limit: 100
   entity_claim_explicit_min_confidence: 0.72
   entity_claim_derived_min_confidence: 0.75
   entity_claim_signal_max_per_fact: 3

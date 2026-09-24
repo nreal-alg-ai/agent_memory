@@ -1,6 +1,7 @@
 """Runtime adapter between application input events and memory storage.
 
-``MemoryNodeManager`` owns episode persistence, reflection, and recall.  This
+``MemoryNodeManager`` owns episode persistence, entity-claim updates, and
+recall. This
 adapter owns the short-lived interaction buffer and converts frontend-shaped
 turns or transcript segments into the manager's raw episode segments.
 """
@@ -46,7 +47,7 @@ class _DerivedMemoryTaskScheduler:
     """
 
     _KIND_TO_TASK = {
-        "reflect": "memory_reflect",
+        "entity_claim": "memory_entity_claim_update",
         "future_commitment": "memory_future_commitment_update",
     }
 
@@ -61,24 +62,24 @@ class _DerivedMemoryTaskScheduler:
         self._logger = logger or logging.getLogger(__name__)
         settings = dict(config or {})
         self._thresholds = {
-            "reflect": {
+            "entity_claim": {
                 "default": {
                     "batches": max(1, int(
-                        settings.get("reflect_min_signal_batches", 4) or 4
+                        settings.get("entity_claim_min_signal_batches", 4) or 4
                     )),
                     "facts": max(1, int(
-                        settings.get("reflect_min_signal_facts", 8) or 8
+                        settings.get("entity_claim_min_signal_facts", 8) or 8
                     )),
                 },
                 "interaction": {
                     "batches": max(1, int(
                         settings.get(
-                            "interaction_reflect_min_signal_batches", 3
+                            "interaction_entity_claim_min_signal_batches", 3
                         ) or 3
                     )),
                     "facts": max(1, int(
                         settings.get(
-                            "interaction_reflect_min_signal_facts", 5
+                            "interaction_entity_claim_min_signal_facts", 5
                         ) or 5
                     )),
                 },
@@ -123,6 +124,7 @@ class _DerivedMemoryTaskScheduler:
             for kind in self._KIND_TO_TASK
         }
         self._force_pending_kinds: set[str] = set()
+        self._force_failed_kinds: set[str] = set()
 
     def on_task_completion(self, event: Dict[str, Any]) -> None:
         """Consume a manager completion event on the manager worker thread."""
@@ -147,7 +149,10 @@ class _DerivedMemoryTaskScheduler:
         if self._KIND_TO_TASK.get(kind) != task_kind:
             return
         if bool(scheduler_context.get("force_drain")):
-            self._finish_force_drain(kind)
+            self._finish_force_drain(
+                kind,
+                succeeded=bool(event.get("succeeded")),
+            )
             return
         if not bool(scheduler_context.get("automatic")):
             return
@@ -163,11 +168,12 @@ class _DerivedMemoryTaskScheduler:
         """
         with self._lock:
             self._force_pending_kinds = set(self._KIND_TO_TASK)
+            self._force_failed_kinds.clear()
         reports = {
-            "reflect": self._manager.submit_memory_reflect_task(
+            "entity_claim": self._manager.submit_memory_entity_claim_update_task(
                 completion_context={
                     "derived_task_scheduler": {
-                        "kind": "reflect",
+                        "kind": "entity_claim",
                         "force_drain": True,
                     }
                 }
@@ -187,9 +193,11 @@ class _DerivedMemoryTaskScheduler:
             for kind, report in reports.items():
                 if not bool((report or {}).get("queued")):
                     self._force_pending_kinds.discard(kind)
-            should_retry = not self._force_pending_kinds
-        if should_retry:
-            self._schedule_eligible_tasks()
+                    self._force_failed_kinds.add(kind)
+                    self._mark_kind_needing_retry_locked(kind)
+            force_round_finished = not self._force_pending_kinds
+        if force_round_finished:
+            self._finish_force_drain()
         return reports
 
     def snapshot(self) -> Dict[str, Any]:
@@ -200,6 +208,7 @@ class _DerivedMemoryTaskScheduler:
                     kind: dict(values) for kind, values in self._thresholds.items()
                 },
                 "force_pending_kinds": sorted(self._force_pending_kinds),
+                "force_failed_kinds": sorted(self._force_failed_kinds),
                 "tasks": {
                     kind: dict(values) for kind, values in self._state.items()
                 },
@@ -218,7 +227,7 @@ class _DerivedMemoryTaskScheduler:
         )
         contains_interaction = bool(context.get("contains_interaction_turn"))
         signal_stats = {
-            "reflect": {
+            "entity_claim": {
                 "signal_count": int(result.get("entity_claim_signal_count") or 0),
                 "signal_fact_count": int(
                     result.get("entity_claim_signal_fact_count") or 0
@@ -238,8 +247,8 @@ class _DerivedMemoryTaskScheduler:
             "entity_claim_signal_facts=%s future_commitment_signals=%s "
             "future_commitment_signal_facts=%s contains_interaction_turn=%s",
             int(result.get("new_fact_count") or 0),
-            signal_stats["reflect"]["signal_count"],
-            signal_stats["reflect"]["signal_fact_count"],
+            signal_stats["entity_claim"]["signal_count"],
+            signal_stats["entity_claim"]["signal_fact_count"],
             signal_stats["future_commitment"]["signal_count"],
             signal_stats["future_commitment"]["signal_fact_count"],
             contains_interaction,
@@ -288,8 +297,8 @@ class _DerivedMemoryTaskScheduler:
                 "target_generation": target_generation,
             }
         }
-        if kind == "reflect":
-            report = self._manager.submit_memory_reflect_task(
+        if kind == "entity_claim":
+            report = self._manager.submit_memory_entity_claim_update_task(
                 completion_context=completion_context,
             )
         else:
@@ -328,28 +337,54 @@ class _DerivedMemoryTaskScheduler:
                 state["unscheduled_signal_facts"] = 0
                 state["unscheduled_contains_interaction"] = False
             else:
-                state["unscheduled_signal_batches"] = max(
-                    int(state["unscheduled_signal_batches"]),
-                    self._thresholds[kind]["default"]["batches"],
-                )
-                state["unscheduled_signal_facts"] = max(
-                    int(state["unscheduled_signal_facts"]),
-                    self._thresholds[kind]["default"]["facts"],
-                )
+                self._mark_kind_needing_retry_locked(kind)
         if succeeded:
             self._schedule_kind_if_eligible(kind)
 
-    def _finish_force_drain(self, kind: str) -> None:
+    def _finish_force_drain(
+        self,
+        kind: Optional[str] = None,
+        *,
+        succeeded: bool = True,
+    ) -> None:
+        """Settle one force-drain round without discarding failed evidence."""
         with self._lock:
-            self._force_pending_kinds.discard(kind)
+            if kind:
+                self._force_pending_kinds.discard(kind)
+                if not succeeded:
+                    self._force_failed_kinds.add(kind)
+                    self._mark_kind_needing_retry_locked(kind)
             if self._force_pending_kinds:
                 return
-            for state in self._state.values():
+            failed_kinds = set(self._force_failed_kinds)
+            self._force_failed_kinds.clear()
+            for state_kind, state in self._state.items():
+                if state_kind in failed_kinds:
+                    continue
                 state["completed_generation"] = int(state["generation"])
                 state["unscheduled_signal_batches"] = 0
                 state["unscheduled_signal_facts"] = 0
                 state["unscheduled_contains_interaction"] = False
-        self._schedule_eligible_tasks()
+        if not failed_kinds:
+            self._schedule_eligible_tasks()
+        else:
+            self._logger.warning(
+                "memory derived force drain failed kinds=%s; retained pending evidence",
+                sorted(failed_kinds),
+            )
+
+    def _mark_kind_needing_retry_locked(self, kind: str) -> None:
+        """Preserve enough state for a later store completion or drain retry."""
+        state = self._state[kind]
+        threshold = self._thresholds[kind]["default"]
+        state["unscheduled_signal_batches"] = max(
+            int(state["unscheduled_signal_batches"]),
+            threshold["batches"],
+        )
+        state["unscheduled_signal_facts"] = max(
+            int(state["unscheduled_signal_facts"]),
+            threshold["facts"],
+        )
 
 
 class MemoryRuntime:
@@ -451,7 +486,7 @@ class MemoryRuntime:
                 )
                 if not shutdown_ok:
                     # A bounded shutdown timeout must not allow the database
-                    # to close while a reflection transaction is still in
+                    # to close while an entity-claim transaction is still in
                     # flight. Continue draining without a deadline so all
                     # queued writes are committed before the connection closes.
                     self._logger.warning(
@@ -641,11 +676,24 @@ class MemoryRuntime:
                     "reason": str(append_report.get("reason") or "queue_rejected"),
                 }
         if ambient_recording_enabled:
+            watermark: Optional[datetime] = None
             for normalized_segment in normalized_segments:
-                self._memory_context_manager.update_ambient_asr_watermark(
+                watermark = self._memory_context_manager.update_ambient_asr_watermark(
                     normalized_segment.get("ended_at")
                     or normalized_segment.get("started_at"),
                 )
+            self._logger.info(
+                "memory runtime updated ambient ASR watermark batch_segments=%s "
+                "batch_started_at=%s batch_ended_at=%s watermark=%s "
+                "awaiting_unit_count=%s",
+                len(normalized_segments),
+                normalized_segments[0].get("started_at") or "",
+                normalized_segments[-1].get("ended_at")
+                or normalized_segments[-1].get("started_at")
+                or "",
+                _to_timestamp_text(watermark) or "",
+                self._memory_context_manager.awaiting_ambient_unit_count(),
+            )
             drain_report = self._process_awaiting_ambient_units(
                 evaluate_episode_summary=True,
             )
@@ -725,7 +773,7 @@ class MemoryRuntime:
         queued = False
         last_reason = ""
         for unit, decision, finalized_units in (
-            self._memory_context_manager.process_awaiting_ambient_units(
+            self._memory_context_manager.iter_awaiting_ambient_units(
                 force=force,
             )
         ):
