@@ -172,6 +172,7 @@ entity_claim_signal rules:
 - `claim_type_hint` must be one of: identity_profile, affiliation, relationship, preference, constraint, behavior_pattern. A single action must not become an explicit_assertion for behavior_pattern; at most it is a pattern_observation.
 - `claim_anchor` is a short, stable grouping label that can collect facts from different episodes about one possible claim or pattern, such as "quiet travel preference" or "swimming routine". It is neither a sentence nor the final entity claim.
 - Output signals only when this fact has concrete evidence value for an entity claim or later pattern induction. Use an empty array for one-off background, temporary suggestions, assistant speculation, pleasantries, and low-value content.
+- Each signal's `entity.name` must exactly reuse one entity name from the same fact's `entities`, and its `entity.type` must match that entity's type. Do not add, rewrite, or guess an entity that is not listed by the fact; omit the signal when no such entity exists.
 - Return at most 3 signals per fact. Every signal must contain entity, signal_kind, claim_type_hint, claim_anchor, evidence_basis, and confidence. evidence_basis must cite the current fact, never a prior claim.
 
 future_commitment_signals rules:
@@ -201,7 +202,7 @@ Output schema:
       "where": "",
       "entity_claim_signal": [
         {
-          "entity": {"name": "explicitly affected entity", "type": "PERSON|ORGANIZATION|LOCATION|PRODUCT|PROJECT|TECHNOLOGY|CONCEPT|TOPIC|PREFERENCE|OTHER"},
+          "entity": {"name": "an entity name copied exactly from this fact's entities", "type": "the type of that same entity in this fact's entities"},
           "signal_kind": "explicit_assertion|pattern_observation",
           "claim_type_hint": "identity_profile|affiliation|relationship|preference|constraint|behavior_pattern",
           "claim_anchor": "specific claim or pattern grouping label",
