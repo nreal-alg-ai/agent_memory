@@ -355,7 +355,7 @@ class MemoryOperationReporter:
             "error",
             "queue_rejected",
         }
-        if operation_type == "memory_store":
+        if operation_type == "memory_fact_extraction":
             if not isinstance(result, dict):
                 return bool(result)
             return (
@@ -401,7 +401,7 @@ class MemoryOperationReporter:
             ),
             "total_elapsed_ms": elapsed_ms,
         })
-        if operation_type in {"memory_store", "memory_episode_summary"}:
+        if operation_type in {"memory_fact_extraction", "memory_episode_summary"}:
             report["stored"] = bool(succeeded and error is None)
         if error is not None:
             report["error_type"] = type(error).__name__
@@ -892,8 +892,8 @@ class MemoryNodeManager:
             error: Optional[BaseException] = None
             try:
                 with self._memory_operation_lock:
-                    if task_kind == "memory_store":
-                        result = self._process_memory_store_task(**task["payload"])
+                    if task_kind == "memory_fact_extraction":
+                        result = self._process_memory_fact_extraction_task(**task["payload"])
                     elif task_kind == "memory_episode_summary":
                         result = self._process_memory_episode_summary_task(**task["payload"])
                     elif task_kind == "memory_entity_claim_update":
@@ -1056,10 +1056,11 @@ class MemoryNodeManager:
         worker.join(timeout=remaining)
         return not worker.is_alive() and not self._task_queue.unfinished_tasks
 
-    def submit_memory_store_task(
+    def submit_memory_fact_extraction_task(
         self,
         *,
         raw_segments: List[Dict[str, Any]],
+        preceding_context_segments: Optional[List[Dict[str, Any]]] = None,
         tags: List[str],
         prompt_language: str,
         completion_context: Optional[Dict[str, Any]] = None,
@@ -1067,16 +1068,17 @@ class MemoryNodeManager:
         """Queue one normalized episode for ordered background storage."""
         if not self._memory_enabled or not raw_segments:
             reason = "memory_disabled" if not self._memory_enabled else "no_raw_segments"
-            task_id = self._operation_reporter.next_task_id("memory_store")
+            task_id = self._operation_reporter.next_task_id("memory_fact_extraction")
             return self._reject_memory_task(
-                task_kind="memory_store",
+                task_kind="memory_fact_extraction",
                 task_id=task_id,
                 reason=reason,
             )
         return self._submit_memory_task(
-            task_kind="memory_store",
+            task_kind="memory_fact_extraction",
             payload={
                 "raw_segments": raw_segments,
+                "preceding_context_segments": list(preceding_context_segments or []),
                 "tags": tags,
                 "prompt_language": prompt_language,
             },
@@ -1197,7 +1199,7 @@ class MemoryNodeManager:
             "topic_items_created": int(topic_report.get("created_count", 0) or 0),
             "topic_items_updated": int(topic_report.get("updated_count", 0) or 0),
         })
-        self._log_info("memory_store", "episode_summary_generated", {
+        self._log_info("memory_fact_extraction", "episode_summary_generated", {
             "episode_id": episode_id,
             "fact_count": attached,
             "source_segment_count": len(source_segments),
@@ -1208,16 +1210,19 @@ class MemoryNodeManager:
         })
         return episode_info
 
-    def _process_memory_store_task(
+    def _process_memory_fact_extraction_task(
         self,
         *,
         raw_segments: List[Dict[str, Any]],
+        preceding_context_segments: Optional[List[Dict[str, Any]]] = None,
         tags: List[str],
         prompt_language: str,
     ) -> Dict[str, Any]:
         store_started_at = time.monotonic()
-        self._log_info("memory_store", "start", {
+        preceding_segments = list(preceding_context_segments or [])
+        self._log_info("memory_fact_extraction", "start", {
             "source_segment_count": len(raw_segments),
+            "preceding_context_segment_count": len(preceding_segments),
             "raw_segments": self._build_memory_segments_for_prompt(
                 raw_segments,
                 prompt_language=prompt_language,
@@ -1225,7 +1230,7 @@ class MemoryNodeManager:
         })
         if not raw_segments:
             elapsed_ms = round((time.monotonic() - store_started_at) * 1000, 2)
-            self._log_info("memory_store", "finish", {
+            self._log_info("memory_fact_extraction", "finish", {
                 "status": "skipped",
                 "reason": "no_raw_segments",
                 "total_elapsed_ms": elapsed_ms,
@@ -1233,7 +1238,6 @@ class MemoryNodeManager:
             return {
                 "status": "skipped",
                 "reason": "no_raw_segments",
-                "new_episode_count": 0,
                 "new_fact_count": 0,
                 "total_elapsed_ms": elapsed_ms,
             }
@@ -1243,6 +1247,7 @@ class MemoryNodeManager:
             )
         extracted_info = self._extract_memory_fact_from_raw_segments(
             raw_segments,
+            preceding_context_segments=preceding_segments,
             prompt_language=prompt_language,
         )
         facts = list(extracted_info.get("facts") or [])
@@ -1259,7 +1264,6 @@ class MemoryNodeManager:
             )
         report = {
             "status": "ok",
-            "new_episode_count": 0,
             "new_fact_count": len(list(save_fact_info.get("fact_ids") or [])),
             "fact_ids": list(save_fact_info.get("fact_ids") or []),
             "entity_claim_signal_fact_count": int(
@@ -1281,7 +1285,7 @@ class MemoryNodeManager:
             "topic_items_updated": int(topic_report.get("updated_count", 0) or 0),
             "total_elapsed_ms": round((time.monotonic() - store_started_at) * 1000, 2),
         }
-        self._log_info("memory_store", "finish", report)
+        self._log_info("memory_fact_extraction", "finish", report)
         return report
 
     def _upsert_memory_recall_document(
@@ -1409,7 +1413,7 @@ class MemoryNodeManager:
         for index, fact in enumerate(facts, 1):
             metadata = fact.get("metadata") if isinstance(fact.get("metadata"), dict) else {}
             self._log_info(
-                "memory_store",
+                "memory_fact_extraction",
                 "extract_fact_signals",
                 {
                     "fact_index": index,
@@ -1439,11 +1443,13 @@ class MemoryNodeManager:
         self,
         raw_segments: List[Dict[str, Any]],
         *,
+        preceding_context_segments: Optional[List[Dict[str, Any]]] = None,
         prompt_language: str,
     ) -> Dict[str, Any]:
         """Extract narrative facts with the unified fact prompt."""
         data = self._extract_memory_fact_with_llm(
             raw_segments,
+            preceding_context_segments=preceding_context_segments,
             prompt_language=prompt_language,
         )
         if data and data.get("facts"):
@@ -1580,6 +1586,7 @@ class MemoryNodeManager:
         self,
         segments: List[Dict[str, Any]],
         *,
+        preceding_context_segments: Optional[List[Dict[str, Any]]] = None,
         prompt_language: str,
     ) -> Optional[Dict[str, Any]]:
         prompt_template = (
@@ -1605,16 +1612,55 @@ class MemoryNodeManager:
                     prompt_language=prompt_language,
                 ),
             )
+            .replace(
+                "{preceding_context}",
+                self._build_memory_segments_for_prompt(
+                    list(preceding_context_segments or []),
+                    prompt_language=prompt_language,
+                ) or ("(none)" if prompt_language == "en" else "（无）"),
+            )
         )
         for attempt in range(2):
             result = self._call_llm(prompt)
+            response_text = str(result or "")
+            response_chars = len(response_text)
+            if not response_text.strip():
+                self._log_info("memory_fact_extraction", "llm_output_diagnostics", {
+                    "attempt": attempt + 1,
+                    "parse_status": "empty_response",
+                    "response_chars": response_chars,
+                    "raw_fact_count": None,
+                    "normalized_fact_count": 0,
+                    "dropped_fact_counts": {},
+                })
+                if attempt == 0:
+                    self._logger.debug("Unified memory LLM extraction failed, retrying")
+                continue
             parsed = self._parse_json_object_from_llm_text(result or "")
-            if parsed is not None:
+            if parsed is None:
+                self._log_info("memory_fact_extraction", "llm_output_diagnostics", {
+                    "attempt": attempt + 1,
+                    "parse_status": "invalid_json_object",
+                    "response_chars": response_chars,
+                    "raw_fact_count": None,
+                    "normalized_fact_count": 0,
+                    "dropped_fact_counts": {},
+                })
+            else:
+                normalization_diagnostics: Dict[str, Any] = {}
                 normalized = self._normalize_memory_fact_extraction_llm_output(
                     parsed,
                     segments,
                     prompt_language=prompt_language,
+                    diagnostics=normalization_diagnostics,
                 )
+                self._log_info("memory_fact_extraction", "llm_output_diagnostics", {
+                    "attempt": attempt + 1,
+                    "parse_status": "parsed",
+                    "response_chars": response_chars,
+                    "response_keys": sorted(str(key) for key in parsed.keys()),
+                    **normalization_diagnostics,
+                })
                 if normalized is not None:
                     return normalized
             if attempt == 0:
@@ -1640,7 +1686,7 @@ class MemoryNodeManager:
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.2,
             "stream": False,
-            "max_tokens": 2048,
+            "max_tokens": 4096,
         }
         if self._llm_json_mode:
             payload["response_format"] = {"type": "json_object"}
@@ -1708,22 +1754,78 @@ class MemoryNodeManager:
         raw_segments: List[Dict[str, Any]],
         *,
         prompt_language: str,
+        diagnostics: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
+        diagnostics = diagnostics if diagnostics is not None else {}
         raw_facts = data.get("facts")
         if not isinstance(raw_facts, list):
+            diagnostics.update({
+                "normalization_status": "invalid_facts_field",
+                "facts_field_type": type(raw_facts).__name__,
+                "raw_fact_count": None,
+                "normalized_fact_count": 0,
+                "dropped_fact_counts": {},
+                "fact_candidates": [],
+            })
             return None
         facts: List[Dict[str, Any]] = []
+        dropped_fact_counts: Dict[str, int] = {}
+        candidate_diagnostics: List[Dict[str, Any]] = []
+
+        def record_drop(reason: str) -> None:
+            dropped_fact_counts[reason] = dropped_fact_counts.get(reason, 0) + 1
+
+        def record_candidate(
+            *,
+            index: int,
+            raw_fact: Any,
+            result: str,
+            priority: Optional[int] = None,
+        ) -> None:
+            if len(candidate_diagnostics) >= 12:
+                return
+            raw_payload = raw_fact if isinstance(raw_fact, dict) else {}
+            candidate_diagnostics.append({
+                "index": index,
+                "result": result,
+                "priority": priority,
+                "text": self._format_log_text(
+                    raw_payload.get("text") or raw_payload.get("summary") or "",
+                    limit=300,
+                ),
+                "fact_type": _compact_whitespace(raw_payload.get("fact_type") or ""),
+            })
+
         dialogue_time_key = _to_timestamp_text(
             raw_segments[0].get("started_at") if raw_segments else ""
         ) or _now_text()
-        for raw_fact in raw_facts:
+        for index, raw_fact in enumerate(raw_facts, 1):
             if not isinstance(raw_fact, dict):
+                record_drop("non_object_fact")
+                record_candidate(
+                    index=index,
+                    raw_fact=raw_fact,
+                    result="dropped_non_object_fact",
+                )
                 continue
             text = _compact_whitespace(raw_fact.get("text") or raw_fact.get("summary") or "")
             if not text:
+                record_drop("missing_text")
+                record_candidate(
+                    index=index,
+                    raw_fact=raw_fact,
+                    result="dropped_missing_text",
+                )
                 continue
             priority = self._normalize_priority(raw_fact.get("priority", 70))
             if priority < 60:
+                record_drop("priority_below_runtime_minimum")
+                record_candidate(
+                    index=index,
+                    raw_fact=raw_fact,
+                    result="dropped_priority_below_runtime_minimum",
+                    priority=priority,
+                )
                 continue
             keywords = self._normalize_string_list(raw_fact.get("keywords"), limit=18)
             if not keywords:
@@ -1751,9 +1853,23 @@ class MemoryNodeManager:
             ).lower()
             if primary_entity_name in {"assistant", "agent", "the assistant", "助手"} \
                     and self._is_low_value_assistant_closing(text):
+                record_drop("low_value_assistant_closing")
+                record_candidate(
+                    index=index,
+                    raw_fact=raw_fact,
+                    result="dropped_low_value_assistant_closing",
+                    priority=priority,
+                )
                 continue
             if primary_entity_name in {"user", "the user", "用户"} \
                     and self._is_low_value_user_acknowledgement(text):
+                record_drop("low_value_user_acknowledgement")
+                record_candidate(
+                    index=index,
+                    raw_fact=raw_fact,
+                    result="dropped_low_value_user_acknowledgement",
+                    priority=priority,
+                )
                 continue
             fact_topic_fallback = " ".join(keywords[:3]) if keywords else "general"
             fact_root_topic, fact_aspect_topic = self._normalize_fact_topic_fields(
@@ -1792,6 +1908,24 @@ class MemoryNodeManager:
                     "where": _compact_whitespace(raw_fact.get("where") or ""),
                 },
             })
+            record_candidate(
+                index=index,
+                raw_fact=raw_fact,
+                result="accepted",
+                priority=priority,
+            )
+        diagnostics.update({
+            "normalization_status": "ok",
+            "facts_field_type": "list",
+            "raw_fact_count": len(raw_facts),
+            "normalized_fact_count": len(facts),
+            "dropped_fact_counts": dropped_fact_counts,
+            "fact_candidates": candidate_diagnostics,
+            "omitted_fact_candidate_diagnostics": max(
+                0,
+                len(raw_facts) - len(candidate_diagnostics),
+            ),
+        })
         return {"facts": facts}
 
     def _normalize_fact_topic_fields(

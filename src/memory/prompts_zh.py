@@ -120,6 +120,11 @@ UNIFIED_MEMORY_EXTRACTION_PROMPT_ZH = """你是 AI 眼镜长期记忆系统的�
 
 你现在需要从下面按时间顺序排列的对话/转写证据批次中提取 Hindsight 风格的高质量 narrative facts。episode summary、episode canonical_topics 将由独立模块根据持久化的原始片段及已生成 facts 负责，不要在本 prompt 中输出 episode 级字段。
 
+前置上下文使用规则：
+- 下方的“前置上下文”仅来自紧邻当前批次之前的一小段已处理内容，只用于理解代词、省略、承接关系和当前话题的起点。
+- 唯一允许直接支持本次新 fact 的证据是“对话/转写证据批次”。不得只根据前置上下文生成、补全或确认 fact，也不得把其中已经表达过的内容再次写成新的 fact。
+- 当前批次与前置上下文存在矛盾时，以当前批次为准；若当前批次仍不足以消歧或验证，宁可不输出该 fact。
+
 写入资格门槛（先判断，未通过时直接输出空 `facts`；不要为了覆盖输入而生成 fact）：
 - 默认输出 0 条 fact。只有同时满足“证据可靠”和“未来可用”时才输出；可被流畅概括不等于值得长期记忆。
 - fact 的核心内容必须由用户的语义完整、指代明确的表达，或当前批次中可验证的执行结果支撑。助手的猜测、补全、泛化介绍、安慰、追问、复述和推荐，不能单独证明用户的偏好、身份、情绪、计划、能力或事实。
@@ -241,6 +246,9 @@ future_commitment_signals 输出规则：
 
 已有 memory_topic_items 命名候选：
 {existing_memory_topic_items}
+
+前置上下文（仅用于理解，不是本次 fact 的独立证据）：
+{preceding_context}
 
 对话/转写证据批次：
 {dialogue_batch}
