@@ -520,7 +520,6 @@ class AgentMemoryRuntime:
             query,
             tags=[_clean(tag, 120) for tag in tags] if isinstance(tags, list) else None,
             time_end=_clean(params.get("timeEnd"), 120) or None,
-            prompt_language=_clean(params.get("promptLanguage"), 16) or None,
         )
         self._logger.info(
             "recall owner=%s query_chars=%s status=%s context_chars=%s",

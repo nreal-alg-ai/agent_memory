@@ -1062,7 +1062,6 @@ class MemoryNodeManager:
         raw_segments: List[Dict[str, Any]],
         preceding_context_segments: Optional[List[Dict[str, Any]]] = None,
         tags: List[str],
-        prompt_language: str,
         completion_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Queue one normalized episode for ordered background storage."""
@@ -1080,7 +1079,6 @@ class MemoryNodeManager:
                 "raw_segments": raw_segments,
                 "preceding_context_segments": list(preceding_context_segments or []),
                 "tags": tags,
-                "prompt_language": prompt_language,
             },
             completion_context=completion_context,
         )
@@ -1089,7 +1087,6 @@ class MemoryNodeManager:
         self,
         *,
         tags: List[str],
-        prompt_language: str,
     ) -> Dict[str, Any]:
         """Queue episode summarization after preceding fact-store tasks."""
         if not self._memory_enabled:
@@ -1101,7 +1098,6 @@ class MemoryNodeManager:
             task_kind="memory_episode_summary",
             payload={
                 "tags": list(tags or []),
-                "prompt_language": prompt_language,
             },
         )
 
@@ -1109,7 +1105,6 @@ class MemoryNodeManager:
         self,
         *,
         tags: List[str],
-        prompt_language: str,
     ) -> Dict[str, Any]:
         source_segments = self._db.get_unassigned_memory_source_segments(
             limit=240,
@@ -1135,10 +1130,9 @@ class MemoryNodeManager:
             ended_at=source_ended_at,
             limit=80,
         )
-        episode_info = self.generate_episode_from_source_segments(
+        episode_info = self._generate_episode_from_source_segments(
             source_segments=source_segments,
             facts=facts,
-            prompt_language=prompt_language,
         )
         if episode_info.get("status") != "ok":
             return episode_info
@@ -1216,18 +1210,9 @@ class MemoryNodeManager:
         raw_segments: List[Dict[str, Any]],
         preceding_context_segments: Optional[List[Dict[str, Any]]] = None,
         tags: List[str],
-        prompt_language: str,
     ) -> Dict[str, Any]:
         store_started_at = time.monotonic()
         preceding_segments = list(preceding_context_segments or [])
-        self._log_info("memory_fact_extraction", "start", {
-            "source_segment_count": len(raw_segments),
-            "preceding_context_segment_count": len(preceding_segments),
-            "raw_segments": self._build_memory_segments_for_prompt(
-                raw_segments,
-                prompt_language=prompt_language,
-            ),
-        })
         if not raw_segments:
             elapsed_ms = round((time.monotonic() - store_started_at) * 1000, 2)
             self._log_info("memory_fact_extraction", "finish", {
@@ -1245,12 +1230,11 @@ class MemoryNodeManager:
             source_segment_ids = self._db.insert_memory_source_segments(
                 segments=raw_segments,
             )
-        extracted_info = self._extract_memory_fact_from_raw_segments(
+        fact_info = self._extract_memory_fact_from_raw_segments(
             raw_segments,
             preceding_context_segments=preceding_segments,
-            prompt_language=prompt_language,
         )
-        facts = list(extracted_info.get("facts") or [])
+        facts = list(fact_info.get("facts") or [])
         self._log_extracted_fact_info(facts=facts)
         with self._db.transaction():
             save_fact_info = self._store_extracted_memory_facts_into_db(
@@ -1444,24 +1428,106 @@ class MemoryNodeManager:
         raw_segments: List[Dict[str, Any]],
         *,
         preceding_context_segments: Optional[List[Dict[str, Any]]] = None,
-        prompt_language: str,
     ) -> Dict[str, Any]:
         """Extract narrative facts with the unified fact prompt."""
-        data = self._extract_memory_fact_with_llm(
-            raw_segments,
-            preceding_context_segments=preceding_context_segments,
-            prompt_language=prompt_language,
+        prompt_language = self._resolve_prompt_language_from_memory_segments(
+            [*raw_segments, *(preceding_context_segments or [])],
         )
-        if data and data.get("facts"):
-            return data
+        self._log_info("memory_fact_extraction", "start", {
+            "source_segment_count": len(raw_segments),
+            "preceding_context_segment_count": len(preceding_context_segments or []),
+            "current_segments": self._build_memory_segments_for_prompt(
+                raw_segments,
+                prompt_language=prompt_language,
+            ),
+            "preceding_context_segments": self._build_memory_segments_for_prompt(
+                list(preceding_context_segments or []),
+                prompt_language=prompt_language,
+            ),
+        })
+        prompt_template = (
+            UNIFIED_MEMORY_EXTRACTION_PROMPT_EN
+            if prompt_language == "en"
+            else UNIFIED_MEMORY_EXTRACTION_PROMPT_ZH
+        )
+        memory_topic_item_context = (
+            self._collect_memory_topic_item_context(segments=raw_segments)
+            if prompt_language != "en"
+            else {"canonical_topics": [], "aspect_topics": []}
+        )
+        prompt = (
+            prompt_template
+            .replace(
+                "{existing_memory_topic_items}",
+                self._format_memory_topic_items_for_prompt(memory_topic_item_context),
+            )
+            .replace(
+                "{dialogue_batch}",
+                self._build_memory_segments_for_prompt(
+                    raw_segments,
+                    prompt_language=prompt_language,
+                ),
+            )
+            .replace(
+                "{preceding_context}",
+                self._build_memory_segments_for_prompt(
+                    list(preceding_context_segments or []),
+                    prompt_language=prompt_language,
+                ) or ("(none)" if prompt_language == "en" else "（无）"),
+            )
+        )
+        for attempt in range(2):
+            result = self._call_llm(prompt)
+            response_text = str(result or "")
+            response_chars = len(response_text)
+            if not response_text.strip():
+                self._log_info("memory_fact_extraction", "llm_output_diagnostics", {
+                    "attempt": attempt + 1,
+                    "parse_status": "empty_response",
+                    "response_chars": response_chars,
+                    "raw_fact_count": None,
+                    "normalized_fact_count": 0,
+                    "dropped_fact_counts": {},
+                })
+                if attempt == 0:
+                    self._logger.debug("Unified memory LLM extraction failed, retrying")
+                continue
+            parsed = self._parse_json_object_from_llm_text(result or "")
+            if parsed is None:
+                self._log_info("memory_fact_extraction", "llm_output_diagnostics", {
+                    "attempt": attempt + 1,
+                    "parse_status": "invalid_json_object",
+                    "response_chars": response_chars,
+                    "raw_fact_count": None,
+                    "normalized_fact_count": 0,
+                    "dropped_fact_counts": {},
+                })
+            else:
+                normalization_diagnostics: Dict[str, Any] = {}
+                normalized = self._normalize_memory_fact_extraction_llm_output(
+                    parsed,
+                    raw_segments,
+                    prompt_language=prompt_language,
+                    diagnostics=normalization_diagnostics,
+                )
+                self._log_info("memory_fact_extraction", "llm_output_diagnostics", {
+                    "attempt": attempt + 1,
+                    "parse_status": "parsed",
+                    "response_chars": response_chars,
+                    "response_keys": sorted(str(key) for key in parsed.keys()),
+                    **normalization_diagnostics,
+                })
+                if normalized is not None:
+                    return normalized
+            if attempt == 0:
+                self._logger.debug("Unified memory LLM extraction failed, retrying")
         return {"facts": []}
 
-    def generate_episode_from_source_segments(
+    def _generate_episode_from_source_segments(
         self,
         *,
         source_segments: Sequence[Dict[str, Any]],
         facts: Sequence[Dict[str, Any]],
-        prompt_language: str = "zh",
     ) -> Dict[str, Any]:
         """Generate an experience-level episode from source evidence.
 
@@ -1481,6 +1547,9 @@ class MemoryNodeManager:
                 "fact_count": 0,
                 "source_segment_count": 0,
             }
+        prompt_language = self._resolve_prompt_language_from_memory_segments(
+            segment_list,
+        )
         fact_list = [
             item for item in facts or []
             if isinstance(item, dict)
@@ -1581,91 +1650,6 @@ class MemoryNodeManager:
             "started_at": start,
             "ended_at": end,
         }
-
-    def _extract_memory_fact_with_llm(
-        self,
-        segments: List[Dict[str, Any]],
-        *,
-        preceding_context_segments: Optional[List[Dict[str, Any]]] = None,
-        prompt_language: str,
-    ) -> Optional[Dict[str, Any]]:
-        prompt_template = (
-            UNIFIED_MEMORY_EXTRACTION_PROMPT_EN
-            if prompt_language == "en"
-            else UNIFIED_MEMORY_EXTRACTION_PROMPT_ZH
-        )
-        memory_topic_item_context = (
-            self._collect_memory_topic_item_context(segments=segments)
-            if prompt_language != "en"
-            else {"canonical_topics": [], "aspect_topics": []}
-        )
-        prompt = (
-            prompt_template
-            .replace(
-                "{existing_memory_topic_items}",
-                self._format_memory_topic_items_for_prompt(memory_topic_item_context),
-            )
-            .replace(
-                "{dialogue_batch}",
-                self._build_memory_segments_for_prompt(
-                    segments,
-                    prompt_language=prompt_language,
-                ),
-            )
-            .replace(
-                "{preceding_context}",
-                self._build_memory_segments_for_prompt(
-                    list(preceding_context_segments or []),
-                    prompt_language=prompt_language,
-                ) or ("(none)" if prompt_language == "en" else "（无）"),
-            )
-        )
-        for attempt in range(2):
-            result = self._call_llm(prompt)
-            response_text = str(result or "")
-            response_chars = len(response_text)
-            if not response_text.strip():
-                self._log_info("memory_fact_extraction", "llm_output_diagnostics", {
-                    "attempt": attempt + 1,
-                    "parse_status": "empty_response",
-                    "response_chars": response_chars,
-                    "raw_fact_count": None,
-                    "normalized_fact_count": 0,
-                    "dropped_fact_counts": {},
-                })
-                if attempt == 0:
-                    self._logger.debug("Unified memory LLM extraction failed, retrying")
-                continue
-            parsed = self._parse_json_object_from_llm_text(result or "")
-            if parsed is None:
-                self._log_info("memory_fact_extraction", "llm_output_diagnostics", {
-                    "attempt": attempt + 1,
-                    "parse_status": "invalid_json_object",
-                    "response_chars": response_chars,
-                    "raw_fact_count": None,
-                    "normalized_fact_count": 0,
-                    "dropped_fact_counts": {},
-                })
-            else:
-                normalization_diagnostics: Dict[str, Any] = {}
-                normalized = self._normalize_memory_fact_extraction_llm_output(
-                    parsed,
-                    segments,
-                    prompt_language=prompt_language,
-                    diagnostics=normalization_diagnostics,
-                )
-                self._log_info("memory_fact_extraction", "llm_output_diagnostics", {
-                    "attempt": attempt + 1,
-                    "parse_status": "parsed",
-                    "response_chars": response_chars,
-                    "response_keys": sorted(str(key) for key in parsed.keys()),
-                    **normalization_diagnostics,
-                })
-                if normalized is not None:
-                    return normalized
-            if attempt == 0:
-                self._logger.debug("Unified memory LLM extraction failed, retrying")
-        return None
 
     def _call_llm(self, prompt: str) -> Optional[str]:
         if (
@@ -2554,6 +2538,23 @@ class MemoryNodeManager:
         if re.search(r"[\u4e00-\u9fff]", str(text or "")):
             return "zh"
         return "en" if str(fallback).lower().startswith("en") else "zh"
+
+    def _resolve_prompt_language_from_memory_segments(
+        self,
+        segments: Sequence[Dict[str, Any]],
+    ) -> str:
+        """Resolve one LLM task's prompt language from its actual source text."""
+        text = "\n".join(
+            _compact_whitespace(
+                segment.get("text")
+                or segment.get("user_message")
+                or segment.get("assistant_response")
+                or ""
+            )
+            for segment in segments
+            if isinstance(segment, dict)
+        )
+        return self._resolve_prompt_language_from_text(text)
 
     def _episode_title(self, turns: List[Dict[str, Any]]) -> str:
         for turn in turns:
@@ -6173,7 +6174,6 @@ class MemoryNodeManager:
         query: str,
         tags: Optional[List[str]] = None,
         time_end: Optional[str] = None,
-        prompt_language: str = "zh",
     ) -> Dict[str, Any]:
         """Run recall immediately against the latest committed memory snapshot."""
         # Recall is read-only and must not wait for the store/entity-claim worker's
@@ -6185,7 +6185,6 @@ class MemoryNodeManager:
                 tags=tags,
                 time_end=time_end,
                 recall_mode=self._recall_mode,
-                prompt_language=prompt_language,
                 database=reader_db,
             )
 
@@ -6195,11 +6194,11 @@ class MemoryNodeManager:
         tags: Optional[List[str]] = None,
         time_end: Optional[str] = None,
         recall_mode: str = "normal",
-        prompt_language: str = "zh",
         database: Optional[SessionDB] = None,
     ) -> Dict[str, Any]:
         requested_recall_mode = str(recall_mode or "normal").strip().lower()
         started_at = time.monotonic()
+        prompt_language = self._resolve_prompt_language_from_text(query)
         if not self._memory_enabled or not str(query or "").strip():
             recall_report = {
                 "memory_context": "",

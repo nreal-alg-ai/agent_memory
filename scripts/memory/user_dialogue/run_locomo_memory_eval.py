@@ -230,8 +230,7 @@ def resolve_runtime_args(args: argparse.Namespace) -> None:
     args.llm_timeout = args.llm_timeout or int(str(llm_config.get("llm_timeout", 120)))
     args.llm_thinking = args.llm_thinking or str(llm_config.get("llm_thinking") or "disabled")
     args.memory_prompt_language = args.memory_prompt_language or str(
-        runtime_config.get("memory_prompt_language_mode")
-        or manager_config.get("memory_prompt_language_mode")
+        manager_config.get("memory_prompt_language_mode")
         or "source"
     )
     args.memory_output_language = args.memory_output_language or str(
@@ -279,7 +278,6 @@ def prepare_runtime_configs(
     llm_config["llm_json_mode"] = bool(args.llm_json_mode)
     memory_manager_config["memory_prompt_language_mode"] = str(args.memory_prompt_language)
     memory_manager_config["memory_output_language_mode"] = str(args.memory_output_language)
-    memory_runtime_config["memory_prompt_language_mode"] = str(args.memory_prompt_language)
     memory_runtime_config["memory_output_language_mode"] = str(args.memory_output_language)
     return memory_runtime_config, memory_manager_config, llm_config, embedding_config
 

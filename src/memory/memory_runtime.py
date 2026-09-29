@@ -440,10 +440,6 @@ class MemoryRuntime:
         self._memory_database = database
         self._memory_manager = manager
         runtime_config = dict(memory_runtime_config or {})
-        self._prompt_language_mode = str(
-            runtime_config.get("memory_prompt_language_mode")
-            or "source"
-        ).strip().lower()
         self._embedding_client = EmbeddingClient(
             dict(embedding_config or getattr(manager, "_embedding_cfg", {}) or {}),
         )
@@ -463,7 +459,6 @@ class MemoryRuntime:
             build_fact_extraction_window_config(runtime_config),
         )
         self._episode_tags: List[str] = []
-        self._episode_prompt_language = "zh"
         self._has_pending_episode_sources = False
         scheduler_config = runtime_config.get("derived_task_scheduling")
         self._derived_task_scheduler = _DerivedMemoryTaskScheduler(
@@ -735,7 +730,6 @@ class MemoryRuntime:
         *,
         reason: str = "explicit",
         tags: Optional[List[str]] = None,
-        prompt_language: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Queue one completed source episode after its fact-store batches.
 
@@ -744,9 +738,6 @@ class MemoryRuntime:
         reaching back into runtime input buffers.
         """
         resolved_tags = list(self._episode_tags if tags is None else tags or [])
-        resolved_prompt_language = str(
-            prompt_language or self._episode_prompt_language
-        ).strip() or "zh"
 
         if not self._has_pending_episode_sources:
             return {
@@ -756,7 +747,6 @@ class MemoryRuntime:
             }
         report = self._memory_manager.submit_memory_episode_summary_task(
             tags=resolved_tags,
-            prompt_language=resolved_prompt_language,
         )
         if bool(report.get("queued")):
             self._has_pending_episode_sources = False
@@ -927,7 +917,6 @@ class MemoryRuntime:
         *,
         reason: str = "explicit_flush",
         tags: Optional[List[str]] = None,
-        prompt_language: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Finalize tail input, then append episode and derived-task fences."""
         queued = False
@@ -959,7 +948,6 @@ class MemoryRuntime:
         episode_summary_report = self._trigger_memory_episode_summary(
             reason=reason,
             tags=tags,
-            prompt_language=prompt_language,
         )
         derived_task_reports = self._derived_task_scheduler.force_drain()
         return {
@@ -1003,10 +991,8 @@ class MemoryRuntime:
         preceding_context_units = (
             self._memory_context_manager.preceding_context_units_snapshot()
         )
-        raw_segments, prompt_language = self._normalize_units_into_memory_raw_segments(
-            canonical_units,
-        )
-        preceding_context_segments, _ = self._normalize_units_into_memory_raw_segments(
+        raw_segments = self._normalize_units_into_memory_raw_segments(canonical_units)
+        preceding_context_segments = self._normalize_units_into_memory_raw_segments(
             preceding_context_units,
         )
         if not raw_segments:
@@ -1030,7 +1016,6 @@ class MemoryRuntime:
                 "original_semantic_unit_count": len(pending_units),
                 "preceding_context_unit_count": len(preceding_context_units),
                 "preceding_context_segment_count": len(preceding_context_segments),
-                "prompt_language": prompt_language,
                 "deduplication": deduplication_report,
                 "preceding_context_segments": preceding_context_segments,
                 "segments": raw_segments,
@@ -1040,14 +1025,12 @@ class MemoryRuntime:
             raw_segments=raw_segments,
             preceding_context_segments=preceding_context_segments,
             tags=sorted(tags),
-            prompt_language=prompt_language,
             completion_context=self._memory_store_completion_context(canonical_units),
         )
         queued = bool(queue_report.get("queued"))
         if queued:
             self._memory_context_manager.clear_sealed_chapter_buffers()
             self._has_pending_episode_sources = True
-            self._episode_prompt_language = prompt_language
             self._episode_tags = sorted(set(self._episode_tags).union(tags))
             self._memory_context_manager.record_stored_units(
                 canonical_units,
@@ -1100,7 +1083,6 @@ class MemoryRuntime:
         *,
         reason: str = "explicit_finalize",
         tags: Optional[List[str]] = None,
-        prompt_language: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Append a final store → episode → derived-task FIFO fence.
 
@@ -1112,7 +1094,6 @@ class MemoryRuntime:
         input_flush = self._flush_pending_memory_input_units(
             reason=reason,
             tags=tags,
-            prompt_language=prompt_language,
         )
         return {
             "input_flush": input_flush,
@@ -1126,19 +1107,12 @@ class MemoryRuntime:
         *,
         tags: Optional[List[str]] = None,
         time_end: Optional[str] = None,
-        prompt_language: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Run recall immediately through the manager without adding buffering."""
-        resolved_prompt_language = str(prompt_language or "").strip().lower()
-        if not resolved_prompt_language:
-            resolved_prompt_language = self._resolve_prompt_language_from_segments(
-                [{"text": str(query or "")}]
-            )
         return self._memory_manager.process_memory_recall_immediately(
             query=str(query or ""),
             tags=tags,
             time_end=time_end,
-            prompt_language=resolved_prompt_language,
         )
 
     def flush_pending_memory_inputs(
@@ -1146,13 +1120,11 @@ class MemoryRuntime:
         timeout: Optional[float] = None,
         *,
         tags: Optional[List[str]] = None,
-        prompt_language: Optional[str] = None,
     ) -> bool:
         """Finalize buffered tail input without waiting for manager tasks."""
         input_flush_report = self._flush_pending_memory_input_units(
             reason="explicit_input_boundary",
             tags=tags,
-            prompt_language=prompt_language,
         )
         return not (
             not input_flush_report.get("queued")
@@ -1166,29 +1138,6 @@ class MemoryRuntime:
     def derived_task_scheduler_snapshot(self) -> Dict[str, Any]:
         """Return runtime-local derived-task scheduling diagnostics."""
         return self._derived_task_scheduler.snapshot()
-
-    def _resolve_prompt_language_from_segments(
-        self,
-        records: Sequence[Dict[str, Any]],
-    ) -> str:
-        """Resolve prompt language for normalized segments or interaction turns."""
-        mode = self._prompt_language_mode
-        if mode in {"en", "english", "force_en"}:
-            return "en"
-        if mode in {"zh", "chinese", "force_zh"}:
-            return "zh"
-        sample = "\n".join(
-            text
-            for record in list(records)[:12]
-            if isinstance(record, dict)
-            for text in (
-                str(record.get("text") or "").strip()
-                or str(record.get("user_message") or "").strip()
-                or str(record.get("assistant_response") or "").strip(),
-            )
-            if text
-        )
-        return "zh" if re.search(r"[\u4e00-\u9fff]", sample) else "en"
 
     @staticmethod
     def _transcript_segment_text(segment: Dict[str, Any]) -> str:
@@ -1226,7 +1175,7 @@ class MemoryRuntime:
     def _normalize_units_into_memory_raw_segments(
         self,
         units: Sequence[MemoryUnit],
-    ) -> Tuple[List[Dict[str, Any]], str]:
+    ) -> List[Dict[str, Any]]:
         """Expand buffered units into normalized raw segments for storage."""
         normalized: List[Tuple[Dict[str, Any], int]] = []
         raw_segments = [
@@ -1254,9 +1203,7 @@ class MemoryRuntime:
             ),
         )
         ordered_segments = [item for item, _stable_index in normalized]
-        return ordered_segments, self._resolve_prompt_language_from_segments(
-            ordered_segments,
-        )
+        return ordered_segments
 
     def _memory_store_completion_context(
         self,
