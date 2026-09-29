@@ -71,11 +71,11 @@ ENTITY_EXTRACTION_GUIDANCE_ZH = """实体提取规则:
 每条长期记忆 fact 通常至少包含主体实体（如 用户/助手/speaker）和 1-4 个核心语义锚点。"""
 
 
-EPISODE_SUMMARY_PROMPT_ZH = """你是长期记忆系统的 episode 聚合模块。输入是一段连续时间内的原始交互/转写片段，以及从同一片段中提炼出的高价值 facts。你的任务是生成一段可回顾经历的叙事摘要。
+EPISODE_SUMMARY_PROMPT_ZH = """你是长期记忆系统的 episode 聚合模块。输入是一段连续时间内的原始交互/转写 unit，以及从同一批 unit 中提炼出的高价值 facts。你的任务是生成一段可回顾经历的叙事摘要。
 
 输入角色：
-- `source_segments` 是按时间排列的原始证据，是 episode 内容、先后关系和语气的唯一主要依据。
-- `evidence_facts` 是从这些片段中筛出的长期价值锚点，只用于核对重要信息是否被遗漏；绝不能逐条改写、拼接或扩写它们。
+- `source_units` 是按时间排列的原始证据，是 episode 内容、先后关系和语气的唯一主要依据。
+- `evidence_facts` 是从这些 unit 中筛出的长期价值锚点，只用于核对重要信息是否被遗漏；绝不能逐条改写、拼接或扩写它们。
 
 概念边界：
 - fact 是可独立召回的原子证据，保留可精确引用的事实细节。
@@ -83,13 +83,13 @@ EPISODE_SUMMARY_PROMPT_ZH = """你是长期记忆系统的 episode 聚合模块�
 - episode 不是长期 state、用户画像、跨经历规律、风险评估或待办事项；不要将一次经历推广成长期结论。
 
 生成规则：
-1. 先从原始片段恢复这段经历的主线：背景/触发 → 讨论、观察或行动 → 关键转折/态度 → 结果、决定或未决点。没有证据的环节直接省略。
+1. 先从原始 unit 恢复这段经历的主线：背景/触发 → 讨论、观察或行动 → 关键转折/态度 → 结果、决定或未决点。没有证据的环节直接省略。
 2. 可以概括多个相关表达，但不要按说话轮次复述，也不要把每条 fact 各写一句。summary 必须比 facts 更连贯、更具上下文，而不是更长的事实清单。
 3. 忽略唤醒词、寒暄、礼貌收尾、重复确认、无信息量的短回应和助手的模板化表述。只保留理解这次经历所需的对象、场景、问题、用户关切、关键回应、决定、约束、结果或开放问题。
-4. `evidence_facts` 中的高价值信息如与原始片段一致，应尽量在合适的叙事位置覆盖；如两者存在冲突、歧义或 facts 过度概括，以原始片段为准，并保留不确定性。
+4. `evidence_facts` 中的高价值信息如与原始 unit 一致，应尽量在合适的叙事位置覆盖；如两者存在冲突、歧义或 facts 过度概括，以原始 unit 为准，并保留不确定性。
 5. 保留时间顺序、条件和立场。不能把建议写成决定、把可能/计划写成完成、把助手的观点写成用户的信念，也不能编造因果、责任人、截止时间或结果。
 6. 若同一连续区间存在多个互不相关但有价值的话题，可用一段有层次的概括串联，但不要为了单一主题删除重要内容或虚构关联。
-7. summary 必须是一段简洁、自包含的经历摘要；读者不看 source segments 也能理解核心人物/对象、发生过程和结论/未决点。
+7. summary 必须是一段简洁、自包含的经历摘要；读者不看 source units 也能理解核心人物/对象、发生过程和结论/未决点。
 8. title 是检索标题：简短、具体、可区分，优先“对象 + 核心事件/问题/决定”，不要使用泛主题标题。
 9. canonical_topics 只输出 1-3 个稳定主题。优先复用 evidence_facts 中的 `fact_root_topic`；不要将动作、一次性结论、情绪或零散关键词当作主题。
 10. 只返回符合格式的 JSON，不要 markdown、解释文字或额外字段。
@@ -101,8 +101,8 @@ EPISODE_SUMMARY_PROMPT_ZH = """你是长期记忆系统的 episode 聚合模块�
   "canonical_topics": ["稳定主题1", "稳定主题2"]
 }
 
-原始 source segments：
-{source_segments}
+原始 source units：
+{source_units}
 
 高价值 evidence facts（仅用于覆盖核对，不要逐条拼接）：
 {evidence_facts}
@@ -118,7 +118,7 @@ UNIFIED_MEMORY_EXTRACTION_PROMPT_ZH = """你是 AI 眼镜长期记忆系统的�
 - entity_claim：由独立 reflection 模块从 facts 中形成的、可回溯证据的实体主张；它不是当前对话的直接证据。
 - goal / plan / work_item：由独立 Intent & Execution 模块从已落库 facts 提取的未来目标、明确安排和可闭环责任事项；本 prompt 不输出这些对象。
 
-你现在需要从下面按时间顺序排列的对话/转写证据批次中提取 Hindsight 风格的高质量 narrative facts。episode summary、episode canonical_topics 将由独立模块根据持久化的原始片段及已生成 facts 负责，不要在本 prompt 中输出 episode 级字段。
+你现在需要从下面按时间顺序排列的对话/转写证据 unit 批次中提取 Hindsight 风格的高质量 narrative facts。每个 unit 的 `单元类型` 仅用于说明来源：`interaction` 是一轮按顺序保留的用户与助手对话，`transcript` 是环境录音 ASR 转写。episode summary、episode canonical_topics 将由独立模块根据持久化的原始 unit 及已生成 facts 负责，不要在本 prompt 中输出 episode 级字段。
 
 前置上下文使用规则：
 - 下方的“前置上下文”仅来自紧邻当前批次之前的一小段已处理内容，只用于理解代词、省略、承接关系和当前话题的起点。

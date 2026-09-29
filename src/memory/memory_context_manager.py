@@ -7,6 +7,7 @@ from typing import Any, Deque, Dict, Iterator, List, Optional, Sequence, Tuple
 import numpy as np
 
 from .embedding_client import EmbeddingClient
+from .memory_types import MemoryUnit
 from .utils import _as_embedding_vector, _cal_embedding_cosine_similarity, _sigmoid, _centroid, _cohesion
 from .memory_manager import (
     _compact_whitespace,
@@ -39,16 +40,6 @@ class ChapterBoundaryDecision:
     scoring_mode: str = "single_unit"
     rolling_window_tail_units: int = 0
     rolling_window_tail_tokens: int = 0
-
-
-@dataclass
-class MemoryUnit:
-    text: str
-    token_count: int
-    timestamp: str = ""
-    ended_at: str = ""
-    raw: Optional[Dict[str, Any]] = None
-    embedding: Optional[np.ndarray] = None
 
 
 @dataclass
@@ -404,38 +395,28 @@ def convert_interaction_turn_to_online_unit(
         for tag in turn.get("tags") or []
         if str(tag).strip()
     ]
-    raw_segments: List[Dict[str, Any]] = []
+    texts: List[str] = []
+    speakers: List[str] = []
+    started_ats: List[str] = []
+    ended_ats: List[str] = []
     if user_message:
-        raw_segments.append({
-            "speaker": "用户",
-            "text": user_message,
-            "started_at": user_started_at,
-            "ended_at": user_ended_at,
-            "tags": tags,
-        })
+        texts.append(user_message)
+        speakers.append("用户")
+        started_ats.append(user_started_at)
+        ended_ats.append(user_ended_at)
     if assistant_response:
-        raw_segments.append({
-            "speaker": "助手",
-            "text": assistant_response,
-            "started_at": assistant_started_at,
-            "ended_at": assistant_ended_at,
-            "tags": tags,
-        })
+        texts.append(assistant_response)
+        speakers.append("助手")
+        started_ats.append(assistant_started_at)
+        ended_ats.append(assistant_ended_at)
     return MemoryUnit(
-        text=text,
+        texts=texts,
+        speakers=speakers,
         token_count=_estimate_interaction_token_count(text),
-        # A unified unit needs a sortable envelope while raw segments retain
-        # their individual speech/playback intervals.
-        timestamp=(
-            user_started_at if user_message else assistant_started_at
-        ) or fallback_timestamp,
-        ended_at=(
-            assistant_ended_at if assistant_response else user_ended_at
-        ) or fallback_timestamp,
-        raw={
-            "raw_segments": raw_segments,
-            "input_kind": "interaction",
-        },
+        started_ats=started_ats,
+        ended_ats=ended_ats,
+        unit_type="interaction",
+        tags=tags,
     )
 
 
@@ -500,15 +481,20 @@ class TranscriptUnitAssembler:
                 for segment in raw_segments
             )
         )
+        tags = list(dict.fromkeys(
+            str(tag).strip()
+            for segment in raw_segments
+            for tag in segment.get("tags") or []
+            if str(tag).strip()
+        ))
         unit = MemoryUnit(
-            text=text,
+            texts=[text],
+            speakers=[", ".join(speaker_labels) or "unknown_speaker"],
             token_count=max(1, self._current_token_count),
-            timestamp=self._segment_started_at(raw_segments[0]),
-            ended_at=self._segment_ended_at(raw_segments[-1]),
-            raw={
-                "raw_segments": raw_segments,
-                "speaker_labels": speaker_labels,
-            },
+            started_ats=[self._segment_started_at(raw_segments[0])],
+            ended_ats=[self._segment_ended_at(raw_segments[-1])],
+            unit_type="transcript",
+            tags=tags,
         )
         self._current_segments = []
         self._current_token_count = 0
@@ -674,7 +660,9 @@ class MemoryContextManager:
             return self._fact_task_decision_without_new_sealed_chapter(
                 chapter_boundary_decision,
             )
-        incoming_unit.embedding = _as_embedding_vector(self.embedding_client.embed_text(self.unit_text(incoming_unit)))
+        incoming_unit.embedding = _as_embedding_vector(
+            self.embedding_client.embed_text(incoming_unit.text),
+        )
         chapter_boundary_decision = self._evaluate_incoming_unit_for_chapter(
             incoming_unit,
         )
@@ -747,7 +735,7 @@ class MemoryContextManager:
     def _ambient_asr_covers_unit(self, unit: MemoryUnit) -> bool:
         if self._ambient_asr_watermark is None:
             return False
-        ended_at = self._parse_timestamp(self.unit_end_timestamp(unit))
+        ended_at = self._parse_timestamp(unit.end_time)
         return ended_at is not None and ended_at <= self._ambient_asr_watermark
 
     def pending_unit_snapshot(self) -> List[MemoryUnit]:
@@ -789,7 +777,7 @@ class MemoryContextManager:
         self._sealed_chapter_buffers.clear()
 
     def preceding_context_units_snapshot(self) -> List[MemoryUnit]:
-        """Return the prior fact task's bounded trailing canonical units."""
+        """Return the prior fact task's bounded trailing task units."""
         return list(self._preceding_context_units)
 
     def record_preceding_context_units(
@@ -815,7 +803,7 @@ class MemoryContextManager:
         for unit in reversed(list(units or [])):
             if len(selected_reversed) >= max_units:
                 break
-            token_count = max(0, self.unit_token_count(unit))
+            token_count = max(0, unit.token_count)
             if selected_reversed and selected_tokens + token_count > max_tokens:
                 break
             if not selected_reversed and token_count > max_tokens:
@@ -832,7 +820,7 @@ class MemoryContextManager:
         return (
             len(self._sealed_chapter_buffers),
             sum(
-                self.unit_token_count(unit)
+                unit.token_count
                 for chapter in self._sealed_chapter_buffers
                 for unit in chapter.units
             ),
@@ -889,13 +877,13 @@ class MemoryContextManager:
         self,
         units: Sequence[MemoryUnit],
     ) -> None:
-        """Record successfully queued canonical units in the episode window."""
+        """Record successfully queued task units in the episode window."""
         for unit in units:
-            token_count = max(0, self.unit_token_count(unit))
+            token_count = max(0, unit.token_count)
             if token_count <= 0:
                 continue
-            started_at = self._parse_timestamp(self.unit_timestamp(unit))
-            ended_at = self._parse_timestamp(self.unit_end_timestamp(unit))
+            started_at = self._parse_timestamp(unit.start_time)
+            ended_at = self._parse_timestamp(unit.end_time)
             if self._episode_started_at is None and started_at is not None:
                 self._episode_started_at = started_at
             latest_at = ended_at or started_at
@@ -948,13 +936,13 @@ class MemoryContextManager:
         if not active_units:
             decision = ChapterBoundaryDecision(
                 reason="start_unit",
-                prospective_tokens=self.unit_token_count(incoming_unit),
+                prospective_tokens=incoming_unit.token_count,
                 prospective_units=1,
                 time_gap_seconds=time_gap_seconds,
             )
             return decision
         active_token_count = sum(
-            self.unit_token_count(item) for item in active_units
+            item.token_count for item in active_units
         )
         if (
             self.config.max_pending_units > 0
@@ -990,7 +978,7 @@ class MemoryContextManager:
                 prospective_units=len(active_units),
                 time_gap_seconds=time_gap_seconds,
             )
-        incoming_token_count = self.unit_token_count(incoming_unit)
+        incoming_token_count = incoming_unit.token_count
         if incoming_token_count < self.config.min_boundary_scoring_incoming_tokens:
             return ChapterBoundaryDecision(
                 reason="short_unit_append",
@@ -1017,11 +1005,11 @@ class MemoryContextManager:
         if self.config.rolling_window_enabled and tail_limit > 0:
             tail_units = list(active_units[-tail_limit:])
             texts = [
-                self.unit_text(unit)
+                unit.text
                 for unit in tail_units
-                if self.unit_text(unit)
+                if unit.text
             ]
-            incoming_text = self.unit_text(incoming_unit)
+            incoming_text = incoming_unit.text
             if incoming_text:
                 texts.append(incoming_text)
             if len(texts) > 1:
@@ -1037,7 +1025,7 @@ class MemoryContextManager:
                 tail_units = []
 
         tail_token_count = sum(
-            self.unit_token_count(unit)
+            unit.token_count
             for unit in tail_units
         )
         if incoming_embedding is None or any(
@@ -1046,7 +1034,7 @@ class MemoryContextManager:
             return ChapterBoundaryDecision(
                 reason="embedding_unavailable",
                 prospective_tokens=sum(
-                    self.unit_token_count(item) for item in active_units
+                    item.token_count for item in active_units
                 ),
                 prospective_units=len(active_units),
                 rolling_window_tail_units=len(tail_units),
@@ -1071,8 +1059,8 @@ class MemoryContextManager:
         cohesion_after = _cohesion([*active_embeddings, incoming_embedding])
         cohesion_drop = max(0.0, cohesion_before - cohesion_after)
         prospective_tokens = (
-            sum(self.unit_token_count(item) for item in active_units)
-            + self.unit_token_count(incoming_unit)
+            sum(item.token_count for item in active_units)
+            + incoming_unit.token_count
         )
         prospective_units = len(active_units) + 1
         length_signal = length_pressure(prospective_tokens, self.config)
@@ -1108,7 +1096,7 @@ class MemoryContextManager:
             return decision
         min_units = max(1, int(self.config.min_pending_units))
         active_token_count = sum(
-            self.unit_token_count(item) for item in active_units
+            item.token_count for item in active_units
         )
         meets_token_minimum = (
             not self.config.enforce_min_pending_tokens
@@ -1127,21 +1115,6 @@ class MemoryContextManager:
         return decision
 
     @staticmethod
-    def unit_text(unit: Any) -> str:
-        return str(getattr(unit, "text", "") or "")
-
-    @staticmethod
-    def unit_token_count(unit: Any) -> int:
-        value = getattr(unit, "token_count", None)
-        if value is not None:
-            return max(1, int(value))
-        return _estimate_interaction_token_count(MemoryContextManager.unit_text(unit))
-
-    @staticmethod
-    def unit_timestamp(unit: Any) -> str:
-        return _to_timestamp_text(getattr(unit, "timestamp", "")) or ""
-
-    @staticmethod
     def _parse_timestamp(value: Any) -> Optional[datetime]:
         text = _to_timestamp_text(value)
         if not text:
@@ -1155,30 +1128,23 @@ class MemoryContextManager:
             return None
 
     @classmethod
-    def _unit_time_order_key(cls, unit: Any) -> Tuple[int, float]:
+    def _unit_time_order_key(cls, unit: MemoryUnit) -> Tuple[int, float]:
         """Sort known timestamps first; stable sorting preserves arrival order."""
-        parsed = cls._parse_timestamp(cls.unit_timestamp(unit))
+        parsed = cls._parse_timestamp(unit.start_time)
         return (
             0 if parsed is not None else 1,
             parsed.timestamp() if parsed is not None else float("inf"),
         )
 
     @classmethod
-    def unit_end_timestamp(cls, unit: Any) -> str:
-        return (
-            _to_timestamp_text(getattr(unit, "ended_at", ""))
-            or cls.unit_timestamp(unit)
-        )
-
-    @classmethod
     def unit_time_gap_seconds(
         cls,
-        previous_unit: Any,
-        incoming_unit: Any,
+        previous_unit: MemoryUnit,
+        incoming_unit: MemoryUnit,
     ) -> Optional[float]:
         return cls.timestamp_gap_seconds(
-            cls.unit_end_timestamp(previous_unit),
-            cls.unit_timestamp(incoming_unit),
+            previous_unit.end_time,
+            incoming_unit.start_time,
         )
 
     @classmethod

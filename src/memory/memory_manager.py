@@ -4,7 +4,7 @@
 The public surface mirrors the current project's `MemoryNodeManager`, but the
 internal model is deliberately unified:
 
-1. Submitted source segments are organized into `memory_episodes`.
+1. Submitted source units are organized into `memory_episodes`.
 2. Extracted evidence becomes narrative `memory_facts`.
 3. Traceable explicit and inductive propositions live in entity claims.
 4. The legacy actionable-item projection is temporarily disabled while the
@@ -36,6 +36,7 @@ except ImportError:  # pragma: no cover - exercised only in minimal installs
 
 from .embedding_client import EmbeddingClient
 from .memory_database import SessionDB
+from .memory_types import MemoryUnit
 from .prompts_en import (
     DERIVED_ENTITY_CLAIM_EXTRACTION_PROMPT_EN,
     ENTITY_CLAIM_RECONCILIATION_PROMPT_EN,
@@ -824,7 +825,7 @@ class MemoryNodeManager:
             self._embedding_client = EmbeddingClient(self._embedding_cfg)
         return True
 
-    # ── Store path: raw segments -> episode -> facts -> index cards ──────
+    # ── Store path: source units -> episode -> facts -> index cards ──────
 
     @property
     def enabled(self) -> bool:
@@ -984,7 +985,7 @@ class MemoryNodeManager:
                 payload={
                     key: value
                     for key, value in payload.items()
-                    if key != "raw_segments"
+                    if key not in {"units", "preceding_context_units"}
                 },
             )
             self._ensure_task_worker_locked()
@@ -1059,14 +1060,14 @@ class MemoryNodeManager:
     def submit_memory_fact_extraction_task(
         self,
         *,
-        raw_segments: List[Dict[str, Any]],
-        preceding_context_segments: Optional[List[Dict[str, Any]]] = None,
+        units: List[MemoryUnit],
+        preceding_context_units: Optional[List[MemoryUnit]] = None,
         tags: List[str],
         completion_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Queue one normalized episode for ordered background storage."""
-        if not self._memory_enabled or not raw_segments:
-            reason = "memory_disabled" if not self._memory_enabled else "no_raw_segments"
+        """Queue one typed unit batch for ordered fact extraction."""
+        if not self._memory_enabled or not units:
+            reason = "memory_disabled" if not self._memory_enabled else "no_units"
             task_id = self._operation_reporter.next_task_id("memory_fact_extraction")
             return self._reject_memory_task(
                 task_kind="memory_fact_extraction",
@@ -1076,8 +1077,8 @@ class MemoryNodeManager:
         return self._submit_memory_task(
             task_kind="memory_fact_extraction",
             payload={
-                "raw_segments": raw_segments,
-                "preceding_context_segments": list(preceding_context_segments or []),
+                "units": list(units),
+                "preceding_context_units": list(preceding_context_units or []),
                 "tags": tags,
             },
             completion_context=completion_context,
@@ -1106,23 +1107,22 @@ class MemoryNodeManager:
         *,
         tags: List[str],
     ) -> Dict[str, Any]:
-        source_segments = self._db.get_unassigned_memory_source_segments(
+        source_units = self._db.get_unassigned_memory_source_segments(
             limit=240,
         )
-        if not source_segments:
+        if not source_units:
             return {
                 "status": "empty",
-                "reason": "no_unassigned_source_segments",
+                "reason": "no_unassigned_source_units",
                 "new_episode_count": 0,
                 "fact_count": 0,
-                "source_segment_count": 0,
+                "source_unit_count": 0,
             }
         source_started_at = _compact_whitespace(
-            source_segments[0].get("started_at") or ""
+            source_units[0].start_time
         )
         source_ended_at = _compact_whitespace(
-            source_segments[-1].get("ended_at")
-            or source_segments[-1].get("started_at")
+            source_units[-1].end_time
             or source_started_at
         )
         facts = self._db.get_unassigned_memory_facts_in_time_window(
@@ -1130,8 +1130,8 @@ class MemoryNodeManager:
             ended_at=source_ended_at,
             limit=80,
         )
-        episode_info = self._generate_episode_from_source_segments(
-            source_segments=source_segments,
+        episode_info = self._generate_episode_from_source_units(
+            source_units=source_units,
             facts=facts,
         )
         if episode_info.get("status") != "ok":
@@ -1149,8 +1149,8 @@ class MemoryNodeManager:
                 metadata={
                     "tags": list(tags or []),
                     "fact_count": len(facts),
-                    "source_segment_count": len(source_segments),
-                    "generated_from_source_segments": True,
+                    "source_unit_count": len(source_units),
+                    "generated_from_source_units": True,
                     "evidence_fact_ids": list(episode_info.get("fact_ids") or []),
                 },
             )
@@ -1177,18 +1177,18 @@ class MemoryNodeManager:
             attached = self._db.update_facts_episode_id(
                 fact_ids=episode_info.get("fact_ids") or [], episode_id=episode_id,
             )
-            attached_source_segment_rows = self._db.update_memory_source_segments_episode_id(
-                source_segment_ids=episode_info.get("source_segment_ids") or [],
+            attached_source_unit_rows = self._db.update_memory_source_segments_episode_id(
+                source_segment_ids=episode_info.get("source_unit_row_ids") or [],
                 episode_id=episode_id,
             )
         episode_info.update({
             "episode_id": episode_id,
             "fact_count": attached,
             # Source evidence is expanded from batch rows before episode
-            # generation, so expose the logical segment count rather than
+            # generation, so expose the logical unit count rather than
             # the number of physical persistence rows attached here.
-            "source_segment_count": len(source_segments),
-            "source_segment_row_count": attached_source_segment_rows,
+            "source_unit_count": len(source_units),
+            "source_unit_row_count": attached_source_unit_rows,
             "new_episode_count": 1,
             "topic_items_created": int(topic_report.get("created_count", 0) or 0),
             "topic_items_updated": int(topic_report.get("updated_count", 0) or 0),
@@ -1196,8 +1196,8 @@ class MemoryNodeManager:
         self._log_info("memory_fact_extraction", "episode_summary_generated", {
             "episode_id": episode_id,
             "fact_count": attached,
-            "source_segment_count": len(source_segments),
-            "source_segment_row_count": attached_source_segment_rows,
+            "source_unit_count": len(source_units),
+            "source_unit_row_count": attached_source_unit_rows,
             "title": episode_info.get("title") or "",
             "topic_items_created": episode_info.get("topic_items_created", 0),
             "topic_items_updated": episode_info.get("topic_items_updated", 0),
@@ -1207,32 +1207,32 @@ class MemoryNodeManager:
     def _process_memory_fact_extraction_task(
         self,
         *,
-        raw_segments: List[Dict[str, Any]],
-        preceding_context_segments: Optional[List[Dict[str, Any]]] = None,
+        units: List[MemoryUnit],
+        preceding_context_units: Optional[List[MemoryUnit]] = None,
         tags: List[str],
     ) -> Dict[str, Any]:
         store_started_at = time.monotonic()
-        preceding_segments = list(preceding_context_segments or [])
-        if not raw_segments:
+        preceding_units = list(preceding_context_units or [])
+        if not units:
             elapsed_ms = round((time.monotonic() - store_started_at) * 1000, 2)
             self._log_info("memory_fact_extraction", "finish", {
                 "status": "skipped",
-                "reason": "no_raw_segments",
+                "reason": "no_units",
                 "total_elapsed_ms": elapsed_ms,
             })
             return {
                 "status": "skipped",
-                "reason": "no_raw_segments",
+                "reason": "no_units",
                 "new_fact_count": 0,
                 "total_elapsed_ms": elapsed_ms,
             }
         with self._db.transaction():
-            source_segment_ids = self._db.insert_memory_source_segments(
-                segments=raw_segments,
+            source_unit_row_ids = self._db.insert_memory_source_segments(
+                units=units,
             )
-        fact_info = self._extract_memory_fact_from_raw_segments(
-            raw_segments,
-            preceding_context_segments=preceding_segments,
+        fact_info = self._extract_memory_fact_from_units(
+            units,
+            preceding_context_units=preceding_units,
         )
         facts = list(fact_info.get("facts") or [])
         self._log_extracted_fact_info(facts=facts)
@@ -1262,15 +1262,27 @@ class MemoryNodeManager:
             "future_commitment_signal_count": int(
                 save_fact_info.get("future_commitment_signal_count") or 0
             ),
-            "source_segment_ids": source_segment_ids,
-            "source_segment_count": len(raw_segments),
-            "source_segment_row_count": len(source_segment_ids),
+            "source_unit_row_ids": source_unit_row_ids,
+            "source_unit_count": len(units),
+            "source_unit_row_count": len(source_unit_row_ids),
             "topic_items_created": int(topic_report.get("created_count", 0) or 0),
             "topic_items_updated": int(topic_report.get("updated_count", 0) or 0),
             "total_elapsed_ms": round((time.monotonic() - store_started_at) * 1000, 2),
         }
         self._log_info("memory_fact_extraction", "finish", report)
         return report
+
+    @staticmethod
+    def _valid_memory_units(
+        units: Sequence[MemoryUnit],
+    ) -> List[MemoryUnit]:
+        """Keep task units with usable text, without rebuilding their order."""
+        return [
+            unit
+            for unit in units or ()
+            if isinstance(unit, MemoryUnit)
+            and _compact_whitespace(unit.text)
+        ]
 
     def _upsert_memory_recall_document(
         self,
@@ -1366,7 +1378,7 @@ class MemoryNodeManager:
         started_at: str,
         ended_at: str,
     ) -> int:
-        """Project one experience-level summary without exposing raw segments."""
+        """Project one experience-level summary without exposing raw units."""
         return self._upsert_memory_recall_document(
             object_type="episode",
             object_id=episode_id,
@@ -1423,25 +1435,27 @@ class MemoryNodeManager:
                 },
             )
 
-    def _extract_memory_fact_from_raw_segments(
+    def _extract_memory_fact_from_units(
         self,
-        raw_segments: List[Dict[str, Any]],
+        units: Sequence[MemoryUnit],
         *,
-        preceding_context_segments: Optional[List[Dict[str, Any]]] = None,
+        preceding_context_units: Optional[Sequence[MemoryUnit]] = None,
     ) -> Dict[str, Any]:
         """Extract narrative facts with the unified fact prompt."""
-        prompt_language = self._resolve_prompt_language_from_memory_segments(
-            [*raw_segments, *(preceding_context_segments or [])],
+        current_units = self._valid_memory_units(units)
+        preceding_units = self._valid_memory_units(preceding_context_units or [])
+        prompt_language = self._resolve_prompt_language_from_memory_units(
+            [*current_units, *preceding_units],
         )
         self._log_info("memory_fact_extraction", "start", {
-            "source_segment_count": len(raw_segments),
-            "preceding_context_segment_count": len(preceding_context_segments or []),
-            "current_segments": self._build_memory_segments_for_prompt(
-                raw_segments,
+            "source_unit_count": len(current_units),
+            "preceding_context_unit_count": len(preceding_units),
+            "current_units": self._build_memory_units_for_prompt(
+                current_units,
                 prompt_language=prompt_language,
             ),
-            "preceding_context_segments": self._build_memory_segments_for_prompt(
-                list(preceding_context_segments or []),
+            "preceding_context_units": self._build_memory_units_for_prompt(
+                preceding_units,
                 prompt_language=prompt_language,
             ),
         })
@@ -1451,7 +1465,7 @@ class MemoryNodeManager:
             else UNIFIED_MEMORY_EXTRACTION_PROMPT_ZH
         )
         memory_topic_item_context = (
-            self._collect_memory_topic_item_context(segments=raw_segments)
+            self._collect_memory_topic_item_context(units=current_units)
             if prompt_language != "en"
             else {"canonical_topics": [], "aspect_topics": []}
         )
@@ -1463,15 +1477,15 @@ class MemoryNodeManager:
             )
             .replace(
                 "{dialogue_batch}",
-                self._build_memory_segments_for_prompt(
-                    raw_segments,
+                self._build_memory_units_for_prompt(
+                    current_units,
                     prompt_language=prompt_language,
                 ),
             )
             .replace(
                 "{preceding_context}",
-                self._build_memory_segments_for_prompt(
-                    list(preceding_context_segments or []),
+                self._build_memory_units_for_prompt(
+                    preceding_units,
                     prompt_language=prompt_language,
                 ) or ("(none)" if prompt_language == "en" else "（无）"),
             )
@@ -1506,7 +1520,7 @@ class MemoryNodeManager:
                 normalization_diagnostics: Dict[str, Any] = {}
                 normalized = self._normalize_memory_fact_extraction_llm_output(
                     parsed,
-                    raw_segments,
+                    current_units,
                     prompt_language=prompt_language,
                     diagnostics=normalization_diagnostics,
                 )
@@ -1523,32 +1537,28 @@ class MemoryNodeManager:
                 self._logger.debug("Unified memory LLM extraction failed, retrying")
         return {"facts": []}
 
-    def _generate_episode_from_source_segments(
+    def _generate_episode_from_source_units(
         self,
         *,
-        source_segments: Sequence[Dict[str, Any]],
+        source_units: Sequence[MemoryUnit],
         facts: Sequence[Dict[str, Any]],
     ) -> Dict[str, Any]:
         """Generate an experience-level episode from source evidence.
 
         Facts remain compact coverage anchors, but the chronological source
-        segments are the authoritative narrative material. This prevents an
+        units are the authoritative narrative material. This prevents an
         episode from degrading into a sentence-by-sentence fact concatenation.
         """
-        segment_list = [
-            item for item in source_segments or []
-            if isinstance(item, dict)
-            and _compact_whitespace(item.get("text") or "")
-        ]
-        if not segment_list:
+        unit_list = self._valid_memory_units(source_units)
+        if not unit_list:
             return {
                 "status": "empty",
                 "new_episode_count": 0,
                 "fact_count": 0,
-                "source_segment_count": 0,
+                "source_unit_count": 0,
             }
-        prompt_language = self._resolve_prompt_language_from_memory_segments(
-            segment_list,
+        prompt_language = self._resolve_prompt_language_from_memory_units(
+            unit_list,
         )
         fact_list = [
             item for item in facts or []
@@ -1567,8 +1577,8 @@ class MemoryNodeManager:
             }
             for item in fact_list
         ]
-        source_text = self._build_memory_segments_for_prompt(
-            segment_list,
+        source_text = self._build_memory_units_for_prompt(
+            unit_list,
             prompt_language=prompt_language,
         )
         prompt_template = (
@@ -1578,7 +1588,7 @@ class MemoryNodeManager:
         )
         prompt = (
             prompt_template
-            .replace("{source_segments}", source_text)
+            .replace("{source_units}", source_text)
             .replace("{evidence_facts}", json.dumps(fact_payload, ensure_ascii=False))
         )
         parsed: Dict[str, Any] = {}
@@ -1588,12 +1598,12 @@ class MemoryNodeManager:
                 break
         summary = _compact_whitespace(parsed.get("summary") or "")
         if not summary:
-            summary = self._fallback_generate_episode_summary_from_raw_segments(segment_list)
+            summary = self._fallback_generate_episode_summary_from_units(unit_list)
         title = _compact_whitespace(parsed.get("title") or "")
         if not title:
-            title = self._fallback_generate_episode_title_from_raw_segments(segment_list)
+            title = self._fallback_generate_episode_title_from_units(unit_list)
         source_text_for_topics = " ".join(
-            _compact_whitespace(item.get("text") or "") for item in segment_list
+            _compact_whitespace(item.text) for item in unit_list
         )
         topics = self._normalize_episode_canonical_topics(
             parsed.get("canonical_topics"),
@@ -1609,7 +1619,7 @@ class MemoryNodeManager:
                 ])[:3]
                 or self._topic_candidates(summary)[:3]
         )
-        participants = self._parse_participants_from_raw_segments(segment_list)
+        participants = self._parse_participants_from_units(unit_list)
         episode_entity_ids: List[int] = []
         for fact in fact_list:
             for value in fact.get("entity_ids") or []:
@@ -1623,10 +1633,11 @@ class MemoryNodeManager:
                     break
             if len(episode_entity_ids) >= 64:
                 break
-        start = _compact_whitespace(segment_list[0].get("started_at") or "") or _now_text()
+        start = _compact_whitespace(
+            unit_list[0].start_time,
+        ) or _now_text()
         end = (
-            _compact_whitespace(segment_list[-1].get("ended_at") or "")
-            or _compact_whitespace(segment_list[-1].get("started_at") or "")
+            _compact_whitespace(unit_list[-1].end_time)
             or start
         )
         return {
@@ -1642,10 +1653,10 @@ class MemoryNodeManager:
                 for item in fact_list
                 if str(item.get("id", "")).isdigit()
             ],
-            "source_segment_ids": list(dict.fromkeys(
-                int(item["id"])
-                for item in segment_list
-                if str(item.get("id", "")).isdigit()
+            "source_unit_row_ids": list(dict.fromkeys(
+                int(item.source_unit_row_id)
+                for item in unit_list
+                if item.source_unit_row_id is not None
             )),
             "started_at": start,
             "ended_at": end,
@@ -1735,7 +1746,7 @@ class MemoryNodeManager:
     def _normalize_memory_fact_extraction_llm_output(
         self,
         data: Dict[str, Any],
-        raw_segments: List[Dict[str, Any]],
+        units: Sequence[MemoryUnit],
         *,
         prompt_language: str,
         diagnostics: Optional[Dict[str, Any]] = None,
@@ -1781,7 +1792,7 @@ class MemoryNodeManager:
             })
 
         dialogue_time_key = _to_timestamp_text(
-            raw_segments[0].get("started_at") if raw_segments else ""
+            units[0].start_time if units else ""
         ) or _now_text()
         for index, raw_fact in enumerate(raw_facts, 1):
             if not isinstance(raw_fact, dict):
@@ -2156,18 +2167,19 @@ class MemoryNodeManager:
         return "\n\n".join(blocks)
 
     @staticmethod
-    def _parse_participants_from_raw_segments(raw_segments: List[Dict[str, Any]]) -> List[str]:
+    def _parse_participants_from_units(units: Sequence[MemoryUnit]) -> List[str]:
         participants: List[str] = []
         seen: set[str] = set()
-        for segment in raw_segments:
-            speaker = _compact_whitespace(segment.get("speaker") or "")
-            if not speaker:
-                continue
-            key = speaker.lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            participants.append(speaker)
+        for unit in units or []:
+            for value in unit.speakers or []:
+                speaker = _compact_whitespace(value)
+                if not speaker:
+                    continue
+                key = speaker.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                participants.append(speaker)
         return participants or ["unknown_speaker"]
 
     @staticmethod
@@ -2239,29 +2251,51 @@ class MemoryNodeManager:
             )
         return descriptors
 
-    def _build_memory_segments_for_prompt(
+    def _build_memory_units_for_prompt(
         self,
-        segments: List[Dict[str, Any]],
+        units: Sequence[MemoryUnit],
         *,
         prompt_language: str,
     ) -> str:
         is_en = prompt_language == "en"
         time_label = "Time" if is_en else "时间"
+        unit_type_label = "Unit type" if is_en else "单元类型"
         speaker_label = "Speaker" if is_en else "说话人"
         text_label = "Text" if is_en else "文本"
         blocks: List[str] = []
-        for index, segment in enumerate(segments, 1):
-            started_at = segment.get("started_at") or ""
-            ended_at = segment.get("ended_at") or started_at
-            time_text = started_at if started_at == ended_at else f"{started_at} - {ended_at}"
-            blocks.append(
-                "\n".join([
-                    f"[Segment {index}]",
+        for index, unit in enumerate(units, 1):
+            entry_blocks: List[str] = []
+            for entry_index, text in enumerate(unit.texts or [], 1):
+                started_at = (
+                    unit.started_ats[entry_index - 1]
+                    if entry_index <= len(unit.started_ats)
+                    else ""
+                ) or ""
+                ended_at = (
+                    unit.ended_ats[entry_index - 1]
+                    if entry_index <= len(unit.ended_ats)
+                    else started_at
+                ) or started_at
+                time_text = (
+                    started_at
+                    if started_at == ended_at
+                    else f"{started_at} - {ended_at}"
+                )
+                speaker = (
+                    unit.speakers[entry_index - 1]
+                    if entry_index <= len(unit.speakers)
+                    else ""
+                )
+                entry_blocks.append("\n".join([
                     f"{time_label}: {time_text}",
-                    f"{speaker_label}: {segment.get('speaker') or ''}",
-                    f"{text_label}: {segment.get('text') or ''}",
-                ])
-            )
+                    f"{speaker_label}: {speaker}",
+                    f"{text_label}: {text}",
+                ]))
+            blocks.append("\n".join([
+                f"[Unit {index}]",
+                f"{unit_type_label}: {unit.unit_type or 'transcript'}",
+                *entry_blocks,
+            ]))
         return "\n\n".join(blocks)
 
     def _is_indexable_memory_topic(self, value: Any) -> bool:
@@ -2330,15 +2364,15 @@ class MemoryNodeManager:
     def _collect_memory_topic_item_context(
         self,
         *,
-        segments: Sequence[Dict[str, Any]],
+        units: Sequence[MemoryUnit],
         canonical_limit: int = 12,
         aspect_limit: int = 12,
     ) -> Dict[str, List[str]]:
         """Return only topic names lexically related to the incoming evidence."""
         query_text = " ".join(
-            _compact_whitespace(segment.get("text") or "")
-            for segment in segments or ()
-            if isinstance(segment, dict)
+            _compact_whitespace(unit.text)
+            for unit in units or ()
+            if isinstance(unit, MemoryUnit)
         )
         query_terms = self._lexical_search_terms_for_text(
             query_text,
@@ -2539,20 +2573,15 @@ class MemoryNodeManager:
             return "zh"
         return "en" if str(fallback).lower().startswith("en") else "zh"
 
-    def _resolve_prompt_language_from_memory_segments(
+    def _resolve_prompt_language_from_memory_units(
         self,
-        segments: Sequence[Dict[str, Any]],
+        units: Sequence[MemoryUnit],
     ) -> str:
         """Resolve one LLM task's prompt language from its actual source text."""
         text = "\n".join(
-            _compact_whitespace(
-                segment.get("text")
-                or segment.get("user_message")
-                or segment.get("assistant_response")
-                or ""
-            )
-            for segment in segments
-            if isinstance(segment, dict)
+            _compact_whitespace(unit.text)
+            for unit in units
+            if isinstance(unit, MemoryUnit)
         )
         return self._resolve_prompt_language_from_text(text)
 
@@ -2572,22 +2601,31 @@ class MemoryNodeManager:
                 chunks.append(f"Assistant: {turn['assistant_response'][:600]}")
         return "\n".join(chunks)
 
-    def _fallback_generate_episode_title_from_raw_segments(self, raw_segments: List[Dict[str, Any]]) -> str:
-        for segment in raw_segments:
-            text = segment.get("text") or ""
+    def _fallback_generate_episode_title_from_units(self, units: Sequence[MemoryUnit]) -> str:
+        for unit in units:
+            text = unit.text or ""
             if text:
                 return _compact_whitespace(text)[:96]
         return "memory episode"
 
-    def _fallback_generate_episode_summary_from_raw_segments(self, raw_segments: List[Dict[str, Any]]) -> str:
+    def _fallback_generate_episode_summary_from_units(self, units: Sequence[MemoryUnit]) -> str:
         chunks: List[str] = []
-        for segment in raw_segments[:10]:
-            speaker = segment.get("speaker") or "speaker"
-            text = _compact_whitespace(segment.get("text") or "")
-            if not text:
-                continue
-            started_at = segment.get("started_at") or ""
-            chunks.append(f"{started_at} {speaker}: {text[:600]}")
+        for unit in list(units)[:10]:
+            for index, text in enumerate(unit.texts or []):
+                clean_text = _compact_whitespace(text)
+                if not clean_text:
+                    continue
+                speaker = (
+                    unit.speakers[index]
+                    if index < len(unit.speakers)
+                    else "speaker"
+                )
+                started_at = (
+                    unit.started_ats[index]
+                    if index < len(unit.started_ats)
+                    else ""
+                ) or ""
+                chunks.append(f"{started_at} {speaker}: {clean_text[:600]}")
         return "\n".join(chunks)
 
     def _is_low_value_assistant_closing(self, text: str) -> bool:

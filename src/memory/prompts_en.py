@@ -71,11 +71,11 @@ Entities must come from explicit conversation content or be directly determined 
 Each retained memory fact should usually include a subject entity, such as user/assistant/speaker, plus 1-4 core semantic anchors."""
 
 
-EPISODE_SUMMARY_PROMPT_EN = """You are the episode aggregation module for a long-term memory system. The input contains raw interaction/transcript segments from one continuous interval and high-value facts extracted from the same evidence. Generate a narrative summary of one reviewable experience.
+EPISODE_SUMMARY_PROMPT_EN = """You are the episode aggregation module for a long-term memory system. The input contains raw interaction/transcript units from one continuous interval and high-value facts extracted from the same evidence. Generate a narrative summary of one reviewable experience.
 
 Input roles:
-- `source_segments` are chronological source evidence and the sole primary basis for the episode's content, ordering, and stance.
-- `evidence_facts` are durable coverage anchors selected from those segments. Use them only to check that important information is not missed; never rewrite, concatenate, or expand them one by one.
+- `source_units` are chronological source evidence and the sole primary basis for the episode's content, ordering, and stance.
+- `evidence_facts` are durable coverage anchors selected from those units. Use them only to check that important information is not missed; never rewrite, concatenate, or expand them one by one.
 
 Conceptual boundaries:
 - A fact is an independently retrievable atomic evidence unit containing precise details.
@@ -83,13 +83,13 @@ Conceptual boundaries:
 - An episode is not a long-term state, user profile, cross-experience pattern, risk assessment, or actionable item. Never generalize one episode into a durable conclusion.
 
 Generation rules:
-1. Reconstruct the experience from source segments: context/trigger -> discussion, observation, or action -> meaningful turn or stance -> result, decision, or unresolved point. Omit any unsupported step.
+1. Reconstruct the experience from source units: context/trigger -> discussion, observation, or action -> meaningful turn or stance -> result, decision, or unresolved point. Omit any unsupported step.
 2. Abstract related expressions, but do not replay every turn or write one sentence per fact. The summary must be more coherent and contextual than the facts, not a longer fact list.
 3. Ignore wake words, greetings, courtesy closings, repetitions, empty acknowledgements, and templated assistant language. Retain only the people/objects, setting, issue, user concern, key response, decision, constraint, outcome, or open question needed to understand the experience.
-4. Cover high-value information in `evidence_facts` where it agrees with source segments. If facts conflict with, overstate, or leave ambiguity in the source, follow the source and preserve uncertainty.
+4. Cover high-value information in `evidence_facts` where it agrees with source units. If facts conflict with, overstate, or leave ambiguity in the source, follow the source and preserve uncertainty.
 5. Preserve chronology, conditions, and speaker stance. Do not turn advice into a decision, a possibility or plan into completion, an assistant view into a user belief, or invent causality, owners, deadlines, or outcomes.
 6. If the continuous interval contains several unrelated but valuable topics, connect them with a structured summary without forcing a causal link or omitting important content.
-7. summary must be one concise, self-contained experience narrative: understandable without source segments and clear about the central people/objects, progression, and conclusion/open point.
+7. summary must be one concise, self-contained experience narrative: understandable without source units and clear about the central people/objects, progression, and conclusion/open point.
 8. title is a short, concrete, distinguishable retrieval title. Prefer "object + core event/problem/decision" over broad labels.
 9. canonical_topics contains only 1-3 stable topics. Prefer `fact_root_topic` values from evidence facts; never use an action, one-off conclusion, emotion, or isolated keyword as a topic.
 10. Return JSON matching the schema exactly. No markdown, explanation, or extra fields.
@@ -101,8 +101,8 @@ Output schema:
   "canonical_topics": ["stable topic 1", "stable topic 2"]
 }
 
-Raw source segments:
-{source_segments}
+Raw source units:
+{source_units}
 
 High-value evidence facts (coverage checks only; do not concatenate):
 {evidence_facts}
@@ -118,7 +118,7 @@ Current memory structure:
 - entity_claim: a traceable entity proposition projected from facts by a separate reflection task; it is not direct evidence from the current dialogue.
 - goal / plan / work_item: future desired outcomes, explicit arrangements, and closed-loop responsibilities extracted by a separate Intent & Execution task after facts are stored. Do not output them here.
 
-Your task now is to extract Hindsight-style high-quality narrative facts from the chronological dialogue/transcript evidence batch below. Episode summary and episode canonical_topics are generated by a separate module from persisted source segments with extracted facts as coverage anchors; do not output episode-level fields in this prompt.
+Your task now is to extract Hindsight-style high-quality narrative facts from the chronological dialogue/transcript evidence-unit batch below. Each unit's `Unit type` only identifies its source: `interaction` is one ordered user-and-assistant exchange, while `transcript` is ambient-recording ASR text. Episode summary and episode canonical_topics are generated by a separate module from persisted source units with extracted facts as coverage anchors; do not output episode-level fields in this prompt.
 
 Preceding-context rules:
 - The preceding context below is a short tail from the already processed batch immediately before the current batch. Use it only to resolve references, ellipsis, continuity, and the starting point of the current topic.
