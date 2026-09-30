@@ -418,7 +418,7 @@ class AgentMemoryRuntime:
         )
         holder.active_ambient_recording_ids.discard(recording_id)
         input_flush = dict(finalization.get("input_flush") or {})
-        episode = dict(finalization.get("episode_summary") or {})
+        episode = dict(finalization.get("episode_summary_trigger") or {})
         derived_tasks = dict(finalization.get("derived_tasks") or {})
         entity_claim = dict(derived_tasks.get("entity_claim") or {})
         future_commitment = dict(derived_tasks.get("future_commitment") or {})
@@ -469,7 +469,7 @@ class AgentMemoryRuntime:
                 tags=["qwen-audio-agent", "session-close"],
             )
             input_flush = dict(finalization.get("input_flush") or {})
-            episode = dict(finalization.get("episode_summary") or {})
+            episode = dict(finalization.get("episode_summary_trigger") or {})
             derived_tasks = dict(finalization.get("derived_tasks") or {})
             entity_claim = dict(derived_tasks.get("entity_claim") or {})
             future_commitment = dict(

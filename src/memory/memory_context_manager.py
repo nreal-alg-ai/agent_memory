@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from collections import deque
 import re
@@ -43,7 +43,9 @@ class ChapterBoundaryDecision:
 
 
 @dataclass
-class MemoryContextMangerConfig:
+class FactExtractionWindowConfig:
+    """Chapter-boundary and sealed-window settings for fact extraction."""
+
     threshold: float = 0.60
     bias: float = -1.10
     surprise_history_window: int = 64
@@ -63,11 +65,6 @@ class MemoryContextMangerConfig:
     rolling_window_tail_units: int = 0
     min_boundary_scoring_incoming_tokens: int = 0
 
-
-@dataclass
-class FactExtractionWindowConfig:
-    """Limits for coalescing sealed chapters into one fact task."""
-
     min_sealed_chapters: int = 2
     target_sealed_tokens: int = 1200
     max_sealed_chapters: int = 5
@@ -81,6 +78,16 @@ class EpisodeSummaryConfig:
     max_duration_seconds: float = 1800.0
     max_tokens: int = 6000
     min_tokens_for_duration: int = 1000
+
+
+@dataclass
+class MemoryContextMangerConfig:
+    fact_extraction: FactExtractionWindowConfig = field(
+        default_factory=FactExtractionWindowConfig,
+    )
+    episode_summary: EpisodeSummaryConfig = field(
+        default_factory=EpisodeSummaryConfig,
+    )
 
 
 @dataclass
@@ -128,7 +135,7 @@ def _estimate_interaction_token_count(text: str) -> int:
 def _unit_text_from_turn(turn: Dict[str, Any]) -> str:
     user_text = _compact_whitespace(turn.get("user_message") or "")
     assistant_text = _compact_whitespace(turn.get("assistant_response") or "")
-    return f"用户：{user_text}\n助手：{assistant_text}".strip()
+    return f"用户本人：{user_text}\n助手：{assistant_text}".strip()
 
 def _clipped(value: float, low: float, high: float) -> float:
     return min(high, max(low, value))
@@ -160,7 +167,7 @@ def _linear(value: float, start: float, end: float, low: float, high: float) -> 
     return low + ratio * (high - low)
 
 
-def length_pressure(token_count: int, config: MemoryContextMangerConfig) -> float:
+def length_pressure(token_count: int, config: FactExtractionWindowConfig) -> float:
     min_tokens = max(1, int(config.min_pending_tokens))
     max_tokens = max(min_tokens + 1, int(config.max_pending_tokens))
     length = float(max(0, token_count))
@@ -185,99 +192,37 @@ def turn_count_pressure(unit_count: int) -> float:
         return 0.15
     return min(1.0, 0.30 + 0.15 * (count - 4))
 
-def _build_online_segmentation_config(
-    segmentation_config: Dict[str, Any],
-) -> MemoryContextMangerConfig:
-    """Build the shared memory-input semantic segmentation configuration."""
-    def config_int(key: str, default: int) -> int:
-        value = segmentation_config.get(key)
-        if value in (None, ""):
-            return default
-        return int(value)
 
-    max_gap = segmentation_config.get("max_time_gap_seconds")
-    return MemoryContextMangerConfig(
-        threshold=float(segmentation_config.get("threshold", 0.60)),
-        bias=float(segmentation_config.get("bias", -1.10)),
-        surprise_history_window=max(
-            1,
-            config_int("surprise_history_window", 64),
-        ),
-        min_surprise_history=max(
-            0,
-            config_int("min_surprise_history", 5),
-        ),
-        robust_surprise_weight=float(
-            segmentation_config.get("robust_surprise_weight", 0.8),
-        ),
-        absolute_surprise_weight=float(
-            segmentation_config.get("absolute_surprise_weight", 0.8),
-        ),
-        cohesion_drop_weight=float(
-            segmentation_config.get("cohesion_drop_weight", 1.0),
-        ),
-        length_weight=float(segmentation_config.get("length_weight", 0.40)),
-        max_pending_units=max(
-            1,
-            config_int("max_pending_units", 40),
-        ),
-        max_pending_tokens=max(
-            1,
-            config_int("max_pending_tokens", 1000),
-        ),
-        min_pending_tokens=max(
-            1,
-            config_int("min_pending_tokens", 200),
-        ),
-        min_pending_units=max(
-            1,
-            config_int("min_pending_units", 4),
-        ),
-        min_segment_override_probability=float(
-            segmentation_config.get("min_segment_override_probability", 0.90),
-        ),
-        max_time_gap_seconds=float(-1.0 if max_gap in (None, "") else max_gap),
-        enforce_min_pending_tokens=bool(
-            segmentation_config.get("enforce_min_pending_tokens", True)
-        ),
-        rolling_window_enabled=bool(
-            segmentation_config.get("rolling_window_enabled", False),
-        ),
-        rolling_window_tail_units=max(
-            0,
-            config_int("rolling_window_tail_units", 0),
-        ),
-        min_boundary_scoring_incoming_tokens=max(
-            0,
-            config_int("min_boundary_scoring_incoming_tokens", 0),
-        ),
-    )
-
-
-def build_online_segmentation_config(
+def build_memory_context_manager_config(
     runtime_config: Dict[str, Any],
 ) -> MemoryContextMangerConfig:
     """Build the shared semantic segmentation configuration for memory input."""
     memory_input_config = runtime_config.get("memory_context_manager")
     if not isinstance(memory_input_config, dict):
         memory_input_config = {}
-    segmentation_config = memory_input_config.get("fact_extraction")
-    if not isinstance(segmentation_config, dict):
-        segmentation_config = {}
-    return _build_online_segmentation_config(segmentation_config)
+    fact_extraction_trigger_config = memory_input_config.get("fact_extraction_trigger")
+    if not isinstance(fact_extraction_trigger_config, dict):
+        fact_extraction_trigger_config = {}
+    episode_summary_trigger_config = memory_input_config.get("episode_summary_trigger")
+    if not isinstance(episode_summary_trigger_config, dict):
+        episode_summary_trigger_config = {}
+    return MemoryContextMangerConfig(
+        fact_extraction=_build_fact_extraction_window_config(fact_extraction_trigger_config or {}),
+        episode_summary=_build_episode_summary_config(episode_summary_trigger_config or {}),
+    )
 
 
-def build_fact_extraction_window_config(
-    runtime_config: Dict[str, Any],
+def _build_fact_extraction_window_config(
+    extraction_config: Dict[str, Any],
 ) -> FactExtractionWindowConfig:
-    """Build the fact-window coalescing limits from memory input settings."""
-    memory_input_config = runtime_config.get("memory_context_manager")
-    if not isinstance(memory_input_config, dict):
-        memory_input_config = {}
-    extraction_config = memory_input_config.get("fact_extraction")
-    if not isinstance(extraction_config, dict):
-        extraction_config = {}
+    """Build fact-window coalescing limits from fact-extraction settings."""
+    def config_int(key: str, default: int) -> int:
+        value = extraction_config.get(key)
+        if value in (None, ""):
+            return default
+        return int(value)
 
+    max_gap = extraction_config.get("max_time_gap_seconds")
     min_chapters = max(
         1,
         int(extraction_config.get("min_sealed_chapters", 2)),
@@ -303,6 +248,60 @@ def build_fact_extraction_window_config(
         int(extraction_config.get("preceding_context_max_tokens", 400)),
     )
     return FactExtractionWindowConfig(
+        threshold=float(extraction_config.get("threshold", 0.60)),
+        bias=float(extraction_config.get("bias", -1.10)),
+        surprise_history_window=max(
+            1,
+            config_int("surprise_history_window", 64),
+        ),
+        min_surprise_history=max(
+            0,
+            config_int("min_surprise_history", 5),
+        ),
+        robust_surprise_weight=float(
+            extraction_config.get("robust_surprise_weight", 0.8),
+        ),
+        absolute_surprise_weight=float(
+            extraction_config.get("absolute_surprise_weight", 0.8),
+        ),
+        cohesion_drop_weight=float(
+            extraction_config.get("cohesion_drop_weight", 1.0),
+        ),
+        length_weight=float(extraction_config.get("length_weight", 0.40)),
+        max_pending_units=max(
+            1,
+            config_int("max_pending_units", 40),
+        ),
+        max_pending_tokens=max(
+            1,
+            config_int("max_pending_tokens", 1000),
+        ),
+        min_pending_tokens=max(
+            1,
+            config_int("min_pending_tokens", 200),
+        ),
+        min_pending_units=max(
+            1,
+            config_int("min_pending_units", 4),
+        ),
+        min_segment_override_probability=float(
+            extraction_config.get("min_segment_override_probability", 0.90),
+        ),
+        max_time_gap_seconds=float(-1.0 if max_gap in (None, "") else max_gap),
+        enforce_min_pending_tokens=bool(
+            extraction_config.get("enforce_min_pending_tokens", True)
+        ),
+        rolling_window_enabled=bool(
+            extraction_config.get("rolling_window_enabled", False),
+        ),
+        rolling_window_tail_units=max(
+            0,
+            config_int("rolling_window_tail_units", 0),
+        ),
+        min_boundary_scoring_incoming_tokens=max(
+            0,
+            config_int("min_boundary_scoring_incoming_tokens", 0),
+        ),
         min_sealed_chapters=min_chapters,
         target_sealed_tokens=target_tokens,
         max_sealed_chapters=max_chapters,
@@ -312,16 +311,10 @@ def build_fact_extraction_window_config(
     )
 
 
-def build_episode_summary_config(
-    runtime_config: Dict[str, Any],
+def _build_episode_summary_config(
+    episode_summary_config: Dict[str, Any],
 ) -> EpisodeSummaryConfig:
-    """Build episode-summary limits from the shared memory-input settings."""
-    memory_input_config = runtime_config.get("memory_context_manager")
-    if not isinstance(memory_input_config, dict):
-        memory_input_config = {}
-    episode_summary_config = memory_input_config.get("episode_summary")
-    if not isinstance(episode_summary_config, dict):
-        episode_summary_config = {}
+    """Build episode-summary limits from episode-summary settings."""
     return EpisodeSummaryConfig(
         max_duration_seconds=max(
             0.0,
@@ -401,7 +394,7 @@ def convert_interaction_turn_to_online_unit(
     ended_ats: List[str] = []
     if user_message:
         texts.append(user_message)
-        speakers.append("用户")
+        speakers.append("用户本人")
         started_ats.append(user_started_at)
         ended_ats.append(user_ended_at)
     if assistant_response:
@@ -599,23 +592,17 @@ class MemoryContextManager:
         self,
         embedding_client: EmbeddingClient,
         config: Optional[MemoryContextMangerConfig] = None,
-        episode_summary_config: Optional[EpisodeSummaryConfig] = None,
-        fact_extraction_window_config: Optional[FactExtractionWindowConfig] = None,
     ) -> None:
         self.embedding_client = embedding_client
         self.config = config or MemoryContextMangerConfig()
         self.surprise_history: Deque[float] = deque(
-            maxlen=max(1, self.config.surprise_history_window),
+            maxlen=max(1, self.config.fact_extraction.surprise_history_window),
         )
         self._pending_unit_buffer: List[MemoryUnit] = []
         self._sealed_chapter_buffers: List[SealedMemoryChapter] = []
         self._preceding_context_units: List[MemoryUnit] = []
         self._awaiting_ambient_unit_buffer: List[MemoryUnit] = []
         self._ambient_asr_watermark: Optional[datetime] = None
-        self.episode_summary_config = episode_summary_config or EpisodeSummaryConfig()
-        self.fact_extraction_window_config = (
-            fact_extraction_window_config or FactExtractionWindowConfig()
-        )
         self._episode_started_at: Optional[datetime] = None
         self._episode_latest_at: Optional[datetime] = None
         self._episode_token_count = 0
@@ -791,7 +778,7 @@ class MemoryContextManager:
         history buffer.  Units are selected from newest to oldest under both
         configured bounds, then restored to chronological order.
         """
-        config = self.fact_extraction_window_config
+        config = self.config.fact_extraction
         max_units = max(0, int(config.preceding_context_max_units))
         max_tokens = max(0, int(config.preceding_context_max_tokens))
         if max_units <= 0 or max_tokens <= 0:
@@ -851,7 +838,7 @@ class MemoryContextManager:
         if chapter_count <= 0:
             decision.reason = "no_sealed_chapters"
             return decision
-        config = self.fact_extraction_window_config
+        config = self.config.fact_extraction
         if (
             chapter_count >= config.max_sealed_chapters
             or token_count >= config.max_sealed_tokens
@@ -898,13 +885,17 @@ class MemoryContextManager:
         self._episode_latest_at = None
         self._episode_token_count = 0
 
+    def has_pending_episode_summary_units(self) -> bool:
+        """Whether successfully queued fact units await episode summarization."""
+        return self._episode_token_count > 0
+
     def evaluate_episode_summary_trigger_decision(self) -> EpisodeSummaryBoundaryDecision:
         token_count = self._episode_token_count
         if token_count <= 0:
             return EpisodeSummaryBoundaryDecision(accumulated_tokens=token_count)
         if (
-            self.episode_summary_config.max_tokens > 0
-            and token_count >= self.episode_summary_config.max_tokens
+            self.config.episode_summary.max_tokens > 0
+            and token_count >= self.config.episode_summary.max_tokens
         ):
             return EpisodeSummaryBoundaryDecision(True, "max_tokens", token_count)
         if self._episode_started_at is None or self._episode_latest_at is None:
@@ -914,9 +905,9 @@ class MemoryContextManager:
             (self._episode_latest_at - self._episode_started_at).total_seconds(),
         )
         if (
-            self.episode_summary_config.max_duration_seconds > 0
-            and elapsed_seconds >= self.episode_summary_config.max_duration_seconds
-            and token_count >= self.episode_summary_config.min_tokens_for_duration
+            self.config.episode_summary.max_duration_seconds > 0
+            and elapsed_seconds >= self.config.episode_summary.max_duration_seconds
+            and token_count >= self.config.episode_summary.min_tokens_for_duration
         ):
             return EpisodeSummaryBoundaryDecision(
                 True, "max_duration", token_count, elapsed_seconds,
@@ -945,8 +936,8 @@ class MemoryContextManager:
             item.token_count for item in active_units
         )
         if (
-            self.config.max_pending_units > 0
-            and len(active_units) >= self.config.max_pending_units
+            self.config.fact_extraction.max_pending_units > 0
+            and len(active_units) >= self.config.fact_extraction.max_pending_units
         ):
             return ChapterBoundaryDecision(
                 reason="pending_unit_limit",
@@ -956,8 +947,8 @@ class MemoryContextManager:
                 time_gap_seconds=time_gap_seconds,
             )
         if (
-            self.config.max_pending_tokens > 0
-            and active_token_count >= self.config.max_pending_tokens
+            self.config.fact_extraction.max_pending_tokens > 0
+            and active_token_count >= self.config.fact_extraction.max_pending_tokens
         ):
             return ChapterBoundaryDecision(
                 reason="pending_token_limit",
@@ -967,9 +958,9 @@ class MemoryContextManager:
                 time_gap_seconds=time_gap_seconds,
             )
         if (
-            self.config.max_time_gap_seconds >= 0
+            self.config.fact_extraction.max_time_gap_seconds >= 0
             and time_gap_seconds is not None
-            and time_gap_seconds > self.config.max_time_gap_seconds
+            and time_gap_seconds > self.config.fact_extraction.max_time_gap_seconds
         ):
             return ChapterBoundaryDecision(
                 reason="time_gap",
@@ -979,7 +970,10 @@ class MemoryContextManager:
                 time_gap_seconds=time_gap_seconds,
             )
         incoming_token_count = incoming_unit.token_count
-        if incoming_token_count < self.config.min_boundary_scoring_incoming_tokens:
+        if (
+            incoming_token_count
+            < self.config.fact_extraction.min_boundary_scoring_incoming_tokens
+        ):
             return ChapterBoundaryDecision(
                 reason="short_unit_append",
                 prospective_tokens=(
@@ -998,11 +992,12 @@ class MemoryContextManager:
         incoming_unit: MemoryUnit,
     ) -> ChapterBoundaryDecision:
         """Score one chapter boundary, including its rolling incoming context."""
-        tail_limit = max(0, int(self.config.rolling_window_tail_units))
+        fact_config = self.config.fact_extraction
+        tail_limit = max(0, int(fact_config.rolling_window_tail_units))
         scoring_mode = "single_unit"
         tail_units: List[MemoryUnit] = []
         incoming_embedding = incoming_unit.embedding
-        if self.config.rolling_window_enabled and tail_limit > 0:
+        if fact_config.rolling_window_enabled and tail_limit > 0:
             tail_units = list(active_units[-tail_limit:])
             texts = [
                 unit.text
@@ -1051,7 +1046,7 @@ class MemoryContextManager:
         robust_surprise = robust_surprise_signal(
             semantic_surprise,
             list(self.surprise_history),
-            self.config.min_surprise_history,
+            fact_config.min_surprise_history,
         )
         absolute_surprise = absolute_surprise_signal(semantic_surprise)
 
@@ -1063,14 +1058,14 @@ class MemoryContextManager:
             + incoming_unit.token_count
         )
         prospective_units = len(active_units) + 1
-        length_signal = length_pressure(prospective_tokens, self.config)
+        length_signal = length_pressure(prospective_tokens, fact_config)
         score = (
-            self.config.robust_surprise_weight * robust_surprise
-            + self.config.absolute_surprise_weight * absolute_surprise
-            + self.config.cohesion_drop_weight * cohesion_drop
-            + self.config.length_weight * length_signal
+            fact_config.robust_surprise_weight * robust_surprise
+            + fact_config.absolute_surprise_weight * absolute_surprise
+            + fact_config.cohesion_drop_weight * cohesion_drop
+            + fact_config.length_weight * length_signal
         )
-        cut_probability = _sigmoid(self.config.bias + score)
+        cut_probability = _sigmoid(fact_config.bias + score)
         self.surprise_history.append(float(semantic_surprise))
 
         decision = ChapterBoundaryDecision(
@@ -1092,23 +1087,23 @@ class MemoryContextManager:
             rolling_window_tail_units=len(tail_units),
             rolling_window_tail_tokens=tail_token_count,
         )
-        if cut_probability < self.config.threshold:
+        if cut_probability < fact_config.threshold:
             return decision
-        min_units = max(1, int(self.config.min_pending_units))
+        min_units = max(1, int(fact_config.min_pending_units))
         active_token_count = sum(
             item.token_count for item in active_units
         )
         meets_token_minimum = (
-            not self.config.enforce_min_pending_tokens
-            or active_token_count >= max(1, int(self.config.min_pending_tokens))
+            not fact_config.enforce_min_pending_tokens
+            or active_token_count >= max(1, int(fact_config.min_pending_tokens))
         )
         if len(active_units) >= min_units and meets_token_minimum:
             decision.reason = "semantic_boundary"
             decision.should_finalize = True
             return decision
         if (
-            not self.config.enforce_min_pending_tokens
-            and cut_probability >= float(self.config.min_segment_override_probability)
+            not fact_config.enforce_min_pending_tokens
+            and cut_probability >= float(fact_config.min_segment_override_probability)
         ):
             decision.reason = "semantic_boundary"
             decision.should_finalize = True

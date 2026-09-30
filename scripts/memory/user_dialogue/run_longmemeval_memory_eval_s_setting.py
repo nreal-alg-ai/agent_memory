@@ -661,7 +661,7 @@ def prepare_runtime_configs(
         "memory_context_manager",
         {},
     )
-    segmentation_config = memory_input_config.setdefault("fact_extraction", {})
+    segmentation_config = memory_input_config.setdefault("fact_extraction_trigger", {})
     configured_max_pending_turns = segmentation_config.get("max_pending_units")
     if configured_max_pending_turns in (None, ""):
         configured_max_pending_turns = segmentation_config.get("max_pending_units", 1)

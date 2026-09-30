@@ -122,7 +122,8 @@ _ATTRIBUTE_ONLY_ENTITY_PATTERNS = (
 # treated as an entity strong anchor during recall.
 _LOW_VALUE_ENTITY_ALIASES = {
     "user": {
-        "user", "the user", "用户", "我", "我自己", "me", "myself",
+        "用户", "user", "the user", "用户本人", "user self", "user_self",
+        "我", "我自己", "me", "myself",
     },
     "assistant": {
         "assistant", "the assistant", "助手", "ai", "人工智能", "bot",
@@ -135,6 +136,16 @@ _LOW_VALUE_ENTITY_ALIASES = {
         "speaker", "说话人", "unknown", "unknown_speaker",
         "speaker_1", "speaker_2",
     },
+}
+
+# ``用户本人`` / ``user self`` identify the wearer whose personal world model
+# this database represents. They are intentionally distinct from ordinary
+# mentions of product users, customers, or consumers in ambient recordings.
+_WORLD_OWNER_ENTITY_REFERENCE_ALIASES = {
+    "用户本人", "user self", "user_self",
+}
+_AMBIGUOUS_USER_ENTITY_ALIASES = {
+    "用户", "user", "the user",
 }
 
 
@@ -462,9 +473,18 @@ class MemoryNodeManager:
             self._memory_cfg.get("enable_memory_future_commitment_update", True),
             True,
         )
-        self._world_owner_entity_name = _compact_whitespace(
-            self._memory_cfg.get("world_owner_entity_name") or "用户"
-        ) or "用户"
+        configured_world_owner_name = _compact_whitespace(
+            self._memory_cfg.get("world_owner_entity_name") or ""
+        )
+        if configured_world_owner_name.lower() in _AMBIGUOUS_USER_ENTITY_ALIASES:
+            raise ValueError(
+                "memory.world_owner_entity_name must use '用户本人', "
+                "'user self', or a concrete owner name; bare '用户' / 'user' "
+                "is ambiguous with product users and consumers."
+            )
+        self._world_owner_entity_name = (
+            configured_world_owner_name or "用户本人"
+        )
         self._entity_claim_explicit_min_confidence = self._clamp_float(
             self._memory_cfg.get("entity_claim_explicit_min_confidence"),
             0.0,
@@ -1825,22 +1845,45 @@ class MemoryNodeManager:
             keywords = self._normalize_string_list(raw_fact.get("keywords"), limit=18)
             if not keywords:
                 keywords = self._keywords(text, limit=18)
-            entity_descriptors = self._normalize_entity_descriptors(
+            allows_world_owner_reference = self._units_include_world_owner(
+                units,
+            )
+            entity_descriptors = self._normalize_fact_entity_descriptors(
                 raw_fact.get("entities"),
+                allows_world_owner_reference=allows_world_owner_reference,
             )
             entities = [item["name"] for item in entity_descriptors]
             if not entities:
-                entities = self._entities(text)
-            primary_entity = self._normalize_primary_entity(
+                entity_descriptors = self._normalize_fact_entity_descriptors(
+                    self._entities(text),
+                    allows_world_owner_reference=allows_world_owner_reference,
+                )
+                entities = [item["name"] for item in entity_descriptors]
+            primary_candidates = self._normalize_fact_entity_descriptors(
                 raw_fact.get("primary_entity"),
-                entities=entities,
+                allows_world_owner_reference=allows_world_owner_reference,
             )
-            if primary_entity:
-                primary_entity_name = primary_entity["name"]
-                if primary_entity_name not in entities:
-                    entities = [primary_entity_name, *entities]
+            if primary_candidates and not any(
+                descriptor["name"] == primary_candidates[0]["name"]
+                for descriptor in entity_descriptors
+            ):
                 self._merge_entity_descriptor(
                     entity_descriptors,
+                    primary_candidates[0],
+                )
+                entities = [item["name"] for item in entity_descriptors]
+            primary_entity = (
+                primary_candidates[0]
+                if primary_candidates
+                else (entity_descriptors[0] if entity_descriptors else None)
+            )
+            if primary_entity is not None:
+                primary_entity = next(
+                    (
+                        descriptor
+                        for descriptor in entity_descriptors
+                        if descriptor["name"] == primary_entity["name"]
+                    ),
                     primary_entity,
                 )
             primary_entity_name = _compact_whitespace(
@@ -1856,7 +1899,7 @@ class MemoryNodeManager:
                     priority=priority,
                 )
                 continue
-            if primary_entity_name in {"user", "the user", "用户"} \
+            if self._is_world_owner_entity_reference(primary_entity_name) \
                     and self._is_low_value_user_acknowledgement(text):
                 record_drop("low_value_user_acknowledgement")
                 record_candidate(
@@ -1879,6 +1922,7 @@ class MemoryNodeManager:
             future_commitment_signals = self._normalize_future_commitment_signals(
                 raw_fact.get("future_commitment_signals"),
                 fallback_entity=primary_entity,
+                allows_world_owner_reference=allows_world_owner_reference,
             )
             event_time_key = _compact_whitespace(raw_fact.get("event_time_key") or "")
             facts.append({
@@ -1901,6 +1945,7 @@ class MemoryNodeManager:
                     "priority": priority,
                     "time_confidence": _compact_whitespace(raw_fact.get("time_confidence") or "unknown"),
                     "where": _compact_whitespace(raw_fact.get("where") or ""),
+                    "has_world_owner_interaction": allows_world_owner_reference,
                 },
             })
             record_candidate(
@@ -2038,6 +2083,7 @@ class MemoryNodeManager:
         *,
         fallback_entity: Optional[Dict[str, str]] = None,
         limit: Optional[int] = None,
+        allows_world_owner_reference: bool = False,
     ) -> List[Dict[str, Any]]:
         """Normalize fact-level evidence for the prospective world model."""
         if not isinstance(value, list):
@@ -2110,8 +2156,12 @@ class MemoryNodeManager:
                 )
             else:
                 subject_name = _compact_whitespace(subject)
-            if subject_name.lower() in {"我", "本人", "用户", "user", "the user"}:
+            if self._is_world_owner_entity_reference(subject_name):
+                if not allows_world_owner_reference:
+                    continue
                 subject_name = self._world_owner_entity_name
+            elif subject_name.lower() in _AMBIGUOUS_USER_ENTITY_ALIASES:
+                continue
             future_commitment_anchor = _compact_whitespace(
                 raw.get("future_commitment_anchor") or raw.get("intent_anchor") or ""
             )[:240]
@@ -2144,6 +2194,57 @@ class MemoryNodeManager:
                 break
         return normalized
 
+    @staticmethod
+    def _is_world_owner_entity_reference(value: Any) -> bool:
+        return _compact_whitespace(value).lower() in {
+            alias.lower() for alias in _WORLD_OWNER_ENTITY_REFERENCE_ALIASES
+        }
+
+    @staticmethod
+    def _units_include_world_owner(units: Sequence[MemoryUnit]) -> bool:
+        """Return whether this fact task contains the tagged wearer side."""
+        return any(
+            isinstance(unit, MemoryUnit)
+            and unit.unit_type == "interaction"
+            and any(
+                _compact_whitespace(speaker) == "用户本人"
+                for speaker in unit.speakers or []
+            )
+            for unit in units or ()
+        )
+
+    def _normalize_fact_entity_descriptors(
+        self,
+        value: Any,
+        *,
+        allows_world_owner_reference: bool,
+        limit: int = 16,
+    ) -> List[Dict[str, str]]:
+        """Apply source-aware identity boundaries to extracted entities.
+
+        A bare ``用户`` is ambiguous: in ambient audio it generally denotes a
+        product user or customer, not the wearer. Only the reserved
+        ``用户本人`` / ``user self`` reference from a tagged interaction may
+        resolve to this database's world owner.
+        """
+        descriptors = self._normalize_entity_descriptors(value, limit=limit)
+        normalized: List[Dict[str, str]] = []
+        for descriptor in descriptors:
+            name = _compact_whitespace(descriptor.get("name") or "")
+            if not name or name.lower() in _AMBIGUOUS_USER_ENTITY_ALIASES:
+                continue
+            if self._is_world_owner_entity_reference(name):
+                if not allows_world_owner_reference:
+                    continue
+                descriptor = {
+                    "name": self._world_owner_entity_name,
+                    "type": "PERSON",
+                }
+            self._merge_entity_descriptor(normalized, descriptor)
+            if len(normalized) >= limit:
+                break
+        return normalized
+
     def _build_dialogue_batch_for_prompt(
         self,
         turns: List[Dict[str, Any]],
@@ -2152,7 +2253,7 @@ class MemoryNodeManager:
     ) -> str:
         is_en = prompt_language == "en"
         time_label = "Conversation timestamp" if is_en else "对话发生时间"
-        user_label = "User" if is_en else "用户"
+        user_label = "user self" if is_en else "用户本人"
         assistant_label = "Assistant" if is_en else "助手"
         blocks: List[str] = []
         for index, turn in enumerate(turns, 1):
@@ -2957,8 +3058,13 @@ class MemoryNodeManager:
                 INTENT_EXTRACTION_PROMPT_EN
                 if language == "en" else INTENT_EXTRACTION_PROMPT_ZH
             )
+            world_owner_prompt_name = (
+                "user self"
+                if language == "en"
+                else self._world_owner_entity_name
+            )
             raw = self._call_llm(
-                prompt_template.replace("{world_owner_name}", self._world_owner_entity_name)
+                prompt_template.replace("{world_owner_name}", world_owner_prompt_name)
                 .replace("{reference_timestamp}", str(reference_timestamp))
                 .replace("{facts}", json.dumps(
                     self._future_commitment_group_fact_prompt_views(group),
@@ -3340,6 +3446,16 @@ class MemoryNodeManager:
         summary = _compact_whitespace(raw.get("summary") or "")[:480]
         if not summary or not evidence_ids:
             return None
+        allows_world_owner_reference = any(
+            isinstance(facts_by_id[fact_id].get("metadata"), dict)
+            and bool(
+                facts_by_id[fact_id]["metadata"].get(
+                    "has_world_owner_interaction"
+                )
+            )
+            for fact_id in evidence_ids
+            if isinstance(facts_by_id.get(fact_id, {}).get("metadata"), dict)
+        )
         canonical_key = self._generate_topic_name_key(raw.get("canonical_key") or summary)
         confidence = self._clamp_float(raw.get("confidence"), 0.0, 1.0, 0.7)
         lifecycle_evidence = str(raw.get("lifecycle_evidence") or "none").strip().lower()
@@ -3359,14 +3475,21 @@ class MemoryNodeManager:
         }
         def entity_id(value: Any, *, fallback: int = 0) -> int:
             name = _compact_whitespace(value or "")
-            if name.lower() in {"我", "本人", "用户", "user", "the user"}:
-                return world_owner_id
+            if self._is_world_owner_entity_reference(name):
+                return world_owner_id if allows_world_owner_reference else 0
             return int(entity_ids.get(name) or fallback)
         if object_type == "goal":
-            owner_name = _compact_whitespace(raw.get("owner_entity") or self._world_owner_entity_name)
-            if owner_name.lower() in {"我", "本人", "用户", "user", "the user"}:
+            owner_name = _compact_whitespace(raw.get("owner_entity") or "")
+            if self._is_world_owner_entity_reference(owner_name):
+                if not allows_world_owner_reference:
+                    return None
                 owner_name = self._world_owner_entity_name
-            owner_id = entity_id(owner_name, fallback=world_owner_id)
+            elif not owner_name and allows_world_owner_reference:
+                owner_name = self._world_owner_entity_name
+            owner_id = entity_id(
+                owner_name,
+                fallback=(world_owner_id if allows_world_owner_reference else 0),
+            )
             desired_outcome = _compact_whitespace(raw.get("desired_outcome") or "")[:480]
             if not owner_id or not desired_outcome:
                 return None
@@ -3374,10 +3497,17 @@ class MemoryNodeManager:
                 success_criteria=_compact_whitespace(raw.get("success_criteria") or "")[:480],
                 target_at=_compact_whitespace(raw.get("target_at") or "")[:80])
         elif object_type == "plan":
-            actor_name = _compact_whitespace(raw.get("actor_entity") or self._world_owner_entity_name)
-            if actor_name.lower() in {"我", "本人", "用户", "user", "the user"}:
+            actor_name = _compact_whitespace(raw.get("actor_entity") or "")
+            if self._is_world_owner_entity_reference(actor_name):
+                if not allows_world_owner_reference:
+                    return None
                 actor_name = self._world_owner_entity_name
-            actor_id = entity_id(actor_name, fallback=world_owner_id)
+            elif not actor_name and allows_world_owner_reference:
+                actor_name = self._world_owner_entity_name
+            actor_id = entity_id(
+                actor_name,
+                fallback=(world_owner_id if allows_world_owner_reference else 0),
+            )
             event = _compact_whitespace(raw.get("event_or_activity") or "")[:320]
             if not actor_id or not event:
                 return None
@@ -3397,7 +3527,9 @@ class MemoryNodeManager:
                 participant_names=self._normalize_string_list(raw.get("participants"), limit=12))
         else:
             responsible_name = _compact_whitespace(raw.get("responsible_entity") or "")
-            if responsible_name.lower() in {"我", "本人", "用户", "user", "the user"}:
+            if self._is_world_owner_entity_reference(responsible_name):
+                if not allows_world_owner_reference:
+                    return None
                 responsible_name = self._world_owner_entity_name
             responsible_id = entity_id(responsible_name)
             action_text = _compact_whitespace(raw.get("action_text") or "")[:480]
@@ -5075,6 +5207,10 @@ class MemoryNodeManager:
         raw_signals = self._normalize_future_commitment_signals(
             fact.get("future_commitment_signals"),
             fallback_entity=fact.get("primary_entity"),
+            allows_world_owner_reference=(
+                isinstance(fact.get("metadata"), dict)
+                and bool(fact["metadata"].get("has_world_owner_interaction"))
+            ),
         )
         fact_entities_by_name = {
             str(descriptor["name"]).lower(): descriptor
@@ -9496,8 +9632,8 @@ class MemoryNodeManager:
     def _recall_entity_lookup_aliases(query: Any) -> List[str]:
         """Return canonical role entities implied by first/second-person text.
 
-        Memory entities use stable role names (``用户``/``助手`` or
-        ``user``/``assistant``), while recall questions naturally use
+        Memory entities use stable role names (``用户本人``/``助手`` or
+        ``user self``/``assistant``), while recall questions naturally use
         pronouns such as ``我`` and ``你``. These aliases are only used to
         query the entity-node index; the original query remains unchanged for
         time parsing, lexical search, scoring, and LLM analysis.
@@ -9512,7 +9648,7 @@ class MemoryNodeManager:
         if re.search(r"我(?!们)", text) or re.search(
             r"\b(?:i|me|my|mine|myself)\b", text, re.IGNORECASE
         ):
-            aliases.append("用户" if is_chinese else "user")
+            aliases.extend(["用户本人", "user self"])
         if re.search(r"你(?!们)", text) or re.search(
             r"\b(?:you|your|yours|yourself)\b", text, re.IGNORECASE
         ):
@@ -10051,29 +10187,6 @@ class MemoryNodeManager:
         if not chinese_chars and len(text.split()) > 5:
             return False
         return len(text) > 1
-
-    @classmethod
-    def _normalize_primary_entity(
-        cls,
-        value: Any,
-        *,
-        entities: Sequence[str],
-    ) -> Optional[Dict[str, str]]:
-        """Normalize the single entity used for entity-state assignment."""
-        name = ""
-        entity_type = "CONCEPT"
-        if isinstance(value, dict):
-            name = _compact_whitespace(value.get("name") or value.get("text") or "")
-            entity_type = _compact_whitespace(value.get("type") or "CONCEPT").upper()
-        else:
-            name = _compact_whitespace(value)
-        if not name:
-            if entities:
-                name = _compact_whitespace(entities[0])
-        if not name:
-            return None
-        entity_type = cls._normalize_entity_type(entity_type)
-        return {"name": name, "type": entity_type}
 
     def _recall_stage2_candidate_limits(
         self,

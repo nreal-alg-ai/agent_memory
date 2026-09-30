@@ -30,9 +30,7 @@ from .memory_manager import (
 from .memory_context_manager import (
     MemoryContextManager,
     TranscriptUnitAssembler,
-    build_episode_summary_config,
-    build_fact_extraction_window_config,
-    build_online_segmentation_config,
+    build_memory_context_manager_config,
     build_transcript_aggregation_config,
     convert_interaction_turn_to_online_unit,
 )
@@ -445,7 +443,7 @@ class MemoryRuntime:
         )
         if hasattr(self._memory_manager, "set_embedding_client"):
             self._memory_manager.set_embedding_client(self._embedding_client)
-        memory_context_manager_config = build_online_segmentation_config(
+        memory_context_manager_config = build_memory_context_manager_config(
             runtime_config,
         )
         self._transcript_unit_assembler = TranscriptUnitAssembler(
@@ -455,11 +453,8 @@ class MemoryRuntime:
         self._memory_context_manager = MemoryContextManager(
             self._embedding_client,
             memory_context_manager_config,
-            build_episode_summary_config(runtime_config),
-            build_fact_extraction_window_config(runtime_config),
         )
         self._episode_tags: List[str] = []
-        self._has_pending_episode_sources = False
         scheduler_config = runtime_config.get("derived_task_scheduling")
         self._derived_task_scheduler = _DerivedMemoryTaskScheduler(
             self._memory_manager,
@@ -739,17 +734,16 @@ class MemoryRuntime:
         """
         resolved_tags = list(self._episode_tags if tags is None else tags or [])
 
-        if not self._has_pending_episode_sources:
+        if not self._memory_context_manager.has_pending_episode_summary_units():
             return {
                 "queued": False,
-                "reason": "no_pending_episode_sources",
+                "reason": "no_pending_episode_summary_units",
                 "trigger_reason": reason,
             }
         report = self._memory_manager.submit_memory_episode_summary_task(
             tags=resolved_tags,
         )
         if bool(report.get("queued")):
-            self._has_pending_episode_sources = False
             self._episode_tags = []
             self._memory_context_manager.reset_episode_summary_window()
         report["trigger_reason"] = reason
@@ -848,7 +842,7 @@ class MemoryRuntime:
                 if bool((episode_summary_report or {}).get("queued"))
                 else str(store_report.get("reason") or "")
             ),
-            "episode_summary": episode_summary_report,
+            "episode_summary_trigger": episode_summary_report,
         }
 
     def _log_sealed_memory_input_chapters_for_fact_task(
@@ -957,7 +951,7 @@ class MemoryRuntime:
                 )
             ),
             "reason": str(store_report.get("reason") or ""),
-            "episode_summary": episode_summary_report,
+            "episode_summary_trigger": episode_summary_report,
             "derived_tasks": derived_task_reports,
         }
 
@@ -1023,7 +1017,6 @@ class MemoryRuntime:
         queued = bool(queue_report.get("queued"))
         if queued:
             self._memory_context_manager.clear_sealed_chapter_buffers()
-            self._has_pending_episode_sources = True
             self._episode_tags = sorted(set(self._episode_tags).union(tags))
             self._memory_context_manager.record_stored_units(
                 canonical_units,
@@ -1089,7 +1082,7 @@ class MemoryRuntime:
         )
         return {
             "input_flush": input_flush,
-            "episode_summary": dict(input_flush.get("episode_summary") or {}),
+            "episode_summary_trigger": dict(input_flush.get("episode_summary_trigger") or {}),
             "derived_tasks": dict(input_flush.get("derived_tasks") or {}),
         }
     
@@ -1319,7 +1312,7 @@ class MemoryRuntime:
             entry
             for entry in entries
             if _compact_whitespace(entry.get("speaker") or "")
-            in {"用户", "助手"}
+            in {"用户本人", "助手"}
         ]
 
     def _iter_time_nearby_transcript_unit_indexes(
