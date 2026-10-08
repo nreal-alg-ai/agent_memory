@@ -247,6 +247,10 @@ class SpeakerReferenceDetector:
 
         for audio_segment in audio_segments:
             embedding = self._encode_audio(self._segment_audio(audio_segment))
+            user_assignment = self._assign_embedding_to_user_reference(embedding)
+            if user_assignment is not None:
+                all_speaker_assignments.append(user_assignment)
+                continue
             reference_eligible = self._reference_segment_is_eligible(
                 self._segment_duration_s(audio_segment)
             )
@@ -343,7 +347,7 @@ class SpeakerReferenceDetector:
             cluster_segments = [audio_segments[index] for index in cluster_indexes]
             cluster_segment_embeddings = [embeddings[index] for index in cluster_indexes]
             cluster_mean_embedding = _l2_normalize(np.mean(np.vstack(cluster_segment_embeddings), axis=0))
-            user_assignment = self._assign_cluster_to_user_reference(cluster_mean_embedding)
+            user_assignment = self._assign_embedding_to_user_reference(cluster_mean_embedding)
             if user_assignment is not None:
                 assignment = user_assignment
             else:
@@ -360,14 +364,14 @@ class SpeakerReferenceDetector:
         self._save_reference_embeddings()
         return [assignment for assignment in assignments if assignment is not None]
 
-    def _assign_cluster_to_user_reference(
+    def _assign_embedding_to_user_reference(
         self,
-        cluster_mean_embedding: np.ndarray,
+        embedding: np.ndarray,
     ) -> Optional[SpeakerAssignment]:
         if not self.user_reference_embeddings:
             return None
         similarities = [
-            _cosine_similarity(reference_embedding, cluster_mean_embedding)
+            _cosine_similarity(reference_embedding, embedding)
             for reference_embedding in self.user_reference_embeddings
         ]
         best_similarity = max(similarities)
