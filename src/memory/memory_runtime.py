@@ -842,7 +842,7 @@ class MemoryRuntime:
                 if bool((episode_summary_report or {}).get("queued"))
                 else str(store_report.get("reason") or "")
             ),
-            "episode_summary_trigger": episode_summary_report,
+            "episode_summary": episode_summary_report,
         }
 
     def _log_sealed_memory_input_chapters_for_fact_task(
@@ -951,7 +951,7 @@ class MemoryRuntime:
                 )
             ),
             "reason": str(store_report.get("reason") or ""),
-            "episode_summary_trigger": episode_summary_report,
+            "episode_summary": episode_summary_report,
             "derived_tasks": derived_task_reports,
         }
 
@@ -1082,7 +1082,7 @@ class MemoryRuntime:
         )
         return {
             "input_flush": input_flush,
-            "episode_summary_trigger": dict(input_flush.get("episode_summary_trigger") or {}),
+            "episode_summary": dict(input_flush.get("episode_summary") or {}),
             "derived_tasks": dict(input_flush.get("derived_tasks") or {}),
         }
     
