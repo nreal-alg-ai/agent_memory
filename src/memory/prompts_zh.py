@@ -228,7 +228,7 @@ future_commitment_signals 输出规则：
       "where": "明确出现的地点、场景、平台或项目范围；没有明确证据时保持为空字符串，不要填写‘未提及’或类似说明",
       "entity_claim_signal": [
         {
-          "entity": {"name": "必须原样取自本 fact entities 的实体名", "type": "必须与该 fact entities 中同名实体的类型一致"},
+          "entity": {"name": "必须原样取自本 fact entities 的实体名" ,"type": "必须与该 fact entities 中同名实体的类型一致"},
           "signal_kind": "explicit_assertion|pattern_observation",
           "claim_type_hint": "identity_profile|affiliation|relationship|preference|constraint|behavior_pattern",
           "claim_anchor": "用于跨 fact 聚合的具体主张或规律标签",
