@@ -197,7 +197,7 @@ def main() -> None:
         tags=["Eval_Ali", textgrid_path.stem],
     )
     final_input_flush = dict(finalization.get("input_flush") or {})
-    episode_summary_result = dict(finalization.get("episode_summary_trigger") or {})
+    episode_summary_result = dict(finalization.get("episode_summary") or {})
     entity_claim_submit = dict(
         (finalization.get("derived_tasks") or {}).get("entity_claim") or {}
     )

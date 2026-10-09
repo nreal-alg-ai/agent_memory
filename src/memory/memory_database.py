@@ -601,37 +601,24 @@ class SessionDB:
                 created_at TEXT NOT NULL
             );
 
-            CREATE TABLE IF NOT EXISTS memory_goal_work_item_mappings (
-                goal_id INTEGER NOT NULL,
-                work_item_id INTEGER NOT NULL,
-                relation TEXT NOT NULL,
+            CREATE TABLE IF NOT EXISTS memory_proactive_candidates (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                candidate_type TEXT NOT NULL,
+                target_object_type TEXT NOT NULL,
+                target_object_id INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                score REAL NOT NULL DEFAULT 0.0,
+                confidence REAL NOT NULL DEFAULT 0.0,
+                reason_code TEXT NOT NULL DEFAULT '',
+                evidence_fact_ids TEXT NOT NULL DEFAULT '[]',
+                trigger_kind TEXT NOT NULL DEFAULT '',
+                trigger_at TEXT NOT NULL DEFAULT '',
+                deliver_after TEXT NOT NULL DEFAULT '',
+                expires_at TEXT NOT NULL DEFAULT '',
+                dedup_key TEXT NOT NULL UNIQUE,
+                payload TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                PRIMARY KEY(goal_id, work_item_id, relation),
-                FOREIGN KEY(goal_id) REFERENCES memory_goals(id) ON DELETE CASCADE,
-                FOREIGN KEY(work_item_id) REFERENCES memory_work_items(id) ON DELETE CASCADE
-            );
-
-            CREATE TABLE IF NOT EXISTS memory_plan_work_item_mappings (
-                plan_id INTEGER NOT NULL,
-                work_item_id INTEGER NOT NULL,
-                relation TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                PRIMARY KEY(plan_id, work_item_id, relation),
-                FOREIGN KEY(plan_id) REFERENCES memory_plans(id) ON DELETE CASCADE,
-                FOREIGN KEY(work_item_id) REFERENCES memory_work_items(id) ON DELETE CASCADE
-            );
-
-            CREATE TABLE IF NOT EXISTS memory_work_item_relations (
-                source_work_item_id INTEGER NOT NULL,
-                target_work_item_id INTEGER NOT NULL,
-                relation TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                PRIMARY KEY(source_work_item_id, target_work_item_id, relation),
-                FOREIGN KEY(source_work_item_id) REFERENCES memory_work_items(id) ON DELETE CASCADE,
-                FOREIGN KEY(target_work_item_id) REFERENCES memory_work_items(id) ON DELETE CASCADE
+                updated_at TEXT NOT NULL
             );
 
             CREATE INDEX IF NOT EXISTS idx_memory_facts_event_time ON memory_facts(event_time_key);
@@ -688,6 +675,10 @@ class SessionDB:
             ON memory_intent_evidence(object_type, object_id, role);
             CREATE INDEX IF NOT EXISTS idx_memory_intent_events_object
             ON memory_intent_events(object_type, object_id, effective_at DESC, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_memory_proactive_candidates_schedule
+            ON memory_proactive_candidates(status, deliver_after, expires_at, updated_at);
+            CREATE INDEX IF NOT EXISTS idx_memory_proactive_candidates_target
+            ON memory_proactive_candidates(target_object_type, target_object_id, status);
             """
         )
         self._init_identity_fts()
@@ -2074,6 +2065,180 @@ class SessionDB:
         ).fetchone()
         return self._row_to_dict(row) if row else None
 
+    def upsert_proactive_candidate(
+        self,
+        candidate: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Create or refresh one undelivered proactive-service candidate.
+
+        A candidate is a policy input, not a delivered notification.  Future
+        delivery states (for example ``delivered`` or ``dismissed``) are never
+        overwritten by generation refreshes.
+        """
+        candidate_type = str(candidate.get("candidate_type") or "").strip()
+        target_object_type = str(
+            candidate.get("target_object_type") or ""
+        ).strip().lower()
+        dedup_key = str(candidate.get("dedup_key") or "").strip()
+        try:
+            target_object_id = int(candidate.get("target_object_id") or 0)
+        except (TypeError, ValueError):
+            target_object_id = 0
+        if (
+            not candidate_type
+            or target_object_type not in {"plan", "work_item"}
+            or target_object_id <= 0
+            or not dedup_key
+        ):
+            raise ValueError("invalid proactive candidate")
+
+        existing_row = self._conn.execute(
+            "SELECT id, status FROM memory_proactive_candidates WHERE dedup_key = ?",
+            (dedup_key,),
+        ).fetchone()
+        existing = self._row_to_dict(existing_row) if existing_row else None
+        if existing and str(existing.get("status") or "") not in {"pending", "expired"}:
+            return {
+                "id": int(existing["id"]),
+                "created": False,
+                "updated": False,
+                "status": str(existing.get("status") or ""),
+            }
+
+        now = local_now_text()
+        values = {
+            "candidate_type": candidate_type,
+            "target_object_type": target_object_type,
+            "target_object_id": target_object_id,
+            "status": str(candidate.get("status") or "pending").strip().lower(),
+            "score": float(candidate.get("score") or 0.0),
+            "confidence": float(candidate.get("confidence") or 0.0),
+            "reason_code": str(candidate.get("reason_code") or "").strip(),
+            "evidence_fact_ids": _json_dumps(candidate.get("evidence_fact_ids") or []),
+            "trigger_kind": str(candidate.get("trigger_kind") or "").strip(),
+            "trigger_at": str(candidate.get("trigger_at") or "").strip(),
+            "deliver_after": str(candidate.get("deliver_after") or "").strip(),
+            "expires_at": str(candidate.get("expires_at") or "").strip(),
+            "dedup_key": dedup_key,
+            "payload": _json_dumps(
+                candidate.get("payload")
+                if isinstance(candidate.get("payload"), dict)
+                else {}
+            ),
+        }
+        insert_columns = (
+            "candidate_type", "target_object_type", "target_object_id", "status",
+            "score", "confidence", "reason_code", "evidence_fact_ids",
+            "trigger_kind", "trigger_at", "deliver_after", "expires_at",
+            "dedup_key", "payload",
+        )
+        insert_values = tuple(values[column] for column in insert_columns)
+        refresh_columns = tuple(
+            column for column in insert_columns if column != "dedup_key"
+        )
+        refresh_values = tuple(values[column] for column in refresh_columns)
+        if existing is None:
+            cur = self._conn.execute(
+                """
+                INSERT INTO memory_proactive_candidates (
+                    candidate_type, target_object_type, target_object_id, status,
+                    score, confidence, reason_code, evidence_fact_ids, trigger_kind,
+                    trigger_at, deliver_after, expires_at, dedup_key, payload,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (*insert_values, now, now),
+            )
+            candidate_id = int(cur.lastrowid)
+            created = True
+        else:
+            candidate_id = int(existing["id"])
+            self._conn.execute(
+                """
+                UPDATE memory_proactive_candidates
+                SET candidate_type = ?, target_object_type = ?, target_object_id = ?,
+                    status = ?, score = ?, confidence = ?, reason_code = ?,
+                    evidence_fact_ids = ?, trigger_kind = ?, trigger_at = ?,
+                    deliver_after = ?, expires_at = ?, payload = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (*refresh_values, now, candidate_id),
+            )
+            created = False
+        self._commit_if_needed()
+        return {
+            "id": candidate_id,
+            "created": created,
+            "updated": not created,
+            "status": values["status"],
+        }
+
+    def expire_proactive_candidates(
+        self,
+        *,
+        reference_timestamp: str,
+        target_objects: Optional[Sequence[tuple[str, int]]] = None,
+    ) -> int:
+        """Expire pending candidates whose window ended or whose target changed."""
+        clauses = ["status = 'pending'"]
+        params: List[Any] = []
+        if target_objects:
+            normalized: List[tuple[str, int]] = []
+            for object_type, object_id in target_objects:
+                normalized_type = str(object_type or "").strip().lower()
+                try:
+                    normalized_id = int(object_id)
+                except (TypeError, ValueError):
+                    continue
+                if normalized_type in {"plan", "work_item"} and normalized_id > 0:
+                    normalized.append((normalized_type, normalized_id))
+            if normalized:
+                clauses.append(
+                    "(" + " OR ".join(
+                        "(target_object_type = ? AND target_object_id = ?)"
+                        for _item in normalized
+                    ) + ")"
+                )
+                params.extend(
+                    value
+                    for object_type, object_id in normalized
+                    for value in (object_type, object_id)
+                )
+        else:
+            clauses.append("expires_at != '' AND expires_at <= ?")
+            params.append(str(reference_timestamp or ""))
+        if len(clauses) == 1:
+            return 0
+        cur = self._conn.execute(
+            "UPDATE memory_proactive_candidates SET status = 'expired', updated_at = ? "
+            "WHERE " + " AND ".join(clauses),
+            (local_now_text(), *params),
+        )
+        self._commit_if_needed()
+        return int(cur.rowcount or 0)
+
+    def get_proactive_candidates(
+        self,
+        *,
+        statuses: Optional[Sequence[str]] = None,
+        limit: int = 120,
+    ) -> List[Dict[str, Any]]:
+        """Read generated candidates for diagnostics and the future policy layer."""
+        clauses: List[str] = []
+        params: List[Any] = []
+        if statuses:
+            normalized = [str(status).strip().lower() for status in statuses if str(status).strip()]
+            if normalized:
+                clauses.append("status IN (" + ", ".join("?" for _ in normalized) + ")")
+                params.extend(normalized)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        rows = self._conn.execute(
+            "SELECT * FROM memory_proactive_candidates" + where
+            + " ORDER BY score DESC, updated_at DESC, id DESC LIMIT ?",
+            (*params, max(1, int(limit or 120))),
+        ).fetchall()
+        return [self._row_to_dict(row) for row in rows]
+
     def upsert_intent_evidence(self, evidence: Sequence[Dict[str, Any]]) -> int:
         now = local_now_text()
         changed = 0
@@ -2177,36 +2342,6 @@ class SessionDB:
             changed += 1
         self._commit_if_needed()
         return changed
-
-    def upsert_goal_work_item_mapping(self, *, goal_id: int, work_item_id: int, relation: str) -> bool:
-        if int(goal_id or 0) <= 0 or int(work_item_id or 0) <= 0:
-            return False
-        now = local_now_text()
-        self._conn.execute(
-            """
-            INSERT INTO memory_goal_work_item_mappings (goal_id, work_item_id, relation, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(goal_id, work_item_id, relation) DO UPDATE SET updated_at = excluded.updated_at
-            """,
-            (int(goal_id), int(work_item_id), str(relation or "advances"), now, now),
-        )
-        self._commit_if_needed()
-        return True
-
-    def upsert_plan_work_item_mapping(self, *, plan_id: int, work_item_id: int, relation: str) -> bool:
-        if int(plan_id or 0) <= 0 or int(work_item_id or 0) <= 0:
-            return False
-        now = local_now_text()
-        self._conn.execute(
-            """
-            INSERT INTO memory_plan_work_item_mappings (plan_id, work_item_id, relation, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(plan_id, work_item_id, relation) DO UPDATE SET updated_at = excluded.updated_at
-            """,
-            (int(plan_id), int(work_item_id), str(relation or "prepares"), now, now),
-        )
-        self._commit_if_needed()
-        return True
 
     def get_entity_claim_events(
         self,
@@ -3263,6 +3398,7 @@ class SessionDB:
             "topic_keys",
             "tags",
             "metadata",
+            "payload",
             "details",
             "previous_payload",
             "new_payload",
@@ -3273,7 +3409,7 @@ class SessionDB:
             if key in item:
                 item[key] = _json_loads(
                     item[key],
-                    {} if key in {"metadata", "details"} else [],
+                    {} if key in {"metadata", "payload", "details"} else [],
                 )
         for key in (
             "embedding",

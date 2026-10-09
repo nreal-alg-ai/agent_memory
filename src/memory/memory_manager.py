@@ -378,6 +378,7 @@ class MemoryOperationReporter:
             "memory_episode_summary",
             "memory_entity_claim_update",
             "memory_future_commitment_update",
+            "memory_proactive_candidate_time_tick",
         }:
             if not isinstance(result, dict):
                 return False
@@ -473,6 +474,14 @@ class MemoryNodeManager:
             self._memory_cfg.get("enable_memory_future_commitment_update", True),
             True,
         )
+        self._enable_memory_proactive_candidate_generation = self._config_bool(
+            self._memory_cfg.get(
+                "enable_memory_proactive_candidate_generation",
+                True,
+            ),
+            True,
+        )
+        self._initialize_proactive_candidate_config()
         configured_world_owner_name = _compact_whitespace(
             self._memory_cfg.get("world_owner_entity_name") or ""
         )
@@ -534,6 +543,41 @@ class MemoryNodeManager:
         self._task_completion_listeners: List[
             Callable[[Dict[str, Any]], None]
         ] = []
+
+    def _initialize_proactive_candidate_config(self) -> None:
+        """Parse the deterministic candidate-generation window settings."""
+        configured = self._memory_cfg.get("proactive_candidate")
+        self._proactive_candidate_cfg = dict(
+            configured if isinstance(configured, dict) else {}
+        )
+
+        def hours_to_seconds(key: str, default_hours: float) -> float:
+            try:
+                hours = float(
+                    self._proactive_candidate_cfg.get(key, default_hours)
+                    or default_hours
+                )
+            except (TypeError, ValueError):
+                hours = default_hours
+            return max(60.0, hours * 3600.0)
+
+        self._proactive_candidate_plan_horizon_seconds = hours_to_seconds(
+            "plan_upcoming_horizon_hours", 24.0,
+        )
+        self._proactive_candidate_work_item_horizon_seconds = hours_to_seconds(
+            "work_item_due_horizon_hours", 24.0,
+        )
+        self._proactive_candidate_overdue_repeat_seconds = hours_to_seconds(
+            "work_item_overdue_repeat_hours", 24.0,
+        )
+        try:
+            configured_limit = int(
+                self._proactive_candidate_cfg.get("scan_limit_per_object_type", 120)
+                or 120
+            )
+        except (TypeError, ValueError):
+            configured_limit = 120
+        self._proactive_candidate_scan_limit = max(1, configured_limit)
 
     def _initialize_recall_config(self) -> None:
         """Parse nested recall settings and keep legacy flat overrides working."""
@@ -921,6 +965,10 @@ class MemoryNodeManager:
                         result = self._process_memory_entity_claim_update_task(**task["payload"])
                     elif task_kind == "memory_future_commitment_update":
                         result = self._process_memory_future_commitment_update_task(**task["payload"])
+                    elif task_kind == "memory_proactive_candidate_time_tick":
+                        result = self._process_memory_proactive_candidate_time_tick_task(
+                            **task["payload"]
+                        )
                     else:
                         raise ValueError(f"Unsupported memory async task: {task_kind}")
                 self._operation_reporter.on_task_finished(
@@ -2932,6 +2980,41 @@ class MemoryNodeManager:
             ),
         )
 
+    def submit_memory_proactive_candidate_time_tick_task(
+        self,
+        *,
+        reference_timestamp: Optional[Any] = None,
+        completion_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Queue a deterministic scan for time-sensitive proactive candidates."""
+        if (
+            not self._memory_enabled
+            or not self._enable_memory_proactive_candidate_generation
+        ):
+            task_id = self._operation_reporter.next_task_id(
+                "memory_proactive_candidate_time_tick"
+            )
+            return self._reject_memory_task(
+                task_kind="memory_proactive_candidate_time_tick",
+                task_id=task_id,
+                reason=(
+                    "memory_disabled"
+                    if not self._memory_enabled
+                    else "proactive_candidate_generation_disabled"
+                ),
+            )
+        return self._submit_memory_task(
+            task_kind="memory_proactive_candidate_time_tick",
+            payload={
+                "reference_timestamp": reference_timestamp or _now_text(),
+            },
+            completion_context=(
+                dict(completion_context)
+                if isinstance(completion_context, dict)
+                else None
+            ),
+        )
+
     def _process_memory_entity_claim_update_task(
         self,
         limit: Optional[int] = None,
@@ -3017,6 +3100,8 @@ class MemoryNodeManager:
             "updated": 0,
             "facts_marked_processed": 0,
             "failed_group_count": 0,
+            "affected_objects": [],
+            "proactive_candidate_refresh": {},
         }
         self._log_future_commitment_facts_loaded(
             "future_commitment_update", facts, limit, reference_timestamp,
@@ -3135,6 +3220,10 @@ class MemoryNodeManager:
             report["applied_count"] += len(applied)
             report["created"] += sum(item["created"] for item in applied)
             report["updated"] += sum(not item["created"] for item in applied)
+            report["affected_objects"].extend({
+                "object_type": str(item.get("object_type") or ""),
+                "object_id": int(item.get("object_id") or 0),
+            } for item in applied)
             self._log_info("memory_future_commitment_update", "group_finish", {
                 "group_index": group_index,
                 "group_key": group["group_key"],
@@ -3155,12 +3244,366 @@ class MemoryNodeManager:
                     fact_ids=completed_group_fact_ids,
                 )
 
+        if report["affected_objects"]:
+            report["proactive_candidate_refresh"] = self._refresh_proactive_candidates(
+                trigger_kind="future_commitment_update",
+                reference_timestamp=reference_timestamp,
+                affected_objects=report["affected_objects"],
+            )
+
         report["status"] = (
             "error" if report["failed_group_count"] == len(evidence_groups)
             else "ok"
         )
         self._log_info("memory_future_commitment_update", "finish", report)
         return report
+
+    def _process_memory_proactive_candidate_time_tick_task(
+        self,
+        *,
+        reference_timestamp: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        """Refresh time-sensitive candidates without invoking an LLM."""
+        resolved_timestamp = reference_timestamp or _now_text()
+        report = self._refresh_proactive_candidates(
+            trigger_kind="time_tick",
+            reference_timestamp=resolved_timestamp,
+        )
+        report["status"] = "ok"
+        self._log_info("memory_proactive_candidate", "time_tick_finish", report)
+        return report
+
+    def _refresh_proactive_candidates(
+        self,
+        *,
+        trigger_kind: str,
+        reference_timestamp: Any,
+        affected_objects: Optional[Sequence[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        """Generate policy inputs from active plans and work items.
+
+        This layer intentionally produces no user-facing text.  It merely
+        records why a specific future-commitment object deserves a later
+        policy/delivery decision, while retaining the fact evidence needed to
+        audit that decision.
+        """
+        reference_dt = self._parse_proactive_timestamp(reference_timestamp)
+        if reference_dt is None:
+            reference_dt = datetime.now().astimezone()
+        reference_text = reference_dt.isoformat()
+        is_targeted_refresh = affected_objects is not None
+        normalized_targets = self._normalize_proactive_target_objects(
+            affected_objects or [],
+        )
+        report: Dict[str, Any] = {
+            "trigger_kind": str(trigger_kind or ""),
+            "reference_timestamp": reference_text,
+            "scanned_plan_count": 0,
+            "scanned_work_item_count": 0,
+            "candidate_count": 0,
+            "created": 0,
+            "updated": 0,
+            "expired": 0,
+            "skipped_without_time": 0,
+            "skipped_without_evidence": 0,
+        }
+        if not self._enable_memory_proactive_candidate_generation:
+            report["status"] = "disabled"
+            return report
+
+        world_owner_id = self._intent_world_owner_entity_id()
+        with self._db.transaction():
+            if is_targeted_refresh:
+                if normalized_targets:
+                    report["expired"] += self._db.expire_proactive_candidates(
+                        reference_timestamp=reference_text,
+                        target_objects=normalized_targets,
+                    )
+                objects = self._proactive_target_objects_from_ids(
+                    normalized_targets,
+                    world_owner_id=world_owner_id,
+                )
+            else:
+                report["expired"] += self._db.expire_proactive_candidates(
+                    reference_timestamp=reference_text,
+                )
+                objects = self._proactive_active_target_objects(
+                    world_owner_id=world_owner_id,
+                )
+
+            report["scanned_plan_count"] = len(objects["plan"])
+            report["scanned_work_item_count"] = len(objects["work_item"])
+            evidence_by_object = self._db.get_intent_evidence_fact_ids(
+                [
+                    (object_type, int(item["id"]))
+                    for object_type, items in objects.items()
+                    for item in items
+                ],
+                limit=max(120, self._proactive_candidate_scan_limit * 4),
+            )
+            for plan in objects["plan"]:
+                plan_evidence = evidence_by_object.get(("plan", int(plan["id"])), [])
+                if not plan_evidence:
+                    report["skipped_without_evidence"] += 1
+                    continue
+                candidate = self._build_upcoming_plan_proactive_candidate(
+                    plan,
+                    reference_dt=reference_dt,
+                    trigger_kind=trigger_kind,
+                    evidence_fact_ids=plan_evidence,
+                )
+                if candidate is None:
+                    if not _compact_whitespace(plan.get("start_at") or ""):
+                        report["skipped_without_time"] += 1
+                    continue
+                saved = self._db.upsert_proactive_candidate(candidate)
+                report["candidate_count"] += 1
+                report["created"] += int(bool(saved.get("created")))
+                report["updated"] += int(bool(saved.get("updated")))
+            for work_item in objects["work_item"]:
+                work_item_evidence = evidence_by_object.get(
+                    ("work_item", int(work_item["id"])), []
+                )
+                if not work_item_evidence:
+                    report["skipped_without_evidence"] += 1
+                    continue
+                candidate = self._build_work_item_proactive_candidate(
+                    work_item,
+                    reference_dt=reference_dt,
+                    trigger_kind=trigger_kind,
+                    evidence_fact_ids=work_item_evidence,
+                )
+                if candidate is None:
+                    if not _compact_whitespace(work_item.get("due_at") or ""):
+                        report["skipped_without_time"] += 1
+                    continue
+                saved = self._db.upsert_proactive_candidate(candidate)
+                report["candidate_count"] += 1
+                report["created"] += int(bool(saved.get("created")))
+                report["updated"] += int(bool(saved.get("updated")))
+        return report
+
+    @staticmethod
+    def _normalize_proactive_target_objects(
+        raw_targets: Sequence[Dict[str, Any]],
+    ) -> List[Tuple[str, int]]:
+        normalized: List[Tuple[str, int]] = []
+        seen: set[Tuple[str, int]] = set()
+        for item in raw_targets:
+            if not isinstance(item, dict):
+                continue
+            object_type = str(item.get("object_type") or "").strip().lower()
+            try:
+                object_id = int(item.get("object_id") or 0)
+            except (TypeError, ValueError):
+                continue
+            key = (object_type, object_id)
+            if (
+                object_type not in {"plan", "work_item"}
+                or object_id <= 0
+                or key in seen
+            ):
+                continue
+            seen.add(key)
+            normalized.append(key)
+        return normalized
+
+    def _proactive_target_objects_from_ids(
+        self,
+        targets: Sequence[Tuple[str, int]],
+        *,
+        world_owner_id: int,
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        objects: Dict[str, List[Dict[str, Any]]] = {
+            "plan": [], "work_item": [],
+        }
+        active_statuses = {
+            "plan": {"planned", "rescheduled"},
+            "work_item": {"open", "blocked"},
+        }
+        owner_fields = {
+            "plan": "actor_entity_id",
+            "work_item": "responsible_entity_id",
+        }
+        for object_type, object_id in targets:
+            item = self._db.get_intent_object(
+                object_type=object_type,
+                object_id=object_id,
+            )
+            if (
+                not item
+                or int(item.get("world_owner_entity_id") or 0) != world_owner_id
+                or int(item.get(owner_fields[object_type]) or 0) != world_owner_id
+                or str(item.get("status") or "").strip().lower()
+                not in active_statuses[object_type]
+            ):
+                continue
+            objects[object_type].append(item)
+        return objects
+
+    def _proactive_active_target_objects(
+        self,
+        *,
+        world_owner_id: int,
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        objects: Dict[str, List[Dict[str, Any]]] = {"plan": [], "work_item": []}
+        configurations = (
+            ("plan", {"planned", "rescheduled"}, "actor_entity_id"),
+            ("work_item", {"open", "blocked"}, "responsible_entity_id"),
+        )
+        for object_type, statuses, owner_field in configurations:
+            for item in self._db.get_intent_objects(
+                object_type=object_type,
+                world_owner_entity_id=world_owner_id,
+                statuses=sorted(statuses),
+                limit=self._proactive_candidate_scan_limit,
+            ):
+                if int(item.get(owner_field) or 0) == world_owner_id:
+                    objects[object_type].append(item)
+        return objects
+
+    def _build_upcoming_plan_proactive_candidate(
+        self,
+        plan: Dict[str, Any],
+        *,
+        reference_dt: datetime,
+        trigger_kind: str,
+        evidence_fact_ids: Sequence[int],
+    ) -> Optional[Dict[str, Any]]:
+        time_precision = str(plan.get("time_precision") or "unknown").lower()
+        if time_precision in {"unknown", "week"}:
+            return None
+        start_dt = self._parse_proactive_timestamp(plan.get("start_at"))
+        if start_dt is None:
+            return None
+        seconds_until_start = (start_dt - reference_dt).total_seconds()
+        if (
+            seconds_until_start < 0
+            or seconds_until_start > self._proactive_candidate_plan_horizon_seconds
+        ):
+            return None
+        plan_id = int(plan.get("id") or 0)
+        if plan_id <= 0:
+            return None
+        urgency = 1.0 - min(
+            1.0,
+            seconds_until_start / self._proactive_candidate_plan_horizon_seconds,
+        )
+        confidence = self._clamp_float(plan.get("confidence"), 0.0, 1.0, 0.0)
+        return {
+            "candidate_type": "upcoming_plan",
+            "target_object_type": "plan",
+            "target_object_id": plan_id,
+            "status": "pending",
+            "score": round(0.55 * confidence + 0.45 * urgency, 6),
+            "confidence": confidence,
+            "reason_code": "plan_starts_within_horizon",
+            "evidence_fact_ids": list(dict.fromkeys(int(item) for item in evidence_fact_ids))[:24],
+            "trigger_kind": str(trigger_kind or ""),
+            "trigger_at": reference_dt.isoformat(),
+            "deliver_after": (
+                start_dt - timedelta(seconds=self._proactive_candidate_plan_horizon_seconds)
+            ).isoformat(),
+            "expires_at": start_dt.isoformat(),
+            "dedup_key": f"upcoming_plan:{plan_id}:{start_dt.isoformat()}",
+            "payload": {
+                "summary": _compact_whitespace(plan.get("summary") or ""),
+                "event_or_activity": _compact_whitespace(
+                    plan.get("event_or_activity") or ""
+                ),
+                "scheduled_at": start_dt.isoformat(),
+                "time_precision": time_precision,
+                "location_text": _compact_whitespace(plan.get("location_text") or ""),
+                "object_status": str(plan.get("status") or ""),
+            },
+        }
+
+    def _build_work_item_proactive_candidate(
+        self,
+        work_item: Dict[str, Any],
+        *,
+        reference_dt: datetime,
+        trigger_kind: str,
+        evidence_fact_ids: Sequence[int],
+    ) -> Optional[Dict[str, Any]]:
+        due_dt = self._parse_proactive_timestamp(work_item.get("due_at"))
+        if due_dt is None:
+            return None
+        work_item_id = int(work_item.get("id") or 0)
+        if work_item_id <= 0:
+            return None
+        seconds_until_due = (due_dt - reference_dt).total_seconds()
+        confidence = self._clamp_float(
+            work_item.get("confidence"), 0.0, 1.0, 0.0
+        )
+        if seconds_until_due >= 0:
+            if seconds_until_due > self._proactive_candidate_work_item_horizon_seconds:
+                return None
+            candidate_type = "due_work_item"
+            reason_code = "work_item_due_within_horizon"
+            urgency = 1.0 - min(
+                1.0,
+                seconds_until_due / self._proactive_candidate_work_item_horizon_seconds,
+            )
+            deliver_after = (
+                due_dt - timedelta(
+                    seconds=self._proactive_candidate_work_item_horizon_seconds
+                )
+            )
+            expires_at = due_dt
+            dedup_suffix = due_dt.isoformat()
+        else:
+            overdue_seconds = abs(seconds_until_due)
+            overdue_slot = int(
+                overdue_seconds // self._proactive_candidate_overdue_repeat_seconds
+            )
+            candidate_type = "overdue_work_item"
+            reason_code = "work_item_overdue"
+            urgency = 1.0
+            deliver_after = due_dt + timedelta(
+                seconds=overdue_slot * self._proactive_candidate_overdue_repeat_seconds
+            )
+            expires_at = deliver_after + timedelta(
+                seconds=self._proactive_candidate_overdue_repeat_seconds
+            )
+            dedup_suffix = f"{due_dt.isoformat()}:overdue:{overdue_slot}"
+        return {
+            "candidate_type": candidate_type,
+            "target_object_type": "work_item",
+            "target_object_id": work_item_id,
+            "status": "pending",
+            "score": round(0.55 * confidence + 0.45 * urgency, 6),
+            "confidence": confidence,
+            "reason_code": reason_code,
+            "evidence_fact_ids": list(dict.fromkeys(int(item) for item in evidence_fact_ids))[:24],
+            "trigger_kind": str(trigger_kind or ""),
+            "trigger_at": reference_dt.isoformat(),
+            "deliver_after": deliver_after.isoformat(),
+            "expires_at": expires_at.isoformat(),
+            "dedup_key": f"{candidate_type}:{work_item_id}:{dedup_suffix}",
+            "payload": {
+                "summary": _compact_whitespace(work_item.get("summary") or ""),
+                "action_text": _compact_whitespace(work_item.get("action_text") or ""),
+                "deliverable": _compact_whitespace(work_item.get("deliverable") or ""),
+                "due_at": due_dt.isoformat(),
+                "priority": _compact_whitespace(work_item.get("priority") or ""),
+                "object_status": str(work_item.get("status") or ""),
+            },
+        }
+
+    @staticmethod
+    def _parse_proactive_timestamp(value: Any) -> Optional[datetime]:
+        text = _compact_whitespace(value or "")
+        if not text:
+            return None
+        normalized = text.replace("Z", "+00:00")
+        try:
+            parsed = datetime.fromisoformat(normalized)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=datetime.now().astimezone().tzinfo)
+        return parsed.astimezone()
 
     def _group_future_commitment_signals(
         self,
@@ -3885,6 +4328,10 @@ class MemoryNodeManager:
             processing_target="entity_claim",
             limit=limit,
             reference_timestamp=reference_timestamp,
+            # ``created_at`` is wall-clock persistence time, whereas the
+            # reference timestamp is source event time.  Processing flags
+            # already provide the intended incremental boundary.
+            restrict_to_today=False,
         )
         explicit_report = self._update_explicit_entity_claims_from_facts(explicit_facts)
         explicit_completed = bool(explicit_report.pop("completed", False))

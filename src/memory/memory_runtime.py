@@ -133,6 +133,28 @@ class _DerivedMemoryTaskScheduler:
         }
         self._force_pending_kinds: set[str] = set()
         self._force_failed_kinds: set[str] = set()
+        # This is event time from accepted source input, never wall-clock task
+        # execution time.  It lets benchmark replays and delayed ASR preserve
+        # the same temporal reference across derived projections.
+        self._latest_input_time_end = ""
+
+    def record_memory_store_submission(
+        self,
+        completion_context: Optional[Dict[str, Any]],
+    ) -> None:
+        """Record a queued store batch's source-time high-water mark.
+
+        Submission is recorded in addition to task completion: a derived task
+        may be appended after a completed store while later store batches are
+        already waiting ahead of it in the manager's FIFO queue.
+        """
+        context = (
+            dict(completion_context)
+            if isinstance(completion_context, dict)
+            else {}
+        )
+        with self._lock:
+            self._record_input_time_end_locked(context.get("input_time_end"))
 
     def on_task_completion(self, event: Dict[str, Any]) -> None:
         """Consume a manager completion event on the manager worker thread."""
@@ -166,7 +188,11 @@ class _DerivedMemoryTaskScheduler:
             return
         self._finish_automatic_task(kind, succeeded=bool(event.get("succeeded")))
 
-    def force_drain(self) -> Dict[str, Dict[str, Any]]:
+    def force_drain(
+        self,
+        *,
+        reference_timestamp: Optional[Any] = None,
+    ) -> Dict[str, Dict[str, Any]]:
         """Append both projections after all previously queued memory work.
 
         This is intentionally unconditional.  The tasks query unprocessed
@@ -177,21 +203,27 @@ class _DerivedMemoryTaskScheduler:
         with self._lock:
             self._force_pending_kinds = set(self._KIND_TO_TASK)
             self._force_failed_kinds.clear()
+            self._record_input_time_end_locked(reference_timestamp)
+            resolved_reference_timestamp = self._latest_input_time_end
         reports = {
             "entity_claim": self._manager.submit_memory_entity_claim_update_task(
+                reference_timestamp=resolved_reference_timestamp or None,
                 completion_context={
                     "derived_task_scheduler": {
                         "kind": "entity_claim",
                         "force_drain": True,
+                        "reference_timestamp": resolved_reference_timestamp,
                     }
                 }
             ),
             "future_commitment": (
                 self._manager.submit_memory_future_commitment_update_task(
+                    reference_timestamp=resolved_reference_timestamp or None,
                     completion_context={
                         "derived_task_scheduler": {
                             "kind": "future_commitment",
                             "force_drain": True,
+                            "reference_timestamp": resolved_reference_timestamp,
                         }
                     }
                 )
@@ -217,6 +249,7 @@ class _DerivedMemoryTaskScheduler:
                 },
                 "force_pending_kinds": sorted(self._force_pending_kinds),
                 "force_failed_kinds": sorted(self._force_failed_kinds),
+                "latest_input_time_end": self._latest_input_time_end,
                 "tasks": {
                     kind: dict(values) for kind, values in self._state.items()
                 },
@@ -253,15 +286,18 @@ class _DerivedMemoryTaskScheduler:
         self._logger.info(
             "memory store completion observed facts=%s entity_claim_signals=%s "
             "entity_claim_signal_facts=%s future_commitment_signals=%s "
-            "future_commitment_signal_facts=%s contains_interaction_turn=%s",
+            "future_commitment_signal_facts=%s contains_interaction_turn=%s "
+            "input_time_end=%s",
             int(result.get("new_fact_count") or 0),
             signal_stats["entity_claim"]["signal_count"],
             signal_stats["entity_claim"]["signal_fact_count"],
             signal_stats["future_commitment"]["signal_count"],
             signal_stats["future_commitment"]["signal_fact_count"],
             contains_interaction,
+            context.get("input_time_end") or "",
         )
         with self._lock:
+            self._record_input_time_end_locked(context.get("input_time_end"))
             for kind, stats in signal_stats.items():
                 if stats["signal_count"] <= 0 or stats["signal_fact_count"] <= 0:
                     continue
@@ -297,20 +333,24 @@ class _DerivedMemoryTaskScheduler:
                 return
             state["task_pending"] = True
             target_generation = int(state["generation"])
+            reference_timestamp = self._latest_input_time_end
 
         completion_context = {
             "derived_task_scheduler": {
                 "kind": kind,
                 "automatic": True,
                 "target_generation": target_generation,
+                "reference_timestamp": reference_timestamp,
             }
         }
         if kind == "entity_claim":
             report = self._manager.submit_memory_entity_claim_update_task(
+                reference_timestamp=reference_timestamp or None,
                 completion_context=completion_context,
             )
         else:
             report = self._manager.submit_memory_future_commitment_update_task(
+                reference_timestamp=reference_timestamp or None,
                 completion_context=completion_context,
             )
         if bool((report or {}).get("queued")):
@@ -320,9 +360,11 @@ class _DerivedMemoryTaskScheduler:
                 state["unscheduled_signal_facts"] = 0
                 state["unscheduled_contains_interaction"] = False
             self._logger.info(
-                "memory derived task scheduled kind=%s target_generation=%s",
+                "memory derived task scheduled kind=%s target_generation=%s "
+                "reference_timestamp=%s",
                 kind,
                 target_generation,
+                reference_timestamp or "",
             )
             return
         with self._lock:
@@ -332,6 +374,32 @@ class _DerivedMemoryTaskScheduler:
             kind,
             (report or {}).get("reason"),
         )
+
+    def _record_input_time_end_locked(self, value: Any) -> None:
+        """Advance the source-time high-water mark while holding ``_lock``."""
+        candidate = str(value or "").strip()
+        if not candidate:
+            return
+        current = self._latest_input_time_end
+        if not current or self._is_later_timestamp(candidate, current):
+            self._latest_input_time_end = candidate
+
+    @staticmethod
+    def _is_later_timestamp(candidate: str, current: str) -> bool:
+        """Compare ISO-like source timestamps without mixing naïve/aware datetimes."""
+        def epoch(value: str) -> Optional[float]:
+            try:
+                return datetime.fromisoformat(
+                    str(value).strip().replace("Z", "+00:00")
+                ).timestamp()
+            except (TypeError, ValueError, OSError):
+                return None
+
+        candidate_epoch = epoch(candidate)
+        current_epoch = epoch(current)
+        if candidate_epoch is not None and current_epoch is not None:
+            return candidate_epoch > current_epoch
+        return candidate > current
 
     def _finish_automatic_task(self, kind: str, *, succeeded: bool) -> None:
         with self._lock:
@@ -1008,14 +1076,20 @@ class MemoryRuntime:
                 "units": self._memory_units_log_view(canonical_units),
             },
         )
+        store_completion_context = self._memory_store_completion_context(
+            canonical_units,
+        )
         queue_report = self._memory_manager.submit_memory_fact_extraction_task(
             units=canonical_units,
             preceding_context_units=preceding_context_units,
             tags=sorted(tags),
-            completion_context=self._memory_store_completion_context(canonical_units),
+            completion_context=store_completion_context,
         )
         queued = bool(queue_report.get("queued"))
         if queued:
+            self._derived_task_scheduler.record_memory_store_submission(
+                store_completion_context,
+            )
             self._memory_context_manager.clear_sealed_chapter_buffers()
             self._episode_tags = sorted(set(self._episode_tags).union(tags))
             self._memory_context_manager.record_stored_units(

@@ -201,6 +201,14 @@ memory_manager:
   memory_enabled: true
   enable_memory_entity_claim_update: true
   enable_memory_future_commitment_update: true
+  enable_memory_proactive_candidate_generation: true
+  # Candidate generation creates durable, auditable policy inputs only.  It
+  # never sends a reminder or speaks to the user; delivery is a later layer.
+  proactive_candidate:
+    plan_upcoming_horizon_hours: 24
+    work_item_due_horizon_hours: 24
+    work_item_overdue_repeat_hours: 24
+    scan_limit_per_object_type: 120
   llm:
     llm_provider: deepseek
     llm_name: deepseek-v4-flash
