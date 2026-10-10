@@ -198,30 +198,30 @@ def main() -> None:
     )
     final_input_flush = dict(finalization.get("input_flush") or {})
     episode_summary_result = dict(finalization.get("episode_summary") or {})
-    entity_claim_submit = dict(
-        (finalization.get("derived_tasks") or {}).get("entity_claim") or {}
+    user_claim_submit = dict(
+        (finalization.get("derived_tasks") or {}).get("user_claim") or {}
     )
-    future_commitment_submit = dict(
-        (finalization.get("derived_tasks") or {}).get("future_commitment") or {}
+    user_intent_submit = dict(
+        (finalization.get("derived_tasks") or {}).get("user_intent") or {}
     )
     queued_memory_store_count += int(bool(final_input_flush.get("queued")))
 
     if (
         queued_memory_store_count
         or episode_summary_result.get("queued")
-        or entity_claim_submit.get("queued")
-        or future_commitment_submit.get("queued")
+        or user_claim_submit.get("queued")
+        or user_intent_submit.get("queued")
     ) and not runtime.wait_for_memory_tasks():
         raise RuntimeError("Timed out while draining queued memory tasks")
 
     store_operation_report = operation_reporter.operation_report("memory_fact_extraction")
-    entity_claim_result = (
-        operation_reporter.latest_report("memory_entity_claim_update")
-        or entity_claim_submit
+    user_claim_result = (
+        operation_reporter.latest_report("memory_user_claim_update")
+        or user_claim_submit
     )
-    future_commitment_result = (
-        operation_reporter.latest_report("memory_future_commitment_update")
-        or future_commitment_submit
+    user_intent_result = (
+        operation_reporter.latest_report("memory_user_intent_update")
+        or user_intent_submit
     )
     logging.info(
         "Transcript input complete segments=%s pending=%s queued_memory_stores=%s "
@@ -247,8 +247,8 @@ def main() -> None:
         "ambient_recording_enabled": True,
         "session_start": session_start.isoformat(),
         "episode_summary_result": episode_summary_result,
-        "entity_claim_result": entity_claim_result,
-        "future_commitment_result": future_commitment_result,
+        "user_claim_result": user_claim_result,
+        "user_intent_result": user_intent_result,
     }
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     logging.info("Wrote report: %s", report_path)

@@ -14,7 +14,7 @@ MEMORY_RETRIEVED_SECTION_SPECS_ZH = (
     (
         "[实体知识]",
         "这些是当前有效的 entity claim；应结合其支撑事实理解，不要忽略状态或来源。",
-        "entity_claim",
+        "user_claim",
     ),
     (
         "[当前目标]",
@@ -116,13 +116,13 @@ UNIFIED_MEMORY_EXTRACTION_PROMPT_ZH = """你是 AI 眼镜长期记忆系统的�
 - fact：从一批连续证据中提炼出的可追溯、自包含、可独立召回的 narrative fact，是记忆提炼的基本证据单元。
 - episode：由独立模块根据一段连续时间内持久化的原始交互/转写片段生成的更高层经历摘要；已生成 facts 仅作为重要信息覆盖锚点，它不是每个输入批次或每条 fact 的简单副本。
 - memory_topic_items：由已落库 facts 与 episodes 提供的可复用主题命名词表。它包含 canonical topic 和 fact aspect topic，但不保存主题进展、总结或历史事实。
-- entity_claim：由独立 reflection 模块从 facts 中形成的、可回溯证据的实体主张；它不是当前对话的直接证据。
+- user_claim：由独立 reflection 模块从 facts 中形成的、可回溯证据的实体主张；它不是当前对话的直接证据。
 - goal / plan / work_item：由独立 Intent & Execution 模块从已落库 facts 提取的未来目标、明确安排和可闭环责任事项；本 prompt 不输出这些对象。
 
 你现在需要从下面按时间顺序排列的对话/转写证据 unit 批次中提取 Hindsight 风格的高质量 narrative facts。每个 unit 的 `单元类型` 仅用于说明来源：`interaction` 是一轮按顺序保留的用户与助手对话，`transcript` 是环境录音 ASR 转写。episode summary、episode canonical_topics 将由独立模块根据持久化的原始 unit 及已生成 facts 负责，不要在本 prompt 中输出 episode 级字段。
 
 身份边界：
-- “用户本人”仅指 AI 眼镜佩戴者，即 interaction 中说话人明确标为“用户本人”的一方；英文输出时使用 `user self`。只有该类 interaction 证据可以将其写入 entities、primary_entity 或 future_commitment_signals。
+- “用户本人”仅指 AI 眼镜佩戴者，即 interaction 中说话人明确标为“用户本人”的一方；英文输出时使用 `user self`。只有该类 interaction 证据可以将其写入 entities、primary_entity 或 user_intent_signals。
 - 对纯 transcript 或说话人为 N_SPKxxx / speaker_x 的环境录音，不得因为“我”“我们”“用户”等词推断任何说话人是用户本人；环境录音中的发言者、团队成员和外部对象都应按其实际名称或 speaker 标签记录。
 - 产品、市场、服务讨论中的“用户、客户、消费者、受众”指外部领域角色。优先输出“产品用户”“目标消费者”“目标客户”等具体实体；绝不输出裸“用户”，也不得将其标为 PERSON、用户本人或 future commitment 的 owner。
 
@@ -190,8 +190,8 @@ fact_type 判别规则：
 10. keywords 只能包含用于检索的短实体、主题、症状、方案、约束、决定和关键时间/顺序锚，通常每个关键词 2-8 个汉字或一个短英文短语；对带时间锚的事件，必须加入原始或补全后的时间词，例如“March 15 2023”“first service”“3/22”“last Saturday”“two months ago”“上周六”“两个月前”。不要把完整句子、寒暄、礼貌话、语气词、泛化表达或“希望这个方法能帮到您”这类文本放入 keywords。
 11. 只返回 JSON，不要 markdown。
 
-entity_claim_signal 输出规则：
-- `entity_claim_signal` 是当前 fact 对个人世界模型中 entity claim 的结构化证据提示，不是最终 claim，也不能直接决定与已有 claim 的关系。
+user_claim_signal 输出规则：
+- `user_claim_signal` 是当前 fact 对个人世界模型中 entity claim 的结构化证据提示，不是最终 claim，也不能直接决定与已有 claim 的关系。
 - `signal_kind` 只能是：`explicit_assertion`（实体明确陈述或可靠记录直接确认的稳定主张）、`pattern_observation`（可在未来与其他 episode 共同支持一个方向明确的规律的观察）。
 - `claim_type_hint` 只能是 identity_profile、affiliation、relationship、preference、constraint、behavior_pattern。单次行为不得作为 explicit_assertion 直接生成 behavior_pattern；它至多是 pattern_observation。
 - `claim_anchor` 是简短、稳定的聚合标签，用于把不同 episode 中可能描述同一主张或规律的 facts 收拢，例如“安静旅行偏好”“游泳活动习惯”。它不是完整句子，也不是最终 entity claim。
@@ -200,16 +200,16 @@ entity_claim_signal 输出规则：
 - 信号与 fact 必须严格一致：signal 的实体、主张及其必要限定信息必须由同一 fact 的 `text` 完整支持。不得从同一批次中的其他 unit、其他 fact 或前置上下文借用未写入该 fact 的信息；若某项信息值得输出 signal，先将其写入该 fact 的 `text`，否则不输出该 signal。
 - 每条 fact 最多输出 3 个 signal。每个 signal 必须包含 entity、signal_kind、claim_type_hint、claim_anchor、evidence_basis、confidence；其中 evidence_basis 必须引用当前 fact `text` 中可直接定位的具体证据，不要引用历史 claim 或未被该 fact 保留的原始输入。
 
-future_commitment_signals 输出规则：
-- `future_commitment_signals` 是当前 fact 对用户未来世界的证据提示，不是最终 goal、plan 或 work_item，也不能直接决定创建、更新或覆盖已有对象。
+user_intent_signals 输出规则：
+- `user_intent_signals` 是当前 fact 对用户未来世界的证据提示，不是最终 goal、plan 或 work_item，也不能直接决定创建、更新或覆盖已有对象。
 - 只记录“用户本人”的未来导向信息：`subject_entity` 必须固定填写“用户本人”（英文输出填写 `user self`），不得填写任何其他人、团队、组织、产品用户或环境录音 speaker。
 - 仅在当前 fact 提供用户本人未来导向的目标、安排、责任，或这些对象的完成、取消、改期、阻塞等生命周期变化的直接证据时输出；其余情况输出空数组。纯 transcript、环境录音或未明确标记用户本人的证据一律输出空数组。
 - `evidence_kind` 只能是 `goal`、`plan`、`responsibility`、`lifecycle_update`。`candidate_object_types` 只能包含 goal、plan、work_item；goal 只允许来自“用户本人”明确表达的持续性目标。
 - `user_role` 只能是 owner、participant、responsible，表示用户本人分别是目标拥有者、安排参与者或责任承担者。产品用户、客户、消费者或环境录音中的未知说话人只是被顺带提及时不得输出 signal。
 - `assertion_source` 只能是 self_statement、third_party_report、observed_event；`explicitness` 只能是 direct、reported、tentative。助手建议、助手复述、开放假设、条件讨论和推测不得输出 signal。
-- `future_commitment_anchor` 是简短、稳定的事件/事项/目标聚合标签，例如“天津客户会议”“半马训练目标”“客户报告交付”；它不是完整句子，也不是最终对象描述。
+- `user_intent_anchor` 是简短、稳定的事件/事项/目标聚合标签，例如“天津客户会议”“半马训练目标”“客户报告交付”；它不是完整句子，也不是最终对象描述。
 - 信号与 fact 必须严格一致：future goal、安排、责任或生命周期变化本身必须明确写在同一 fact 的 `text` 中。不得因为原始 unit 批次中存在相关内容，就把它挂到未保留该内容的 fact 上；无法由该 fact `text` 独立支撑时输出空数组。
-- 每条 fact 最多输出 2 个 signal。每个 signal 必须包含 subject_entity、evidence_kind、candidate_object_types、user_role、future_commitment_anchor、assertion_source、explicitness、evidence_basis、confidence；其中 evidence_basis 必须是当前 fact `text` 中可直接定位的内容，不得引用未被该 fact 保留的原始输入。
+- 每条 fact 最多输出 2 个 signal。每个 signal 必须包含 subject_entity、evidence_kind、candidate_object_types、user_role、user_intent_anchor、assertion_source、explicitness、evidence_basis、confidence；其中 evidence_basis 必须是当前 fact `text` 中可直接定位的内容，不得引用未被该 fact 保留的原始输入。
 
 输出格式：
 {
@@ -226,7 +226,7 @@ future_commitment_signals 输出规则：
       "event_time_key": "根据对话时间锚点和 fact 内容推导出的事件实际发生时间或代表性时间锚点；无法判断时为空字符串",
       "time_confidence": "explicit|inferred_from_turn|unknown；分别表示原文明确给出、结合当前片段 Time 和相对表达推断、无法判断",
       "where": "明确出现的地点、场景、平台或项目范围；没有明确证据时保持为空字符串，不要填写‘未提及’或类似说明",
-      "entity_claim_signal": [
+      "user_claim_signal": [
         {
           "entity": {"name": "必须原样取自本 fact entities 的实体名" ,"type": "必须与该 fact entities 中同名实体的类型一致"},
           "signal_kind": "explicit_assertion|pattern_observation",
@@ -236,13 +236,13 @@ future_commitment_signals 输出规则：
           "confidence": 0.8
         }
       ],
-      "future_commitment_signals": [
+      "user_intent_signals": [
         {
           "subject_entity": "固定为‘用户本人’；英文输出固定为‘user self’",
           "evidence_kind": "goal|plan|responsibility|lifecycle_update",
           "candidate_object_types": ["goal|plan|work_item"],
           "user_role": "owner|participant|responsible",
-          "future_commitment_anchor": "用于跨 fact 聚合的目标、安排或事项标签",
+          "user_intent_anchor": "用于跨 fact 聚合的目标、安排或事项标签",
           "assertion_source": "self_statement|third_party_report|observed_event",
           "explicitness": "direct|reported|tentative",
           "evidence_basis": "当前 fact 中支持该 signal 的具体证据",
@@ -275,8 +275,9 @@ INTENT_EXTRACTION_PROMPT_ZH = """你负责从已落库、可追溯的 narrative 
 - “也许”“如果”“要不要”“考虑一下”等弱假设默认不输出对象。
 - goal 或 plan 不得自动拆出 work_item；只有文本明确表达下一步、交付、承诺或分配时才输出 work_item。
 - 计划发生是 `occurred`，事项完成是 `completed`，二者不能混淆。
-- 每个列表只输出其定义对应的对象；同一 fact 不得自动拆成多类对象，除非 fact 明确提供每一类对象的独立证据。
+- 每个 candidate 只能属于一种 `object_type`；同一 fact 不得自动拆成多类对象，除非 fact 明确提供每一类对象的独立证据。
 - `lifecycle_evidence` 只描述当前 fact 可直接观察到的生命周期证据，不是数据库操作；最终 create、update、complete 等操作由后续 reconciliation 结合已有对象决定。
+- 每个 candidate 必须输出一个 `primary_domain`，且只能为 `general|health|work|life|information|finance|family|learning|social|interest|travel`。它表示对象主要影响的用户生活领域，优先选择最具体领域；`general` 仅用于真正跨领域的对象，不能作为不确定时的兜底。
 
 world owner：{world_owner_name}
 当前时间：{reference_timestamp}
@@ -285,57 +286,29 @@ world owner：{world_owner_name}
 
 输出 JSON：
 {
-  "goal_candidates": [
+  "intent_candidates": [
     {
-      "summary": "完整、可展示的持续性目标描述",
-      "canonical_key": "用于同义目标匹配的简短稳定名称",
-      "owner_entity": "goal 归属实体；没有明确证据时填 world owner",
-      "desired_outcome": "目标达成后的结果",
-      "success_criteria": "可判定的达成条件；证据不足为空",
-      "target_at": "目标时间；证据不足为空",
-      "lifecycle_evidence": "none|confirmed|completed|cancelled|blocked",
+      "object_type": "goal|plan|work_item",
+      "summary": "完整、可展示的对象描述",
+      "canonical_key": "用于同类对象匹配的简短稳定名称",
+      "primary_domain": "general|health|work|life|information|finance|family|learning|social|interest|travel",
+      "subject_entity": "对象的核心主体：goal owner、plan actor 或 work_item 负责人",
+      "time_start": "开始/可开始时间；没有证据时为空",
+      "time_end": "目标时间/安排结束时间/截止时间；没有证据时为空",
+      "lifecycle_evidence": "由 object_type 决定的生命周期证据枚举",
       "confidence": 0.0,
-      "evidence_fact_ids": [1]
-    }
-  ],
-  "plan_candidates": [
-    {
-      "summary": "完整、可展示的未来安排描述",
-      "canonical_key": "用于同义安排匹配的简短稳定名称",
-      "actor_entity": "plan 的行动/参与主体",
-      "event_or_activity": "未来事件或活动",
-      "scheduled_start_at": "计划开始时间，保留已解析时间或原始明确时间",
-      "scheduled_end_at": "计划结束时间",
-      "time_precision": "exact|day|week|relative|unknown",
-      "location": "计划地点",
-      "participants": ["其他参与者"],
-      "lifecycle_evidence": "none|confirmed|occurred|cancelled|rescheduled|blocked",
-      "confidence": 0.0,
-      "evidence_fact_ids": [1]
-    }
-  ],
-  "work_item_candidates": [
-    {
-      "summary": "完整、可展示的责任事项描述",
-      "canonical_key": "用于同义事项匹配的简短稳定名称",
-      "responsible_entity": "work_item 负责人",
-      "beneficiary_entities": ["交付/受益对象"],
-      "delegator_entities": ["分配或委托对象"],
-      "collaborator_entities": ["协作者"],
-      "responsibility_type": "personal_action|commitment|assigned|external_commitment",
-      "action_text": "具体动作",
-      "deliverable": "交付物或完成结果",
-      "due_at": "截止时间",
-      "available_from": "可开始执行的时间；证据不足为空",
-      "priority": "仅文本明确表达时填写",
-      "lifecycle_evidence": "none|confirmed|completed|cancelled|blocked",
-      "confidence": 0.0,
-      "evidence_fact_ids": [1]
+      "evidence_fact_ids": [1],
+      "details": {}
     }
   ]
 }
 
-每个 candidate 必须至少引用一个输入 fact id。三个候选列表都必须存在；没有合格对象时对应输出空数组。只返回 JSON。"""
+`details` 是对象专属字段的结构化容器，不要把其中的内容重复拼成多个顶层字段：
+- goal：`desired_outcome`（必需）、`success_criteria`、`target_at`。`time_end` 可同时表达 target_at。
+- plan：`event_or_activity`（必需）、`time_precision`、`location`、`participants`。
+- work_item：`action_text`（必需）、`deliverable`、`responsibility_type`、`priority`、`beneficiary_entities`、`delegator_entities`、`collaborator_entities`。
+
+`lifecycle_evidence` 的允许值：goal 为 `none|confirmed|completed|cancelled|blocked`；plan 为 `none|confirmed|occurred|cancelled|rescheduled|blocked`；work_item 为 `none|confirmed|completed|cancelled|blocked`。每个 candidate 必须至少引用一个输入 fact id。没有合格对象时输出空数组。只返回 JSON。"""
 
 
 INTENT_RECONCILIATION_PROMPT_ZH = """你是个人世界模型的 Intent & Execution reconciliation 模块。你只判断新的 candidate 与已有对象是否为同一个现实中的 goal、plan 或 work_item，并在确认同一对象后给出其生命周期更新操作。
@@ -389,9 +362,9 @@ existing objects：
 """
 
 
-EXPLICIT_ENTITY_CLAIM_EXTRACTION_PROMPT_ZH = """你是个人世界模型的显式主张（explicit claim）更新模块。
+EXPLICIT_USER_CLAIM_EXTRACTION_PROMPT_ZH = """你是个人世界模型的显式主张（explicit claim）更新模块。
 
-输入是已经落库、可追溯的 narrative facts。每条 fact 可能带有 `entity_claim_signal`，它只是当前 fact 的结构化提示；必须以 fact summary 与 evidence_fact_ids 为准，不得把 signal 当作额外事实。请只提取 fact 中被说话者明确陈述、或由可靠事件记录直接确认的原子主张；不要把单次行为、建议、助手推测或常识扩展成偏好、习惯或人格结论。
+输入是已经落库、可追溯的 narrative facts。每条 fact 可能带有 `user_claim_signal`，它只是当前 fact 的结构化提示；必须以 fact summary 与 evidence_fact_ids 为准，不得把 signal 当作额外事实。请只提取 fact 中被说话者明确陈述、或由可靠事件记录直接确认的原子主张；不要把单次行为、建议、助手推测或常识扩展成偏好、习惯或人格结论。
 
 允许的 claim_type 只有：
 - identity_profile：身份、背景、角色、稳定画像；
@@ -409,7 +382,8 @@ EXPLICIT_ENTITY_CLAIM_EXTRACTION_PROMPT_ZH = """你是个人世界模型的显�
 5. claim_text 是给人阅读的完整、自包含陈述，必须明确主语、关系/属性和值，例如“用户明确偏好安静、节奏较慢的旅行方式”。
 6. 否定语义必须写入 predicate 与 claim_text，例如 dislikes、cannot、is_not_member_of；不要输出独立的正负字段。没有直接明示时不要输出。
 7. 不要输出一次行程、临时任务、单次建议、待办、开放问题；它们属于 fact / intent 层，而不是 claim。
-8. 输出空数组是正确结果。只返回 JSON。
+8. `primary_domain` 必须为 `general|health|work|life|information|finance|family|learning|social|interest|travel` 之一，表示该主张主要涉及的用户生活领域；优先选择最具体领域，`general` 只用于真正跨领域的主张。
+9. 输出空数组是正确结果。只返回 JSON。
 
 输出：
 {
@@ -417,6 +391,7 @@ EXPLICIT_ENTITY_CLAIM_EXTRACTION_PROMPT_ZH = """你是个人世界模型的显�
     {
       "subject_entity": "",
       "claim_type": "identity_profile|affiliation|relationship|preference|constraint",
+      "primary_domain": "general|health|work|life|information|finance|family|learning|social|interest|travel",
       "predicate": "",
       "object_entity": "",
       "claim_text": "包含主体和完整语义的陈述",
@@ -433,7 +408,7 @@ facts：
 """
 
 
-INDUCTIVE_ENTITY_CLAIM_EXTRACTION_PROMPT_ZH = """你是个人世界模型的规律归纳（inductive claim）模块。
+INDUCTIVE_USER_CLAIM_EXTRACTION_PROMPT_ZH = """你是个人世界模型的规律归纳（inductive claim）模块。
 
 输入是同一实体、同一 claim_anchor 下、来自已完成 episode 的可追溯 facts。claim_anchor 只用于召集候选证据，不是结论；你的任务是保守地判断这些证据是否支持一条规律，而不是重新复述 facts。
 
@@ -445,7 +420,8 @@ INDUCTIVE_ENTITY_CLAIM_EXTRACTION_PROMPT_ZH = """你是个人世界模型的规�
 3. 不要把偶然行为升级为偏好。只引用直接支持当前规律的 support_fact_ids；其他事实不需要标注为反例。
 4. subject_entity 必须是输入给定实体。predicate 使用 prefers、dislikes、usually_does、avoids、has_routine 之一。
 5. claim_text 必须是一条带实体主体、属性和值的完整规律陈述；condition_text 为空或简短条件。
-6. evidence IDs 必须来自输入。输出空数组是正确结果。只返回 JSON。
+6. `primary_domain` 必须为 `general|health|work|life|information|finance|family|learning|social|interest|travel` 之一，表示该规律主要涉及的用户生活领域；优先选择最具体领域，`general` 只用于真正跨领域的规律。
+7. evidence IDs 必须来自输入。输出空数组是正确结果。只返回 JSON。
 
 输出：
 {
@@ -453,6 +429,7 @@ INDUCTIVE_ENTITY_CLAIM_EXTRACTION_PROMPT_ZH = """你是个人世界模型的规�
     {
       "subject_entity": "",
       "claim_type": "preference|behavior_pattern",
+      "primary_domain": "general|health|work|life|information|finance|family|learning|social|interest|travel",
       "predicate": "prefers|dislikes|usually_does|avoids|has_routine",
       "claim_text": "包含主体和完整规律语义的陈述",
       "condition_text": "",
@@ -470,7 +447,7 @@ episode evidence facts：
 """
 
 
-DERIVED_ENTITY_CLAIM_EXTRACTION_PROMPT_ZH = """你是个人世界模型中的直接推导（derived claim）模块。
+DERIVED_USER_CLAIM_EXTRACTION_PROMPT_ZH = """你是个人世界模型中的直接推导（derived claim）模块。
 
 输入分为两部分：`changed_explicit_claims` 是当前 subject 在本轮新接收事实后发生变化的 explicit claims；`related_active_explicit_claims` 是从数据库读取的、与该 subject 或其直接关联实体相关的历史 active explicit claims。你的任务是仅根据这两部分 claims 的文本和结构，找出能够被直接逻辑推出的新结论。
 
@@ -485,7 +462,8 @@ DERIVED_ENTITY_CLAIM_EXTRACTION_PROMPT_ZH = """你是个人世界模型中的直
 4. subject_entity_id 和 object_entity_id（0 表示无 object）必须来自输入中出现的实体 ID；不能创建新实体。
 5. predicate 使用简短、稳定的小写英文键；claim_text 必须是完整、自包含、面向阅读者的结论。
 6. 不要重复或改写某个 premise 本身；没有严格成立的新结论时返回空数组。
-7. confidence 表示“在给定 premise 下该结论成立”的把握，不表示 premise 本身的真实性。只返回 JSON。
+7. `primary_domain` 必须为 `general|health|work|life|information|finance|family|learning|social|interest|travel` 之一，表示该推导结论主要涉及的用户生活领域；优先选择最具体领域，`general` 只用于真正跨领域的结论。
+8. confidence 表示“在给定 premise 下该结论成立”的把握，不表示 premise 本身的真实性。只返回 JSON。
 
 输出：
 {
@@ -493,6 +471,7 @@ DERIVED_ENTITY_CLAIM_EXTRACTION_PROMPT_ZH = """你是个人世界模型中的直
     {
       "subject_entity_id": 0,
       "claim_type": "affiliation|relationship|constraint",
+      "primary_domain": "general|health|work|life|information|finance|family|learning|social|interest|travel",
       "predicate": "",
       "object_entity_id": 0,
       "claim_text": "完整、自包含的推导结论",
@@ -510,7 +489,7 @@ related active explicit claims：
 """
 
 
-ENTITY_CLAIM_RECONCILIATION_PROMPT_ZH = """你是个人世界模型中的 entity claim reconciliation 模块。
+USER_CLAIM_RECONCILIATION_PROMPT_ZH = """你是个人世界模型中的 entity claim reconciliation 模块。
 
 输入只包含新旧 entity claim 的文本。你的任务只通过这些文本的自然语言语义，判断每个 candidate 与已有 claim 的关系；不要推断来源可信度、不要考虑 claim_origin、置信度、时间、数据库状态或后续写入策略。
 
@@ -549,21 +528,106 @@ existing_claims：
 """
 
 
+USER_STATE_UPDATE_PROMPT_ZH = """你负责增量更新个人世界模型中的用户状态（User State）。
+
+`user_claim` 是可审计的信念与证据账本；`goal`、`plan`、`work_item` 是未来导向对象。你的任务不是复述这些输入，也不是创建它们的副本，而是判断本轮变化是否应当创建或修改一个面向后续预测、决策的用户状态。
+
+状态只有三类：
+1. `enduring_state`：变化慢、跨情境仍大致成立的长期偏好、稳定约束、沟通或决策倾向。单次事件或临时安排通常不足以创建它。
+2. `recurring_state`：反复出现的行为、节律或带条件的模式。`conditions` 应保留关键条件、时间窗口、频率或例外；不能把单次行为写成规律。
+3. `situational_state`：当前阶段暂时成立的关注、压力、约束、准备状态或可用性。必须有合理的有效期、结束条件或可被未来证据改变的空间；不要把每个 goal/plan/work_item 原样复制成 situational_state。
+
+本轮只允许使用 `changed_claims` 与 `changed_intent_objects` 作为 operation 的直接 evidence。`active_intent_objects` 仅用于理解当前背景，不能单独作为 evidence。已有状态在 `existing_states` 中：若本轮证据在更新已有状态，必须填写其 id；不要为同一语义重复创建 state。
+
+本轮 `state_domain` 由系统固定指定。你只能创建或更新该领域内的状态；不得根据输入中的其他领域信息创建、修改或引用其他领域的 state。`general` 仅表示真正跨领域的用户状态，不是领域不明确时的兜底。
+
+operation 只能为：
+- `create`：创建此前不存在的状态；target_state_id 必须为 0。
+- `reinforce`：新证据强化已有状态，通常保持语义不变。
+- `revise`：已有状态的内容、范围、条件或有效期需要实质修正。
+- `weaken`：新证据降低已有状态的适用性或置信度，但不证明它已结束。
+- `expire`：已有状态已经结束、失效或明确不再适用。
+- `no_change`：本轮证据不应改变状态；此类项无需输出。
+
+硬规则：
+1. 仅输出有直接输入证据的操作；不做常识补全、人格诊断或自由猜测。
+2. `state_key` 不是自由命名字段，只能从当前 `state_class` 对应的受控选项中选择。更新已有状态时必须保持目标 state 的 state_key；没有适合选项时不输出操作：
+   - `enduring_state`：`communication_style`、`decision_style`、`value_priority`、`risk_preference`、`privacy_preference`、`time_preference`、`work_style`、`lifestyle_preference`、`long_term_constraint`。
+   - `recurring_state`：`daily_routine`、`weekly_routine`、`work_routine`、`health_routine`、`social_routine`、`conditional_behavior`。
+   - `situational_state`：`current_focus`、`current_constraint`、`current_availability`、`current_energy`、`current_stress`、`current_social_engagement`、`current_preparation`。
+   `state_key` 表示稳定的状态维度，不得把具体对象、领域、时间、取值或一次事件写进 key；这些信息必须写入 `state_text` 或 `conditions`。
+3. `state_text` 必须是完整、自包含、可被人阅读的中文陈述，表达聚合后的状态而不是逐条粘贴 claim。
+4. evidence 中每一项必须来自允许的本轮变化对象，格式为 user_claim / goal / plan / work_item 的 id；至少有一条 `change_trigger` 或 `support`。
+5. 对 evidence 不足、相互矛盾且无法判断、或只意味着一次性事实的输入，宁可不输出操作。
+6. `runtime_context` 当前可能为空；仅当其中信息明确给出且与本轮证据一致时，才能将其写入 conditions，不能自行臆造情境。
+7. confidence 表示该状态操作在给定证据下的可信程度，范围 0 到 1。
+8. 本轮 domain 为 `state_domain`，所有操作均由系统写入该 domain；不要输出跨领域操作。
+9. 只返回 JSON。
+
+输出：
+{
+  "operations": [
+    {
+      "operation": "create|reinforce|revise|weaken|expire",
+      "target_state_id": 0,
+      "state_class": "enduring_state|recurring_state|situational_state",
+      "state_key": "从当前 state_class 的受控选项中选择",
+      "state_text": "完整、可阅读的用户状态陈述",
+      "conditions": {},
+      "valid_from": "",
+      "valid_to": "",
+      "confidence": 0.8,
+      "evidence": [
+        {
+          "evidence_type": "user_claim|goal|plan|work_item",
+          "evidence_id": 1,
+          "role": "change_trigger|support|counterexample|context",
+          "weight": 1.0
+        }
+      ],
+      "reason": "简短说明本轮变化如何影响该状态"
+    }
+  ]
+}
+
+reference_time：
+{reference_time}
+
+state_domain：
+{state_domain}
+
+runtime_context：
+{runtime_context}
+
+existing_states：
+{existing_states}
+
+changed_claims：
+{changed_claims}
+
+changed_intent_objects：
+{changed_intent_objects}
+
+active_intent_objects（仅背景，不可单独作为 evidence）：
+{active_intent_objects}
+"""
+
+
 RECALL_QUERY_ANALYSIS_PROMPT_ZH = """你是 AI 眼镜长期记忆系统中的 recall query 分析器。
 
 请先理解当前记忆结构，再分析用户查询的检索方式。
 
 记忆结构：
 1. `fact`：从一次 episode 的对话或全天候转写中提炼出的、可追溯且自包含的 narrative evidence。它保留具体发生了什么、谁参与、时间、地点/场景、原因、观点变化、建议、接受/拒绝、约束、结论和未解决问题等证据。fact 通常带有 `summary`、`keywords`、`entities`、`fact_root_topic`、`fact_aspect_topic`、`event_time_key` 和 `dialogue_time_key`。
-2. `entity_claim`：从多个 facts 反思得到、具有状态和置信度且可回溯支撑 facts 的实体主张，例如稳定偏好、习惯、关系、背景、约束或特征。
+2. `user_claim`：从多个 facts 反思得到、具有状态和置信度且可回溯支撑 facts 的实体主张，例如稳定偏好、习惯、关系、背景、约束或特征。
 3. `goal`、`plan`、`work_item`：从 facts 中提炼出的未来导向对象，分别表示期望结果、明确安排和可闭环责任事项；其 status 和目标/开始/截止时间具有重要语义。
 4. `episode`：连续原始片段的经历摘要，只用于在 facts 之间建立关联，绝不作为 direct recall object。
 
 判断准则：
 - 只有当 query 明确指向用户与助手的主动对话，才偏向 `assistant_wakeup`；明确指向全天录音、会议、旁听、多人数对话，才偏向 `allday_recording`；不确定时两者都保留。
-- `recall_object_types` 是本次可直接检索的对象类型。必须始终包含 `fact`；仅在 query 明确需要稳定实体知识时加入 `entity_claim`；仅在 query 询问未来目标、安排、责任、截止、未完成事项或其状态变化时加入相应的 `goal`、`plan`、`work_item`。绝不能输出 `episode`。
+- `recall_object_types` 是本次可直接检索的对象类型。必须始终包含 `fact`；仅在 query 明确需要稳定实体知识时加入 `user_claim`；仅在 query 询问未来目标、安排、责任、截止、未完成事项或其状态变化时加入相应的 `goal`、`plan`、`work_item`。绝不能输出 `episode`。
 - 具体发生了什么、日期、地点、人名、原话语义、事件先后和可追溯证据，优先 `fact`。
-- 稳定偏好、长期约束、习惯/流程、关系画像或个人背景，除 `fact` 外可加入 `entity_claim`；仍需保留 `fact` 以提供证据。
+- 稳定偏好、长期约束、习惯/流程、关系画像或个人背景，除 `fact` 外可加入 `user_claim`；仍需保留 `fact` 以提供证据。
 - 任务、承诺、未来安排、目标、截止与未完成事项，除 `fact` 外可加入对应 prospective object；仍需保留 `fact` 以提供证据。
 - 不确定时保持宽检索，漏掉证据比少取几个候选更糟。
 - `keywords` 输出 2-8 个短检索词，优先保留具体人物、组织、产品、项目、主题、动作、结果和约束；不要输出完整句子、寒暄、泛化词或普通时间表达。

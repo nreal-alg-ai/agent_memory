@@ -420,27 +420,27 @@ class AgentMemoryRuntime:
         input_flush = dict(finalization.get("input_flush") or {})
         episode = dict(finalization.get("episode_summary") or {})
         derived_tasks = dict(finalization.get("derived_tasks") or {})
-        entity_claim = dict(derived_tasks.get("entity_claim") or {})
-        future_commitment = dict(derived_tasks.get("future_commitment") or {})
+        user_claim = dict(derived_tasks.get("user_claim") or {})
+        user_intent = dict(derived_tasks.get("user_intent") or {})
         result = {
             "finalized": bool((episode or {}).get("queued")),
             "recordingId": recording_id,
             "inputFlushed": bool(input_flush.get("queued")),
             "episodeSummaryQueued": bool((episode or {}).get("queued")),
-            "entityClaimQueued": bool((entity_claim or {}).get("queued")),
-            "futureCommitmentQueued": bool(future_commitment.get("queued")),
+            "entityClaimQueued": bool((user_claim or {}).get("queued")),
+            "userIntentQueued": bool(user_intent.get("queued")),
             "activeAmbientRecordingCount": len(holder.active_ambient_recording_ids),
         }
         self._logger.info(
             "finalize_transcript_recording owner=%s recording=%s input_flushed=%s "
-            "episode_summary_queued=%s entity_claim_queued=%s future_commitment_queued=%s "
+            "episode_summary_queued=%s user_claim_queued=%s user_intent_queued=%s "
             "active_ambient_recordings=%s",
             _owner_key(owner_id)[:12],
             recording_id[:80],
             result["inputFlushed"],
             result["episodeSummaryQueued"],
             result["entityClaimQueued"],
-            result["futureCommitmentQueued"],
+            result["userIntentQueued"],
             result["activeAmbientRecordingCount"],
         )
         return result
@@ -451,8 +451,8 @@ class AgentMemoryRuntime:
         ``checkpoint`` is for a transport-level close: it may flush input but
         never treats the reconnect as a conversation boundary.
         ``session_end`` is reserved for an explicit user-created new session;
-        it submits store, episode summary, entity-claim update, and future
-        commitment in
+        it submits store, episode summary, entity-claim update, and user intent
+        in
         that FIFO order.
         """
         owner_id = _clean(params.get("ownerId"), 240)
@@ -471,41 +471,41 @@ class AgentMemoryRuntime:
             input_flush = dict(finalization.get("input_flush") or {})
             episode = dict(finalization.get("episode_summary") or {})
             derived_tasks = dict(finalization.get("derived_tasks") or {})
-            entity_claim = dict(derived_tasks.get("entity_claim") or {})
-            future_commitment = dict(
-                derived_tasks.get("future_commitment") or {}
+            user_claim = dict(derived_tasks.get("user_claim") or {})
+            user_intent = dict(
+                derived_tasks.get("user_intent") or {}
             )
         else:
             input_flushed = holder.runtime.flush_pending_memory_inputs()
             input_flush = {"queued": bool(input_flushed)}
             episode = None
-            entity_claim = None
-            future_commitment = None
+            user_claim = None
+            user_intent = None
         result = {
             "finalized": boundary == "session_end" and bool((episode or {}).get("queued")),
             "boundary": boundary,
             "sessionId": session_id,
             "episodeSummaryQueued": bool((episode or {}).get("queued")),
             "inputFlushed": bool(input_flush.get("queued")),
-            "entityClaimQueued": bool((entity_claim or {}).get("queued")),
-            "futureCommitmentQueued": bool(
-                (future_commitment or {}).get("queued")
+            "entityClaimQueued": bool((user_claim or {}).get("queued")),
+            "userIntentQueued": bool(
+                (user_intent or {}).get("queued")
             ),
             "episode": episode,
-            "entityClaim": entity_claim,
-            "futureCommitment": future_commitment,
+            "entityClaim": user_claim,
+            "userIntent": user_intent,
         }
         self._logger.info(
             "finalize owner=%s boundary=%s session=%s input_flushed=%s "
-            "episode_summary_queued=%s entity_claim_queued=%s "
-            "future_commitment_queued=%s reason=%s",
+            "episode_summary_queued=%s user_claim_queued=%s "
+            "user_intent_queued=%s reason=%s",
             _owner_key(owner_id)[:12],
             boundary,
             session_id[:80],
             result["inputFlushed"],
             result["episodeSummaryQueued"],
             result["entityClaimQueued"],
-            result["futureCommitmentQueued"],
+            result["userIntentQueued"],
             (episode or {}).get("reason") or "",
         )
         return result

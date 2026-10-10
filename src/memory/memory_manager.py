@@ -38,37 +38,42 @@ from .embedding_client import EmbeddingClient
 from .memory_database import SessionDB
 from .memory_types import MemoryUnit
 from .prompts_en import (
-    DERIVED_ENTITY_CLAIM_EXTRACTION_PROMPT_EN,
-    ENTITY_CLAIM_RECONCILIATION_PROMPT_EN,
-    EXPLICIT_ENTITY_CLAIM_EXTRACTION_PROMPT_EN,
-    INDUCTIVE_ENTITY_CLAIM_EXTRACTION_PROMPT_EN,
+    DERIVED_USER_CLAIM_EXTRACTION_PROMPT_EN,
+    USER_CLAIM_RECONCILIATION_PROMPT_EN,
+    EXPLICIT_USER_CLAIM_EXTRACTION_PROMPT_EN,
+    INDUCTIVE_USER_CLAIM_EXTRACTION_PROMPT_EN,
     INTENT_EXTRACTION_PROMPT_EN,
     INTENT_RECONCILIATION_PROMPT_EN,
     EPISODE_SUMMARY_PROMPT_EN,
     MEMORY_RETRIEVED_FORMAT_PROMPT_EN,
     MEMORY_RETRIEVED_SECTION_SPECS_EN,
     RECALL_QUERY_ANALYSIS_PROMPT_EN,
+    USER_STATE_UPDATE_PROMPT_EN,
     UNIFIED_MEMORY_EXTRACTION_PROMPT_EN,
 )
 from .prompts_zh import (
-    DERIVED_ENTITY_CLAIM_EXTRACTION_PROMPT_ZH,
-    ENTITY_CLAIM_RECONCILIATION_PROMPT_ZH,
-    EXPLICIT_ENTITY_CLAIM_EXTRACTION_PROMPT_ZH,
-    INDUCTIVE_ENTITY_CLAIM_EXTRACTION_PROMPT_ZH,
+    DERIVED_USER_CLAIM_EXTRACTION_PROMPT_ZH,
+    USER_CLAIM_RECONCILIATION_PROMPT_ZH,
+    EXPLICIT_USER_CLAIM_EXTRACTION_PROMPT_ZH,
+    INDUCTIVE_USER_CLAIM_EXTRACTION_PROMPT_ZH,
     INTENT_EXTRACTION_PROMPT_ZH,
     INTENT_RECONCILIATION_PROMPT_ZH,
     EPISODE_SUMMARY_PROMPT_ZH,
     MEMORY_RETRIEVED_FORMAT_PROMPT_ZH,
     MEMORY_RETRIEVED_SECTION_SPECS_ZH,
     RECALL_QUERY_ANALYSIS_PROMPT_ZH,
+    USER_STATE_UPDATE_PROMPT_ZH,
     UNIFIED_MEMORY_EXTRACTION_PROMPT_ZH,
 )
 from .utils import _cal_embedding_cosine_similarity
+from user_state import UserStateResolver
 
 RecallTimeBounds = Optional[Tuple[Optional[str], Optional[str]]]
 
 DEFAULT_LLM_BASE_URL = "https://api.deepseek.com/v1"
 DEFAULT_LLM_MODEL = "deepseek-v4-flash"
+
+_PRIMARY_DOMAINS = UserStateResolver.STATE_DOMAINS
 
 _STOPWORDS = {
     "the", "a", "an", "and", "or", "to", "of", "in", "on", "for", "with",
@@ -376,9 +381,9 @@ class MemoryOperationReporter:
             )
         if operation_type in {
             "memory_episode_summary",
-            "memory_entity_claim_update",
-            "memory_future_commitment_update",
-            "memory_proactive_candidate_time_tick",
+            "memory_user_claim_update",
+            "memory_user_intent_update",
+            "memory_user_state_update",
         }:
             if not isinstance(result, dict):
                 return False
@@ -436,6 +441,7 @@ class MemoryNodeManager:
     ) -> None:
         self._db = db
         self._logger = logger or logging.getLogger(__name__)
+        self._user_state_resolver = UserStateResolver(db=self._db)
         self._operation_reporter = operation_reporter or MemoryOperationReporter()
         self._memory_cfg = dict(memory_manager_config or {})
         configured_embedding = self._memory_cfg.get("embedding")
@@ -466,22 +472,22 @@ class MemoryNodeManager:
             or "source"
         )
         self._memory_enabled = bool(self._memory_cfg.get("memory_enabled", True))
-        self._enable_memory_entity_claim_update = self._config_bool(
-            self._memory_cfg.get("enable_memory_entity_claim_update", True),
+        self._enable_memory_user_claim_update = self._config_bool(
+            self._memory_cfg.get("enable_memory_user_claim_update", True),
             True,
         )
-        self._enable_memory_future_commitment_update = self._config_bool(
-            self._memory_cfg.get("enable_memory_future_commitment_update", True),
+        self._enable_memory_user_intent_update = self._config_bool(
+            self._memory_cfg.get("enable_memory_user_intent_update", True),
             True,
         )
-        self._enable_memory_proactive_candidate_generation = self._config_bool(
-            self._memory_cfg.get(
-                "enable_memory_proactive_candidate_generation",
-                True,
-            ),
+        self._enable_memory_user_state_update = self._config_bool(
+            self._memory_cfg.get("enable_memory_user_state_update", True),
             True,
         )
-        self._initialize_proactive_candidate_config()
+        self._user_state_update_limit = max(
+            1,
+            int(self._memory_cfg.get("user_state_update_limit", 80) or 80),
+        )
         configured_world_owner_name = _compact_whitespace(
             self._memory_cfg.get("world_owner_entity_name") or ""
         )
@@ -494,37 +500,37 @@ class MemoryNodeManager:
         self._world_owner_entity_name = (
             configured_world_owner_name or "用户本人"
         )
-        self._entity_claim_explicit_min_confidence = self._clamp_float(
-            self._memory_cfg.get("entity_claim_explicit_min_confidence"),
+        self._user_claim_explicit_min_confidence = self._clamp_float(
+            self._memory_cfg.get("user_claim_explicit_min_confidence"),
             0.0,
             1.0,
             0.72,
         )
-        self._entity_claim_derived_min_confidence = self._clamp_float(
-            self._memory_cfg.get("entity_claim_derived_min_confidence"),
+        self._user_claim_derived_min_confidence = self._clamp_float(
+            self._memory_cfg.get("user_claim_derived_min_confidence"),
             0.0,
             1.0,
             0.75,
         )
-        self._entity_claim_induction_min_support_facts = max(
+        self._user_claim_induction_min_support_facts = max(
             3,
             int(
                 self._memory_cfg.get(
-                    "entity_claim_induction_min_support_facts", 3,
+                    "user_claim_induction_min_support_facts", 3,
                 ) or 3
             ),
         )
-        self._entity_claim_induction_min_episodes = max(
+        self._user_claim_induction_min_episodes = max(
             3,
-            int(self._memory_cfg.get("entity_claim_induction_min_episodes", 3) or 3),
+            int(self._memory_cfg.get("user_claim_induction_min_episodes", 3) or 3),
         )
-        self._entity_claim_induction_min_time_windows = max(
+        self._user_claim_induction_min_time_windows = max(
             2,
-            int(self._memory_cfg.get("entity_claim_induction_min_time_windows", 2) or 2),
+            int(self._memory_cfg.get("user_claim_induction_min_time_windows", 2) or 2),
         )
-        self._entity_claim_induction_evidence_limit = max(
-            self._entity_claim_induction_min_support_facts,
-            int(self._memory_cfg.get("entity_claim_induction_evidence_limit", 16) or 16),
+        self._user_claim_induction_evidence_limit = max(
+            self._user_claim_induction_min_support_facts,
+            int(self._memory_cfg.get("user_claim_induction_evidence_limit", 16) or 16),
         )
         self._initialize_recall_config()
         self._embedding_client: Optional[EmbeddingClient] = None
@@ -543,41 +549,6 @@ class MemoryNodeManager:
         self._task_completion_listeners: List[
             Callable[[Dict[str, Any]], None]
         ] = []
-
-    def _initialize_proactive_candidate_config(self) -> None:
-        """Parse the deterministic candidate-generation window settings."""
-        configured = self._memory_cfg.get("proactive_candidate")
-        self._proactive_candidate_cfg = dict(
-            configured if isinstance(configured, dict) else {}
-        )
-
-        def hours_to_seconds(key: str, default_hours: float) -> float:
-            try:
-                hours = float(
-                    self._proactive_candidate_cfg.get(key, default_hours)
-                    or default_hours
-                )
-            except (TypeError, ValueError):
-                hours = default_hours
-            return max(60.0, hours * 3600.0)
-
-        self._proactive_candidate_plan_horizon_seconds = hours_to_seconds(
-            "plan_upcoming_horizon_hours", 24.0,
-        )
-        self._proactive_candidate_work_item_horizon_seconds = hours_to_seconds(
-            "work_item_due_horizon_hours", 24.0,
-        )
-        self._proactive_candidate_overdue_repeat_seconds = hours_to_seconds(
-            "work_item_overdue_repeat_hours", 24.0,
-        )
-        try:
-            configured_limit = int(
-                self._proactive_candidate_cfg.get("scan_limit_per_object_type", 120)
-                or 120
-            )
-        except (TypeError, ValueError):
-            configured_limit = 120
-        self._proactive_candidate_scan_limit = max(1, configured_limit)
 
     def _initialize_recall_config(self) -> None:
         """Parse nested recall settings and keep legacy flat overrides working."""
@@ -961,14 +932,12 @@ class MemoryNodeManager:
                         result = self._process_memory_fact_extraction_task(**task["payload"])
                     elif task_kind == "memory_episode_summary":
                         result = self._process_memory_episode_summary_task(**task["payload"])
-                    elif task_kind == "memory_entity_claim_update":
-                        result = self._process_memory_entity_claim_update_task(**task["payload"])
-                    elif task_kind == "memory_future_commitment_update":
-                        result = self._process_memory_future_commitment_update_task(**task["payload"])
-                    elif task_kind == "memory_proactive_candidate_time_tick":
-                        result = self._process_memory_proactive_candidate_time_tick_task(
-                            **task["payload"]
-                        )
+                    elif task_kind == "memory_user_claim_update":
+                        result = self._process_memory_user_claim_update_task(**task["payload"])
+                    elif task_kind == "memory_user_intent_update":
+                        result = self._process_memory_user_intent_update_task(**task["payload"])
+                    elif task_kind == "memory_user_state_update":
+                        result = self._process_memory_user_state_update_task(**task["payload"])
                     else:
                         raise ValueError(f"Unsupported memory async task: {task_kind}")
                 self._operation_reporter.on_task_finished(
@@ -1318,17 +1287,17 @@ class MemoryNodeManager:
             "status": "ok",
             "new_fact_count": len(list(save_fact_info.get("fact_ids") or [])),
             "fact_ids": list(save_fact_info.get("fact_ids") or []),
-            "entity_claim_signal_fact_count": int(
-                save_fact_info.get("entity_claim_signal_fact_count") or 0
+            "user_claim_signal_fact_count": int(
+                save_fact_info.get("user_claim_signal_fact_count") or 0
             ),
-            "entity_claim_signal_count": int(
-                save_fact_info.get("entity_claim_signal_count") or 0
+            "user_claim_signal_count": int(
+                save_fact_info.get("user_claim_signal_count") or 0
             ),
-            "future_commitment_signal_fact_count": int(
-                save_fact_info.get("future_commitment_signal_fact_count") or 0
+            "user_intent_signal_fact_count": int(
+                save_fact_info.get("user_intent_signal_fact_count") or 0
             ),
-            "future_commitment_signal_count": int(
-                save_fact_info.get("future_commitment_signal_count") or 0
+            "user_intent_signal_count": int(
+                save_fact_info.get("user_intent_signal_count") or 0
             ),
             "source_unit_row_ids": source_unit_row_ids,
             "source_unit_count": len(units),
@@ -1491,8 +1460,8 @@ class MemoryNodeManager:
                     "primary_entity": fact.get("primary_entity"),
                     "fact_root_topic": fact.get("fact_root_topic") or "",
                     "fact_aspect_topic": fact.get("fact_aspect_topic") or "",
-                    "entity_claim_signal": fact.get("entity_claim_signal") or [],
-                    "future_commitment_signals": fact.get("future_commitment_signals") or [],
+                    "user_claim_signal": fact.get("user_claim_signal") or [],
+                    "user_intent_signals": fact.get("user_intent_signals") or [],
                     "importance": fact.get("importance"),
                     "confidence": fact.get("confidence"),
                     "time_confidence": metadata.get("time_confidence") or "",
@@ -1964,11 +1933,11 @@ class MemoryNodeManager:
                 fallback_root_topic=fact_topic_fallback,
                 fallback_aspect_topic=fact_topic_fallback,
             )
-            entity_claim_signal = self._normalize_entity_claim_signal(
-                raw_fact.get("entity_claim_signal"),
+            user_claim_signal = self._normalize_user_claim_signal(
+                raw_fact.get("user_claim_signal"),
             )
-            future_commitment_signals = self._normalize_future_commitment_signals(
-                raw_fact.get("future_commitment_signals"),
+            user_intent_signals = self._normalize_user_intent_signals(
+                raw_fact.get("user_intent_signals"),
                 fallback_entity=primary_entity,
                 allows_world_owner_reference=allows_world_owner_reference,
             )
@@ -1982,8 +1951,8 @@ class MemoryNodeManager:
                 "entities": entities,
                 "entity_descriptors": entity_descriptors,
                 "primary_entity": primary_entity,
-                "entity_claim_signal": entity_claim_signal,
-                "future_commitment_signals": future_commitment_signals,
+                "user_claim_signal": user_claim_signal,
+                "user_intent_signals": user_intent_signals,
                 "fact_root_topic": fact_root_topic,
                 "fact_aspect_topic": fact_aspect_topic,
                 "importance": max(0.6, min(1.0, priority / 100.0)),
@@ -2036,7 +2005,7 @@ class MemoryNodeManager:
         )
         return normalized_root, normalized_aspect
 
-    def _normalize_entity_claim_signal(
+    def _normalize_user_claim_signal(
         self,
         value: Any,
         *,
@@ -2049,12 +2018,12 @@ class MemoryNodeManager:
             int(
                 limit
                 if limit is not None
-                else self._memory_cfg.get("entity_claim_signal_max_per_fact", 3) or 3
+                else self._memory_cfg.get("user_claim_signal_max_per_fact", 3) or 3
             ),
         )
         if max_items <= 0:
             return []
-        allowed_types = self._entity_claim_types()
+        allowed_types = self._user_claim_types()
         allowed_kinds = {"explicit_assertion", "pattern_observation"}
         normalized: List[Dict[str, Any]] = []
         seen: set[Tuple[str, str, str, str]] = set()
@@ -2125,7 +2094,7 @@ class MemoryNodeManager:
                 break
         return normalized
 
-    def _normalize_future_commitment_signals(
+    def _normalize_user_intent_signals(
         self,
         value: Any,
         *,
@@ -2141,7 +2110,7 @@ class MemoryNodeManager:
             int(
                 limit
                 if limit is not None
-                else self._memory_cfg.get("future_commitment_signal_max_per_fact", 2) or 2
+                else self._memory_cfg.get("user_intent_signal_max_per_fact", 2) or 2
             ),
         )
         if max_items <= 0:
@@ -2210,19 +2179,19 @@ class MemoryNodeManager:
                 subject_name = self._world_owner_entity_name
             elif subject_name.lower() in _AMBIGUOUS_USER_ENTITY_ALIASES:
                 continue
-            future_commitment_anchor = _compact_whitespace(
-                raw.get("future_commitment_anchor") or raw.get("intent_anchor") or ""
+            user_intent_anchor = _compact_whitespace(
+                raw.get("user_intent_anchor") or raw.get("intent_anchor") or ""
             )[:240]
             evidence_basis = _compact_whitespace(
                 raw.get("evidence_basis") or raw.get("evidence") or raw.get("reason") or ""
             )[:480]
-            if not subject_name or not future_commitment_anchor or not evidence_basis:
+            if not subject_name or not user_intent_anchor or not evidence_basis:
                 continue
             confidence = self._clamp_float(raw.get("confidence"), 0.0, 1.0, 0.75)
             key = (
                 subject_name.lower(),
                 evidence_kind,
-                self._generate_topic_name_key(future_commitment_anchor),
+                self._generate_topic_name_key(user_intent_anchor),
             )
             if key in seen:
                 continue
@@ -2232,7 +2201,7 @@ class MemoryNodeManager:
                 "evidence_kind": evidence_kind,
                 "candidate_object_types": candidate_object_types,
                 "user_role": user_role,
-                "future_commitment_anchor": future_commitment_anchor,
+                "user_intent_anchor": user_intent_anchor,
                 "assertion_source": assertion_source,
                 "explicitness": explicitness,
                 "evidence_basis": evidence_basis,
@@ -2819,10 +2788,10 @@ class MemoryNodeManager:
     ) -> Dict[str, Any]:
         fact_ids: List[int] = []
         topic_item_updates: List[Dict[str, Any]] = []
-        entity_claim_signal_mapping_updates: List[Dict[str, Any]] = []
-        future_commitment_signal_mapping_updates: List[Dict[str, Any]] = []
-        entity_claim_signal_fact_ids: List[int] = []
-        future_commitment_signal_fact_ids: List[int] = []
+        user_claim_signal_mapping_updates: List[Dict[str, Any]] = []
+        user_intent_signal_mapping_updates: List[Dict[str, Any]] = []
+        user_claim_signal_fact_ids: List[int] = []
+        user_intent_signal_fact_ids: List[int] = []
         for fact in facts:
             keywords = self._normalize_string_list(
                 fact.get("keywords"),
@@ -2886,24 +2855,24 @@ class MemoryNodeManager:
                 importance=float(fact["importance"]),
             )
             fact_ids.append(fact_id)
-            entity_claim_updates = (
-                self._fact_entity_claim_signal_mapping_updates(fact_id, fact)
+            user_claim_updates = (
+                self._fact_user_claim_signal_mapping_updates(fact_id, fact)
             )
-            entity_claim_signal_mapping_updates.extend(entity_claim_updates)
+            user_claim_signal_mapping_updates.extend(user_claim_updates)
             if any(
                 str(item.get("signal_key") or "") != "__fact__"
-                for item in entity_claim_updates
+                for item in user_claim_updates
             ):
-                entity_claim_signal_fact_ids.append(fact_id)
-            future_commitment_updates = (
-                self._fact_future_commitment_signal_mapping_updates(fact_id, fact)
+                user_claim_signal_fact_ids.append(fact_id)
+            user_intent_updates = (
+                self._fact_user_intent_signal_mapping_updates(fact_id, fact)
             )
-            future_commitment_signal_mapping_updates.extend(future_commitment_updates)
+            user_intent_signal_mapping_updates.extend(user_intent_updates)
             if any(
                 str(item.get("signal_key") or "") != "__fact__"
-                for item in future_commitment_updates
+                for item in user_intent_updates
             ):
-                future_commitment_signal_fact_ids.append(fact_id)
+                user_intent_signal_fact_ids.append(fact_id)
             topic_item_updates.extend(
                 self._build_memory_topic_item_updates(
                     canonical_topics=[fact_root_topic],
@@ -2911,47 +2880,47 @@ class MemoryNodeManager:
                     fact_id=fact_id,
                 )
             )
-        self._db.upsert_fact_entity_claim_signal_mappings(
-            entity_claim_signal_mapping_updates
+        self._db.upsert_fact_user_claim_signal_mappings(
+            user_claim_signal_mapping_updates
         )
-        self._db.upsert_fact_future_commitment_signal_mappings(
-            future_commitment_signal_mapping_updates
+        self._db.upsert_fact_user_intent_signal_mappings(
+            user_intent_signal_mapping_updates
         )
         return {
             "fact_ids": fact_ids,
             "topic_item_updates": topic_item_updates,
-            "entity_claim_signal_fact_count": len(entity_claim_signal_fact_ids),
-            "entity_claim_signal_count": sum(
+            "user_claim_signal_fact_count": len(user_claim_signal_fact_ids),
+            "user_claim_signal_count": sum(
                 1
-                for item in entity_claim_signal_mapping_updates
+                for item in user_claim_signal_mapping_updates
                 if str(item.get("signal_key") or "") != "__fact__"
             ),
-            "future_commitment_signal_fact_count": len(
-                future_commitment_signal_fact_ids
+            "user_intent_signal_fact_count": len(
+                user_intent_signal_fact_ids
             ),
-            "future_commitment_signal_count": sum(
+            "user_intent_signal_count": sum(
                 1
-                for item in future_commitment_signal_mapping_updates
+                for item in user_intent_signal_mapping_updates
                 if str(item.get("signal_key") or "") != "__fact__"
             ),
         }
 
     # ── Entity-claim update: facts/episodes -> entity claims ─────────────
 
-    def submit_memory_entity_claim_update_task(self, *_, **kwargs: Any) -> Dict[str, Any]:
+    def submit_memory_user_claim_update_task(self, *_, **kwargs: Any) -> Dict[str, Any]:
         """Queue an entity-claim update after accepted memory tasks."""
         completion_context = kwargs.pop("completion_context", None)
         if not self._memory_enabled:
             task_id = self._operation_reporter.next_task_id(
-                "memory_entity_claim_update"
+                "memory_user_claim_update"
             )
             return self._reject_memory_task(
-                task_kind="memory_entity_claim_update",
+                task_kind="memory_user_claim_update",
                 task_id=task_id,
                 reason="memory_disabled",
             )
         return self._submit_memory_task(
-            task_kind="memory_entity_claim_update",
+            task_kind="memory_user_claim_update",
             payload=dict(kwargs),
             completion_context=(
                 dict(completion_context)
@@ -2960,18 +2929,18 @@ class MemoryNodeManager:
             ),
         )
 
-    def submit_memory_future_commitment_update_task(self, *_, **kwargs: Any) -> Dict[str, Any]:
+    def submit_memory_user_intent_update_task(self, *_, **kwargs: Any) -> Dict[str, Any]:
         """Queue a future-commitment projection after committed fact evidence."""
         completion_context = kwargs.pop("completion_context", None)
-        if not self._memory_enabled or not self._enable_memory_future_commitment_update:
-            task_id = self._operation_reporter.next_task_id("memory_future_commitment_update")
+        if not self._memory_enabled or not self._enable_memory_user_intent_update:
+            task_id = self._operation_reporter.next_task_id("memory_user_intent_update")
             return self._reject_memory_task(
-                task_kind="memory_future_commitment_update",
+                task_kind="memory_user_intent_update",
                 task_id=task_id,
-                reason=("memory_disabled" if not self._memory_enabled else "future_commitment_update_disabled"),
+                reason=("memory_disabled" if not self._memory_enabled else "user_intent_update_disabled"),
             )
         return self._submit_memory_task(
-            task_kind="memory_future_commitment_update",
+            task_kind="memory_user_intent_update",
             payload=dict(kwargs),
             completion_context=(
                 dict(completion_context)
@@ -2980,42 +2949,183 @@ class MemoryNodeManager:
             ),
         )
 
-    def submit_memory_proactive_candidate_time_tick_task(
+    def submit_memory_user_state_update_task(
         self,
         *,
+        changed_claim_ids: Optional[Sequence[int]] = None,
+        changed_intent_objects: Optional[Sequence[Dict[str, Any]]] = None,
         reference_timestamp: Optional[Any] = None,
+        runtime_context: Optional[Dict[str, Any]] = None,
         completion_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Queue a deterministic scan for time-sensitive proactive candidates."""
-        if (
-            not self._memory_enabled
-            or not self._enable_memory_proactive_candidate_generation
-        ):
-            task_id = self._operation_reporter.next_task_id(
-                "memory_proactive_candidate_time_tick"
-            )
+        """Queue a bounded incremental user-state projection."""
+        if not self._memory_enabled or not self._enable_memory_user_state_update:
+            task_id = self._operation_reporter.next_task_id("memory_user_state_update")
             return self._reject_memory_task(
-                task_kind="memory_proactive_candidate_time_tick",
+                task_kind="memory_user_state_update",
                 task_id=task_id,
                 reason=(
                     "memory_disabled"
-                    if not self._memory_enabled
-                    else "proactive_candidate_generation_disabled"
+                    if not self._memory_enabled else "user_state_update_disabled"
                 ),
             )
+        claim_ids = sorted({
+            int(value)
+            for value in changed_claim_ids or []
+            if str(value).strip().isdigit() and int(value) > 0
+        })
+        intent_objects = [
+            dict(value)
+            for value in changed_intent_objects or []
+            if isinstance(value, dict)
+        ]
+        if not claim_ids and not intent_objects:
+            task_id = self._operation_reporter.next_task_id("memory_user_state_update")
+            return self._reject_memory_task(
+                task_kind="memory_user_state_update",
+                task_id=task_id,
+                reason="no_changed_state_evidence",
+            )
         return self._submit_memory_task(
-            task_kind="memory_proactive_candidate_time_tick",
+            task_kind="memory_user_state_update",
             payload={
-                "reference_timestamp": reference_timestamp or _now_text(),
+                "changed_claim_ids": claim_ids,
+                "changed_intent_objects": intent_objects,
+                "reference_timestamp": reference_timestamp,
+                "runtime_context": dict(runtime_context or {}),
             },
-            completion_context=(
-                dict(completion_context)
-                if isinstance(completion_context, dict)
-                else None
-            ),
+            completion_context=completion_context,
         )
 
-    def _process_memory_entity_claim_update_task(
+    def get_user_states(
+        self,
+        *,
+        state_domains: Optional[Sequence[str]] = None,
+        state_classes: Optional[Sequence[str]] = None,
+        statuses: Optional[Sequence[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Read durable states written by incremental update tasks."""
+        with self._memory_operation_lock:
+            return self._user_state_resolver.get_current_states(
+                user_entity_id=self._intent_world_owner_entity_id(),
+                state_domains=state_domains,
+                state_classes=state_classes,
+                statuses=statuses,
+            )
+
+    def _process_memory_user_state_update_task(
+        self,
+        *,
+        changed_claim_ids: Optional[Sequence[int]] = None,
+        changed_intent_objects: Optional[Sequence[Dict[str, Any]]] = None,
+        reference_timestamp: Optional[Any] = None,
+        runtime_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Apply independently grounded User State deltas for each domain."""
+        owner_id = self._intent_world_owner_entity_id()
+        update_inputs = self._user_state_resolver.build_domain_update_inputs(
+            user_entity_id=owner_id,
+            changed_claim_ids=list(changed_claim_ids or []),
+            changed_intent_objects=list(changed_intent_objects or []),
+            reference_time=reference_timestamp,
+            runtime_context=runtime_context or {},
+            limit_per_domain=self._user_state_update_limit,
+        )
+        report: Dict[str, Any] = {
+            "status": "empty",
+            "domain_count": len(update_inputs),
+            "changed_claim_count": sum(
+                len(item["changed_claims"]) for item in update_inputs.values()
+            ),
+            "changed_intent_object_count": sum(
+                len(item["changed_intent_objects"]) for item in update_inputs.values()
+            ),
+            "existing_state_count": sum(
+                len(item["existing_states"]) for item in update_inputs.values()
+            ),
+            "operation_count": 0,
+            "created": 0,
+            "reinforced": 0,
+            "revised": 0,
+            "weakened": 0,
+            "expired": 0,
+            "state_ids": [],
+            "domain_reports": {},
+        }
+        if not update_inputs:
+            self._log_info("memory_user_state", "finish", report)
+            return report
+        failed_domain_count = 0
+        for state_domain, update_input in update_inputs.items():
+            domain_report: Dict[str, Any] = {
+                "changed_claim_count": len(update_input["changed_claims"]),
+                "changed_intent_object_count": len(update_input["changed_intent_objects"]),
+                "existing_state_count": len(update_input["existing_states"]),
+                "operation_count": 0,
+                "state_ids": [],
+            }
+            if not self._user_state_resolver.has_update_evidence(update_input):
+                domain_report["status"] = "empty"
+                report["domain_reports"][state_domain] = domain_report
+                continue
+            source_text = "\n".join([
+                *(str(item.get("claim_text") or "") for item in update_input["changed_claims"]),
+                *(str(item.get("summary") or "") for item in update_input["changed_intent_objects"]),
+            ])
+            language = self._resolve_prompt_language_from_text(source_text)
+            prompt_template = (
+                USER_STATE_UPDATE_PROMPT_EN if language == "en"
+                else USER_STATE_UPDATE_PROMPT_ZH
+            )
+            prompt = prompt_template
+            for key in (
+                "state_domain", "reference_time", "runtime_context", "existing_states",
+                "changed_claims", "changed_intent_objects", "active_intent_objects",
+            ):
+                value = update_input[key]
+                serialized = (
+                    json.dumps(value, ensure_ascii=False, indent=2)
+                    if isinstance(value, (dict, list)) else str(value or "")
+                )
+                prompt = prompt.replace("{" + key + "}", serialized)
+            parsed = self._parse_json_object_from_llm_text(
+                self._call_llm(prompt) or ""
+            )
+            if parsed is None or not isinstance(parsed.get("operations"), list):
+                domain_report.update({
+                    "status": "error",
+                    "error": "invalid_llm_user_state_update_response",
+                })
+                failed_domain_count += 1
+                report["domain_reports"][state_domain] = domain_report
+                continue
+            operations = self._user_state_resolver.normalize_operations(
+                parsed["operations"], update_input=update_input,
+            )
+            if not operations:
+                domain_report["status"] = "ok"
+                report["domain_reports"][state_domain] = domain_report
+                continue
+            with self._db.transaction():
+                applied = self._user_state_resolver.apply_operations(
+                    user_entity_id=owner_id,
+                    operations=operations,
+                    reference_time=update_input["reference_time"],
+                )
+            domain_report.update(applied)
+            domain_report["status"] = "ok"
+            report["domain_reports"][state_domain] = domain_report
+            for key in ("operation_count", "created", "reinforced", "revised", "weakened", "expired"):
+                report[key] += int(applied.get(key) or 0)
+            report["state_ids"].extend(applied.get("state_ids") or [])
+        report["state_ids"] = sorted(set(report["state_ids"]))
+        report["status"] = "error" if failed_domain_count == len(update_inputs) else "ok"
+        if failed_domain_count:
+            report["failed_domain_count"] = failed_domain_count
+        self._log_info("memory_user_state", "finish", report)
+        return report
+
+    def _process_memory_user_claim_update_task(
         self,
         limit: Optional[int] = None,
         reference_timestamp: Optional[Any] = None,
@@ -3025,16 +3135,16 @@ class MemoryNodeManager:
         update_started_at = time.monotonic()
         limit = max(
             1,
-            int(limit or self._memory_cfg.get("entity_claim_limit") or 100),
+            int(limit or self._memory_cfg.get("user_claim_limit") or 100),
         )
         if reference_timestamp is None:
             reference_timestamp = kwargs.get("timestamp") or _now_text()
-        self._log_info("memory_entity_claim", "start", {
+        self._log_info("memory_user_claim", "start", {
             "limit": limit,
             "timestamp": reference_timestamp,
         })
         with self._db.transaction():
-            claim_report = self._update_memory_entity_claims(
+            claim_report = self._update_memory_user_claims(
                 limit=limit,
                 reference_timestamp=reference_timestamp,
             )
@@ -3057,10 +3167,10 @@ class MemoryNodeManager:
             "derived_claims_updated": int(
                 claim_report.get("derived", {}).get("updated", 0) or 0
             ),
-            "facts_marked_processed_for_memory_entity_claim": int(
+            "facts_marked_processed_for_memory_user_claim": int(
                 claim_report.get("explicit", {}).get("facts_marked_processed", 0) or 0
             ),
-            "facts_marked_processed_for_entity_claim_induction": int(
+            "facts_marked_processed_for_user_claim_induction": int(
                 claim_report.get("inductive", {}).get("facts_marked_processed", 0) or 0
             ),
             "total_elapsed_ms": round(
@@ -3068,10 +3178,17 @@ class MemoryNodeManager:
                 2,
             ),
         }
-        self._log_info("memory_entity_claim", "finish", report)
+        affected_claim_ids = list(claim_report.get("affected_claim_ids") or [])
+        report["affected_claim_ids"] = affected_claim_ids
+        if affected_claim_ids:
+            report["user_state_update_task"] = self.submit_memory_user_state_update_task(
+                changed_claim_ids=affected_claim_ids,
+                reference_timestamp=reference_timestamp,
+            )
+        self._log_info("memory_user_claim", "finish", report)
         return report
 
-    def _process_memory_future_commitment_update_task(
+    def _process_memory_user_intent_update_task(
         self,
         *,
         limit: Optional[int] = None,
@@ -3080,11 +3197,11 @@ class MemoryNodeManager:
         """Settle pending future-facing evidence in isolated evidence groups."""
         limit = max(
             1,
-            int(limit or self._memory_cfg.get("future_commitment_limit") or 100),
+            int(limit or self._memory_cfg.get("user_intent_limit") or 100),
         )
         reference_timestamp = reference_timestamp or _now_text()
         facts = self._db.get_unprocessed_facts(
-            processing_target="future_commitment_update",
+            processing_target="user_intent_update",
             reference_timestamp=reference_timestamp,
             limit=limit,
             restrict_to_today=False,
@@ -3092,7 +3209,7 @@ class MemoryNodeManager:
         report: Dict[str, Any] = {
             "status": "empty",
             "seed_fact_count": len(facts),
-            "future_commitment_signal_count": 0,
+            "user_intent_signal_count": 0,
             "evidence_group_count": 0,
             "candidate_count": 0,
             "applied_count": 0,
@@ -3101,13 +3218,12 @@ class MemoryNodeManager:
             "facts_marked_processed": 0,
             "failed_group_count": 0,
             "affected_objects": [],
-            "proactive_candidate_refresh": {},
         }
-        self._log_future_commitment_facts_loaded(
-            "future_commitment_update", facts, limit, reference_timestamp,
+        self._log_user_intent_facts_loaded(
+            "user_intent_update", facts, limit, reference_timestamp,
         )
         if not facts:
-            self._log_info("memory_future_commitment_update", "finish", report)
+            self._log_info("memory_user_intent_update", "finish", report)
             return report
 
         facts_by_id = {
@@ -3115,19 +3231,19 @@ class MemoryNodeManager:
             for fact in facts
             if str(fact.get("id") or "").strip().isdigit()
         }
-        future_commitment_signals = [
+        user_intent_signals = [
             signal
             for fact in facts_by_id.values()
-            for signal in self._future_commitment_signals_from_fact(fact)
+            for signal in self._user_intent_signals_from_fact(fact)
         ]
-        report["future_commitment_signal_count"] = len(future_commitment_signals)
-        if not future_commitment_signals:
-            self._log_info("memory_future_commitment_update", "finish", report)
+        report["user_intent_signal_count"] = len(user_intent_signals)
+        if not user_intent_signals:
+            self._log_info("memory_user_intent_update", "finish", report)
             return report
 
         world_owner_id = self._intent_world_owner_entity_id()
-        evidence_groups = self._group_future_commitment_signals(
-            future_commitment_signals,
+        evidence_groups = self._group_user_intent_signals(
+            user_intent_signals,
             facts_by_id=facts_by_id,
         )
         report["evidence_group_count"] = len(evidence_groups)
@@ -3152,29 +3268,24 @@ class MemoryNodeManager:
                 prompt_template.replace("{world_owner_name}", world_owner_prompt_name)
                 .replace("{reference_timestamp}", str(reference_timestamp))
                 .replace("{facts}", json.dumps(
-                    self._future_commitment_group_fact_prompt_views(group),
+                    self._user_intent_group_fact_prompt_views(group),
                     ensure_ascii=False,
                     indent=2,
                 ))
             )
             parsed = self._parse_json_object_from_llm_text(raw or "")
-            candidate_list_fields = (
-                "goal_candidates",
-                "plan_candidates",
-                "work_item_candidates",
-            )
             if (
                 parsed is None
                 or not isinstance(parsed, dict)
-                or any(not isinstance(parsed.get(field), list) for field in candidate_list_fields)
+                or not isinstance(parsed.get("intent_candidates"), list)
             ):
                 report["failed_group_count"] += 1
                 failed_group_fact_ids.update(group_fact_ids)
-                self._log_info("memory_future_commitment_update", "group_error", {
+                self._log_info("memory_user_intent_update", "group_error", {
                     "group_index": group_index,
                     "group_key": group["group_key"],
                     "fact_ids": group_fact_ids,
-                    "error": "invalid_llm_future_commitment_extraction_response",
+                    "error": "invalid_llm_user_intent_extraction_response",
                 })
                 continue
 
@@ -3209,7 +3320,7 @@ class MemoryNodeManager:
                 candidates,
                 world_owner_id=world_owner_id,
                 prompt_language=language,
-                existing_by_type=self._retrieve_future_commitment_related_intent_objects(
+                existing_by_type=self._retrieve_user_intent_related_intent_objects(
                     candidates,
                     world_owner_id=world_owner_id,
                 ),
@@ -3224,11 +3335,11 @@ class MemoryNodeManager:
                 "object_type": str(item.get("object_type") or ""),
                 "object_id": int(item.get("object_id") or 0),
             } for item in applied)
-            self._log_info("memory_future_commitment_update", "group_finish", {
+            self._log_info("memory_user_intent_update", "group_finish", {
                 "group_index": group_index,
                 "group_key": group["group_key"],
                 "fact_ids": group_fact_ids,
-                "future_commitment_signal_count": len(group["signals"]),
+                "user_intent_signal_count": len(group["signals"]),
                 "candidate_count": len(candidates),
                 "created": sum(item["created"] for item in applied),
                 "updated": sum(not item["created"] for item in applied),
@@ -3240,380 +3351,31 @@ class MemoryNodeManager:
         if completed_group_fact_ids:
             with self._db.transaction():
                 report["facts_marked_processed"] += self._db.mark_facts_processed(
-                    processing_target="future_commitment_update",
+                    processing_target="user_intent_update",
                     fact_ids=completed_group_fact_ids,
                 )
-
-        if report["affected_objects"]:
-            report["proactive_candidate_refresh"] = self._refresh_proactive_candidates(
-                trigger_kind="future_commitment_update",
-                reference_timestamp=reference_timestamp,
-                affected_objects=report["affected_objects"],
-            )
 
         report["status"] = (
             "error" if report["failed_group_count"] == len(evidence_groups)
             else "ok"
         )
-        self._log_info("memory_future_commitment_update", "finish", report)
+        if report["affected_objects"]:
+            report["user_state_update_task"] = self.submit_memory_user_state_update_task(
+                changed_intent_objects=report["affected_objects"],
+                reference_timestamp=reference_timestamp,
+            )
+        self._log_info("memory_user_intent_update", "finish", report)
         return report
 
-    def _process_memory_proactive_candidate_time_tick_task(
+    def _group_user_intent_signals(
         self,
-        *,
-        reference_timestamp: Optional[Any] = None,
-    ) -> Dict[str, Any]:
-        """Refresh time-sensitive candidates without invoking an LLM."""
-        resolved_timestamp = reference_timestamp or _now_text()
-        report = self._refresh_proactive_candidates(
-            trigger_kind="time_tick",
-            reference_timestamp=resolved_timestamp,
-        )
-        report["status"] = "ok"
-        self._log_info("memory_proactive_candidate", "time_tick_finish", report)
-        return report
-
-    def _refresh_proactive_candidates(
-        self,
-        *,
-        trigger_kind: str,
-        reference_timestamp: Any,
-        affected_objects: Optional[Sequence[Dict[str, Any]]] = None,
-    ) -> Dict[str, Any]:
-        """Generate policy inputs from active plans and work items.
-
-        This layer intentionally produces no user-facing text.  It merely
-        records why a specific future-commitment object deserves a later
-        policy/delivery decision, while retaining the fact evidence needed to
-        audit that decision.
-        """
-        reference_dt = self._parse_proactive_timestamp(reference_timestamp)
-        if reference_dt is None:
-            reference_dt = datetime.now().astimezone()
-        reference_text = reference_dt.isoformat()
-        is_targeted_refresh = affected_objects is not None
-        normalized_targets = self._normalize_proactive_target_objects(
-            affected_objects or [],
-        )
-        report: Dict[str, Any] = {
-            "trigger_kind": str(trigger_kind or ""),
-            "reference_timestamp": reference_text,
-            "scanned_plan_count": 0,
-            "scanned_work_item_count": 0,
-            "candidate_count": 0,
-            "created": 0,
-            "updated": 0,
-            "expired": 0,
-            "skipped_without_time": 0,
-            "skipped_without_evidence": 0,
-        }
-        if not self._enable_memory_proactive_candidate_generation:
-            report["status"] = "disabled"
-            return report
-
-        world_owner_id = self._intent_world_owner_entity_id()
-        with self._db.transaction():
-            if is_targeted_refresh:
-                if normalized_targets:
-                    report["expired"] += self._db.expire_proactive_candidates(
-                        reference_timestamp=reference_text,
-                        target_objects=normalized_targets,
-                    )
-                objects = self._proactive_target_objects_from_ids(
-                    normalized_targets,
-                    world_owner_id=world_owner_id,
-                )
-            else:
-                report["expired"] += self._db.expire_proactive_candidates(
-                    reference_timestamp=reference_text,
-                )
-                objects = self._proactive_active_target_objects(
-                    world_owner_id=world_owner_id,
-                )
-
-            report["scanned_plan_count"] = len(objects["plan"])
-            report["scanned_work_item_count"] = len(objects["work_item"])
-            evidence_by_object = self._db.get_intent_evidence_fact_ids(
-                [
-                    (object_type, int(item["id"]))
-                    for object_type, items in objects.items()
-                    for item in items
-                ],
-                limit=max(120, self._proactive_candidate_scan_limit * 4),
-            )
-            for plan in objects["plan"]:
-                plan_evidence = evidence_by_object.get(("plan", int(plan["id"])), [])
-                if not plan_evidence:
-                    report["skipped_without_evidence"] += 1
-                    continue
-                candidate = self._build_upcoming_plan_proactive_candidate(
-                    plan,
-                    reference_dt=reference_dt,
-                    trigger_kind=trigger_kind,
-                    evidence_fact_ids=plan_evidence,
-                )
-                if candidate is None:
-                    if not _compact_whitespace(plan.get("start_at") or ""):
-                        report["skipped_without_time"] += 1
-                    continue
-                saved = self._db.upsert_proactive_candidate(candidate)
-                report["candidate_count"] += 1
-                report["created"] += int(bool(saved.get("created")))
-                report["updated"] += int(bool(saved.get("updated")))
-            for work_item in objects["work_item"]:
-                work_item_evidence = evidence_by_object.get(
-                    ("work_item", int(work_item["id"])), []
-                )
-                if not work_item_evidence:
-                    report["skipped_without_evidence"] += 1
-                    continue
-                candidate = self._build_work_item_proactive_candidate(
-                    work_item,
-                    reference_dt=reference_dt,
-                    trigger_kind=trigger_kind,
-                    evidence_fact_ids=work_item_evidence,
-                )
-                if candidate is None:
-                    if not _compact_whitespace(work_item.get("due_at") or ""):
-                        report["skipped_without_time"] += 1
-                    continue
-                saved = self._db.upsert_proactive_candidate(candidate)
-                report["candidate_count"] += 1
-                report["created"] += int(bool(saved.get("created")))
-                report["updated"] += int(bool(saved.get("updated")))
-        return report
-
-    @staticmethod
-    def _normalize_proactive_target_objects(
-        raw_targets: Sequence[Dict[str, Any]],
-    ) -> List[Tuple[str, int]]:
-        normalized: List[Tuple[str, int]] = []
-        seen: set[Tuple[str, int]] = set()
-        for item in raw_targets:
-            if not isinstance(item, dict):
-                continue
-            object_type = str(item.get("object_type") or "").strip().lower()
-            try:
-                object_id = int(item.get("object_id") or 0)
-            except (TypeError, ValueError):
-                continue
-            key = (object_type, object_id)
-            if (
-                object_type not in {"plan", "work_item"}
-                or object_id <= 0
-                or key in seen
-            ):
-                continue
-            seen.add(key)
-            normalized.append(key)
-        return normalized
-
-    def _proactive_target_objects_from_ids(
-        self,
-        targets: Sequence[Tuple[str, int]],
-        *,
-        world_owner_id: int,
-    ) -> Dict[str, List[Dict[str, Any]]]:
-        objects: Dict[str, List[Dict[str, Any]]] = {
-            "plan": [], "work_item": [],
-        }
-        active_statuses = {
-            "plan": {"planned", "rescheduled"},
-            "work_item": {"open", "blocked"},
-        }
-        owner_fields = {
-            "plan": "actor_entity_id",
-            "work_item": "responsible_entity_id",
-        }
-        for object_type, object_id in targets:
-            item = self._db.get_intent_object(
-                object_type=object_type,
-                object_id=object_id,
-            )
-            if (
-                not item
-                or int(item.get("world_owner_entity_id") or 0) != world_owner_id
-                or int(item.get(owner_fields[object_type]) or 0) != world_owner_id
-                or str(item.get("status") or "").strip().lower()
-                not in active_statuses[object_type]
-            ):
-                continue
-            objects[object_type].append(item)
-        return objects
-
-    def _proactive_active_target_objects(
-        self,
-        *,
-        world_owner_id: int,
-    ) -> Dict[str, List[Dict[str, Any]]]:
-        objects: Dict[str, List[Dict[str, Any]]] = {"plan": [], "work_item": []}
-        configurations = (
-            ("plan", {"planned", "rescheduled"}, "actor_entity_id"),
-            ("work_item", {"open", "blocked"}, "responsible_entity_id"),
-        )
-        for object_type, statuses, owner_field in configurations:
-            for item in self._db.get_intent_objects(
-                object_type=object_type,
-                world_owner_entity_id=world_owner_id,
-                statuses=sorted(statuses),
-                limit=self._proactive_candidate_scan_limit,
-            ):
-                if int(item.get(owner_field) or 0) == world_owner_id:
-                    objects[object_type].append(item)
-        return objects
-
-    def _build_upcoming_plan_proactive_candidate(
-        self,
-        plan: Dict[str, Any],
-        *,
-        reference_dt: datetime,
-        trigger_kind: str,
-        evidence_fact_ids: Sequence[int],
-    ) -> Optional[Dict[str, Any]]:
-        time_precision = str(plan.get("time_precision") or "unknown").lower()
-        if time_precision in {"unknown", "week"}:
-            return None
-        start_dt = self._parse_proactive_timestamp(plan.get("start_at"))
-        if start_dt is None:
-            return None
-        seconds_until_start = (start_dt - reference_dt).total_seconds()
-        if (
-            seconds_until_start < 0
-            or seconds_until_start > self._proactive_candidate_plan_horizon_seconds
-        ):
-            return None
-        plan_id = int(plan.get("id") or 0)
-        if plan_id <= 0:
-            return None
-        urgency = 1.0 - min(
-            1.0,
-            seconds_until_start / self._proactive_candidate_plan_horizon_seconds,
-        )
-        confidence = self._clamp_float(plan.get("confidence"), 0.0, 1.0, 0.0)
-        return {
-            "candidate_type": "upcoming_plan",
-            "target_object_type": "plan",
-            "target_object_id": plan_id,
-            "status": "pending",
-            "score": round(0.55 * confidence + 0.45 * urgency, 6),
-            "confidence": confidence,
-            "reason_code": "plan_starts_within_horizon",
-            "evidence_fact_ids": list(dict.fromkeys(int(item) for item in evidence_fact_ids))[:24],
-            "trigger_kind": str(trigger_kind or ""),
-            "trigger_at": reference_dt.isoformat(),
-            "deliver_after": (
-                start_dt - timedelta(seconds=self._proactive_candidate_plan_horizon_seconds)
-            ).isoformat(),
-            "expires_at": start_dt.isoformat(),
-            "dedup_key": f"upcoming_plan:{plan_id}:{start_dt.isoformat()}",
-            "payload": {
-                "summary": _compact_whitespace(plan.get("summary") or ""),
-                "event_or_activity": _compact_whitespace(
-                    plan.get("event_or_activity") or ""
-                ),
-                "scheduled_at": start_dt.isoformat(),
-                "time_precision": time_precision,
-                "location_text": _compact_whitespace(plan.get("location_text") or ""),
-                "object_status": str(plan.get("status") or ""),
-            },
-        }
-
-    def _build_work_item_proactive_candidate(
-        self,
-        work_item: Dict[str, Any],
-        *,
-        reference_dt: datetime,
-        trigger_kind: str,
-        evidence_fact_ids: Sequence[int],
-    ) -> Optional[Dict[str, Any]]:
-        due_dt = self._parse_proactive_timestamp(work_item.get("due_at"))
-        if due_dt is None:
-            return None
-        work_item_id = int(work_item.get("id") or 0)
-        if work_item_id <= 0:
-            return None
-        seconds_until_due = (due_dt - reference_dt).total_seconds()
-        confidence = self._clamp_float(
-            work_item.get("confidence"), 0.0, 1.0, 0.0
-        )
-        if seconds_until_due >= 0:
-            if seconds_until_due > self._proactive_candidate_work_item_horizon_seconds:
-                return None
-            candidate_type = "due_work_item"
-            reason_code = "work_item_due_within_horizon"
-            urgency = 1.0 - min(
-                1.0,
-                seconds_until_due / self._proactive_candidate_work_item_horizon_seconds,
-            )
-            deliver_after = (
-                due_dt - timedelta(
-                    seconds=self._proactive_candidate_work_item_horizon_seconds
-                )
-            )
-            expires_at = due_dt
-            dedup_suffix = due_dt.isoformat()
-        else:
-            overdue_seconds = abs(seconds_until_due)
-            overdue_slot = int(
-                overdue_seconds // self._proactive_candidate_overdue_repeat_seconds
-            )
-            candidate_type = "overdue_work_item"
-            reason_code = "work_item_overdue"
-            urgency = 1.0
-            deliver_after = due_dt + timedelta(
-                seconds=overdue_slot * self._proactive_candidate_overdue_repeat_seconds
-            )
-            expires_at = deliver_after + timedelta(
-                seconds=self._proactive_candidate_overdue_repeat_seconds
-            )
-            dedup_suffix = f"{due_dt.isoformat()}:overdue:{overdue_slot}"
-        return {
-            "candidate_type": candidate_type,
-            "target_object_type": "work_item",
-            "target_object_id": work_item_id,
-            "status": "pending",
-            "score": round(0.55 * confidence + 0.45 * urgency, 6),
-            "confidence": confidence,
-            "reason_code": reason_code,
-            "evidence_fact_ids": list(dict.fromkeys(int(item) for item in evidence_fact_ids))[:24],
-            "trigger_kind": str(trigger_kind or ""),
-            "trigger_at": reference_dt.isoformat(),
-            "deliver_after": deliver_after.isoformat(),
-            "expires_at": expires_at.isoformat(),
-            "dedup_key": f"{candidate_type}:{work_item_id}:{dedup_suffix}",
-            "payload": {
-                "summary": _compact_whitespace(work_item.get("summary") or ""),
-                "action_text": _compact_whitespace(work_item.get("action_text") or ""),
-                "deliverable": _compact_whitespace(work_item.get("deliverable") or ""),
-                "due_at": due_dt.isoformat(),
-                "priority": _compact_whitespace(work_item.get("priority") or ""),
-                "object_status": str(work_item.get("status") or ""),
-            },
-        }
-
-    @staticmethod
-    def _parse_proactive_timestamp(value: Any) -> Optional[datetime]:
-        text = _compact_whitespace(value or "")
-        if not text:
-            return None
-        normalized = text.replace("Z", "+00:00")
-        try:
-            parsed = datetime.fromisoformat(normalized)
-        except ValueError:
-            return None
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=datetime.now().astimezone().tzinfo)
-        return parsed.astimezone()
-
-    def _group_future_commitment_signals(
-        self,
-        future_commitment_signals: Sequence[Dict[str, Any]],
+        user_intent_signals: Sequence[Dict[str, Any]],
         *,
         facts_by_id: Dict[int, Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
         """Group compatible persisted signals while keeping each prompt small."""
         groups_by_key: Dict[str, List[Dict[str, Any]]] = {}
-        for signal in future_commitment_signals:
+        for signal in user_intent_signals:
             fact_id = int(signal["fact_id"])
             if fact_id not in facts_by_id:
                 continue
@@ -3649,7 +3411,7 @@ class MemoryNodeManager:
             for group in groups
         ]
 
-    def _future_commitment_group_fact_prompt_views(
+    def _user_intent_group_fact_prompt_views(
         self,
         group: Dict[str, Any],
     ) -> List[Dict[str, Any]]:
@@ -3659,12 +3421,12 @@ class MemoryNodeManager:
         views: List[Dict[str, Any]] = []
         for fact in group["facts"]:
             view = self._intent_fact_prompt_view(fact)
-            view["future_commitment_signals"] = [
+            view["user_intent_signals"] = [
                 {
                     key: signal[key]
                     for key in (
                         "evidence_kind", "candidate_object_types", "subject_entity",
-                        "user_role", "future_commitment_anchor",
+                        "user_role", "user_intent_anchor",
                         "assertion_source", "explicitness",
                     )
                 }
@@ -3673,7 +3435,7 @@ class MemoryNodeManager:
             views.append(view)
         return views
 
-    def _retrieve_future_commitment_related_intent_objects(
+    def _retrieve_user_intent_related_intent_objects(
         self,
         candidates: Sequence[Dict[str, Any]],
         *,
@@ -3845,28 +3607,26 @@ class MemoryNodeManager:
         entity_ids: Dict[str, int],
         world_owner_id: int,
     ) -> List[Dict[str, Any]]:
-        """Normalize type-specific prompt lists into one internal sequence."""
+        """Normalize the unified prompt list into typed internal candidates."""
         normalized: List[Dict[str, Any]] = []
-        for field_name, object_type in (
-            ("goal_candidates", "goal"),
-            ("plan_candidates", "plan"),
-            ("work_item_candidates", "work_item"),
-        ):
-            raw_candidates = payload.get(field_name)
-            if not isinstance(raw_candidates, list):
+        raw_candidates = payload.get("intent_candidates")
+        if not isinstance(raw_candidates, list):
+            return normalized
+        for raw_candidate in raw_candidates:
+            if not isinstance(raw_candidate, dict):
                 continue
-            for raw_candidate in raw_candidates:
-                candidate = self._normalize_intent_candidate(
-                    raw_candidate,
-                    object_type=object_type,
-                    facts_by_id=facts_by_id,
-                    entity_ids=entity_ids,
-                    world_owner_id=world_owner_id,
-                )
-                if candidate is not None:
-                    normalized.append(candidate)
-                if len(normalized) >= 24:
-                    return normalized
+            object_type = str(raw_candidate.get("object_type") or "").strip().lower()
+            candidate = self._normalize_intent_candidate(
+                raw_candidate,
+                object_type=object_type,
+                facts_by_id=facts_by_id,
+                entity_ids=entity_ids,
+                world_owner_id=world_owner_id,
+            )
+            if candidate is not None:
+                normalized.append(candidate)
+            if len(normalized) >= 24:
+                return normalized
         return normalized
 
     def _normalize_intent_candidate(
@@ -3882,12 +3642,15 @@ class MemoryNodeManager:
             return None
         if object_type not in {"goal", "plan", "work_item"}:
             return None
+        details = raw.get("details")
+        details = details if isinstance(details, dict) else {}
         evidence_ids = list(dict.fromkeys(
             int(value) for value in (raw.get("evidence_fact_ids") or [])
             if str(value).strip().isdigit() and int(value) in facts_by_id
         ))[:12]
         summary = _compact_whitespace(raw.get("summary") or "")[:480]
-        if not summary or not evidence_ids:
+        primary_domain = self._normalize_primary_domain(raw.get("primary_domain"))
+        if not summary or not evidence_ids or not primary_domain:
             return None
         allows_world_owner_reference = any(
             isinstance(facts_by_id[fact_id].get("metadata"), dict)
@@ -3912,6 +3675,7 @@ class MemoryNodeManager:
         candidate: Dict[str, Any] = {
             "object_type": object_type, "summary": summary,
             "canonical_key": canonical_key, "confidence": confidence,
+            "primary_domain": primary_domain,
             "evidence_fact_ids": evidence_ids,
             "world_owner_entity_id": world_owner_id,
             "lifecycle_evidence": lifecycle_evidence,
@@ -3922,7 +3686,7 @@ class MemoryNodeManager:
                 return world_owner_id if allows_world_owner_reference else 0
             return int(entity_ids.get(name) or fallback)
         if object_type == "goal":
-            owner_name = _compact_whitespace(raw.get("owner_entity") or "")
+            owner_name = _compact_whitespace(raw.get("subject_entity") or "")
             if self._is_world_owner_entity_reference(owner_name):
                 if not allows_world_owner_reference:
                     return None
@@ -3933,14 +3697,28 @@ class MemoryNodeManager:
                 owner_name,
                 fallback=(world_owner_id if allows_world_owner_reference else 0),
             )
-            desired_outcome = _compact_whitespace(raw.get("desired_outcome") or "")[:480]
+            desired_outcome = _compact_whitespace(details.get("desired_outcome") or "")[:480]
             if not owner_id or not desired_outcome:
                 return None
-            candidate.update(owner_entity_id=owner_id, owner_name=owner_name, desired_outcome=desired_outcome,
-                success_criteria=_compact_whitespace(raw.get("success_criteria") or "")[:480],
-                target_at=_compact_whitespace(raw.get("target_at") or "")[:80])
+            target_at = _compact_whitespace(
+                details.get("target_at") or raw.get("time_end") or ""
+            )[:80]
+            candidate.update(
+                owner_entity_id=owner_id,
+                owner_name=owner_name,
+                desired_outcome=desired_outcome,
+                success_criteria=_compact_whitespace(details.get("success_criteria") or "")[:480],
+                target_at=target_at,
+                time_start="",
+                time_end=target_at,
+                details={
+                    "desired_outcome": desired_outcome,
+                    "success_criteria": _compact_whitespace(details.get("success_criteria") or "")[:480],
+                    "target_at": target_at,
+                },
+            )
         elif object_type == "plan":
-            actor_name = _compact_whitespace(raw.get("actor_entity") or "")
+            actor_name = _compact_whitespace(raw.get("subject_entity") or "")
             if self._is_world_owner_entity_reference(actor_name):
                 if not allows_world_owner_reference:
                     return None
@@ -3951,39 +3729,54 @@ class MemoryNodeManager:
                 actor_name,
                 fallback=(world_owner_id if allows_world_owner_reference else 0),
             )
-            event = _compact_whitespace(raw.get("event_or_activity") or "")[:320]
+            event = _compact_whitespace(details.get("event_or_activity") or "")[:320]
             if not actor_id or not event:
                 return None
-            location = _compact_whitespace(raw.get("location") or "")[:160]
+            location = _compact_whitespace(details.get("location") or "")[:160]
             if location and location not in entity_ids:
                 entity_ids.update(self._db.add_entity_names([location]))
+            start_at = _compact_whitespace(raw.get("time_start") or "")[:80]
+            end_at = _compact_whitespace(raw.get("time_end") or "")[:80]
             candidate.update(actor_entity_id=actor_id, actor_name=actor_name, event_or_activity=event,
-                start_at=_compact_whitespace(raw.get("scheduled_start_at") or "")[:80],
-                end_at=_compact_whitespace(raw.get("scheduled_end_at") or "")[:80],
+                start_at=start_at,
+                end_at=end_at,
                 time_precision=(
-                    str(raw.get("time_precision") or "unknown").lower()
-                    if str(raw.get("time_precision") or "unknown").lower()
+                    str(details.get("time_precision") or "unknown").lower()
+                    if str(details.get("time_precision") or "unknown").lower()
                     in {"exact", "day", "week", "relative", "unknown"}
                     else "unknown"
                 ),
                 location_text=location, location_entity_id=int(entity_ids.get(location) or 0),
-                participant_names=self._normalize_string_list(raw.get("participants"), limit=12))
+                participant_names=self._normalize_string_list(details.get("participants"), limit=12),
+                time_start=start_at,
+                time_end=end_at,
+                details={
+                    "event_or_activity": event,
+                    "time_precision": (
+                        str(details.get("time_precision") or "unknown").lower()
+                        if str(details.get("time_precision") or "unknown").lower()
+                        in {"exact", "day", "week", "relative", "unknown"}
+                        else "unknown"
+                    ),
+                    "location": location,
+                    "participants": self._normalize_string_list(details.get("participants"), limit=12),
+                })
         else:
-            responsible_name = _compact_whitespace(raw.get("responsible_entity") or "")
+            responsible_name = _compact_whitespace(raw.get("subject_entity") or "")
             if self._is_world_owner_entity_reference(responsible_name):
                 if not allows_world_owner_reference:
                     return None
                 responsible_name = self._world_owner_entity_name
             responsible_id = entity_id(responsible_name)
-            action_text = _compact_whitespace(raw.get("action_text") or "")[:480]
-            deliverable = _compact_whitespace(raw.get("deliverable") or "")[:320]
-            responsibility_type = str(raw.get("responsibility_type") or "").lower()
+            action_text = _compact_whitespace(details.get("action_text") or "")[:480]
+            deliverable = _compact_whitespace(details.get("deliverable") or "")[:320]
+            responsibility_type = str(details.get("responsibility_type") or "").lower()
             if not responsible_id or not action_text or responsibility_type not in {
                 "personal_action", "commitment", "assigned", "external_commitment",
             }:
                 return None
-            due_at = _compact_whitespace(raw.get("due_at") or "")[:80]
-            available_from = _compact_whitespace(raw.get("available_from") or "")[:80]
+            due_at = _compact_whitespace(raw.get("time_end") or "")[:80]
+            available_from = _compact_whitespace(raw.get("time_start") or "")[:80]
             has_completion_anchor = bool(deliverable or due_at) or responsibility_type in {
                 "commitment", "assigned", "external_commitment",
             }
@@ -3993,10 +3786,21 @@ class MemoryNodeManager:
                 deliverable=deliverable, responsibility_type=responsibility_type,
                 due_at=due_at,
                 start_at=available_from,
-                priority=_compact_whitespace(raw.get("priority") or "")[:80],
-                beneficiary_names=self._normalize_string_list(raw.get("beneficiary_entities"), limit=8),
-                delegator_names=self._normalize_string_list(raw.get("delegator_entities"), limit=8),
-                collaborator_names=self._normalize_string_list(raw.get("collaborator_entities"), limit=8))
+                priority=_compact_whitespace(details.get("priority") or "")[:80],
+                beneficiary_names=self._normalize_string_list(details.get("beneficiary_entities"), limit=8),
+                delegator_names=self._normalize_string_list(details.get("delegator_entities"), limit=8),
+                collaborator_names=self._normalize_string_list(details.get("collaborator_entities"), limit=8),
+                time_start=available_from,
+                time_end=due_at,
+                details={
+                    "action_text": action_text,
+                    "deliverable": deliverable,
+                    "responsibility_type": responsibility_type,
+                    "priority": _compact_whitespace(details.get("priority") or "")[:80],
+                    "beneficiary_entities": self._normalize_string_list(details.get("beneficiary_entities"), limit=8),
+                    "delegator_entities": self._normalize_string_list(details.get("delegator_entities"), limit=8),
+                    "collaborator_entities": self._normalize_string_list(details.get("collaborator_entities"), limit=8),
+                })
         return candidate
 
     def _reconcile_intent_candidates(
@@ -4008,7 +3812,7 @@ class MemoryNodeManager:
         existing_by_type: Optional[Dict[str, List[Dict[str, Any]]]] = None,
     ) -> Dict[int, Dict[str, Any]]:
         if existing_by_type is None:
-            existing_by_type = self._retrieve_future_commitment_related_intent_objects(
+            existing_by_type = self._retrieve_user_intent_related_intent_objects(
                 candidates,
                 world_owner_id=world_owner_id,
             )
@@ -4098,11 +3902,14 @@ class MemoryNodeManager:
             "plan": ("summary", "event_or_activity", "status", "start_at", "end_at", "location_text", "canonical_key"),
             "work_item": ("summary", "action_text", "deliverable", "status", "due_at", "responsibility_type", "canonical_key"),
         }[object_type]
-        return {"object_type": object_type, "id": item.get("id"), **{
-            field: item.get(field) or "" for field in fields
-        }}
+        return {
+            "object_type": object_type,
+            "id": item.get("id"),
+            "primary_domain": item.get("primary_domain") or "",
+            **{field: item.get(field) or "" for field in fields},
+        }
 
-    def _sync_future_commitment_recall_document(
+    def _sync_user_intent_recall_document(
         self,
         *,
         object_type: str,
@@ -4132,6 +3939,7 @@ class MemoryNodeManager:
                 f"desired_outcome: {_compact_whitespace(item.get('desired_outcome') or '')}",
                 f"success_criteria: {_compact_whitespace(item.get('success_criteria') or '')}",
                 f"canonical_key: {item.get('canonical_key') or ''}",
+                f"primary_domain: {item.get('primary_domain') or ''}",
                 f"status: {item.get('status') or ''}",
                 f"target_at: {item.get('target_at') or ''}",
             ]
@@ -4144,6 +3952,7 @@ class MemoryNodeManager:
                 f"event_or_activity: {_compact_whitespace(item.get('event_or_activity') or '')}",
                 f"location: {_compact_whitespace(item.get('location_text') or '')}",
                 f"canonical_key: {item.get('canonical_key') or ''}",
+                f"primary_domain: {item.get('primary_domain') or ''}",
                 f"status: {item.get('status') or ''}",
                 f"start_at: {item.get('start_at') or ''}",
                 f"end_at: {item.get('end_at') or ''}",
@@ -4157,6 +3966,7 @@ class MemoryNodeManager:
                 f"action: {_compact_whitespace(item.get('action_text') or '')}",
                 f"deliverable: {_compact_whitespace(item.get('deliverable') or '')}",
                 f"canonical_key: {item.get('canonical_key') or ''}",
+                f"primary_domain: {item.get('primary_domain') or ''}",
                 f"status: {item.get('status') or ''}",
                 f"due_at: {item.get('due_at') or ''}",
                 f"priority: {item.get('priority') or ''}",
@@ -4175,7 +3985,8 @@ class MemoryNodeManager:
             confidence=float(item.get("confidence") or 0.0),
             importance=0.7,
             metadata={
-                "future_commitment_object_type": normalized_type,
+                "user_intent_object_type": normalized_type,
+                "primary_domain": item.get("primary_domain") or "",
                 "projection_version": "v1",
             },
         )
@@ -4219,7 +4030,7 @@ class MemoryNodeManager:
                 object_id=object_id,
             )
             if stored_object:
-                self._sync_future_commitment_recall_document(
+                self._sync_user_intent_recall_document(
                     object_type=object_type,
                     item=stored_object,
                 )
@@ -4241,7 +4052,6 @@ class MemoryNodeManager:
                 effective_at=self._intent_effective_at(candidate),
                 decision_source=str(decision.get("reason") or "intent_reconciliation"),
             )
-            self._write_intent_entity_links(object_type, object_id, candidate)
             applied.append({"object_type": object_type, "object_id": object_id, "created": created})
         return applied
 
@@ -4262,62 +4072,72 @@ class MemoryNodeManager:
             "desired_outcome", "success_criteria", "target_at", "actor_entity_id",
             "event_or_activity", "start_at", "end_at", "time_precision", "location_entity_id",
             "location_text", "responsible_entity_id", "action_text", "deliverable",
-            "responsibility_type", "due_at", "priority",
+            "responsibility_type", "due_at", "priority", "primary_domain",
         }}
+        object_type = str(candidate.get("object_type") or "")
+        if object_type == "goal":
+            payload["time_start"] = ""
+            payload["time_end"] = candidate.get("target_at") or ""
+            payload["details"] = {
+                "desired_outcome": candidate.get("desired_outcome") or "",
+                "success_criteria": candidate.get("success_criteria") or "",
+                "target_at": candidate.get("target_at") or "",
+            }
+        elif object_type == "plan":
+            payload["time_start"] = candidate.get("start_at") or ""
+            payload["time_end"] = candidate.get("end_at") or ""
+            payload["details"] = {
+                "event_or_activity": candidate.get("event_or_activity") or "",
+                "time_precision": candidate.get("time_precision") or "unknown",
+                "location_entity_id": candidate.get("location_entity_id") or 0,
+                "location_text": candidate.get("location_text") or "",
+                "participants": candidate.get("participant_names") or [],
+            }
+        elif object_type == "work_item":
+            payload["time_start"] = candidate.get("start_at") or ""
+            payload["time_end"] = candidate.get("due_at") or ""
+            payload["details"] = {
+                "action_text": candidate.get("action_text") or "",
+                "deliverable": candidate.get("deliverable") or "",
+                "responsibility_type": candidate.get("responsibility_type") or "personal_action",
+                "priority": candidate.get("priority") or "",
+                "beneficiary_entities": candidate.get("beneficiary_names") or [],
+                "delegator_entities": candidate.get("delegator_names") or [],
+                "collaborator_entities": candidate.get("collaborator_names") or [],
+                "completed_at": (
+                    self._intent_effective_at(candidate) if status == "completed" else ""
+                ),
+                "extractor_version": "user_intent_update_v1",
+                "prompt_version": "v1",
+            }
         payload.update(status=status, confidence=candidate["confidence"], metadata={
             "source_fact_ids": candidate["evidence_fact_ids"],
+            "primary_domain": candidate["primary_domain"],
         })
-        if candidate["object_type"] == "work_item":
-            payload.update(
-                completed_at=(self._intent_effective_at(candidate) if status == "completed" else ""),
-                extractor_version="future_commitment_update_v1", prompt_version="v1",
-            )
         return payload
 
     @staticmethod
     def _intent_effective_at(candidate: Dict[str, Any]) -> str:
         return str(candidate.get("due_at") or candidate.get("start_at") or candidate.get("target_at") or "")
 
-    def _write_intent_entity_links(self, object_type: str, object_id: int, candidate: Dict[str, Any]) -> None:
-        names_by_role = (
-            {"actor": [candidate.get("actor_name") or ""], "participant": candidate.get("participant_names") or []}
-            if object_type == "plan" else {
-                "beneficiary": candidate.get("beneficiary_names") or [],
-                "delegator": candidate.get("delegator_names") or [],
-                "collaborator": candidate.get("collaborator_names") or [],
-            }
-        )
-        if object_type == "work_item":
-            names_by_role["responsible"] = [candidate.get("responsible_name") or ""]
-        names = [name for values in names_by_role.values() for name in values if name]
-        mapping = self._db.add_entity_names(names)
-        self._db.upsert_intent_entities(
-            object_type=object_type, object_id=object_id,
-            entities=[
-                {"entity_id": mapping[name], "role": role}
-                for role, values in names_by_role.items() for name in values
-                if name in mapping
-            ],
-        )
-
     @staticmethod
-    def _entity_claim_types() -> set[str]:
+    def _user_claim_types() -> set[str]:
         return {
             "identity_profile", "affiliation", "relationship", "preference",
             "constraint", "behavior_pattern",
         }
 
-    def _update_memory_entity_claims(
+    def _update_memory_user_claims(
         self,
         *,
         limit: int,
         reference_timestamp: Any,
-    ) -> Dict[str, Dict[str, Any]]:
+    ) -> Dict[str, Any]:
         """Project facts and completed episodes into traceable claim records."""
         disabled = {
             "enabled": 0, "updated": 0, "facts_marked_processed": 0,
         }
-        if not self._enable_memory_entity_claim_update:
+        if not self._enable_memory_user_claim_update:
             return {
                 "explicit": dict(disabled),
                 "derived": dict(disabled),
@@ -4325,7 +4145,7 @@ class MemoryNodeManager:
             }
 
         explicit_facts = self._db.get_unprocessed_facts(
-            processing_target="entity_claim",
+            processing_target="user_claim",
             limit=limit,
             reference_timestamp=reference_timestamp,
             # ``created_at`` is wall-clock persistence time, whereas the
@@ -4333,10 +4153,10 @@ class MemoryNodeManager:
             # already provide the intended incremental boundary.
             restrict_to_today=False,
         )
-        explicit_report = self._update_explicit_entity_claims_from_facts(explicit_facts)
+        explicit_report = self._update_explicit_user_claims_from_facts(explicit_facts)
         explicit_completed = bool(explicit_report.pop("completed", False))
-        affected_claim_ids = explicit_report.pop("affected_claim_ids", [])
-        derived_report = self._update_derived_entity_claims_from_explicit_claims(
+        affected_claim_ids = list(explicit_report.get("affected_claim_ids") or [])
+        derived_report = self._update_derived_user_claims_from_explicit_claims(
             affected_claim_ids=affected_claim_ids,
         ) if explicit_completed else {
             "enabled": 1,
@@ -4344,7 +4164,6 @@ class MemoryNodeManager:
             "candidate_count": 0,
             "updated": 0,
             "created": 0,
-            "invalidated": 0,
             "completed": False,
             "error": "explicit_claim_update_incomplete",
         }
@@ -4354,30 +4173,42 @@ class MemoryNodeManager:
         # the idempotent claim reconciliation can retry the full local chain.
         if explicit_completed and derived_completed:
             explicit_report["facts_marked_processed"] = self._db.mark_facts_processed(
-                processing_target="entity_claim",
+                processing_target="user_claim",
                 fact_ids=[fact.get("id") for fact in explicit_facts],
             )
         else:
             explicit_report["facts_marked_processed"] = 0
 
         induction_seed_facts = self._db.get_unprocessed_facts(
-            processing_target="entity_claim_induction",
+            processing_target="user_claim_induction",
             reference_timestamp=reference_timestamp,
             limit=max(1, min(limit, 100)),
             restrict_to_today=False,
             require_episode=True,
         )
-        inductive_report = self._update_inductive_entity_claims_from_facts(
+        inductive_report = self._update_inductive_user_claims_from_facts(
             induction_seed_facts,
         )
-        if inductive_report.pop("completed", False):
+        inductive_completed = bool(inductive_report.pop("completed", False))
+        if inductive_completed:
             inductive_report["facts_marked_processed"] = self._db.mark_facts_processed(
-                processing_target="entity_claim_induction",
+                processing_target="user_claim_induction",
                 fact_ids=[fact.get("id") for fact in induction_seed_facts],
             )
         else:
             inductive_report["facts_marked_processed"] = 0
-        self._log_info("memory_entity_claim", "entity_claim_update_finish", {
+        source_reports: List[Dict[str, Any]] = []
+        if explicit_completed and derived_completed:
+            source_reports.extend((explicit_report, derived_report))
+        if inductive_completed:
+            source_reports.append(inductive_report)
+        all_affected_claim_ids = sorted({
+            int(value)
+            for source_report in source_reports
+            for value in source_report.get("affected_claim_ids") or []
+            if str(value).strip().isdigit() and int(value) > 0
+        })
+        self._log_info("memory_user_claim", "user_claim_update_finish", {
             "explicit": explicit_report,
             "derived": derived_report,
             "inductive": inductive_report,
@@ -4386,6 +4217,7 @@ class MemoryNodeManager:
             "explicit": explicit_report,
             "derived": derived_report,
             "inductive": inductive_report,
+            "affected_claim_ids": all_affected_claim_ids,
         }
 
     def _claim_fact_prompt_view(self, fact: Dict[str, Any]) -> Dict[str, Any]:
@@ -4401,12 +4233,12 @@ class MemoryNodeManager:
             "dialogue_time": fact.get("dialogue_time_key") or "",
         }
 
-    def _sync_entity_claim_recall_documents(
+    def _sync_user_claim_recall_documents(
         self,
         claim_ids: Sequence[int],
     ) -> None:
         """Refresh projections for claims created, merged, or transitioned."""
-        claims = self._db.get_entity_claims_by_ids(claim_ids)
+        claims = self._db.get_user_claims_by_ids(claim_ids)
         entity_ids = [
             int(entity_id)
             for claim in claims
@@ -4427,7 +4259,7 @@ class MemoryNodeManager:
                 if entity_id > 0
             ]
             self._upsert_memory_recall_document(
-                object_type="entity_claim",
+                object_type="user_claim",
                 object_id=int(claim["id"]),
                 title=_compact_whitespace(claim.get("claim_text") or "")[:120],
                 summary=_compact_whitespace(claim.get("claim_text") or ""),
@@ -4437,6 +4269,7 @@ class MemoryNodeManager:
                     f"predicate: {claim.get('predicate') or ''}",
                     f"object: {names_by_id.get(object_id, '')}",
                     f"claim_type: {claim.get('claim_type') or ''}",
+                    f"primary_domain: {claim.get('primary_domain') or ''}",
                     f"claim_origin: {claim.get('claim_origin') or ''}",
                     f"status: {claim.get('status') or ''}",
                 ],
@@ -4453,21 +4286,22 @@ class MemoryNodeManager:
                 metadata={
                     "claim_origin": str(claim.get("claim_origin") or ""),
                     "claim_type": str(claim.get("claim_type") or ""),
+                    "primary_domain": str(claim.get("primary_domain") or ""),
                     "predicate": str(claim.get("predicate") or ""),
                     "projection_version": "v1",
                 },
             )
 
     @staticmethod
-    def _entity_claim_origin_priority(origin: Any) -> int:
-        """Origin is a hard reconciliation precedence, not a soft score."""
+    def _user_claim_origin_priority(origin: Any) -> int:
+        """Return a deterministic ordering hint for claim-relation retrieval."""
         return {"explicit": 3, "inductive": 2, "derived": 1}.get(
             str(origin or "").strip().lower(),
             0,
         )
 
     @staticmethod
-    def _entity_claim_storage_payload(candidate: Dict[str, Any]) -> Dict[str, Any]:
+    def _user_claim_storage_payload(candidate: Dict[str, Any]) -> Dict[str, Any]:
         return {
             key: value
             for key, value in candidate.items()
@@ -4477,7 +4311,7 @@ class MemoryNodeManager:
         }
 
     @staticmethod
-    def _entity_claim_support_ids(
+    def _user_claim_support_ids(
         candidate: Dict[str, Any],
     ) -> List[int]:
         support_ids = candidate.get("support_fact_ids")
@@ -4485,15 +4319,15 @@ class MemoryNodeManager:
             support_ids = candidate.get("evidence_fact_ids") or []
         return [int(value) for value in support_ids if str(value).strip().isdigit()]
 
-    def _retrieve_related_entity_claims(
+    def _retrieve_related_user_claims(
         self,
         candidate: Dict[str, Any],
     ) -> List[Dict[str, Any]]:
         """Bound relation candidates to one entity and compatible claim type."""
-        rows = self._db.get_entity_claims(
+        rows = self._db.get_user_claims(
             subject_entity_id=int(candidate["subject_entity_id"]),
             claim_type=str(candidate["claim_type"]),
-            statuses=["active", "candidate", "weakened"],
+            statuses=["active", "candidate", "weakened", "superseded"],
             limit=80,
         )
         predicate = str(candidate.get("predicate") or "")
@@ -4502,19 +4336,24 @@ class MemoryNodeManager:
             key=lambda row: (
                 str(row.get("predicate") or "") != predicate,
                 int(row.get("object_entity_id") or 0) != object_entity_id,
-                -self._entity_claim_origin_priority(row.get("claim_origin")),
+                -self._user_claim_origin_priority(row.get("claim_origin")),
                 -float(row.get("confidence") or 0.0),
             )
         )
         return rows[:24]
 
-    def _finalize_entity_claim_relation_decision(
+    def _finalize_user_claim_relation_decision(
         self,
         candidate: Dict[str, Any],
         target: Optional[Dict[str, Any]],
         semantic_decision: Dict[str, Any],
     ) -> Dict[str, Any]:
-        """Translate text-only relation into a safe origin-aware write plan."""
+        """Translate text-only claim semantics into audit/evidence actions.
+
+        This layer deliberately does not decide which claim is currently true.
+        The UserStateResolver applies origin, freshness, and context weights at
+        read time; reconciliation only records the semantic relation.
+        """
         semantic_relation = str(
             semantic_decision.get("semantic_relation")
             or semantic_decision.get("relation")
@@ -4523,49 +4362,17 @@ class MemoryNodeManager:
         decision = {
             **semantic_decision,
             "semantic_relation": semantic_relation,
-            "merge_into_target": False,
-            "candidate_status": str(candidate.get("status") or "candidate"),
-            "target_status": "",
             "target_evidence_role": "",
         }
         if not target:
             return decision
-        candidate_priority = self._entity_claim_origin_priority(
-            candidate.get("claim_origin")
-        )
-        target_priority = self._entity_claim_origin_priority(
-            target.get("claim_origin")
-        )
-        if semantic_relation == "duplicate":
-            if candidate_priority <= target_priority:
-                decision["merge_into_target"] = True
-                decision["target_evidence_role"] = (
-                    "context" if candidate_priority < target_priority else "support"
-                )
-            else:
-                # Keep a direct explicit assertion as its own, stronger claim,
-                # while using it to support the older inductive conclusion.
-                decision["target_evidence_role"] = "support"
-            return decision
-        if semantic_relation in {"supports", "refines"}:
-            decision["target_evidence_role"] = (
-                "context" if candidate_priority < target_priority else "support"
-            )
-            return decision
-        if semantic_relation not in {"contradicts", "supersedes"}:
-            return decision
-        if candidate_priority < target_priority:
-            # An inferred pattern can coexist as a tentative competing claim,
-            # but it never changes an explicit claim's state.
-            decision["candidate_status"] = "candidate"
-            return decision
-        decision["target_evidence_role"] = "counterexample"
-        decision["target_status"] = (
-            "superseded" if semantic_relation == "supersedes" else "weakened"
-        )
+        if semantic_relation in {"duplicate", "supports", "refines"}:
+            decision["target_evidence_role"] = "support"
+        elif semantic_relation in {"contradicts", "supersedes"}:
+            decision["target_evidence_role"] = "counterexample"
         return decision
 
-    def _classify_entity_claim_relations(
+    def _classify_user_claim_relations(
         self,
         candidates: Sequence[Dict[str, Any]],
         related_by_index: Dict[int, List[Dict[str, Any]]],
@@ -4576,8 +4383,8 @@ class MemoryNodeManager:
             "\n".join(str(candidate.get("claim_text") or "") for candidate in candidates)
         )
         prompt_template = (
-            ENTITY_CLAIM_RECONCILIATION_PROMPT_EN
-            if language == "en" else ENTITY_CLAIM_RECONCILIATION_PROMPT_ZH
+            USER_CLAIM_RECONCILIATION_PROMPT_EN
+            if language == "en" else USER_CLAIM_RECONCILIATION_PROMPT_ZH
         )
         prompt_candidates = [
             {
@@ -4668,14 +4475,14 @@ class MemoryNodeManager:
                 )
                 if target:
                     candidate_decisions.append(
-                        self._finalize_entity_claim_relation_decision(
+                        self._finalize_user_claim_relation_decision(
                             candidate, target, semantic_decision,
                         )
                     )
             finalized.append(candidate_decisions)
         return finalized
 
-    def _write_entity_claim_evidence(
+    def _write_user_claim_evidence(
         self,
         *,
         claim_id: int,
@@ -4698,10 +4505,10 @@ class MemoryNodeManager:
                 "observed_at": fact.get("event_time_key")
                 or fact.get("dialogue_time_key") or "",
             })
-        self._db.upsert_entity_claim_evidence(evidence)
+        self._db.upsert_user_claim_evidence(evidence)
 
     @staticmethod
-    def _entity_claim_transition_effective_at(
+    def _user_claim_transition_effective_at(
         candidate: Dict[str, Any],
         *,
         support_ids: Sequence[int],
@@ -4721,7 +4528,7 @@ class MemoryNodeManager:
         ]
         return max((value for value in observed_at if value), default="")
 
-    def _transition_entity_claim_target(
+    def _record_user_claim_relation(
         self,
         *,
         target: Dict[str, Any],
@@ -4730,52 +4537,35 @@ class MemoryNodeManager:
         decision: Dict[str, Any],
         effective_at: str,
     ) -> bool:
-        """Persist an origin-aware claim-state transition with its audit trail."""
-        target_status = str(decision.get("target_status") or "")
-        if not target_status:
-            return False
-        candidate_origin = str(candidate.get("claim_origin") or "")
-        target_origin = str(target.get("claim_origin") or "")
-        candidate_priority = self._entity_claim_origin_priority(candidate_origin)
-        target_priority = self._entity_claim_origin_priority(target_origin)
+        """Persist semantic claim history without resolving effective state."""
         details = {
             "trigger_claim_snapshot": {
                 "claim_text": candidate.get("claim_text") or "",
-                "claim_origin": candidate_origin,
+                "claim_origin": candidate.get("claim_origin") or "",
                 "claim_type": candidate.get("claim_type") or "",
                 "confidence": candidate.get("confidence"),
             },
             "target_claim_snapshot": {
                 "claim_text": target.get("claim_text") or "",
-                "claim_origin": target_origin,
+                "claim_origin": target.get("claim_origin") or "",
                 "claim_type": target.get("claim_type") or "",
                 "confidence": target.get("confidence"),
             },
-            "origin_priorities": {
-                "trigger": candidate_priority,
-                "target": target_priority,
-            },
         }
-        return self._db.transition_entity_claim_status(
+        return self._db.record_user_claim_relation(
             target_claim_id=int(target["id"]),
-            new_status=target_status,
             trigger_claim_id=trigger_claim_id,
             semantic_relation=str(decision.get("semantic_relation") or ""),
             effective_at=effective_at,
-            decision_source="entity_claim_reconciliation_v1:llm_semantics+origin_policy",
+            decision_source="user_claim_reconciliation_v2:llm_semantics",
             semantic_confidence=self._clamp_float(
                 decision.get("confidence"), 0.0, 1.0, 0.0,
             ),
             semantic_reason=_compact_whitespace(decision.get("reason") or "")[:240],
-            policy_reason=(
-                f"origin_precedence: trigger={candidate_origin}({candidate_priority}), "
-                f"target={target_origin}({target_priority}), "
-                f"target_status={target_status}"
-            ),
             details=details,
         )
 
-    def _reconcile_entity_claims(
+    def _reconcile_user_claims(
         self,
         candidates: Sequence[Dict[str, Any]],
         *,
@@ -4795,28 +4585,22 @@ class MemoryNodeManager:
             seen.add(key)
             unique_candidates.append(candidate)
         related_by_index = {
-            index: self._retrieve_related_entity_claims(candidate)
+            index: self._retrieve_related_user_claims(candidate)
             for index, candidate in enumerate(unique_candidates)
         }
-        decisions = self._classify_entity_claim_relations(
+        decisions = self._classify_user_claim_relations(
             unique_candidates, related_by_index,
         )
         applied: List[Dict[str, Any]] = []
         for index, candidate in enumerate(unique_candidates):
             candidate_decisions = decisions[index]
             candidate_origin = str(candidate.get("claim_origin") or "")
-            support_ids = self._entity_claim_support_ids(candidate)
-            effective_at = self._entity_claim_transition_effective_at(
+            support_ids = self._user_claim_support_ids(candidate)
+            effective_at = self._user_claim_transition_effective_at(
                 candidate,
                 support_ids=support_ids,
                 facts_by_id=facts_by_id,
             )
-            candidate_status = str(candidate.get("status") or "candidate")
-            if any(
-                str(decision.get("candidate_status") or "") == "candidate"
-                for decision in candidate_decisions
-            ):
-                candidate_status = "candidate"
 
             def target_for(decision: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                 target_id = decision.get("existing_claim_id")
@@ -4828,55 +4612,9 @@ class MemoryNodeManager:
                     None,
                 )
 
-            merge_decisions = [
-                decision for decision in candidate_decisions
-                if decision.get("merge_into_target") and target_for(decision)
-            ]
-            if merge_decisions:
-                primary_merge = max(
-                    merge_decisions,
-                    key=lambda decision: self._entity_claim_origin_priority(
-                        (target_for(decision) or {}).get("claim_origin")
-                    ),
-                )
-                primary_target = target_for(primary_merge)
-                assert primary_target is not None
-                claim_id = int(primary_target["id"])
-                for decision in candidate_decisions:
-                    target = target_for(decision)
-                    if not target:
-                        continue
-                    target_status = str(decision.get("target_status") or "")
-                    target_evidence_role = str(
-                        decision.get("target_evidence_role") or ""
-                    )
-                    if target_status:
-                        self._transition_entity_claim_target(
-                            target=target,
-                            trigger_claim_id=claim_id,
-                            candidate=candidate,
-                            decision=decision,
-                            effective_at=effective_at,
-                        )
-                    if target_evidence_role:
-                        self._write_entity_claim_evidence(
-                            claim_id=int(target["id"]),
-                            support_ids=support_ids,
-                            facts_by_id=facts_by_id,
-                            confidence=float(candidate.get("confidence") or 0.0),
-                            support_role=target_evidence_role,
-                        )
-                applied.append({
-                    "claim": candidate, "claim_id": claim_id, "created": False,
-                    "effective_origin": primary_target.get("claim_origin") or "",
-                    "relations": candidate_decisions, "merged": True,
-                })
-                continue
-
-            storage_payload = self._entity_claim_storage_payload(candidate)
-            storage_payload["status"] = candidate_status
-            claim_id, created = self._db.upsert_entity_claim(**storage_payload)
-            self._write_entity_claim_evidence(
+            storage_payload = self._user_claim_storage_payload(candidate)
+            claim_id, created = self._db.upsert_user_claim(**storage_payload)
+            self._write_user_claim_evidence(
                 claim_id=claim_id,
                 support_ids=support_ids,
                 facts_by_id=facts_by_id,
@@ -4886,20 +4624,18 @@ class MemoryNodeManager:
                 target = target_for(decision)
                 if not target:
                     continue
-                target_status = str(decision.get("target_status") or "")
                 target_evidence_role = str(
                     decision.get("target_evidence_role") or ""
                 )
-                if target_status:
-                    self._transition_entity_claim_target(
-                        target=target,
-                        trigger_claim_id=claim_id,
-                        candidate=candidate,
-                        decision=decision,
-                        effective_at=effective_at,
-                    )
+                self._record_user_claim_relation(
+                    target=target,
+                    trigger_claim_id=claim_id,
+                    candidate=candidate,
+                    decision=decision,
+                    effective_at=effective_at,
+                )
                 if target_evidence_role:
-                    self._write_entity_claim_evidence(
+                    self._write_user_claim_evidence(
                         claim_id=int(target["id"]),
                         support_ids=support_ids,
                         facts_by_id=facts_by_id,
@@ -4912,7 +4648,7 @@ class MemoryNodeManager:
                 "relations": candidate_decisions,
                 "merged": False,
             })
-        self._log_info("memory_entity_claim", "entity_claim_reconciled", {
+        self._log_info("memory_user_claim", "user_claim_reconciled", {
             "candidate_count": len(unique_candidates),
             "applied_count": len(applied),
             "relations": [
@@ -4942,12 +4678,12 @@ class MemoryNodeManager:
             if str(decision.get("existing_claim_id") or "").strip().isdigit()
             and int(decision["existing_claim_id"]) > 0
         )
-        self._sync_entity_claim_recall_documents(
+        self._sync_user_claim_recall_documents(
             sorted(recall_document_claim_ids)
         )
         return applied
 
-    def _update_explicit_entity_claims_from_facts(
+    def _update_explicit_user_claims_from_facts(
         self,
         facts: Sequence[Dict[str, Any]],
     ) -> Dict[str, Any]:
@@ -4961,8 +4697,8 @@ class MemoryNodeManager:
             "\n".join(str(fact.get("summary") or "") for fact in facts[:20])
         )
         prompt_template = (
-            EXPLICIT_ENTITY_CLAIM_EXTRACTION_PROMPT_EN
-            if prompt_language == "en" else EXPLICIT_ENTITY_CLAIM_EXTRACTION_PROMPT_ZH
+            EXPLICIT_USER_CLAIM_EXTRACTION_PROMPT_EN
+            if prompt_language == "en" else EXPLICIT_USER_CLAIM_EXTRACTION_PROMPT_ZH
         )
         raw = self._call_llm(prompt_template.replace(
             "{facts}", json.dumps(
@@ -4996,7 +4732,7 @@ class MemoryNodeManager:
                     entity_ids_by_name[entity_name] = entity_id
         candidates: List[Dict[str, Any]] = []
         for raw_claim in parsed["claims"][:32]:
-            claim = self._normalize_explicit_entity_claim(
+            claim = self._normalize_explicit_user_claim(
                 raw_claim,
                 facts_by_id=facts_by_id,
                 entity_ids=entity_ids_by_name,
@@ -5004,7 +4740,7 @@ class MemoryNodeManager:
             if not claim:
                 continue
             candidates.append(claim)
-        applied = self._reconcile_entity_claims(candidates, facts_by_id=facts_by_id)
+        applied = self._reconcile_user_claims(candidates, facts_by_id=facts_by_id)
         report["updated"] = len(applied)
         report["created"] = sum(int(item["created"]) for item in applied)
         report["merged"] = sum(int(item["merged"]) for item in applied)
@@ -5023,7 +4759,7 @@ class MemoryNodeManager:
         })
         return report
 
-    def _normalize_explicit_entity_claim(
+    def _normalize_explicit_user_claim(
         self,
         raw: Any,
         *,
@@ -5033,12 +4769,13 @@ class MemoryNodeManager:
         if not isinstance(raw, dict):
             return None
         claim_type = str(raw.get("claim_type") or "").strip().lower()
-        if claim_type not in self._entity_claim_types() - {"behavior_pattern"}:
+        if claim_type not in self._user_claim_types() - {"behavior_pattern"}:
             return None
         subject = _compact_whitespace(raw.get("subject_entity") or "")
         subject_id = entity_ids.get(subject)
+        primary_domain = self._normalize_primary_domain(raw.get("primary_domain"))
         predicate = re.sub(r"[^a-z0-9_]+", "_", str(raw.get("predicate") or "").lower()).strip("_")
-        if not subject_id or not predicate:
+        if not subject_id or not predicate or not primary_domain:
             return None
         evidence_ids = list(dict.fromkeys(
             int(value) for value in (raw.get("evidence_fact_ids") or [])
@@ -5055,7 +4792,7 @@ class MemoryNodeManager:
         if not object_id and not raw_claim_text:
             return None
         confidence = self._clamp_float(raw.get("confidence"), 0.0, 1.0, 0.7)
-        claim_text = self._normalize_entity_claim_text(
+        claim_text = self._normalize_user_claim_text(
             raw_claim_text,
             subject=subject,
             predicate=predicate,
@@ -5070,26 +4807,27 @@ class MemoryNodeManager:
             "claim_text": claim_text,
             "claim_type": claim_type,
             "claim_origin": "explicit",
-            "status": "active" if confidence >= self._entity_claim_explicit_min_confidence else "candidate",
+            "primary_domain": primary_domain,
+            "status": "active" if confidence >= self._user_claim_explicit_min_confidence else "candidate",
             "confidence": confidence,
             "valid_from": _compact_whitespace(raw.get("valid_from") or ""),
             "valid_to": _compact_whitespace(raw.get("valid_to") or ""),
-            "extractor_version": "entity_claim_explicit_v1",
+            "extractor_version": "user_claim_explicit_v1",
             "prompt_version": "v1",
             "metadata": {"source_fact_count": len(evidence_ids)},
             "evidence_fact_ids": evidence_ids,
         }
 
-    def _update_derived_entity_claims_from_explicit_claims(
+    def _update_derived_user_claims_from_explicit_claims(
         self,
         *,
         affected_claim_ids: Sequence[int],
     ) -> Dict[str, Any]:
         """Derive local conclusions from this batch's explicit-claim changes.
 
-        The LLM proposes only premise-linked conclusions.  Entity IDs,
-        premise activity, fact traceability, lifecycle transitions, and writes
-        remain deterministic program responsibilities.
+        The LLM proposes only premise-linked conclusions. Entity IDs,
+        premise membership, fact traceability, and writes remain deterministic
+        program responsibilities.
         """
         affected_ids = list(dict.fromkeys(
             int(value)
@@ -5105,22 +4843,15 @@ class MemoryNodeManager:
             "candidate_count": 0,
             "updated": 0,
             "created": 0,
-            "invalidated": 0,
             "suppressed": 0,
+            "affected_claim_ids": [],
             "completed": True,
         }
         if not affected_ids:
             return report
-
-        # A premise may have been superseded during explicit reconciliation.
-        # Invalidate its old proof before optionally creating a new proof from
-        # the replacement explicit claim in this same pass.
-        report["invalidated"] = self._invalidate_derived_claims_for_inactive_premises(
-            affected_ids
-        )
         seed_claims = [
             claim
-            for claim in self._db.get_entity_claims_by_ids(affected_ids)
+            for claim in self._db.get_user_claims_by_ids(affected_ids)
             if claim.get("claim_origin") == "explicit"
             and claim.get("status") == "active"
         ]
@@ -5147,7 +4878,7 @@ class MemoryNodeManager:
                 changed_claims=changed_claims,
             )
             report["input_claim_count"] += len(changed_claims) + len(related_claims)
-            outcome = self._extract_derived_entity_claims(
+            outcome = self._extract_derived_user_claims(
                 changed_claims=changed_claims,
                 related_claims=related_claims,
             )
@@ -5159,39 +4890,20 @@ class MemoryNodeManager:
             report["candidate_count"] += len(outcome)
             if not outcome:
                 continue
-            group_report = self._apply_derived_entity_claim_candidates(
+            group_report = self._apply_derived_user_claim_candidates(
                 raw_candidates=outcome,
                 changed_claims=changed_claims,
                 related_claims=related_claims,
             )
             for key in ("updated", "created", "suppressed"):
                 report[key] += int(group_report[key])
+            report["affected_claim_ids"].extend(
+                int(value)
+                for value in group_report.get("claim_ids") or []
+                if int(value) > 0
+            )
+        report["affected_claim_ids"] = sorted(set(report["affected_claim_ids"]))
         return report
-
-    def _invalidate_derived_claims_for_inactive_premises(
-        self,
-        premise_claim_ids: Sequence[int],
-    ) -> int:
-        """Propagate an explicit-premise lifecycle change to derived claims."""
-        affected_derived_ids = self._db.invalidate_entity_claim_derivations_for_premises(
-            premise_claim_ids
-        )
-        invalidated_claim_ids = self._db.get_entity_claim_ids_without_active_derivations(
-            affected_derived_ids
-        )
-        changed_ids: List[int] = []
-        for claim in self._db.get_entity_claims_by_ids(invalidated_claim_ids):
-            if self._db.transition_entity_claim_status(
-                target_claim_id=int(claim["id"]),
-                new_status="invalidated",
-                semantic_relation="premise_invalidated",
-                decision_source="derived_claim_premise_lifecycle_v1",
-                policy_reason="all_derivation_premises_inactive",
-            ):
-                changed_ids.append(int(claim["id"]))
-        if changed_ids:
-            self._sync_entity_claim_recall_documents(changed_ids)
-        return len(changed_ids)
 
     def _retrieve_related_derived_explicit_claims(
         self,
@@ -5206,7 +4918,7 @@ class MemoryNodeManager:
             if str(claim.get("id") or "").strip().isdigit()
         }
         claims_by_id: Dict[int, Dict[str, Any]] = {}
-        for claim in self._db.get_entity_claims(
+        for claim in self._db.get_user_claims(
             entity_id=entity_id,
             claim_origin="explicit",
             statuses=["active"],
@@ -5220,15 +4932,17 @@ class MemoryNodeManager:
             key=lambda claim: -int(claim.get("id") or 0),
         )[:32]
 
-    def _apply_derived_entity_claim_candidates(
+    def _apply_derived_user_claim_candidates(
         self,
         *,
         raw_candidates: Sequence[Dict[str, Any]],
         changed_claims: Sequence[Dict[str, Any]],
         related_claims: Sequence[Dict[str, Any]],
-    ) -> Dict[str, int]:
+    ) -> Dict[str, Any]:
         """Validate, reconcile, and record one subject's LLM conclusions."""
-        report = {"updated": 0, "created": 0, "suppressed": 0}
+        report: Dict[str, Any] = {
+            "updated": 0, "created": 0, "suppressed": 0, "claim_ids": [],
+        }
         input_claims = [*changed_claims, *related_claims]
         input_by_id = {int(claim["id"]): claim for claim in input_claims}
         changed_claim_ids = {int(claim["id"]) for claim in changed_claims}
@@ -5244,7 +4958,7 @@ class MemoryNodeManager:
         candidates = [
             candidate
             for raw_claim in raw_candidates
-            if (candidate := self._normalize_derived_entity_claim(
+            if (candidate := self._normalize_derived_user_claim(
                 raw_claim,
                 input_claims_by_id=input_by_id,
                 new_claim_ids=changed_claim_ids,
@@ -5264,11 +4978,11 @@ class MemoryNodeManager:
             for fact in self._db.get_memory_facts_by_ids(evidence_fact_ids)
             if str(fact.get("id") or "").strip().isdigit()
         }
-        applied = self._reconcile_entity_claims(candidates, facts_by_id=facts_by_id)
+        applied = self._reconcile_user_claims(candidates, facts_by_id=facts_by_id)
         persisted_claims = {
             int(claim["id"]): claim
             for item in applied
-            for claim in self._db.get_entity_claims_by_ids([item["claim_id"]])
+            for claim in self._db.get_user_claims_by_ids([item["claim_id"]])
             if str(claim.get("id") or "").strip().isdigit()
         }
         persisted_derived_ids: List[int] = []
@@ -5280,7 +4994,7 @@ class MemoryNodeManager:
                 continue
             candidate = item["claim"]
             premise_ids = list(candidate["premise_claim_ids"])
-            derivation_id = self._db.upsert_entity_claim_derivation(
+            derivation_id = self._db.upsert_user_claim_derivation(
                 claim_id=claim_id,
                 rule_id="llm_direct_entailment",
                 rule_version="v1",
@@ -5291,20 +5005,22 @@ class MemoryNodeManager:
                 metadata={
                     "prompt_version": "v1",
                     "premise_claim_ids": premise_ids,
-                    "generator": "derived_entity_claim_extraction",
+                    "generator": "derived_user_claim_extraction",
                 },
             )
-            self._db.replace_entity_claim_derivation_premises(
+            self._db.replace_user_claim_derivation_premises(
                 derivation_id=derivation_id,
                 premise_claim_ids=premise_ids,
             )
             persisted_derived_ids.append(claim_id)
+            report["claim_ids"].append(claim_id)
             report["created"] += int(item.get("created") or 0)
             report["updated"] += 1
         if persisted_derived_ids:
-            self._sync_entity_claim_recall_documents(
+            self._sync_user_claim_recall_documents(
                 sorted(set(persisted_derived_ids))
             )
+        report["claim_ids"] = sorted(set(report["claim_ids"]))
         return report
 
     def _derived_claim_prompt_view(
@@ -5323,13 +5039,14 @@ class MemoryNodeManager:
             "object_entity_id": object_id,
             "object_entity": entity_names.get(object_id, ""),
             "claim_type": claim.get("claim_type") or "",
+            "primary_domain": claim.get("primary_domain") or "",
             "claim_text": claim.get("claim_text") or "",
             "valid_from": claim.get("valid_from") or "",
             "valid_to": claim.get("valid_to") or "",
             "confidence": float(claim.get("confidence") or 0.0),
         }
 
-    def _extract_derived_entity_claims(
+    def _extract_derived_user_claims(
         self,
         *,
         changed_claims: Sequence[Dict[str, Any]],
@@ -5349,8 +5066,8 @@ class MemoryNodeManager:
             "\n".join(str(claim.get("claim_text") or "") for claim in input_claims)
         )
         prompt_template = (
-            DERIVED_ENTITY_CLAIM_EXTRACTION_PROMPT_EN
-            if language == "en" else DERIVED_ENTITY_CLAIM_EXTRACTION_PROMPT_ZH
+            DERIVED_USER_CLAIM_EXTRACTION_PROMPT_EN
+            if language == "en" else DERIVED_USER_CLAIM_EXTRACTION_PROMPT_ZH
         )
         raw = self._call_llm(prompt_template.replace(
             "{changed_claims}",
@@ -5376,7 +5093,7 @@ class MemoryNodeManager:
             return None
         return [item for item in parsed["claims"][:16] if isinstance(item, dict)]
 
-    def _normalize_derived_entity_claim(
+    def _normalize_derived_user_claim(
         self,
         raw: Dict[str, Any],
         *,
@@ -5396,6 +5113,9 @@ class MemoryNodeManager:
             return None
         claim_type = str(raw.get("claim_type") or "").strip().lower()
         if claim_type not in {"affiliation", "relationship", "constraint"}:
+            return None
+        primary_domain = self._normalize_primary_domain(raw.get("primary_domain"))
+        if not primary_domain:
             return None
         predicate = re.sub(
             r"[^a-z0-9_]+", "_", str(raw.get("predicate") or "").lower(),
@@ -5435,7 +5155,7 @@ class MemoryNodeManager:
             self._clamp_float(raw.get("confidence"), 0.0, 1.0, 0.7),
             premise_confidence,
         )
-        if confidence < self._entity_claim_derived_min_confidence:
+        if confidence < self._user_claim_derived_min_confidence:
             return None
         valid_from, valid_to = self._derived_claim_validity_bounds(premises)
         if valid_from and valid_to and valid_from > valid_to:
@@ -5443,13 +5163,13 @@ class MemoryNodeManager:
         support_fact_ids = sorted({
             fact_id
             for premise_id in premise_ids
-            for fact_id in self._db.get_entity_claim_evidence_fact_ids([premise_id]).get(
+            for fact_id in self._db.get_user_claim_evidence_fact_ids([premise_id]).get(
                 premise_id, []
             )
         })
         if not support_fact_ids:
             return None
-        claim_text = self._normalize_entity_claim_text(
+        claim_text = self._normalize_user_claim_text(
             raw.get("claim_text") or "",
             subject=entity_names.get(subject_entity_id, ""),
             predicate=predicate,
@@ -5464,11 +5184,12 @@ class MemoryNodeManager:
             "claim_text": claim_text,
             "claim_type": claim_type,
             "claim_origin": "derived",
+            "primary_domain": primary_domain,
             "status": "active",
             "confidence": confidence,
             "valid_from": valid_from,
             "valid_to": valid_to,
-            "extractor_version": "entity_claim_derived_v1",
+            "extractor_version": "user_claim_derived_v1",
             "prompt_version": "v1",
             "metadata": {
                 "derivation_type": "llm_direct_entailment",
@@ -5495,14 +5216,14 @@ class MemoryNodeManager:
         })
         return (starts[-1] if starts else "", ends[0] if ends else "")
 
-    def _update_inductive_entity_claims_from_facts(
+    def _update_inductive_user_claims_from_facts(
         self,
         seed_facts: Sequence[Dict[str, Any]],
     ) -> Dict[str, Any]:
         """Use new facts to trigger bounded, exact-group evidence expansion."""
         report: Dict[str, Any] = {
             "enabled": 1, "seed_fact_count": len(seed_facts), "candidate_count": 0,
-            "updated": 0, "created": 0, "completed": True,
+            "updated": 0, "created": 0, "affected_claim_ids": [], "completed": True,
         }
         if not seed_facts:
             return report
@@ -5511,7 +5232,7 @@ class MemoryNodeManager:
             fact_id = int(fact.get("id") or 0)
             if fact_id <= 0:
                 continue
-            for signal_mapping in self._entity_claim_signals_from_fact(fact):
+            for signal_mapping in self._user_claim_signals_from_fact(fact):
                 key = (
                     int(signal_mapping["subject_entity_id"]),
                     str(signal_mapping["claim_type_hint"]),
@@ -5528,13 +5249,13 @@ class MemoryNodeManager:
                 group["seed_facts_by_id"][fact_id] = fact
         report["candidate_count"] = len(groups)
         for group in list(groups.values())[:12]:
-            historical_facts = self._db.memory_facts_for_entity_claim_signal_group(
+            historical_facts = self._db.memory_facts_for_user_claim_signal_group(
                 subject_entity_id=int(group["subject_entity_id"]),
                 claim_type_hint=str(group["claim_type_hint"]),
                 claim_anchor_key=str(group["claim_anchor_key"]),
-                limit=max(64, self._entity_claim_induction_evidence_limit * 4),
+                limit=max(64, self._user_claim_induction_evidence_limit * 4),
             )
-            evidence_facts = self._select_inductive_entity_claim_evidence_facts(
+            evidence_facts = self._select_inductive_user_claim_evidence_facts(
                 group=group,
                 historical_facts=historical_facts,
             )
@@ -5548,12 +5269,12 @@ class MemoryNodeManager:
                 if str(fact.get("event_time_key") or fact.get("dialogue_time_key") or "")
             }
             if (
-                len(evidence_facts) < self._entity_claim_induction_min_support_facts
-                or len(distinct_episodes) < self._entity_claim_induction_min_episodes
-                or len(time_windows) < self._entity_claim_induction_min_time_windows
+                len(evidence_facts) < self._user_claim_induction_min_support_facts
+                or len(distinct_episodes) < self._user_claim_induction_min_episodes
+                or len(time_windows) < self._user_claim_induction_min_time_windows
             ):
                 continue
-            outcome = self._extract_inductive_entity_claims(
+            outcome = self._extract_inductive_user_claims(
                 group=group, facts=evidence_facts,
             )
             if outcome is None:
@@ -5561,21 +5282,21 @@ class MemoryNodeManager:
                 report["error"] = "invalid_llm_induction_response"
                 return report
             by_id = {int(fact["id"]): fact for fact in evidence_facts}
-            applied = self._reconcile_entity_claims(outcome, facts_by_id=by_id)
+            applied = self._reconcile_user_claims(outcome, facts_by_id=by_id)
             for item in applied:
                 claim = item["claim"]
                 if item["effective_origin"] != "inductive":
                     continue
-                support_ids = self._entity_claim_support_ids(claim)
+                support_ids = self._user_claim_support_ids(claim)
                 if not support_ids:
                     continue
                 claim_id = int(item["claim_id"])
-                support_summary = self._db.get_entity_claim_support_fact_summary(
+                support_summary = self._db.get_user_claim_support_fact_summary(
                     claim_id
                 )
                 if int(support_summary["support_count"]) <= 0:
                     continue
-                self._db.upsert_entity_claim_induction(
+                self._db.upsert_user_claim_induction(
                     claim_id=claim_id,
                     condition_text=str(claim.get("metadata", {}).get("condition_text") or ""),
                     support_count=int(support_summary["support_count"]),
@@ -5584,17 +5305,23 @@ class MemoryNodeManager:
                 )
             report["updated"] += len(applied)
             report["created"] += sum(int(item["created"]) for item in applied)
+            report["affected_claim_ids"].extend(
+                int(item["claim_id"])
+                for item in applied
+                if int(item.get("claim_id") or 0) > 0
+            )
+        report["affected_claim_ids"] = sorted(set(report["affected_claim_ids"]))
         return report
 
-    def _fact_entity_claim_signal_mapping_updates(
+    def _fact_user_claim_signal_mapping_updates(
         self,
         fact_id: int,
         fact: Dict[str, Any],
     ) -> List[Dict[str, Any]]:
         """Project one fact's induction-eligible signals into exact group keys."""
         updates: List[Dict[str, Any]] = []
-        raw_signals = self._normalize_entity_claim_signal(
-            fact.get("entity_claim_signal"),
+        raw_signals = self._normalize_user_claim_signal(
+            fact.get("user_claim_signal"),
         )
         for signal in raw_signals:
             claim_type_hint = str(signal.get("claim_type_hint") or "").lower()
@@ -5603,7 +5330,7 @@ class MemoryNodeManager:
                 continue
             if signal_kind not in {"explicit_assertion", "pattern_observation"}:
                 continue
-            names = self._entities_for_entity_claim_signal(signal, fact)
+            names = self._entities_for_user_claim_signal(signal, fact)
             if not names:
                 continue
             entity_name = names[0]
@@ -5644,15 +5371,15 @@ class MemoryNodeManager:
             "signal_key": "__fact__",
         }]
 
-    def _fact_future_commitment_signal_mapping_updates(
+    def _fact_user_intent_signal_mapping_updates(
         self,
         fact_id: int,
         fact: Dict[str, Any],
     ) -> List[Dict[str, Any]]:
         """Project one fact's normalized prospective signals into DB rows."""
         updates: List[Dict[str, Any]] = []
-        raw_signals = self._normalize_future_commitment_signals(
-            fact.get("future_commitment_signals"),
+        raw_signals = self._normalize_user_intent_signals(
+            fact.get("user_intent_signals"),
             fallback_entity=fact.get("primary_entity"),
             allows_world_owner_reference=(
                 isinstance(fact.get("metadata"), dict)
@@ -5673,24 +5400,24 @@ class MemoryNodeManager:
             entity_mapping = self._db.upsert_entity_nodes([entity_descriptor])
             if subject_name not in entity_mapping:
                 continue
-            future_commitment_anchor = _compact_whitespace(
-                signal.get("future_commitment_anchor") or ""
+            user_intent_anchor = _compact_whitespace(
+                signal.get("user_intent_anchor") or ""
             )
-            future_commitment_anchor_key = self._generate_topic_name_key(future_commitment_anchor)
-            if not future_commitment_anchor or future_commitment_anchor_key == "general":
+            user_intent_anchor_key = self._generate_topic_name_key(user_intent_anchor)
+            if not user_intent_anchor or user_intent_anchor_key == "general":
                 continue
             updates.append({
                 "fact_id": int(fact_id),
                 "signal_key": (
                     f"{int(entity_mapping[subject_name])}|{signal['evidence_kind']}|"
-                    f"{future_commitment_anchor_key}"
+                    f"{user_intent_anchor_key}"
                 ),
                 "subject_entity_id": int(entity_mapping[subject_name]),
                 "evidence_kind": signal["evidence_kind"],
                 "candidate_object_types": signal["candidate_object_types"],
                 "user_role": signal["user_role"],
-                "future_commitment_anchor": future_commitment_anchor,
-                "future_commitment_anchor_key": future_commitment_anchor_key,
+                "user_intent_anchor": user_intent_anchor,
+                "user_intent_anchor_key": user_intent_anchor_key,
                 "assertion_source": signal["assertion_source"],
                 "explicitness": signal["explicitness"],
                 "evidence_basis": signal["evidence_basis"],
@@ -5701,7 +5428,7 @@ class MemoryNodeManager:
             "signal_key": "__fact__",
         }]
 
-    def _select_inductive_entity_claim_evidence_facts(
+    def _select_inductive_user_claim_evidence_facts(
         self,
         *,
         group: Dict[str, Any],
@@ -5739,16 +5466,16 @@ class MemoryNodeManager:
             selected_ids.add(fact_id)
             if episode_id > 0:
                 selected_episodes.add(episode_id)
-            if len(selected) >= self._entity_claim_induction_evidence_limit:
+            if len(selected) >= self._user_claim_induction_evidence_limit:
                 break
-        if len(selected) < self._entity_claim_induction_evidence_limit:
+        if len(selected) < self._user_claim_induction_evidence_limit:
             for fact in ordered:
                 fact_id = int(fact["id"])
                 if fact_id in selected_ids:
                     continue
                 selected.append(fact)
                 selected_ids.add(fact_id)
-                if len(selected) >= self._entity_claim_induction_evidence_limit:
+                if len(selected) >= self._user_claim_induction_evidence_limit:
                     break
         return sorted(
             selected,
@@ -5758,7 +5485,7 @@ class MemoryNodeManager:
             ),
         )
 
-    def _extract_inductive_entity_claims(
+    def _extract_inductive_user_claims(
         self,
         *,
         group: Dict[str, Any],
@@ -5768,8 +5495,8 @@ class MemoryNodeManager:
             "\n".join(str(fact.get("summary") or "") for fact in facts[:16])
         )
         prompt_template = (
-            INDUCTIVE_ENTITY_CLAIM_EXTRACTION_PROMPT_EN
-            if language == "en" else INDUCTIVE_ENTITY_CLAIM_EXTRACTION_PROMPT_ZH
+            INDUCTIVE_USER_CLAIM_EXTRACTION_PROMPT_EN
+            if language == "en" else INDUCTIVE_USER_CLAIM_EXTRACTION_PROMPT_ZH
         )
         raw = self._call_llm(
             prompt_template.replace("{induction_target}", json.dumps({
@@ -5789,14 +5516,14 @@ class MemoryNodeManager:
         }
         result: List[Dict[str, Any]] = []
         for raw_claim in parsed["claims"][:4]:
-            claim = self._normalize_inductive_entity_claim(
+            claim = self._normalize_inductive_user_claim(
                 raw_claim, group=group, facts_by_id=facts_by_id,
             )
             if claim:
                 result.append(claim)
         return result
 
-    def _normalize_inductive_entity_claim(
+    def _normalize_inductive_user_claim(
         self,
         raw: Any,
         *,
@@ -5807,6 +5534,9 @@ class MemoryNodeManager:
             return None
         claim_type = str(raw.get("claim_type") or "").strip().lower()
         if claim_type not in {"preference", "behavior_pattern"}:
+            return None
+        primary_domain = self._normalize_primary_domain(raw.get("primary_domain"))
+        if not primary_domain:
             return None
         if _compact_whitespace(raw.get("subject_entity") or "") != group["subject"]:
             return None
@@ -5826,16 +5556,16 @@ class MemoryNodeManager:
             for fact_id in support_ids
         } - {""}
         if (
-            len(support_ids) < self._entity_claim_induction_min_support_facts
-            or len(episode_ids) < self._entity_claim_induction_min_episodes
-            or len(windows) < self._entity_claim_induction_min_time_windows
+            len(support_ids) < self._user_claim_induction_min_support_facts
+            or len(episode_ids) < self._user_claim_induction_min_episodes
+            or len(windows) < self._user_claim_induction_min_time_windows
         ):
             return None
         raw_claim_text = _compact_whitespace(raw.get("claim_text") or "")
         if not raw_claim_text:
             return None
         confidence = self._clamp_float(raw.get("confidence"), 0.0, 1.0, 0.7)
-        claim_text = self._normalize_entity_claim_text(
+        claim_text = self._normalize_user_claim_text(
             raw_claim_text,
             subject=group["subject"],
             predicate=predicate,
@@ -5844,9 +5574,10 @@ class MemoryNodeManager:
             "subject_entity_id": group["subject_entity_id"], "predicate": predicate,
             "claim_text": claim_text,
             "claim_type": claim_type, "claim_origin": "inductive",
+            "primary_domain": primary_domain,
             "status": "active",
             "confidence": confidence,
-            "extractor_version": "entity_claim_induction_v1", "prompt_version": "v1",
+            "extractor_version": "user_claim_induction_v1", "prompt_version": "v1",
             "metadata": {
                 "condition_text": _compact_whitespace(raw.get("condition_text") or ""),
                 "claim_anchor": group["claim_anchor"],
@@ -5855,7 +5586,7 @@ class MemoryNodeManager:
         }
 
     @staticmethod
-    def _normalize_entity_claim_text(
+    def _normalize_user_claim_text(
         value: Any,
         *,
         subject: str,
@@ -5869,7 +5600,7 @@ class MemoryNodeManager:
         target = _compact_whitespace(object_name)
         return _compact_whitespace(f"{subject} {predicate} {target}")[:480]
 
-    def _log_future_commitment_facts_loaded(
+    def _log_user_intent_facts_loaded(
         self,
         processing_target: str,
         facts: List[Dict[str, Any]],
@@ -5877,7 +5608,7 @@ class MemoryNodeManager:
         reference_timestamp: Any,
     ) -> None:
         """Log the independent fact batch consumed by future-commitment update."""
-        self._log_info("memory_future_commitment_update", "facts_loaded", {
+        self._log_info("memory_user_intent_update", "facts_loaded", {
             "processing_target": processing_target,
             "fact_count": len(facts),
             "fact_ids": [fact.get("id") for fact in facts],
@@ -5892,6 +5623,14 @@ class MemoryNodeManager:
         text = _compact_whitespace(value).lower()
         text = re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff]+", "", text)
         return text or "general"
+
+    @staticmethod
+    def _normalize_primary_domain(value: Any) -> str:
+        """Return a controlled semantic domain or an empty invalid marker."""
+        domain = re.sub(
+            r"[^a-z]+", "_", str(value or "").strip().lower(),
+        ).strip("_")
+        return domain if domain in _PRIMARY_DOMAINS else ""
 
     @staticmethod
     def _normalize_unique_labels(
@@ -6167,25 +5906,25 @@ class MemoryNodeManager:
             "keyword_values": keyword_values,
         }
 
-    def _entity_claim_signals_from_fact(self, fact: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def _user_claim_signals_from_fact(self, fact: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Read claim-level signals from their normalized fact mapping rows."""
         fact_id = int(fact.get("id") or 0)
         if fact_id <= 0:
             return []
         return list(
-            self._db.get_fact_entity_claim_signal_mappings(fact_id).values()
+            self._db.get_fact_user_claim_signal_mappings(fact_id).values()
         )
 
-    def _future_commitment_signals_from_fact(self, fact: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def _user_intent_signals_from_fact(self, fact: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Read prospective evidence solely from its normalized mapping rows."""
         fact_id = int(fact.get("id") or 0)
         if fact_id <= 0:
             return []
         return list(
-            self._db.get_fact_future_commitment_signal_mappings(fact_id).values()
+            self._db.get_fact_user_intent_signal_mappings(fact_id).values()
         )
 
-    def _entities_for_entity_claim_signal(
+    def _entities_for_user_claim_signal(
         self,
         signal: Dict[str, Any],
         fact: Dict[str, Any],
@@ -6204,7 +5943,7 @@ class MemoryNodeManager:
                 return [canonical_name]
         return []
 
-    def _should_route_fact_to_future_commitment_update(self, fact: Dict[str, Any]) -> bool:
+    def _should_route_fact_to_user_intent_update(self, fact: Dict[str, Any]) -> bool:
         """Return whether a fact merits semantic review by the intent task.
 
         This is deliberately a high-recall, deterministic intake gate.  It does
@@ -7011,7 +6750,7 @@ class MemoryNodeManager:
             str(value or "").strip().lower()
             for value in direct_object_types or []
             if str(value or "").strip().lower()
-            in {"fact", "entity_claim", "goal", "plan", "work_item"}
+            in {"fact", "user_claim", "goal", "plan", "work_item"}
         ))
         db = database or self._db
         is_prospective_time_slot_query = bool(
@@ -7075,7 +6814,7 @@ class MemoryNodeManager:
     ) -> Sequence[str]:
         """Keep Stage 1 focused on currently answerable derived objects."""
         return {
-            "entity_claim": ("active",),
+            "user_claim": ("active",),
             "goal": ("active",),
             "plan": ("planned", "rescheduled"),
             "work_item": ("open", "blocked"),
@@ -7280,7 +7019,7 @@ class MemoryNodeManager:
         modes = set(query_modes or [])
         object_types = ["fact"]
         if "knowledge" in modes:
-            object_types.append("entity_claim")
+            object_types.append("user_claim")
         if "prospective" in modes:
             object_types.extend(("goal", "plan", "work_item"))
         return object_types
@@ -7289,7 +7028,7 @@ class MemoryNodeManager:
     def _normalize_recall_object_types(value: Any) -> List[str]:
         """Normalize LLM-routed Stage 2 object types without excluding facts."""
         allowed_types = {
-            "fact", "entity_claim", "goal", "plan", "work_item",
+            "fact", "user_claim", "goal", "plan", "work_item",
         }
         raw_values = value if isinstance(value, (list, tuple, set)) else []
         object_types = ["fact"]
@@ -7502,7 +7241,7 @@ class MemoryNodeManager:
     ) -> Dict[str, int]:
         counts = {
             "fact": 0,
-            "entity_claim": 0,
+            "user_claim": 0,
             "goal": 0,
             "plan": 0,
             "work_item": 0,
@@ -7836,16 +7575,16 @@ class MemoryNodeManager:
         """Expand claim/prospective candidates to their mapped fact evidence."""
         claim_candidates = [
             candidate for candidate in direct_candidates or []
-            if str(candidate.get("index_level") or "") == "entity_claim"
+            if str(candidate.get("index_level") or "") == "user_claim"
         ]
-        future_commitment_candidates = [
+        user_intent_candidates = [
             candidate for candidate in direct_candidates or []
             if str(candidate.get("index_level") or "")
             in {"goal", "plan", "work_item"}
         ]
         evidence_by_fact_id: Dict[int, Tuple[str, float]] = {}
 
-        claim_evidence = database.get_entity_claim_evidence_fact_ids(
+        claim_evidence = database.get_user_claim_evidence_fact_ids(
             [candidate.get("target_id") for candidate in claim_candidates],
             limit=max(24, len(claim_candidates) * 4),
         )
@@ -7869,11 +7608,11 @@ class MemoryNodeManager:
                     str(candidate.get("index_level") or ""),
                     int(candidate.get("target_id") or 0),
                 )
-                for candidate in future_commitment_candidates
+                for candidate in user_intent_candidates
             ],
-            limit=max(24, len(future_commitment_candidates) * 4),
+            limit=max(24, len(user_intent_candidates) * 4),
         )
-        for candidate in future_commitment_candidates:
+        for candidate in user_intent_candidates:
             key = (
                 str(candidate.get("index_level") or ""),
                 int(candidate.get("target_id") or 0),
@@ -7960,7 +7699,7 @@ class MemoryNodeManager:
             # Stage 1 latency or candidate pool for contextual wording.
             "seed_limits": {
                 "fact": seed_per_level_limit,
-                "entity_claim": max(4, min(12, k)),
+                "user_claim": max(4, min(12, k)),
                 "goal": max(4, min(10, k)),
                 "plan": max(4, min(12, k)),
                 "work_item": max(4, min(12, k)),
@@ -7969,7 +7708,7 @@ class MemoryNodeManager:
             "association_per_relation_limit": max(4, min(12, k)),
             "selected_limits": {
                 "fact": k,
-                "entity_claim": max(2, min(4, k)),
+                "user_claim": max(2, min(4, k)),
                 "goal": max(2, min(3, k)),
                 "plan": max(2, min(4, k)),
                 "work_item": max(2, min(4, k)),
@@ -8317,7 +8056,7 @@ class MemoryNodeManager:
             and status_eligible
             and bool(time_score_info.get("within_temporal_bounds"))
         ):
-            strong_anchor_reasons.append("temporal_future_commitment_match")
+            strong_anchor_reasons.append("temporal_user_intent_match")
         has_strong_anchor = bool(strong_anchor_reasons)
         fast_match_details = {
             # Preserve the same detail shape consumed by the Stage 1 evidence
@@ -8529,10 +8268,10 @@ class MemoryNodeManager:
         modes = set(query_modes or [])
         direct_claim_candidates = [
             candidate for candidate in candidates or []
-            if str(candidate.get("index_level") or "") == "entity_claim"
+            if str(candidate.get("index_level") or "") == "user_claim"
             and not candidate.get("_recall_association_relation")
         ]
-        direct_future_commitment_candidates = [
+        direct_user_intent_candidates = [
             candidate for candidate in candidates or []
             if str(candidate.get("index_level") or "")
             in {"goal", "plan", "work_item"}
@@ -8548,10 +8287,10 @@ class MemoryNodeManager:
             if str(candidate.get("_recall_association_relation") or "")
             == "intent_evidence"
         )
-        has_temporal_future_commitment_match = any(
-            "temporal_future_commitment_match"
+        has_temporal_user_intent_match = any(
+            "temporal_user_intent_match"
             in (candidate.get("strong_anchor_reasons") or [])
-            for candidate in direct_future_commitment_candidates
+            for candidate in direct_user_intent_candidates
         )
         # A future-oriented question can intentionally omit the subject of
         # the planned object (for example, "我明天要去哪里？").  In that
@@ -8562,21 +8301,21 @@ class MemoryNodeManager:
             lexical_query_term_coverage_sufficient
             or (
                 "prospective" in modes
-                and has_temporal_future_commitment_match
+                and has_temporal_user_intent_match
             )
         )
         has_primary_query_coverage = bool(
             matched_topic_term_keys
             or matched_high_value_entities
-            or has_temporal_future_commitment_match
+            or has_temporal_user_intent_match
         )
         knowledge_evidence_sufficient = (
             "knowledge" not in modes
             or bool(direct_claim_candidates and claim_evidence_count)
         )
-        future_commitment_evidence_sufficient = (
+        user_intent_evidence_sufficient = (
             "prospective" not in modes
-            or bool(direct_future_commitment_candidates and intent_evidence_count)
+            or bool(direct_user_intent_candidates and intent_evidence_count)
         )
         trusted = (
             bool(candidates)
@@ -8584,7 +8323,7 @@ class MemoryNodeManager:
             and query_term_coverage_sufficient
             and query_entity_coverage_sufficient
             and knowledge_evidence_sufficient
-            and future_commitment_evidence_sufficient
+            and user_intent_evidence_sufficient
         )
         return {
             "trusted": trusted,
@@ -8611,13 +8350,13 @@ class MemoryNodeManager:
             "entity_coverage": round(entity_coverage, 4),
             "query_entity_coverage_sufficient": query_entity_coverage_sufficient,
             "query_modes": sorted(modes),
-            "direct_entity_claim_count": len(direct_claim_candidates),
+            "direct_user_claim_count": len(direct_claim_candidates),
             "claim_evidence_count": claim_evidence_count,
             "knowledge_evidence_sufficient": knowledge_evidence_sufficient,
-            "direct_future_commitment_count": len(direct_future_commitment_candidates),
+            "direct_user_intent_count": len(direct_user_intent_candidates),
             "intent_evidence_count": intent_evidence_count,
-            "future_commitment_evidence_sufficient": future_commitment_evidence_sufficient,
-            "has_temporal_future_commitment_match": has_temporal_future_commitment_match,
+            "user_intent_evidence_sufficient": user_intent_evidence_sufficient,
+            "has_temporal_user_intent_match": has_temporal_user_intent_match,
         }
 
     @staticmethod
@@ -9215,7 +8954,7 @@ class MemoryNodeManager:
             str(value or "").strip().lower()
             for value in direct_object_types or []
             if str(value or "").strip().lower()
-            in {"fact", "entity_claim", "goal", "plan", "work_item"}
+            in {"fact", "user_claim", "goal", "plan", "work_item"}
         ))
         db = database or self._db
         candidates: List[Dict[str, Any]] = []
@@ -9658,10 +9397,10 @@ class MemoryNodeManager:
             }
 
         target_table_by_type = {
-            "entity_claim": "memory_entity_claims",
-            "goal": "memory_goals",
-            "plan": "memory_plans",
-            "work_item": "memory_work_items",
+            "user_claim": "memory_user_claims",
+            "goal": "memory_user_intent_items",
+            "plan": "memory_user_intent_items",
+            "work_item": "memory_user_intent_items",
         }
         target_table = target_table_by_type.get(object_type)
         if not target_table:
@@ -9670,6 +9409,32 @@ class MemoryNodeManager:
             target_id = int(row.get("object_id"))
         except (TypeError, ValueError):
             return None
+        if object_type in {"goal", "plan", "work_item"}:
+            if database is None:
+                return None
+            intent_row = database.get_intent_object(
+                object_type=object_type,
+                object_id=target_id,
+            )
+            if not intent_row:
+                return None
+            hydrated_intent = dict(intent_row)
+            hydrated_intent["object_id"] = target_id
+            intent_metadata = dict(hydrated_intent.get("metadata") or {})
+            document_metadata = row.get("metadata")
+            if isinstance(document_metadata, dict):
+                intent_metadata.update(document_metadata)
+            hydrated_intent["metadata"] = intent_metadata
+            hydrated_intent.update({
+                key: value
+                for key, value in row.items()
+                if key in {
+                    "title", "identity_text", "identity_text_embedding",
+                    "entity_ids", "topic_keys", "importance", "_bm25_score",
+                    "_recall_temporal_match",
+                }
+            })
+            row = hydrated_intent
         time_start = self._normalize_event_time_text(row.get("time_start"))
         time_end = self._normalize_event_time_text(row.get("time_end")) or time_start
         query_start, query_end = temporal_bounds or (None, None)
@@ -10364,7 +10129,7 @@ class MemoryNodeManager:
                         f"   {labels['summary']}: {raw.get('summary') or entry.get('summary_for_retrieval') or ''}",
                         f"   {labels['fact_root_topic']}: {raw.get('fact_root_topic') or ''}; {labels['fact_aspect_topic']}: {raw.get('fact_aspect_topic') or ''}",
                     ]
-                elif group_key == "entity_claim":
+                elif group_key == "user_claim":
                     block_lines = [
                         f"{index}. {labels['claim']}",
                         f"   {labels['summary']}: {raw.get('summary') or entry.get('summary_for_retrieval') or ''}",
@@ -10654,7 +10419,7 @@ class MemoryNodeManager:
         seed_per_channel_limit = max(6, min(16, int(math.ceil(k * 1.5))))
         seed_limits = {
             "fact": seed_per_channel_limit,
-            "entity_claim": max(4, min(10, k)),
+            "user_claim": max(4, min(10, k)),
             "goal": max(4, min(8, k)),
             "plan": max(4, min(10, k)),
             "work_item": max(4, min(10, k)),

@@ -46,7 +46,7 @@ _MEMORY_INPUT_DEDUP_MIN_FUZZY_RATIO = 0.90
 
 
 class _DerivedMemoryTaskScheduler:
-    """Schedule claim and future-commitment projections after committed facts.
+    """Schedule claim and intent projections after committed facts.
 
     The manager owns extraction and persistence.  This runtime-local helper
     merely coalesces successful store completions into follow-up tasks.  It
@@ -55,8 +55,8 @@ class _DerivedMemoryTaskScheduler:
     """
 
     _KIND_TO_TASK = {
-        "entity_claim": "memory_entity_claim_update",
-        "future_commitment": "memory_future_commitment_update",
+        "user_claim": "memory_user_claim_update",
+        "user_intent": "memory_user_intent_update",
     }
 
     def __init__(
@@ -70,50 +70,50 @@ class _DerivedMemoryTaskScheduler:
         self._logger = logger or logging.getLogger(__name__)
         settings = dict(config or {})
         self._thresholds = {
-            "entity_claim": {
+            "user_claim": {
                 "default": {
                     "batches": max(1, int(
-                        settings.get("entity_claim_min_signal_batches", 4) or 4
+                        settings.get("user_claim_min_signal_batches", 4) or 4
                     )),
                     "facts": max(1, int(
-                        settings.get("entity_claim_min_signal_facts", 8) or 8
+                        settings.get("user_claim_min_signal_facts", 8) or 8
                     )),
                 },
                 "interaction": {
                     "batches": max(1, int(
                         settings.get(
-                            "interaction_entity_claim_min_signal_batches", 3
+                            "interaction_user_claim_min_signal_batches", 3
                         ) or 3
                     )),
                     "facts": max(1, int(
                         settings.get(
-                            "interaction_entity_claim_min_signal_facts", 5
+                            "interaction_user_claim_min_signal_facts", 5
                         ) or 5
                     )),
                 },
             },
-            "future_commitment": {
+            "user_intent": {
                 "default": {
                     "batches": max(1, int(
                         settings.get(
-                            "future_commitment_min_signal_batches", 4
+                            "user_intent_min_signal_batches", 4
                         ) or 4
                     )),
                     "facts": max(1, int(
                         settings.get(
-                            "future_commitment_min_signal_facts", 5
+                            "user_intent_min_signal_facts", 5
                         ) or 5
                     )),
                 },
                 "interaction": {
                     "batches": max(1, int(
                         settings.get(
-                            "interaction_future_commitment_min_signal_batches", 3
+                            "interaction_user_intent_min_signal_batches", 3
                         ) or 3
                     )),
                     "facts": max(1, int(
                         settings.get(
-                            "interaction_future_commitment_min_signal_facts", 3
+                            "interaction_user_intent_min_signal_facts", 3
                         ) or 3
                     )),
                 },
@@ -206,22 +206,22 @@ class _DerivedMemoryTaskScheduler:
             self._record_input_time_end_locked(reference_timestamp)
             resolved_reference_timestamp = self._latest_input_time_end
         reports = {
-            "entity_claim": self._manager.submit_memory_entity_claim_update_task(
+            "user_claim": self._manager.submit_memory_user_claim_update_task(
                 reference_timestamp=resolved_reference_timestamp or None,
                 completion_context={
                     "derived_task_scheduler": {
-                        "kind": "entity_claim",
+                        "kind": "user_claim",
                         "force_drain": True,
                         "reference_timestamp": resolved_reference_timestamp,
                     }
                 }
             ),
-            "future_commitment": (
-                self._manager.submit_memory_future_commitment_update_task(
+            "user_intent": (
+                self._manager.submit_memory_user_intent_update_task(
                     reference_timestamp=resolved_reference_timestamp or None,
                     completion_context={
                         "derived_task_scheduler": {
-                            "kind": "future_commitment",
+                            "kind": "user_intent",
                             "force_drain": True,
                             "reference_timestamp": resolved_reference_timestamp,
                         }
@@ -268,31 +268,31 @@ class _DerivedMemoryTaskScheduler:
         )
         contains_interaction = bool(context.get("contains_interaction_turn"))
         signal_stats = {
-            "entity_claim": {
-                "signal_count": int(result.get("entity_claim_signal_count") or 0),
+            "user_claim": {
+                "signal_count": int(result.get("user_claim_signal_count") or 0),
                 "signal_fact_count": int(
-                    result.get("entity_claim_signal_fact_count") or 0
+                    result.get("user_claim_signal_fact_count") or 0
                 ),
             },
-            "future_commitment": {
+            "user_intent": {
                 "signal_count": int(
-                    result.get("future_commitment_signal_count") or 0
+                    result.get("user_intent_signal_count") or 0
                 ),
                 "signal_fact_count": int(
-                    result.get("future_commitment_signal_fact_count") or 0
+                    result.get("user_intent_signal_fact_count") or 0
                 ),
             },
         }
         self._logger.info(
-            "memory store completion observed facts=%s entity_claim_signals=%s "
-            "entity_claim_signal_facts=%s future_commitment_signals=%s "
-            "future_commitment_signal_facts=%s contains_interaction_turn=%s "
+            "memory store completion observed facts=%s user_claim_signals=%s "
+            "user_claim_signal_facts=%s user_intent_signals=%s "
+            "user_intent_signal_facts=%s contains_interaction_turn=%s "
             "input_time_end=%s",
             int(result.get("new_fact_count") or 0),
-            signal_stats["entity_claim"]["signal_count"],
-            signal_stats["entity_claim"]["signal_fact_count"],
-            signal_stats["future_commitment"]["signal_count"],
-            signal_stats["future_commitment"]["signal_fact_count"],
+            signal_stats["user_claim"]["signal_count"],
+            signal_stats["user_claim"]["signal_fact_count"],
+            signal_stats["user_intent"]["signal_count"],
+            signal_stats["user_intent"]["signal_fact_count"],
             contains_interaction,
             context.get("input_time_end") or "",
         )
@@ -343,13 +343,13 @@ class _DerivedMemoryTaskScheduler:
                 "reference_timestamp": reference_timestamp,
             }
         }
-        if kind == "entity_claim":
-            report = self._manager.submit_memory_entity_claim_update_task(
+        if kind == "user_claim":
+            report = self._manager.submit_memory_user_claim_update_task(
                 reference_timestamp=reference_timestamp or None,
                 completion_context=completion_context,
             )
         else:
-            report = self._manager.submit_memory_future_commitment_update_task(
+            report = self._manager.submit_memory_user_intent_update_task(
                 reference_timestamp=reference_timestamp or None,
                 completion_context=completion_context,
             )

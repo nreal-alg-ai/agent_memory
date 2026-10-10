@@ -187,28 +187,21 @@ memory_runtime:
     # derived task still needs multiple committed batches and signal-bearing
     # facts. Signal counts themselves are diagnostic only: one fact may emit
     # several signals in a single extraction result.
-    entity_claim_min_signal_batches: 4
-    entity_claim_min_signal_facts: 8
-    interaction_entity_claim_min_signal_batches: 3
-    interaction_entity_claim_min_signal_facts: 5
-    future_commitment_min_signal_batches: 4
-    future_commitment_min_signal_facts: 5
-    interaction_future_commitment_min_signal_batches: 3
-    interaction_future_commitment_min_signal_facts: 3
+    user_claim_min_signal_batches: 4
+    user_claim_min_signal_facts: 8
+    interaction_user_claim_min_signal_batches: 3
+    interaction_user_claim_min_signal_facts: 5
+    user_intent_min_signal_batches: 4
+    user_intent_min_signal_facts: 5
+    interaction_user_intent_min_signal_batches: 3
+    interaction_user_intent_min_signal_facts: 3
   log_segmentation_decisions: true
 
 memory_manager:
   memory_enabled: true
-  enable_memory_entity_claim_update: true
-  enable_memory_future_commitment_update: true
-  enable_memory_proactive_candidate_generation: true
-  # Candidate generation creates durable, auditable policy inputs only.  It
-  # never sends a reminder or speaks to the user; delivery is a later layer.
-  proactive_candidate:
-    plan_upcoming_horizon_hours: 24
-    work_item_due_horizon_hours: 24
-    work_item_overdue_repeat_hours: 24
-    scan_limit_per_object_type: 120
+  enable_memory_user_claim_update: true
+  enable_memory_user_intent_update: true
+  enable_memory_user_state_update: true
   llm:
     llm_provider: deepseek
     llm_name: deepseek-v4-flash
@@ -230,15 +223,16 @@ memory_manager:
 
   task_queue_maxsize: 100
 
-  entity_claim_limit: 100
-  future_commitment_limit: 100
-  entity_claim_explicit_min_confidence: 0.72
-  entity_claim_derived_min_confidence: 0.75
-  entity_claim_signal_max_per_fact: 3
-  entity_claim_induction_min_support_facts: 3
-  entity_claim_induction_min_episodes: 3
-  entity_claim_induction_min_time_windows: 2
-  entity_claim_induction_evidence_limit: 16
+  user_claim_limit: 100
+  user_intent_limit: 100
+  user_state_update_limit: 80
+  user_claim_explicit_min_confidence: 0.72
+  user_claim_derived_min_confidence: 0.75
+  user_claim_signal_max_per_fact: 3
+  user_claim_induction_min_support_facts: 3
+  user_claim_induction_min_episodes: 3
+  user_claim_induction_min_time_windows: 2
+  user_claim_induction_evidence_limit: 16
   
   recall:  
     recall_top_k: 8
