@@ -12,7 +12,7 @@ CLongEval conversation records are JSONL objects with this shape::
 
 The same context is often reused by several questions. This runner groups
 records by exact context, replays each context into one isolated memory DB,
-and then runs all of that context's questions against the same memory runtime.
+and then runs all of that context's questions against the same personal world model.
 It uses the project config.yaml for the shared runtime and manager settings.
 """
 
@@ -39,7 +39,7 @@ for import_root in (SRC_ROOT, REPO_ROOT, SCRIPT_ROOT):
         sys.path.insert(0, str(import_root))
 
 from memory.memory_manager import MemoryOperationReporter
-from memory.memory_runtime import MemoryRuntime
+from pwm_manager import PersonWorldModel
 from memory.config import split_memory_config
 from scripts.memory.user_dialogue.test_memory_store_fact_extraction import (
     configure_logging,
@@ -322,7 +322,7 @@ def db_counts(db: Any) -> Dict[str, int]:
 
 def replay_context_into_memory(
     *,
-    runtime: MemoryRuntime,
+    runtime: PersonWorldModel,
     db: Any,
     days: Sequence[Dict[str, Any]],
     group_id: str,
@@ -608,7 +608,7 @@ def process_context_group(
     context_log_handler = add_context_log_handler(context_log_path)
     memory_logger: Optional[logging.Logger] = None
     memory_log_handler: Optional[logging.Handler] = None
-    runtime: Optional[MemoryRuntime] = None
+    runtime: Optional[PersonWorldModel] = None
     results: List[Dict[str, Any]] = []
     try:
         memory_logger, memory_log_handler = configure_memory_logger(
@@ -626,7 +626,7 @@ def process_context_group(
             db_path,
         )
         operation_reporter = MemoryOperationReporter()
-        runtime = MemoryRuntime(
+        runtime = PersonWorldModel(
             db_path=db_path,
             memory_runtime_config=memory_runtime_config,
             memory_manager_config=memory_manager_config,
@@ -634,7 +634,7 @@ def process_context_group(
             logger=memory_logger,
         )
         db = runtime.database
-        manager = runtime.manager
+        manager = runtime.memory_manager
         if not args.skip_embedding_validation:
             validate_embedding_runtime(manager, db, embedding_config)
         log_memory_index_state(db, f"before_context:{group_id}")

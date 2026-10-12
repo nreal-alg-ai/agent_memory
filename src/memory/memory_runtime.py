@@ -27,6 +27,8 @@ from .memory_manager import (
     _now_text,
     _to_timestamp_text,
 )
+from llm_client import LLMClient
+from .task_scheduler import TaskScheduler
 from .memory_context_manager import (
     MemoryContextManager,
     TranscriptUnitAssembler,
@@ -35,6 +37,7 @@ from .memory_context_manager import (
     convert_interaction_turn_to_online_unit,
 )
 from .memory_types import MemoryUnit
+from user_state import UserStateResolver
 
 
 _MEMORY_INPUT_TOKEN_RE = re.compile(
@@ -146,7 +149,7 @@ class _DerivedMemoryTaskScheduler:
 
         Submission is recorded in addition to task completion: a derived task
         may be appended after a completed store while later store batches are
-        already waiting ahead of it in the manager's FIFO queue.
+        already waiting ahead of it in the shared scheduler's FIFO queue.
         """
         context = (
             dict(completion_context)
@@ -157,7 +160,7 @@ class _DerivedMemoryTaskScheduler:
             self._record_input_time_end_locked(context.get("input_time_end"))
 
     def on_task_completion(self, event: Dict[str, Any]) -> None:
-        """Consume a manager completion event on the manager worker thread."""
+        """Consume a memory completion event on the shared scheduler worker."""
         task_kind = str(event.get("task_kind") or "")
         result = event.get("result")
         if task_kind == "memory_fact_extraction":
@@ -473,16 +476,39 @@ class MemoryRuntime:
         memory_runtime_config: Optional[Dict[str, Any]] = None,
         memory_manager_config: Optional[Dict[str, Any]] = None,
         operation_reporter: Optional[MemoryOperationReporter] = None,
+        database: Optional[SessionDB] = None,
+        task_scheduler: Optional[TaskScheduler] = None,
+        llm_client: Optional[LLMClient] = None,
         logger: Optional[logging.Logger] = None,
     ) -> None:
-        """Initialize memory storage, manager, and runtime batching.
-
-        Application-facing callers provide ``db_path`` and the two memory
-        config mappings. The runtime owns the ``SessionDB``, embedding client,
-        and standard ``MemoryNodeManager`` lifecycle.
-        """
+        """Initialize input batching and its manager, with optional shared resources."""
         self._logger = logger or logging.getLogger(__name__)
         manager_config = dict(memory_manager_config or {})
+        shared_dependencies = (database, task_scheduler, llm_client)
+        if any(item is not None for item in shared_dependencies) and not all(
+            item is not None for item in shared_dependencies
+        ):
+            raise ValueError(
+                "database, task_scheduler, and llm_client must be injected together"
+            )
+        self._owns_shared_resources = database is None
+        if (
+            task_scheduler is not None
+            and operation_reporter is not None
+            and operation_reporter is not task_scheduler.operation_reporter
+        ):
+            raise ValueError("Runtime and scheduler must share operation_reporter")
+        if (
+            database is not None
+            and Path(db_path).expanduser().resolve()
+            != database.db_path.expanduser().resolve()
+        ):
+            raise ValueError("Injected database path does not match db_path")
+        reporter = (
+            task_scheduler.operation_reporter
+            if task_scheduler is not None
+            else operation_reporter or MemoryOperationReporter()
+        )
         configured_embedding = manager_config.get("embedding")
         embedding_config = (
             dict(configured_embedding)
@@ -490,18 +516,39 @@ class MemoryRuntime:
             else {}
         )
 
-        database = SessionDB(Path(db_path).expanduser().resolve())
+        database = database or SessionDB(Path(db_path).expanduser().resolve())
         try:
             manager_logger = self._logger.getChild("memory_manager")
+            self._llm_client = llm_client or LLMClient(
+                memory_config=manager_config,
+                logger=manager_logger.getChild("llm_client"),
+            )
+            self._task_scheduler = task_scheduler or TaskScheduler(
+                operation_reporter=reporter,
+                maxsize=int(manager_config.get("task_queue_maxsize", 100) or 100),
+                logger=self._logger.getChild("task_scheduler"),
+            )
             manager = MemoryNodeManager(
                 database,
                 embedding_config=dict(embedding_config or {}),
                 memory_manager_config=manager_config,
-                operation_reporter=operation_reporter,
+                task_scheduler=self._task_scheduler,
+                llm_client=self._llm_client,
                 logger=manager_logger,
             )
+            self._user_state_resolver: Optional[UserStateResolver] = None
+            if self._owns_shared_resources:
+                self._user_state_resolver = UserStateResolver(
+                    db=database,
+                    task_scheduler=self._task_scheduler,
+                    llm_client=self._llm_client,
+                    memory_config=manager_config,
+                    world_owner_entity_name=manager.world_owner_entity_name,
+                    logger=self._logger.getChild("user_state_resolver"),
+                )
         except Exception:
-            database.close()
+            if self._owns_shared_resources:
+                database.close()
             raise
         self._memory_database = database
         self._memory_manager = manager
@@ -533,20 +580,51 @@ class MemoryRuntime:
             ),
             logger=self._logger.getChild("derived_task_scheduler"),
         )
-        self._manager_completion_listener = (
-            self._derived_task_scheduler.on_task_completion
-        )
-        self._memory_manager.register_task_completion_listener(
-            self._manager_completion_listener
-        )
+        if self._owns_shared_resources:
+            self._task_scheduler.register_completion_listener(
+                self._handle_task_completion
+            )
+
+    def _handle_task_completion(self, event: Dict[str, Any]) -> None:
+        """Route follow-up work for a standalone MemoryRuntime."""
+        result = event.get("result")
+        if event.get("succeeded") and isinstance(result, dict):
+            request = result.get("user_state_update_request")
+            if isinstance(request, dict) and self._user_state_resolver is not None:
+                self._user_state_resolver.submit_memory_user_state_update_task(
+                    **request,
+                )
+        self.handle_task_completion(event)
+
+    def handle_task_completion(self, event: Dict[str, Any]) -> None:
+        """Advance claim and intent scheduling after a shared task completes."""
+        self._derived_task_scheduler.on_task_completion(event)
 
     def close(self, timeout: Optional[float] = 30.0) -> None:
-        """Drain owned tasks and release resources created by this runtime."""
+        """Flush input; standalone runtimes also drain and close owned resources."""
+        if not self._owns_shared_resources:
+            self.flush_pending_memory_inputs(timeout=timeout)
+            return
+        safe_to_close_database = False
         try:
             self.flush_pending_memory_inputs(timeout=timeout)
         finally:
             try:
-                shutdown_ok = self._memory_manager.shutdown_task_worker(
+                drained = self._task_scheduler.flush(timeout=timeout)
+                if not drained:
+                    # Keep the scheduler accepting work while completion
+                    # listeners enqueue dependent claim/intent/state tasks.
+                    self._logger.warning(
+                        "Memory tasks did not drain within timeout=%s; "
+                        "continuing to drain before shutdown",
+                        timeout,
+                    )
+                    drained = self._task_scheduler.flush(timeout=None)
+                if not drained:
+                    raise RuntimeError(
+                        "Memory task queue stopped before all dependent tasks completed"
+                    )
+                shutdown_ok = self._task_scheduler.shutdown(
                     wait=True,
                     timeout=timeout,
                 )
@@ -560,7 +638,7 @@ class MemoryRuntime:
                         "continuing to drain queued tasks before closing database",
                         timeout,
                     )
-                    shutdown_ok = self._memory_manager.shutdown_task_worker(
+                    shutdown_ok = self._task_scheduler.shutdown(
                         wait=True,
                         timeout=None,
                     )
@@ -568,17 +646,25 @@ class MemoryRuntime:
                     raise RuntimeError(
                         "Memory worker stopped before completing all queued tasks"
                     )
+                safe_to_close_database = True
             finally:
-                self._memory_manager.unregister_task_completion_listener(
-                    self._manager_completion_listener
+                self._task_scheduler.unregister_completion_listener(
+                    self._handle_task_completion
                 )
-                if self._memory_database is not None:
+                if safe_to_close_database and self._memory_database is not None:
                     self._memory_database.close()
 
     @property
     def manager(self) -> MemoryNodeManager:
         """Return the manager owned by this runtime for diagnostics/adapters."""
         return self._memory_manager
+
+    @property
+    def user_state_resolver(self) -> UserStateResolver:
+        """Return the resolver owned by a standalone runtime."""
+        if self._user_state_resolver is None:
+            raise RuntimeError("UserStateResolver is owned by PersonWorldModel")
+        return self._user_state_resolver
 
     @property
     def database(self) -> SessionDB:
@@ -797,7 +883,7 @@ class MemoryRuntime:
         """Queue one completed source episode after its fact-store batches.
 
         Callers must first submit the episode's final store batch.  The
-        manager's FIFO queue preserves this ordering without this function
+        scheduler's FIFO queue preserves this ordering without this function
         reaching back into runtime input buffers.
         """
         resolved_tags = list(self._episode_tags if tags is None else tags or [])
@@ -1147,7 +1233,7 @@ class MemoryRuntime:
 
         This is the lifecycle operation for a frontend session close or an
         ambient recording stop.  It deliberately does not wait for storage:
-        the manager's single FIFO worker makes every submitted projection see
+        the scheduler's single FIFO worker makes every submitted projection see
         all stores that precede it.
         """
         input_flush = self._flush_pending_memory_input_units(
@@ -1192,7 +1278,7 @@ class MemoryRuntime:
 
     def wait_for_memory_tasks(self, timeout: Optional[float] = None) -> bool:
         """Wait until all tasks already submitted to the memory manager complete."""
-        return self._memory_manager.flush_task_queue(timeout=timeout)
+        return self._task_scheduler.flush(timeout=timeout)
 
     def derived_task_scheduler_snapshot(self) -> Dict[str, Any]:
         """Return runtime-local derived-task scheduling diagnostics."""

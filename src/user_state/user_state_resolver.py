@@ -7,12 +7,19 @@ does not manufacture a user model through hand-tuned scores.
 
 from __future__ import annotations
 
+import json
+import logging
 import re
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Sequence
 
+from prompts_en import USER_STATE_UPDATE_PROMPT_EN
+from prompts_zh import USER_STATE_UPDATE_PROMPT_ZH
+
 if TYPE_CHECKING:
     from memory.memory_database import SessionDB
+    from llm_client import LLMClient
+    from memory.task_scheduler import TaskScheduler
 
 
 class UserStateResolver:
@@ -63,8 +70,261 @@ class UserStateResolver:
     EVIDENCE_TYPES = {"user_claim", "goal", "plan", "work_item"}
     EVIDENCE_ROLES = {"support", "change_trigger", "counterexample", "context"}
 
-    def __init__(self, *, db: "SessionDB") -> None:
+    TASK_KIND = "memory_user_state_update"
+
+    def __init__(
+        self,
+        *,
+        db: "SessionDB",
+        task_scheduler: TaskScheduler,
+        llm_client: "LLMClient",
+        memory_config: Optional[Mapping[str, Any]] = None,
+        world_owner_entity_name: str = "用户本人",
+        logger: Optional[logging.Logger] = None,
+    ) -> None:
         self._db = db
+        self._task_scheduler = task_scheduler
+        self._llm_client = llm_client
+        self._world_owner_entity_name = str(world_owner_entity_name or "用户本人").strip()
+        self._logger = logger or logging.getLogger(__name__)
+        config = dict(memory_config or {})
+        self._memory_enabled = self._config_bool(
+            config.get("memory_enabled"), True,
+        )
+        self._enabled = self._config_bool(
+            config.get("enable_memory_user_state_update"), True,
+        )
+        self._update_limit = max(
+            1,
+            int(config.get("user_state_update_limit", 80) or 80),
+        )
+        self._prompt_language_mode = str(
+            config.get("memory_prompt_language_mode")
+            or config.get("prompt_language_mode")
+            or "source"
+        ).strip().lower()
+        self._task_scheduler.register_handler(self.TASK_KIND, self.process_update_task)
+
+    @staticmethod
+    def _config_bool(value: Any, default: bool = False) -> bool:
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        text = str(value).strip().lower()
+        if text in {"1", "true", "yes", "y", "on", "enable", "enabled"}:
+            return True
+        if text in {"0", "false", "no", "n", "off", "disable", "disabled"}:
+            return False
+        return default
+
+    def set_logger(self, logger: Optional[logging.Logger]) -> None:
+        self._logger = logger or logging.getLogger(__name__)
+
+    def submit_memory_user_state_update_task(
+        self,
+        *,
+        changed_claim_ids: Optional[Sequence[int]] = None,
+        changed_intent_objects: Optional[Sequence[Dict[str, Any]]] = None,
+        reference_timestamp: Optional[Any] = None,
+        runtime_context: Optional[Dict[str, Any]] = None,
+        completion_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Validate and enqueue a user-state update on the shared FIFO."""
+        if not self._memory_enabled or not self._enabled:
+            return self._task_scheduler.reject(
+                self.TASK_KIND,
+                "memory_disabled" if not self._memory_enabled
+                else "user_state_update_disabled",
+            )
+        claim_ids = sorted({
+            int(value)
+            for value in changed_claim_ids or []
+            if str(value).strip().isdigit() and int(value) > 0
+        })
+        intent_objects = [
+            dict(value)
+            for value in changed_intent_objects or []
+            if isinstance(value, dict)
+        ]
+        if not claim_ids and not intent_objects:
+            return self._task_scheduler.reject(
+                self.TASK_KIND, "no_changed_state_evidence"
+            )
+
+        payload = {
+            "changed_claim_ids": claim_ids,
+            "changed_intent_objects": intent_objects,
+            "reference_timestamp": reference_timestamp,
+            "runtime_context": dict(runtime_context or {}),
+        }
+        submission = self._task_scheduler.submit(
+            self.TASK_KIND,
+            payload,
+            completion_context=completion_context,
+        )
+        if not submission["queued"]:
+            self._logger.warning(
+                "User state task rejected reason=%s task_id=%s",
+                submission["reason"],
+                submission["task_id"],
+            )
+        return submission
+
+    def process_update_task(
+        self,
+        *,
+        changed_claim_ids: Optional[Sequence[int]] = None,
+        changed_intent_objects: Optional[Sequence[Dict[str, Any]]] = None,
+        reference_timestamp: Optional[Any] = None,
+        runtime_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Build, prompt for, validate, and persist incremental state updates."""
+        owner_mapping = self._db.add_entity_names([self._world_owner_entity_name])
+        owner_id = int(owner_mapping[self._world_owner_entity_name])
+        update_inputs = self.build_domain_update_inputs(
+            user_entity_id=owner_id,
+            changed_claim_ids=list(changed_claim_ids or []),
+            changed_intent_objects=list(changed_intent_objects or []),
+            reference_time=reference_timestamp,
+            runtime_context=runtime_context or {},
+            limit_per_domain=self._update_limit,
+        )
+        report: Dict[str, Any] = {
+            "status": "empty",
+            "domain_count": len(update_inputs),
+            "changed_claim_count": sum(
+                len(item["changed_claims"]) for item in update_inputs.values()
+            ),
+            "changed_intent_object_count": sum(
+                len(item["changed_intent_objects"]) for item in update_inputs.values()
+            ),
+            "existing_state_count": sum(
+                len(item["existing_states"]) for item in update_inputs.values()
+            ),
+            "operation_count": 0,
+            "created": 0,
+            "reinforced": 0,
+            "revised": 0,
+            "weakened": 0,
+            "expired": 0,
+            "state_ids": [],
+            "domain_reports": {},
+        }
+        if not update_inputs:
+            self._log_update(report)
+            return report
+
+        failed_domain_count = 0
+        for state_domain, update_input in update_inputs.items():
+            domain_report: Dict[str, Any] = {
+                "changed_claim_count": len(update_input["changed_claims"]),
+                "changed_intent_object_count": len(update_input["changed_intent_objects"]),
+                "existing_state_count": len(update_input["existing_states"]),
+                "operation_count": 0,
+                "state_ids": [],
+            }
+            if not self.has_update_evidence(update_input):
+                domain_report["status"] = "empty"
+                report["domain_reports"][state_domain] = domain_report
+                continue
+            source_text = "\n".join([
+                *(str(item.get("claim_text") or "") for item in update_input["changed_claims"]),
+                *(str(item.get("summary") or "") for item in update_input["changed_intent_objects"]),
+            ])
+            language = self._resolve_prompt_language(source_text)
+            prompt_template = (
+                USER_STATE_UPDATE_PROMPT_EN
+                if language == "en"
+                else USER_STATE_UPDATE_PROMPT_ZH
+            )
+            prompt = prompt_template
+            for key in (
+                "state_domain", "reference_time", "runtime_context", "existing_states",
+                "changed_claims", "changed_intent_objects", "active_intent_objects",
+            ):
+                value = update_input[key]
+                serialized = (
+                    json.dumps(value, ensure_ascii=False, indent=2)
+                    if isinstance(value, (dict, list)) else str(value or "")
+                )
+                prompt = prompt.replace("{" + key + "}", serialized)
+            parsed = self._parse_json_object(self._llm_client.complete(prompt) or "")
+            if parsed is None or not isinstance(parsed.get("operations"), list):
+                domain_report.update({
+                    "status": "error",
+                    "error": "invalid_llm_user_state_update_response",
+                })
+                failed_domain_count += 1
+                report["domain_reports"][state_domain] = domain_report
+                continue
+            operations = self.normalize_operations(
+                parsed["operations"], update_input=update_input,
+            )
+            if not operations:
+                domain_report["status"] = "ok"
+                report["domain_reports"][state_domain] = domain_report
+                continue
+            with self._db.transaction():
+                applied = self.apply_operations(
+                    user_entity_id=owner_id,
+                    operations=operations,
+                    reference_time=update_input["reference_time"],
+                )
+            domain_report.update(applied)
+            domain_report["status"] = "ok"
+            report["domain_reports"][state_domain] = domain_report
+            for key in (
+                "operation_count", "created", "reinforced", "revised",
+                "weakened", "expired",
+            ):
+                report[key] += int(applied.get(key) or 0)
+            report["state_ids"].extend(applied.get("state_ids") or [])
+        report["state_ids"] = sorted(set(report["state_ids"]))
+        report["status"] = "error" if failed_domain_count == len(update_inputs) else "ok"
+        if failed_domain_count:
+            report["failed_domain_count"] = failed_domain_count
+        self._log_update(report)
+        return report
+
+    def _resolve_prompt_language(self, text: str) -> str:
+        if self._prompt_language_mode in {"en", "english", "force_en"}:
+            return "en"
+        if self._prompt_language_mode in {"zh", "chinese", "force_zh"}:
+            return "zh"
+        if re.search(r"[\u4e00-\u9fff]", str(text or "")):
+            return "zh"
+        return "zh"
+
+    @staticmethod
+    def _parse_json_object(text: str) -> Optional[Dict[str, Any]]:
+        raw = str(text or "").strip()
+        if not raw:
+            return None
+        if raw.startswith("```"):
+            start = raw.find("{")
+            end = raw.rfind("}")
+            if start >= 0 and end > start:
+                raw = raw[start : end + 1]
+        else:
+            start = raw.find("{")
+            end = raw.rfind("}")
+            if 0 <= start < end and (start > 0 or end < len(raw) - 1):
+                raw = raw[start : end + 1]
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+        return data if isinstance(data, dict) else None
+
+    def _log_update(self, payload: Dict[str, Any]) -> None:
+        record = {"scope": "memory_user_state", "event": "finish", "payload": payload}
+        self._logger.info(
+            "\n%s",
+            json.dumps(record, ensure_ascii=False, sort_keys=False, indent=2, default=str),
+        )
 
     def build_domain_update_inputs(
         self,

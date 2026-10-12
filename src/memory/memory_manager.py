@@ -18,17 +18,14 @@ import hashlib
 import json
 import logging
 import math
-import os
-import queue
 import re
 import threading
 import time
 from collections import Counter
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
-import requests
 
 try:
     import jieba
@@ -36,9 +33,11 @@ except ImportError:  # pragma: no cover - exercised only in minimal installs
     jieba = None
 
 from .embedding_client import EmbeddingClient
+from llm_client import LLMClient
 from .memory_database import SessionDB
 from .memory_types import MemoryUnit
-from .prompts_en import (
+from .task_scheduler import TaskScheduler
+from prompts_en import (
     DERIVED_USER_CLAIM_EXTRACTION_PROMPT_EN,
     USER_CLAIM_RECONCILIATION_PROMPT_EN,
     EXPLICIT_USER_CLAIM_EXTRACTION_PROMPT_EN,
@@ -49,10 +48,9 @@ from .prompts_en import (
     MEMORY_RETRIEVED_FORMAT_PROMPT_EN,
     MEMORY_RETRIEVED_SECTION_SPECS_EN,
     RECALL_QUERY_ANALYSIS_PROMPT_EN,
-    USER_STATE_UPDATE_PROMPT_EN,
     UNIFIED_MEMORY_EXTRACTION_PROMPT_EN,
 )
-from .prompts_zh import (
+from prompts_zh import (
     DERIVED_USER_CLAIM_EXTRACTION_PROMPT_ZH,
     USER_CLAIM_RECONCILIATION_PROMPT_ZH,
     EXPLICIT_USER_CLAIM_EXTRACTION_PROMPT_ZH,
@@ -63,16 +61,12 @@ from .prompts_zh import (
     MEMORY_RETRIEVED_FORMAT_PROMPT_ZH,
     MEMORY_RETRIEVED_SECTION_SPECS_ZH,
     RECALL_QUERY_ANALYSIS_PROMPT_ZH,
-    USER_STATE_UPDATE_PROMPT_ZH,
     UNIFIED_MEMORY_EXTRACTION_PROMPT_ZH,
 )
 from .utils import _cal_embedding_cosine_similarity
 from user_state import UserStateResolver
 
 RecallTimeBounds = Optional[Tuple[Optional[str], Optional[str]]]
-
-DEFAULT_LLM_BASE_URL = "https://api.deepseek.com/v1"
-DEFAULT_LLM_MODEL = "deepseek-v4-flash"
 
 _PRIMARY_DOMAINS = UserStateResolver.STATE_DOMAINS
 
@@ -253,7 +247,7 @@ class MemoryOperationReporter:
         started_at: float,
         result: Any = None,
         error: Optional[BaseException] = None,
-    ) -> None:
+    ) -> bool:
         elapsed_ms = round((time.monotonic() - started_at) * 1000, 2)
         succeeded = error is None and self._operation_succeeded(operation_type, result)
         report = self._operation_result_report(
@@ -287,6 +281,7 @@ class MemoryOperationReporter:
                 recent_event["error"] = str(error)
                 recent_event["error_type"] = type(error).__name__
             self._append_recent_locked(recent_event)
+        return succeeded
 
     def on_recall_finished(self, report: Dict[str, Any]) -> None:
         elapsed_ms = float(report.get("elapsed_ms") or 0.0)
@@ -437,35 +432,20 @@ class MemoryNodeManager:
         *,
         embedding_config: Optional[Dict[str, Any]] = None,
         memory_manager_config: Optional[Dict[str, Any]] = None,
-        operation_reporter: Optional[MemoryOperationReporter] = None,
+        task_scheduler: TaskScheduler,
+        llm_client: LLMClient,
         logger: Optional[logging.Logger] = None,
     ) -> None:
         self._db = db
         self._logger = logger or logging.getLogger(__name__)
-        self._user_state_resolver = UserStateResolver(db=self._db)
-        self._operation_reporter = operation_reporter or MemoryOperationReporter()
+        self._operation_reporter = task_scheduler.operation_reporter
+        self._task_scheduler = task_scheduler
+        self._llm_client = llm_client
         self._memory_cfg = dict(memory_manager_config or {})
         configured_embedding = self._memory_cfg.get("embedding")
         self._embedding_cfg = dict(
             embedding_config
             or (configured_embedding if isinstance(configured_embedding, dict) else {})
-        )
-        configured_llm = self._memory_cfg.get("llm")
-        self._llm_cfg = dict(
-            configured_llm if isinstance(configured_llm, dict) else {}
-        )
-        self._llm_model = str(self._llm_cfg.get("llm_name") or DEFAULT_LLM_MODEL)
-        self._llm_base_url = self._normalize_llm_base_url(
-            str(self._llm_cfg.get("llm_base_url") or DEFAULT_LLM_BASE_URL)
-        )
-        self._llm_api_key = self._resolve_env(self._llm_cfg.get("llm_api_key"))
-        self._llm_timeout = int(self._llm_cfg.get("llm_timeout", 120) or 120)
-        self._llm_json_mode = self._config_bool(
-            self._llm_cfg.get("llm_json_mode", True),
-            True,
-        )
-        self._llm_thinking = str(
-            self._llm_cfg.get("llm_thinking", "disabled") or "disabled"
         )
         self._memory_prompt_language = str(
             self._memory_cfg.get("memory_prompt_language_mode")
@@ -480,14 +460,6 @@ class MemoryNodeManager:
         self._enable_memory_user_intent_update = self._config_bool(
             self._memory_cfg.get("enable_memory_user_intent_update", True),
             True,
-        )
-        self._enable_memory_user_state_update = self._config_bool(
-            self._memory_cfg.get("enable_memory_user_state_update", True),
-            True,
-        )
-        self._user_state_update_limit = max(
-            1,
-            int(self._memory_cfg.get("user_state_update_limit", 80) or 80),
         )
         configured_world_owner_name = _compact_whitespace(
             self._memory_cfg.get("world_owner_entity_name") or ""
@@ -535,21 +507,18 @@ class MemoryNodeManager:
         )
         self._initialize_recall_config()
         self._embedding_client: Optional[EmbeddingClient] = None
-        self._task_queue_maxsize = max(
-            1,
-            int(self._memory_cfg.get("task_queue_maxsize", 100) or 100),
+        self._task_scheduler.register_handler(
+            "memory_fact_extraction", self._process_memory_fact_extraction_task,
         )
-        self._task_queue: queue.Queue[Dict[str, Any]] = queue.Queue(
-            maxsize=self._task_queue_maxsize,
+        self._task_scheduler.register_handler(
+            "memory_episode_summary", self._process_memory_episode_summary_task,
         )
-        self._task_worker_thread: Optional[threading.Thread] = None
-        self._task_worker_lock = threading.Lock()
-        self._task_shutdown_event = threading.Event()
-        self._memory_operation_lock = threading.RLock()
-        self._task_completion_listener_lock = threading.Lock()
-        self._task_completion_listeners: List[
-            Callable[[Dict[str, Any]], None]
-        ] = []
+        self._task_scheduler.register_handler(
+            "memory_user_claim_update", self._process_memory_user_claim_update_task,
+        )
+        self._task_scheduler.register_handler(
+            "memory_user_intent_update", self._process_memory_user_intent_update_task,
+        )
 
     def _initialize_recall_config(self) -> None:
         """Parse nested recall settings and keep legacy flat overrides working."""
@@ -839,21 +808,6 @@ class MemoryNodeManager:
             return False
         return default
 
-    @staticmethod
-    def _resolve_env(value: Any) -> str:
-        text = str(value or "").strip()
-        match = re.fullmatch(r"\${([A-Za-z_][A-Za-z0-9_]*)}", text)
-        if match:
-            return os.environ.get(match.group(1), "").strip()
-        return text
-
-    @staticmethod
-    def _normalize_llm_base_url(value: str) -> str:
-        text = str(value or DEFAULT_LLM_BASE_URL).strip().rstrip("/")
-        if text == "https://api.deepseek.com":
-            return "https://api.deepseek.com/v1"
-        return text or DEFAULT_LLM_BASE_URL
-
     # ── Runtime helpers used by benchmark scripts ───────────────────────
 
     def _ensure_embedding_client(self) -> bool:
@@ -867,120 +821,18 @@ class MemoryNodeManager:
     def enabled(self) -> bool:
         return self._memory_enabled
 
+    @property
+    def world_owner_entity_name(self) -> str:
+        return self._world_owner_entity_name
+
     def set_logger(self, logger: Optional[logging.Logger]) -> None:
         """Set the logger used by memory store, entity-claim, and recall operations."""
         self._logger = logger or logging.getLogger(__name__)
+        self._llm_client.set_logger(self._logger)
 
     def set_embedding_client(self, embedding_client: Optional[EmbeddingClient]) -> None:
         """Share a pre-initialized embedding client with memory runtime callers."""
         self._embedding_client = embedding_client
-
-    def register_task_completion_listener(
-        self,
-        listener: Callable[[Dict[str, Any]], None],
-    ) -> None:
-        """Register a non-blocking observer for completed asynchronous tasks.
-
-        Listeners receive task metadata only after the manager's domain lock has
-        been released.  They must not perform memory work synchronously; the
-        runtime uses this hook only to update its local scheduling state and
-        optionally enqueue follow-up tasks.
-        """
-        with self._task_completion_listener_lock:
-            if listener not in self._task_completion_listeners:
-                self._task_completion_listeners.append(listener)
-
-    def unregister_task_completion_listener(
-        self,
-        listener: Callable[[Dict[str, Any]], None],
-    ) -> None:
-        """Remove a previously registered asynchronous task observer."""
-        with self._task_completion_listener_lock:
-            self._task_completion_listeners = [
-                candidate
-                for candidate in self._task_completion_listeners
-                if candidate != listener
-            ]
-
-    def _emit_task_completion(self, event: Dict[str, Any]) -> None:
-        """Notify observers without allowing an observer failure to stop work."""
-        with self._task_completion_listener_lock:
-            listeners = list(self._task_completion_listeners)
-        for listener in listeners:
-            try:
-                listener(dict(event))
-            except Exception:
-                self._logger.exception(
-                    "Memory task completion listener failed task_kind=%s task_id=%s",
-                    event.get("task_kind"),
-                    event.get("task_id"),
-                )
-
-    def _task_worker_loop(self) -> None:
-        while not self._task_shutdown_event.is_set() or not self._task_queue.empty():
-            try:
-                task = self._task_queue.get(timeout=0.2)
-            except queue.Empty:
-                continue
-            task_kind = str(task.get("kind") or "")
-            task_id = str(task.get("task_id") or "")
-            started_at = float(task.get("started_at") or time.monotonic())
-            result: Any = None
-            error: Optional[BaseException] = None
-            try:
-                with self._memory_operation_lock:
-                    if task_kind == "memory_fact_extraction":
-                        result = self._process_memory_fact_extraction_task(**task["payload"])
-                    elif task_kind == "memory_episode_summary":
-                        result = self._process_memory_episode_summary_task(**task["payload"])
-                    elif task_kind == "memory_user_claim_update":
-                        result = self._process_memory_user_claim_update_task(**task["payload"])
-                    elif task_kind == "memory_user_intent_update":
-                        result = self._process_memory_user_intent_update_task(**task["payload"])
-                    elif task_kind == "memory_user_state_update":
-                        result = self._process_memory_user_state_update_task(**task["payload"])
-                    else:
-                        raise ValueError(f"Unsupported memory async task: {task_kind}")
-                self._operation_reporter.on_task_finished(
-                    operation_type=task_kind,
-                    task_id=task_id,
-                    started_at=started_at,
-                    result=result,
-                )
-            except Exception as exc:
-                error = exc
-                self._logger.exception("Async memory %s failed: %s", task.get("kind"), exc)
-                self._operation_reporter.on_task_finished(
-                    operation_type=task_kind,
-                    task_id=task_id,
-                    started_at=started_at,
-                    error=exc,
-                )
-            finally:
-                self._emit_task_completion({
-                    "task_kind": task_kind,
-                    "task_id": task_id,
-                    "result": result,
-                    "error": error,
-                    "succeeded": error is None and self._operation_reporter._operation_succeeded(
-                        task_kind,
-                        result,
-                    ),
-                    "completion_context": dict(
-                        task.get("completion_context") or {}
-                    ),
-                })
-                self._task_queue.task_done()
-
-    def _ensure_task_worker_locked(self) -> None:
-        if self._task_worker_thread and self._task_worker_thread.is_alive():
-            return
-        self._task_worker_thread = threading.Thread(
-            target=self._task_worker_loop,
-            daemon=True,
-            name="memory-node-worker",
-        )
-        self._task_worker_thread.start()
 
     def _submit_memory_task(
         self,
@@ -989,111 +841,23 @@ class MemoryNodeManager:
         payload: Dict[str, Any],
         completion_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        task_id = self._operation_reporter.next_task_id(task_kind)
-        with self._task_worker_lock:
-            if self._task_shutdown_event.is_set():
-                self._logger.warning("Memory worker is shut down; dropping %s task", task_kind)
-                return self._reject_memory_task(
-                    task_kind=task_kind,
-                    task_id=task_id,
-                    reason="worker_shutdown",
-                )
-            try:
-                self._task_queue.put_nowait({
-                    "kind": task_kind,
-                    "payload": payload,
-                    "task_id": task_id,
-                    "started_at": time.monotonic(),
-                    "completion_context": dict(completion_context or {}),
-                })
-            except queue.Full:
-                self._logger.warning(
-                    "Memory task queue is full; dropping %s (maxsize=%d)",
-                    task_kind,
-                    self._task_queue_maxsize,
-                )
-                return self._reject_memory_task(
-                    task_kind=task_kind,
-                    task_id=task_id,
-                    reason="worker_queue_full",
-                )
-            self._operation_reporter.on_task_submitted(
-                operation_type=task_kind,
-                task_id=task_id,
-                payload={
-                    key: value
-                    for key, value in payload.items()
-                    if key not in {"units", "preceding_context_units"}
-                },
-            )
-            self._ensure_task_worker_locked()
-        return {
-            "queued": True,
-            "status": "queued",
-            "task_id": task_id,
-            "operation_type": task_kind,
-        }
-
-    def _reject_memory_task(
-        self,
-        *,
-        task_kind: str,
-        task_id: str,
-        reason: str,
-    ) -> Dict[str, Any]:
-        self._operation_reporter.on_task_rejected(
-            operation_type=task_kind,
-            task_id=task_id,
-            reason=reason,
+        submission = self._task_scheduler.submit(
+            task_kind,
+            payload,
+            completion_context=completion_context,
+            report_payload={
+                key: value
+                for key, value in payload.items()
+                if key not in {"units", "preceding_context_units"}
+            },
         )
-        return {
-            "queued": False,
-            "status": "rejected",
-            "reason": reason,
-            "task_id": task_id,
-            "operation_type": task_kind,
-        }
-
-    def flush_task_queue(self, timeout: Optional[float] = None) -> bool:
-        """Wait until all queued asynchronous memory tasks finish."""
-        deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
-        while self._task_queue.unfinished_tasks:
-            if deadline is not None and time.monotonic() >= deadline:
-                return False
-            time.sleep(0.01)
-        return True
-
-    def shutdown_task_worker(
-        self,
-        *,
-        wait: bool = True,
-        timeout: Optional[float] = None,
-    ) -> bool:
-        """Stop accepting tasks and optionally drain the memory worker.
-
-        When ``wait`` is true, do not report shutdown as successful until every
-        queued task has called ``task_done`` and the worker thread has exited.
-        This is important because callers close the database immediately after
-        shutdown; closing it while an entity-claim transaction is still running
-        rolls back all state updates made by that transaction.
-        """
-        with self._task_worker_lock:
-            self._task_shutdown_event.set()
-            worker = self._task_worker_thread
-        if not wait or worker is None:
-            return not self._task_queue.unfinished_tasks
-
-        deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
-        while self._task_queue.unfinished_tasks:
-            if not worker.is_alive():
-                return False
-            if deadline is not None and time.monotonic() >= deadline:
-                return False
-            time.sleep(0.01)
-
-        remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
-        worker.join(timeout=remaining)
-        return not worker.is_alive() and not self._task_queue.unfinished_tasks
+        if not submission["queued"]:
+            self._logger.warning(
+                "Memory task rejected task_kind=%s reason=%s",
+                task_kind,
+                submission["reason"],
+            )
+        return submission
 
     def submit_memory_fact_extraction_task(
         self,
@@ -1106,12 +870,7 @@ class MemoryNodeManager:
         """Queue one typed unit batch for ordered fact extraction."""
         if not self._memory_enabled or not units:
             reason = "memory_disabled" if not self._memory_enabled else "no_units"
-            task_id = self._operation_reporter.next_task_id("memory_fact_extraction")
-            return self._reject_memory_task(
-                task_kind="memory_fact_extraction",
-                task_id=task_id,
-                reason=reason,
-            )
+            return self._task_scheduler.reject("memory_fact_extraction", reason)
         return self._submit_memory_task(
             task_kind="memory_fact_extraction",
             payload={
@@ -1129,9 +888,8 @@ class MemoryNodeManager:
     ) -> Dict[str, Any]:
         """Queue episode summarization after preceding fact-store tasks."""
         if not self._memory_enabled:
-            task_id = self._operation_reporter.next_task_id("memory_episode_summary")
-            return self._reject_memory_task(
-                task_kind="memory_episode_summary", task_id=task_id, reason="memory_disabled"
+            return self._task_scheduler.reject(
+                "memory_episode_summary", "memory_disabled"
             )
         return self._submit_memory_task(
             task_kind="memory_episode_summary",
@@ -1701,64 +1459,7 @@ class MemoryNodeManager:
         }
 
     def _call_llm(self, prompt: str) -> Optional[str]:
-        if (
-            not self._llm_api_key
-            or not self._llm_base_url
-            or str(self._llm_base_url).strip().lower() == "none"
-        ):
-            self._logger.debug(
-                "Skipping LLM call because llm_api_key or llm_base_url is not configured"
-            )
-            return None
-        url = f"{self._llm_base_url.rstrip('/')}/chat/completions"
-        headers = {"Content-Type": "application/json"}
-        if self._llm_api_key:
-            headers["Authorization"] = f"Bearer {self._llm_api_key}"
-        payload: Dict[str, Any] = {
-            "model": self._llm_model,
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.2,
-            "stream": False,
-            "max_tokens": 4096,
-        }
-        if self._llm_json_mode:
-            payload["response_format"] = {"type": "json_object"}
-        if self._llm_thinking in {"disabled", "enabled"}:
-            payload["thinking"] = {"type": self._llm_thinking}
-
-        attempts = [payload]
-        if "thinking" in payload:
-            stripped = dict(payload)
-            stripped.pop("thinking", None)
-            attempts.append(stripped)
-        if "response_format" in payload:
-            stripped = dict(payload)
-            stripped.pop("response_format", None)
-            attempts.append(stripped)
-
-        seen = set()
-        for item in attempts:
-            marker = json.dumps(sorted(item.keys()), ensure_ascii=False)
-            if marker in seen:
-                continue
-            seen.add(marker)
-            try:
-                response = requests.post(url, json=item, headers=headers, timeout=self._llm_timeout)
-                response.raise_for_status()
-                data = response.json()
-                choices = data.get("choices") or []
-                if choices:
-                    message = choices[0].get("message") or {}
-                    content = message.get("content")
-                    if content:
-                        return str(content)
-            except requests.RequestException as exc:
-                text = str(exc).lower()
-                if "response_format" in text or "json" in text or "thinking" in text:
-                    continue
-                self._logger.warning("Unified memory LLM call failed: %s", exc)
-                return None
-        return None
+        return self._llm_client.complete(prompt)
 
     @staticmethod
     def _parse_json_object_from_llm_text(text: str) -> Optional[Dict[str, Any]]:
@@ -2914,13 +2615,8 @@ class MemoryNodeManager:
         """Queue an entity-claim update after accepted memory tasks."""
         completion_context = kwargs.pop("completion_context", None)
         if not self._memory_enabled:
-            task_id = self._operation_reporter.next_task_id(
-                "memory_user_claim_update"
-            )
-            return self._reject_memory_task(
-                task_kind="memory_user_claim_update",
-                task_id=task_id,
-                reason="memory_disabled",
+            return self._task_scheduler.reject(
+                "memory_user_claim_update", "memory_disabled",
             )
         return self._submit_memory_task(
             task_kind="memory_user_claim_update",
@@ -2936,11 +2632,10 @@ class MemoryNodeManager:
         """Queue a future-commitment projection after committed fact evidence."""
         completion_context = kwargs.pop("completion_context", None)
         if not self._memory_enabled or not self._enable_memory_user_intent_update:
-            task_id = self._operation_reporter.next_task_id("memory_user_intent_update")
-            return self._reject_memory_task(
-                task_kind="memory_user_intent_update",
-                task_id=task_id,
-                reason=("memory_disabled" if not self._memory_enabled else "user_intent_update_disabled"),
+            return self._task_scheduler.reject(
+                "memory_user_intent_update",
+                "memory_disabled"
+                if not self._memory_enabled else "user_intent_update_disabled",
             )
         return self._submit_memory_task(
             task_kind="memory_user_intent_update",
@@ -2951,182 +2646,6 @@ class MemoryNodeManager:
                 else None
             ),
         )
-
-    def submit_memory_user_state_update_task(
-        self,
-        *,
-        changed_claim_ids: Optional[Sequence[int]] = None,
-        changed_intent_objects: Optional[Sequence[Dict[str, Any]]] = None,
-        reference_timestamp: Optional[Any] = None,
-        runtime_context: Optional[Dict[str, Any]] = None,
-        completion_context: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        """Queue a bounded incremental user-state projection."""
-        if not self._memory_enabled or not self._enable_memory_user_state_update:
-            task_id = self._operation_reporter.next_task_id("memory_user_state_update")
-            return self._reject_memory_task(
-                task_kind="memory_user_state_update",
-                task_id=task_id,
-                reason=(
-                    "memory_disabled"
-                    if not self._memory_enabled else "user_state_update_disabled"
-                ),
-            )
-        claim_ids = sorted({
-            int(value)
-            for value in changed_claim_ids or []
-            if str(value).strip().isdigit() and int(value) > 0
-        })
-        intent_objects = [
-            dict(value)
-            for value in changed_intent_objects or []
-            if isinstance(value, dict)
-        ]
-        if not claim_ids and not intent_objects:
-            task_id = self._operation_reporter.next_task_id("memory_user_state_update")
-            return self._reject_memory_task(
-                task_kind="memory_user_state_update",
-                task_id=task_id,
-                reason="no_changed_state_evidence",
-            )
-        return self._submit_memory_task(
-            task_kind="memory_user_state_update",
-            payload={
-                "changed_claim_ids": claim_ids,
-                "changed_intent_objects": intent_objects,
-                "reference_timestamp": reference_timestamp,
-                "runtime_context": dict(runtime_context or {}),
-            },
-            completion_context=completion_context,
-        )
-
-    def get_user_states(
-        self,
-        *,
-        state_domains: Optional[Sequence[str]] = None,
-        state_classes: Optional[Sequence[str]] = None,
-        statuses: Optional[Sequence[str]] = None,
-    ) -> List[Dict[str, Any]]:
-        """Read durable states written by incremental update tasks."""
-        with self._memory_operation_lock:
-            return self._user_state_resolver.get_current_states(
-                user_entity_id=self._intent_world_owner_entity_id(),
-                state_domains=state_domains,
-                state_classes=state_classes,
-                statuses=statuses,
-            )
-
-    def _process_memory_user_state_update_task(
-        self,
-        *,
-        changed_claim_ids: Optional[Sequence[int]] = None,
-        changed_intent_objects: Optional[Sequence[Dict[str, Any]]] = None,
-        reference_timestamp: Optional[Any] = None,
-        runtime_context: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        """Apply independently grounded User State deltas for each domain."""
-        owner_id = self._intent_world_owner_entity_id()
-        update_inputs = self._user_state_resolver.build_domain_update_inputs(
-            user_entity_id=owner_id,
-            changed_claim_ids=list(changed_claim_ids or []),
-            changed_intent_objects=list(changed_intent_objects or []),
-            reference_time=reference_timestamp,
-            runtime_context=runtime_context or {},
-            limit_per_domain=self._user_state_update_limit,
-        )
-        report: Dict[str, Any] = {
-            "status": "empty",
-            "domain_count": len(update_inputs),
-            "changed_claim_count": sum(
-                len(item["changed_claims"]) for item in update_inputs.values()
-            ),
-            "changed_intent_object_count": sum(
-                len(item["changed_intent_objects"]) for item in update_inputs.values()
-            ),
-            "existing_state_count": sum(
-                len(item["existing_states"]) for item in update_inputs.values()
-            ),
-            "operation_count": 0,
-            "created": 0,
-            "reinforced": 0,
-            "revised": 0,
-            "weakened": 0,
-            "expired": 0,
-            "state_ids": [],
-            "domain_reports": {},
-        }
-        if not update_inputs:
-            self._log_info("memory_user_state", "finish", report)
-            return report
-        failed_domain_count = 0
-        for state_domain, update_input in update_inputs.items():
-            domain_report: Dict[str, Any] = {
-                "changed_claim_count": len(update_input["changed_claims"]),
-                "changed_intent_object_count": len(update_input["changed_intent_objects"]),
-                "existing_state_count": len(update_input["existing_states"]),
-                "operation_count": 0,
-                "state_ids": [],
-            }
-            if not self._user_state_resolver.has_update_evidence(update_input):
-                domain_report["status"] = "empty"
-                report["domain_reports"][state_domain] = domain_report
-                continue
-            source_text = "\n".join([
-                *(str(item.get("claim_text") or "") for item in update_input["changed_claims"]),
-                *(str(item.get("summary") or "") for item in update_input["changed_intent_objects"]),
-            ])
-            language = self._resolve_prompt_language_from_text(source_text)
-            prompt_template = (
-                USER_STATE_UPDATE_PROMPT_EN if language == "en"
-                else USER_STATE_UPDATE_PROMPT_ZH
-            )
-            prompt = prompt_template
-            for key in (
-                "state_domain", "reference_time", "runtime_context", "existing_states",
-                "changed_claims", "changed_intent_objects", "active_intent_objects",
-            ):
-                value = update_input[key]
-                serialized = (
-                    json.dumps(value, ensure_ascii=False, indent=2)
-                    if isinstance(value, (dict, list)) else str(value or "")
-                )
-                prompt = prompt.replace("{" + key + "}", serialized)
-            parsed = self._parse_json_object_from_llm_text(
-                self._call_llm(prompt) or ""
-            )
-            if parsed is None or not isinstance(parsed.get("operations"), list):
-                domain_report.update({
-                    "status": "error",
-                    "error": "invalid_llm_user_state_update_response",
-                })
-                failed_domain_count += 1
-                report["domain_reports"][state_domain] = domain_report
-                continue
-            operations = self._user_state_resolver.normalize_operations(
-                parsed["operations"], update_input=update_input,
-            )
-            if not operations:
-                domain_report["status"] = "ok"
-                report["domain_reports"][state_domain] = domain_report
-                continue
-            with self._db.transaction():
-                applied = self._user_state_resolver.apply_operations(
-                    user_entity_id=owner_id,
-                    operations=operations,
-                    reference_time=update_input["reference_time"],
-                )
-            domain_report.update(applied)
-            domain_report["status"] = "ok"
-            report["domain_reports"][state_domain] = domain_report
-            for key in ("operation_count", "created", "reinforced", "revised", "weakened", "expired"):
-                report[key] += int(applied.get(key) or 0)
-            report["state_ids"].extend(applied.get("state_ids") or [])
-        report["state_ids"] = sorted(set(report["state_ids"]))
-        report["status"] = "error" if failed_domain_count == len(update_inputs) else "ok"
-        if failed_domain_count:
-            report["failed_domain_count"] = failed_domain_count
-        self._log_info("memory_user_state", "finish", report)
-        return report
 
     def _process_memory_user_claim_update_task(
         self,
@@ -3184,10 +2703,10 @@ class MemoryNodeManager:
         affected_claim_ids = list(claim_report.get("affected_claim_ids") or [])
         report["affected_claim_ids"] = affected_claim_ids
         if affected_claim_ids:
-            report["user_state_update_task"] = self.submit_memory_user_state_update_task(
-                changed_claim_ids=affected_claim_ids,
-                reference_timestamp=reference_timestamp,
-            )
+            report["user_state_update_request"] = {
+                "changed_claim_ids": affected_claim_ids,
+                "reference_timestamp": reference_timestamp,
+            }
         self._log_info("memory_user_claim", "finish", report)
         return report
 
@@ -3363,10 +2882,10 @@ class MemoryNodeManager:
             else "ok"
         )
         if report["affected_objects"]:
-            report["user_state_update_task"] = self.submit_memory_user_state_update_task(
-                changed_intent_objects=report["affected_objects"],
-                reference_timestamp=reference_timestamp,
-            )
+            report["user_state_update_request"] = {
+                "changed_intent_objects": report["affected_objects"],
+                "reference_timestamp": reference_timestamp,
+            }
         self._log_info("memory_user_intent_update", "finish", report)
         return report
 

@@ -2,8 +2,8 @@
 """Build project memory for LoCoMo and emit evaluator-compatible predictions.
 
 Each LoCoMo ``sample_id`` gets an isolated memory database.  The script replays
-the dated conversation sessions into :class:`MemoryNodeManager`, optionally
-reflects after sessions, recalls for every selected QA row, and asks a reader
+the dated conversation sessions through ``PersonWorldModel``, finalizes memory,
+recalls for every selected QA row, and asks a reader
 model for a concise answer.  The JSON output keeps LoCoMo's native
 ``[{"sample_id": ..., "qa": [...]}]`` structure and is consumable by
 ``task_eval/evaluate_qa.py --model hermes-memory --hermes-answers-file``.
@@ -33,12 +33,9 @@ for import_root in (SRC_ROOT, REPO_ROOT):
     if str(import_root) not in sys.path:
         sys.path.insert(0, str(import_root))
 
-from memory.memory_manager import (
-    DEFAULT_LLM_BASE_URL,
-    DEFAULT_LLM_MODEL,
-    MemoryOperationReporter,
-)
-from memory.memory_runtime import MemoryRuntime
+from llm_client import DEFAULT_LLM_BASE_URL, DEFAULT_LLM_MODEL
+from memory.memory_manager import MemoryOperationReporter
+from pwm_manager import PersonWorldModel
 from memory.config import split_memory_config
 from memory.utils import _as_embedding_vector
 import memory.memory_database as memory_database_module
@@ -125,9 +122,6 @@ def parse_args() -> argparse.Namespace:
         action="append",
         choices=("assistant_wakeup", "allday_recording"),
     )
-    parser.add_argument("--enable-reflect", action="store_true")
-    parser.add_argument("--reflect-every-sessions", type=int, default=1)
-    parser.add_argument("--reflect-limit", type=int, default=100)
     parser.add_argument(
         "--fact-extraction-interval",
         type=int,
@@ -412,62 +406,37 @@ def validate_runtime(manager: Any) -> None:
 
 
 def replay_sample_into_memory(
-    runtime: MemoryRuntime,
+    runtime: PersonWorldModel,
     sample: Dict[str, Any],
     sessions: Sequence[Tuple[int, datetime, str, List[Dict[str, Any]]]],
-    args: argparse.Namespace,
-) -> Tuple[LocomoReplayStats, int]:
+) -> LocomoReplayStats:
     sample_id = str(sample.get("sample_id") or "unknown_sample")
     seen_timestamps: set[str] = set()
-    dialog_turns = turn_pairs = orphan_turns = reflect_runs = 0
+    dialog_turns = turn_pairs = orphan_turns = 0
 
-    for session_position, (session_id, session_dt, date_text, turns) in enumerate(sessions, 1):
+    for session_id, session_dt, date_text, turns in sessions:
         dialog_turns += len(turns)
         pairs, orphaned = paired_dialog_turns(turns, date_text)
         orphan_turns += orphaned
         for pair_index, (user_message, assistant_response, dia_ids) in enumerate(pairs):
             turn_pairs += 1
-            report = runtime.accept_single_interaction_turn(
-                user_message,
-                assistant_response,
+            runtime.accept_memory_input(
+                interaction_turn={
+                    "user_message": user_message,
+                    "assistant_response": assistant_response,
+                    "turn_timestamp": unique_timestamp(
+                        session_dt + timedelta(seconds=pair_index), seen_timestamps
+                    ),
+                },
                 tags=["locomo", f"sample_id:{sample_id}", f"session_id:S{session_id}", *[f"dia_id:{dia_id}" for dia_id in dia_ids]],
-                turn_timestamp=unique_timestamp(session_dt + timedelta(seconds=pair_index), seen_timestamps),
             )
-        if args.enable_reflect and session_position % max(1, int(args.reflect_every_sessions)) == 0:
-            reflect_submit = runtime.trigger_memory_reflect(
-                limit=int(args.reflect_limit),
-                reflect_timestamp=unique_timestamp(
-                    session_dt + timedelta(seconds=max(1, len(pairs))),
-                    seen_timestamps,
-                ),
-            )
-            if reflect_submit.get("queued") and not runtime.flush_pending_memory_inputs():
-                raise RuntimeError("Timed out while draining queued memory reflect")
-            reflect_runs += 1
-
-    if runtime.has_pending_interaction_turns() and not runtime.flush_pending_memory_inputs():
-        raise RuntimeError("Timed out while draining queued memory stores")
-    if args.enable_reflect and sessions:
-        reflect_submit = runtime.trigger_memory_reflect(
-            limit=int(args.reflect_limit),
-            reflect_timestamp=unique_timestamp(
-                sessions[-1][1] + timedelta(seconds=3599),
-                seen_timestamps,
-            ),
-        )
-        if reflect_submit.get("queued") and not runtime.flush_pending_memory_inputs():
-            raise RuntimeError("Timed out while draining queued memory reflect")
-        reflect_runs += 1
-    if runtime.has_pending_interaction_turns():
-        logging.warning(
-            "Replay finished with %s pending turns for %s",
-            len(runtime.get_pending_interaction_turns()),
-            sample_id,
-        )
-    return (
-        LocomoReplayStats(dialog_turns, turn_pairs, 0, orphan_turns),
-        reflect_runs,
+    runtime.finalize_memory_session(
+        reason="locomo_history_complete",
+        tags=["locomo", f"sample_id:{sample_id}"],
     )
+    if not runtime.wait_for_memory_tasks():
+        raise RuntimeError("Timed out while draining queued memory tasks")
+    return LocomoReplayStats(dialog_turns, turn_pairs, 0, orphan_turns)
 
 
 def selected_qas(sample: Dict[str, Any], args: argparse.Namespace) -> List[Tuple[int, Dict[str, Any]]]:
@@ -493,10 +462,10 @@ def build_sample_memory_context(
         sample_state_dir,
         args.manager_log_level,
     ) as (memory_log_path, memory_logger):
-        runtime: Optional[MemoryRuntime] = None
+        runtime: Optional[PersonWorldModel] = None
         try:
             operation_reporter = MemoryOperationReporter()
-            runtime = MemoryRuntime(
+            runtime = PersonWorldModel(
                 db_path=db_path,
                 memory_runtime_config=memory_runtime_config,
                 memory_manager_config=memory_manager_config,
@@ -504,23 +473,31 @@ def build_sample_memory_context(
                 logger=memory_logger,
             )
             db = runtime.database
-            manager = runtime.manager
+            manager = runtime.memory_manager
             validate_runtime(manager)
             sessions = sorted_locomo_sessions(sample, int(args.max_sessions))
-            replay_stats, _ = replay_sample_into_memory(runtime, sample, sessions, args)
-            if not runtime.flush_pending_memory_inputs():
-                raise RuntimeError("Timed out while draining queued memory stores")
+            replay_stats = replay_sample_into_memory(runtime, sample, sessions)
             memory_operation_report = operation_reporter.snapshot()
             operation_counts = memory_operation_report.get("counts") or {}
-            store_operation_report = operation_counts.get("memormemory_fact_extractiony_store") or {}
-            reflect_operation_report = operation_counts.get("memory_reflect") or {}
+            store_operation_report = operation_counts.get("memory_fact_extraction") or {}
+            derived_reports = [
+                operation_counts.get(kind) or {}
+                for kind in (
+                    "memory_user_claim_update",
+                    "memory_user_intent_update",
+                    "memory_user_state_update",
+                )
+            ]
             replay_stats = LocomoReplayStats(
                 replay_stats.dialog_turns_total,
                 replay_stats.turn_pairs_total,
                 int(store_operation_report.get("succeeded") or 0),
                 replay_stats.orphan_dialog_turns,
             )
-            reflect_runs = int(reflect_operation_report.get("submitted") or 0)
+            derived_task_runs = sum(int(item.get("submitted") or 0) for item in derived_reports)
+            derived_total_elapsed_ms = sum(
+                float(item.get("total_elapsed_ms") or 0.0) for item in derived_reports
+            )
             counts = db_counts(db)
             recall_time_end = format_memory_time(
                 sessions[-1][1] + timedelta(hours=1)
@@ -571,19 +548,19 @@ def build_sample_memory_context(
                     "replayed_turn_pairs": replay_stats.turn_pairs_total,
                     "turn_pairs_with_stored_facts": replay_stats.stored_pairs,
                     "orphan_dialog_turns": replay_stats.orphan_dialog_turns,
-                    "reflect_runs": reflect_runs,
+                    "derived_task_runs": derived_task_runs,
                     "db_counts": counts,
                     "store_turn_calls": replay_stats.turn_pairs_total,
                     "store_flushes": int(store_operation_report.get("submitted") or 0),
                     "store_total_elapsed_ms": float(store_operation_report.get("total_elapsed_ms") or 0.0),
-                    "reflect_total_elapsed_ms": float(reflect_operation_report.get("total_elapsed_ms") or 0.0),
+                    "derived_total_elapsed_ms": derived_total_elapsed_ms,
                     "recall_total_elapsed_ms": float(
                         operation_reporter.operation_report("recall").get("total_elapsed_ms") or 0.0
                     ),
                     "memory_operation_report": operation_reporter.snapshot(),
                     "memory_total_elapsed_ms": round(
                         float(store_operation_report.get("total_elapsed_ms") or 0.0)
-                        + float(reflect_operation_report.get("total_elapsed_ms") or 0.0)
+                        + derived_total_elapsed_ms
                         + float(operation_reporter.operation_report("recall").get("total_elapsed_ms") or 0.0),
                         2,
                     ),

@@ -2,7 +2,7 @@
 """Run project memory retrieval on LongMemEval and emit evaluator JSONL.
 
 This script builds an isolated memory DB per benchmark instance, replays the
-timestamped history into ``MemoryNodeManager``, runs reflection, recalls memory
+timestamped history through ``PersonWorldModel``, completes derived tasks, recalls memory
 for the benchmark question, and uses a reader LLM to produce a final
 ``hypothesis`` answer. It can also reuse an existing per-question memory DB to
 run only recall and reader answering.
@@ -36,12 +36,9 @@ for import_root in (SRC_ROOT, REPO_ROOT):
     if str(import_root) not in sys.path:
         sys.path.insert(0, str(import_root))
 
-from memory.memory_manager import (
-    DEFAULT_LLM_BASE_URL,
-    DEFAULT_LLM_MODEL,
-    MemoryOperationReporter,
-)
-from memory.memory_runtime import MemoryRuntime
+from llm_client import DEFAULT_LLM_BASE_URL, DEFAULT_LLM_MODEL
+from memory.memory_manager import MemoryOperationReporter
+from pwm_manager import PersonWorldModel
 from memory.config import split_memory_config
 from memory.utils import _as_embedding_vector
 import memory.memory_database as memory_database_module
@@ -86,7 +83,7 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Reuse existing per-question DBs from "
             "<dir>/<question_id>/memory.db. When set, skip history replay, "
-            "store, and reflect; only rerun recall and reader answering."
+            "store, and derived updates; only rerun recall and reader answering."
         ),
     )
     parser.add_argument("--log-path", type=Path)
@@ -193,29 +190,12 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--enable-reflect",
-        action="store_true",
-        help='Enable reflect',
-    )
-    parser.add_argument(
         "--enable-feedback-analysis",
         action="store_true",
         help=(
             "Enable interpretation-feedback analysis and related recall-event "
             "tracking inside MemoryNodeManager during benchmark replay/recall."
         ),
-    )
-    parser.add_argument(
-        "--reflect-every-sessions",
-        type=int,
-        default=1,
-        help="Run reflect after every N replayed sessions. Default: 1.",
-    )
-    parser.add_argument(
-        "--reflect-limit",
-        type=int,
-        default=100,
-        help="Limit passed to memory reflection.",
     )
     parser.add_argument(
         "--fact-extraction-interval",
@@ -1039,12 +1019,9 @@ def answer_question_with_reader(
 
 def replay_sessions_into_memory(
     *,
-    runtime: MemoryRuntime,
+    runtime: PersonWorldModel,
     item: Dict[str, Any],
     sessions: Sequence[Tuple[str, datetime, List[Dict[str, Any]], int]],
-    enable_reflect: bool,
-    reflect_every_sessions: int,
-    reflect_limit: int,
 ) -> SessionReplayStats:
     seen_timestamps: set[str] = set()
     turn_pairs_total = 0
@@ -1062,9 +1039,12 @@ def replay_sessions_into_memory(
                 session_dt + timedelta(seconds=pair_index),
                 seen_keys=seen_timestamps,
             )
-            runtime.accept_single_interaction_turn(
-                user_message,
-                assistant_response,
+            runtime.accept_memory_input(
+                interaction_turn={
+                    "user_message": user_message,
+                    "assistant_response": assistant_response,
+                    "turn_timestamp": turn_dt,
+                },
                 tags=[
                     "longmemeval",
                     f"question_type:{item.get('question_type')}",
@@ -1072,43 +1052,13 @@ def replay_sessions_into_memory(
                     f"session_id:{session_id}",
                     f"session_index:{session_position}",
                 ],
-                turn_timestamp=turn_dt,
             )
-
-        if enable_reflect and session_position % reflect_every_sessions == 0:
-            reflect_ts = normalize_unique_timestamp(
-                session_dt + timedelta(seconds=max(len(pairs), 1)),
-                seen_keys=seen_timestamps,
-            )
-            reflect_submit = runtime.trigger_memory_reflect(
-                limit=reflect_limit,
-                reflect_timestamp=reflect_ts,
-            )
-            if reflect_submit.get("queued") and not runtime.wait_for_memory_tasks():
-                raise RuntimeError("Timed out while draining queued memory reflect")
-    
-    if enable_reflect and sessions:
-        final_ts = normalize_unique_timestamp(
-            sessions[-1][1] + timedelta(seconds=3599),
-            seen_keys=seen_timestamps,
-        )
-        reflect_submit = runtime.trigger_memory_reflect(
-            limit=reflect_limit,
-            reflect_timestamp=final_ts,
-        )
-        if reflect_submit.get("queued") and not runtime.wait_for_memory_tasks():
-            raise RuntimeError("Timed out while draining queued memory reflect")
-    
-    if runtime.has_pending_interaction_turns():
-        pending_before_flush = len(runtime.get_pending_interaction_turns())
-        if not runtime.flush_pending_memory_inputs():
-            raise RuntimeError("Timed out while draining queued memory stores")
-        if runtime.has_pending_interaction_turns():
-            logging.warning(
-                "Replay finished with %s pending turns still buffered. "
-                "The final batch could not be force-stored.",
-                pending_before_flush,
-            )
+    runtime.finalize_memory_session(
+        reason="longmemeval_history_complete",
+        tags=["longmemeval", f"question_id:{item.get('question_id')}"],
+    )
+    if not runtime.wait_for_memory_tasks():
+        raise RuntimeError("Timed out while draining queued memory tasks")
 
     return SessionReplayStats(
         turn_pairs_total=turn_pairs_total,
@@ -1155,10 +1105,10 @@ def build_instance_memory_context(
             question_id,
             db_path,
         )
-        runtime: Optional[MemoryRuntime] = None
+        runtime: Optional[PersonWorldModel] = None
         try:
             operation_reporter = MemoryOperationReporter()
-            runtime = MemoryRuntime(
+            runtime = PersonWorldModel(
                 db_path=db_path,
                 memory_runtime_config=memory_runtime_config,
                 memory_manager_config=memory_manager_config,
@@ -1166,7 +1116,7 @@ def build_instance_memory_context(
                 logger=memory_logger,
             )
             db = runtime.database
-            manager = runtime.manager
+            manager = runtime.memory_manager
             validate_runtime(manager)
 
             sessions = sorted_history_sessions(item, max_sessions=int(args.max_sessions))
@@ -1181,15 +1131,10 @@ def build_instance_memory_context(
                     runtime=runtime,
                     item=item,
                     sessions=sessions,
-                    enable_reflect=args.enable_reflect,
-                    reflect_every_sessions=max(1, int(args.reflect_every_sessions)),
-                    reflect_limit=int(args.reflect_limit),
                 )
-            if not runtime.flush_pending_memory_inputs():
-                raise RuntimeError("Timed out while draining queued memory stores")
             if not runtime.wait_for_memory_tasks():
                 raise RuntimeError(
-                    "Timed out while draining queued memory store and reflect tasks"
+                    "Timed out while draining queued memory tasks"
                 )
             effective_question_dt = effective_question_datetime(question_dt, sessions)
             effective_question_date_text = format_memory_time(effective_question_dt)
@@ -1202,16 +1147,23 @@ def build_instance_memory_context(
             memory_operation_report = operation_reporter.snapshot()
             operation_counts = memory_operation_report.get("counts") or {}
             store_operation_report = operation_counts.get("memory_fact_extraction") or {}
-            reflect_operation_report = operation_counts.get("memory_reflect") or {}
+            derived_reports = [
+                operation_counts.get(kind) or {}
+                for kind in (
+                    "memory_user_claim_update",
+                    "memory_user_intent_update",
+                    "memory_user_state_update",
+                )
+            ]
             recall_operation_report = operation_counts.get("recall") or {}
             store_turn_calls = replay_stats.turn_pairs_total
             stored_pairs = int(store_operation_report.get("submitted") or 0)
-            reflect_runs = int(reflect_operation_report.get("submitted") or 0)
+            derived_task_runs = sum(int(item.get("submitted") or 0) for item in derived_reports)
             store_total_elapsed_ms = float(
                 store_operation_report.get("total_elapsed_ms") or 0.0
             )
-            reflect_total_elapsed_ms = float(
-                reflect_operation_report.get("total_elapsed_ms") or 0.0
+            derived_total_elapsed_ms = sum(
+                float(item.get("total_elapsed_ms") or 0.0) for item in derived_reports
             )
             recall_total_elapsed_ms = float(
                 recall_operation_report.get("total_elapsed_ms")
@@ -1231,7 +1183,7 @@ def build_instance_memory_context(
                 "turn_pairs_with_stored_facts": stored_pairs,
                 "skipped_assistant_only_turns": replay_stats.skipped_assistant_only,
                 "orphan_user_chunks": replay_stats.orphan_user_chunks,
-                "reflect_runs": reflect_runs,
+                "derived_task_runs": derived_task_runs,
                 "db_path": str(db_path),
                 "reused_existing_db": reused_existing_db,
                 "memory_log_path": str(memory_log_path),
@@ -1254,11 +1206,11 @@ def build_instance_memory_context(
                 "store_episode_submitted": stored_pairs,
                 "store_flushes": stored_pairs,
                 "store_total_elapsed_ms": store_total_elapsed_ms,
-                "reflect_total_elapsed_ms": reflect_total_elapsed_ms,
+                "derived_total_elapsed_ms": derived_total_elapsed_ms,
                 "recall_total_elapsed_ms": recall_total_elapsed_ms,
                 "memory_total_elapsed_ms": round(
                     store_total_elapsed_ms
-                    + reflect_total_elapsed_ms
+                    + derived_total_elapsed_ms
                     + recall_total_elapsed_ms,
                     2,
                 ),
@@ -1596,7 +1548,6 @@ def main() -> int:
         "recall_budget": args.recall_budget,
         "recall_memory_source_override": list(args.recall_memory_source or []),
         "feedback_analysis_enabled": args.enable_feedback_analysis,
-        "reflect_every_sessions": args.reflect_every_sessions,
         "fact_extraction_interval": args.fact_extraction_interval,
     }
     print(json.dumps(summary, ensure_ascii=False, indent=2))
