@@ -14,6 +14,7 @@ internal model is deliberately unified:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import math
@@ -1460,7 +1461,7 @@ class MemoryNodeManager:
                     "primary_entity": fact.get("primary_entity"),
                     "fact_root_topic": fact.get("fact_root_topic") or "",
                     "fact_aspect_topic": fact.get("fact_aspect_topic") or "",
-                    "user_claim_signal": fact.get("user_claim_signal") or [],
+                    "user_claim_signals": fact.get("user_claim_signals") or [],
                     "user_intent_signals": fact.get("user_intent_signals") or [],
                     "importance": fact.get("importance"),
                     "confidence": fact.get("confidence"),
@@ -1933,8 +1934,9 @@ class MemoryNodeManager:
                 fallback_root_topic=fact_topic_fallback,
                 fallback_aspect_topic=fact_topic_fallback,
             )
-            user_claim_signal = self._normalize_user_claim_signal(
-                raw_fact.get("user_claim_signal"),
+            user_claim_signals = self._normalize_user_claim_signal(
+                raw_fact.get("user_claim_signals"),
+                allows_world_owner_reference=allows_world_owner_reference,
             )
             user_intent_signals = self._normalize_user_intent_signals(
                 raw_fact.get("user_intent_signals"),
@@ -1951,7 +1953,7 @@ class MemoryNodeManager:
                 "entities": entities,
                 "entity_descriptors": entity_descriptors,
                 "primary_entity": primary_entity,
-                "user_claim_signal": user_claim_signal,
+                "user_claim_signals": user_claim_signals,
                 "user_intent_signals": user_intent_signals,
                 "fact_root_topic": fact_root_topic,
                 "fact_aspect_topic": fact_aspect_topic,
@@ -1962,7 +1964,10 @@ class MemoryNodeManager:
                     "priority": priority,
                     "time_confidence": _compact_whitespace(raw_fact.get("time_confidence") or "unknown"),
                     "where": _compact_whitespace(raw_fact.get("where") or ""),
-                    "has_world_owner_interaction": allows_world_owner_reference,
+                    "has_world_owner_interaction": bool(
+                        allows_world_owner_reference
+                        and self._world_owner_entity_name in entities
+                    ),
                 },
             })
             record_candidate(
@@ -2009,6 +2014,7 @@ class MemoryNodeManager:
         self,
         value: Any,
         *,
+        allows_world_owner_reference: bool = False,
         limit: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         if not isinstance(value, list):
@@ -2071,6 +2077,17 @@ class MemoryNodeManager:
                 entity_type = "OTHER"
             if not entity_name:
                 continue
+            # user_claim signals are evidence about the configured wearer
+            # only. A third-party entity may still appear in the fact or as
+            # the object of a relation, but cannot be the claim subject.
+            is_owner_reference = (
+                self._is_world_owner_entity_reference(entity_name)
+                or entity_name.lower() == self._world_owner_entity_name.lower()
+            )
+            if not allows_world_owner_reference or not is_owner_reference:
+                continue
+            entity_name = self._world_owner_entity_name
+            entity_type = "PERSON"
             entity_payload = {"name": entity_name, "type": entity_type}
             key = (
                 signal_kind,
@@ -2859,19 +2876,13 @@ class MemoryNodeManager:
                 self._fact_user_claim_signal_mapping_updates(fact_id, fact)
             )
             user_claim_signal_mapping_updates.extend(user_claim_updates)
-            if any(
-                str(item.get("signal_key") or "") != "__fact__"
-                for item in user_claim_updates
-            ):
+            if user_claim_updates:
                 user_claim_signal_fact_ids.append(fact_id)
             user_intent_updates = (
                 self._fact_user_intent_signal_mapping_updates(fact_id, fact)
             )
             user_intent_signal_mapping_updates.extend(user_intent_updates)
-            if any(
-                str(item.get("signal_key") or "") != "__fact__"
-                for item in user_intent_updates
-            ):
+            if user_intent_updates:
                 user_intent_signal_fact_ids.append(fact_id)
             topic_item_updates.extend(
                 self._build_memory_topic_item_updates(
@@ -2890,19 +2901,11 @@ class MemoryNodeManager:
             "fact_ids": fact_ids,
             "topic_item_updates": topic_item_updates,
             "user_claim_signal_fact_count": len(user_claim_signal_fact_ids),
-            "user_claim_signal_count": sum(
-                1
-                for item in user_claim_signal_mapping_updates
-                if str(item.get("signal_key") or "") != "__fact__"
-            ),
+            "user_claim_signal_count": len(user_claim_signal_mapping_updates),
             "user_intent_signal_fact_count": len(
                 user_intent_signal_fact_ids
             ),
-            "user_intent_signal_count": sum(
-                1
-                for item in user_intent_signal_mapping_updates
-                if str(item.get("signal_key") or "") != "__fact__"
-            ),
+            "user_intent_signal_count": len(user_intent_signal_mapping_updates),
         }
 
     # ── Entity-claim update: facts/episodes -> entity claims ─────────────
@@ -3167,10 +3170,10 @@ class MemoryNodeManager:
             "derived_claims_updated": int(
                 claim_report.get("derived", {}).get("updated", 0) or 0
             ),
-            "facts_marked_processed_for_memory_user_claim": int(
+            "facts_marked_processed_for_explicit_user_claim": int(
                 claim_report.get("explicit", {}).get("facts_marked_processed", 0) or 0
             ),
-            "facts_marked_processed_for_user_claim_induction": int(
+            "facts_marked_processed_for_inductive_user_claim": int(
                 claim_report.get("inductive", {}).get("facts_marked_processed", 0) or 0
             ),
             "total_elapsed_ms": round(
@@ -3234,7 +3237,7 @@ class MemoryNodeManager:
         user_intent_signals = [
             signal
             for fact in facts_by_id.values()
-            for signal in self._user_intent_signals_from_fact(fact)
+            for signal in self._get_user_intent_signals_from_fact(fact)
         ]
         report["user_intent_signal_count"] = len(user_intent_signals)
         if not user_intent_signals:
@@ -4145,7 +4148,7 @@ class MemoryNodeManager:
             }
 
         explicit_facts = self._db.get_unprocessed_facts(
-            processing_target="user_claim",
+            processing_target="explicit_user_claim",
             limit=limit,
             reference_timestamp=reference_timestamp,
             # ``created_at`` is wall-clock persistence time, whereas the
@@ -4173,14 +4176,14 @@ class MemoryNodeManager:
         # the idempotent claim reconciliation can retry the full local chain.
         if explicit_completed and derived_completed:
             explicit_report["facts_marked_processed"] = self._db.mark_facts_processed(
-                processing_target="user_claim",
+                processing_target="explicit_user_claim",
                 fact_ids=[fact.get("id") for fact in explicit_facts],
             )
         else:
             explicit_report["facts_marked_processed"] = 0
 
         induction_seed_facts = self._db.get_unprocessed_facts(
-            processing_target="user_claim_induction",
+            processing_target="inductive_user_claim",
             reference_timestamp=reference_timestamp,
             limit=max(1, min(limit, 100)),
             restrict_to_today=False,
@@ -4192,7 +4195,7 @@ class MemoryNodeManager:
         inductive_completed = bool(inductive_report.pop("completed", False))
         if inductive_completed:
             inductive_report["facts_marked_processed"] = self._db.mark_facts_processed(
-                processing_target="user_claim_induction",
+                processing_target="inductive_user_claim",
                 fact_ids=[fact.get("id") for fact in induction_seed_facts],
             )
         else:
@@ -4220,18 +4223,48 @@ class MemoryNodeManager:
             "affected_claim_ids": all_affected_claim_ids,
         }
 
-    def _claim_fact_prompt_view(self, fact: Dict[str, Any]) -> Dict[str, Any]:
+    def _claim_fact_prompt_view(
+        self,
+        fact: Dict[str, Any],
+    ) -> Dict[str, Any]:
         metadata = fact.get("metadata") if isinstance(fact.get("metadata"), dict) else {}
-        return {
+        entities = list(fact.get("entities") or [])
+        has_world_owner = bool(
+            metadata.get("has_world_owner_interaction")
+            and any(
+                _compact_whitespace(entity).lower()
+                == self._world_owner_entity_name.lower()
+                for entity in entities
+            )
+        )
+        prompt_view = {
             "fact_id": fact.get("id"),
             "summary": fact.get("summary") or "",
             "fact_type": fact.get("fact_type") or "",
-            "entities": fact.get("entities") or [],
+            "entities": entities,
+            "world_owner_entity": (
+                self._world_owner_entity_name if has_world_owner else ""
+            ),
             "primary_entity": fact.get("primary_entity") or metadata.get("primary_entity"),
             "keywords": fact.get("keywords") or [],
             "event_time": fact.get("event_time_key") or "",
             "dialogue_time": fact.get("dialogue_time_key") or "",
         }
+        prompt_view["user_claim_signals"] = [
+            {
+                "entity": {
+                    "name": _compact_whitespace(signal.get("subject") or ""),
+                    "type": "PERSON",
+                },
+                "signal_kind": str(signal.get("signal_kind") or ""),
+                "claim_type_hint": str(signal.get("claim_type_hint") or ""),
+                "claim_anchor": str(signal.get("claim_anchor") or ""),
+                "evidence_basis": str(signal.get("evidence_basis") or ""),
+                "confidence": float(signal.get("confidence") or 0.0),
+            }
+            for signal in self._get_user_claim_signals_from_fact(fact)
+        ]
+        return prompt_view
 
     def _sync_user_claim_recall_documents(
         self,
@@ -4572,9 +4605,18 @@ class MemoryNodeManager:
         facts_by_id: Dict[int, Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
         """Resolve new candidate claims before they become durable claims."""
+        candidate_subject_ids = [
+            candidate.get("subject_entity_id") for candidate in candidates or []
+        ]
+        subject_names = self._db.get_entity_names_by_ids(candidate_subject_ids)
         unique_candidates: List[Dict[str, Any]] = []
         seen: set[Tuple[Any, ...]] = set()
         for candidate in candidates:
+            subject_id = int(candidate.get("subject_entity_id") or 0)
+            if _compact_whitespace(subject_names.get(subject_id) or "").lower() != (
+                self._world_owner_entity_name.lower()
+            ):
+                continue
             key = (
                 candidate.get("subject_entity_id"), candidate.get("claim_type"),
                 candidate.get("predicate"), candidate.get("object_entity_id") or 0,
@@ -4702,7 +4744,10 @@ class MemoryNodeManager:
         )
         raw = self._call_llm(prompt_template.replace(
             "{facts}", json.dumps(
-                [self._claim_fact_prompt_view(fact) for fact in facts[:40]],
+                [
+                    self._claim_fact_prompt_view(fact)
+                    for fact in facts[:40]
+                ],
                 ensure_ascii=False, indent=2,
             ),
         ))
@@ -4771,20 +4816,35 @@ class MemoryNodeManager:
         claim_type = str(raw.get("claim_type") or "").strip().lower()
         if claim_type not in self._user_claim_types() - {"behavior_pattern"}:
             return None
-        subject = _compact_whitespace(raw.get("subject_entity") or "")
-        subject_id = entity_ids.get(subject)
-        primary_domain = self._normalize_primary_domain(raw.get("primary_domain"))
-        predicate = re.sub(r"[^a-z0-9_]+", "_", str(raw.get("predicate") or "").lower()).strip("_")
-        if not subject_id or not predicate or not primary_domain:
-            return None
         evidence_ids = list(dict.fromkeys(
             int(value) for value in (raw.get("evidence_fact_ids") or [])
             if str(value).strip().isdigit() and int(value) in facts_by_id
         ))[:12]
-        if not evidence_ids or not all(
-            subject in (facts_by_id[fact_id].get("entities") or [])
+        if not evidence_ids:
+            return None
+        subject = _compact_whitespace(raw.get("subject_entity") or "")
+        if self._is_world_owner_entity_reference(subject):
+            subject = self._world_owner_entity_name
+        if subject.lower() != self._world_owner_entity_name.lower():
+            return None
+        # A claim can only be grounded in facts whose source metadata
+        # explicitly identifies the wearer, and whose normalized entities
+        # retain that exact subject.
+        if not all(
+            isinstance(facts_by_id[fact_id].get("metadata"), dict)
+            and bool(
+                facts_by_id[fact_id]["metadata"].get(
+                    "has_world_owner_interaction"
+                )
+            )
+            and subject in (facts_by_id[fact_id].get("entities") or [])
             for fact_id in evidence_ids
         ):
+            return None
+        subject_id = entity_ids.get(subject)
+        primary_domain = self._normalize_primary_domain(raw.get("primary_domain"))
+        predicate = re.sub(r"[^a-z0-9_]+", "_", str(raw.get("predicate") or "").lower()).strip("_")
+        if not subject_id or not predicate or not primary_domain:
             return None
         object_name = _compact_whitespace(raw.get("object_entity") or "")
         object_id = entity_ids.get(object_name) if object_name else None
@@ -4849,11 +4909,25 @@ class MemoryNodeManager:
         }
         if not affected_ids:
             return report
+        changed_claims = self._db.get_user_claims_by_ids(affected_ids)
+        subject_ids = [
+            claim.get("subject_entity_id") for claim in changed_claims
+        ]
+        subject_names = self._db.get_entity_names_by_ids(subject_ids)
+        world_owner_ids = {
+            entity_id for entity_id, name in subject_names.items()
+            if _compact_whitespace(name).lower()
+            == self._world_owner_entity_name.lower()
+        }
+        if not world_owner_ids:
+            return report
+        world_owner_entity_id = min(world_owner_ids)
         seed_claims = [
             claim
-            for claim in self._db.get_user_claims_by_ids(affected_ids)
+            for claim in changed_claims
             if claim.get("claim_origin") == "explicit"
             and claim.get("status") == "active"
+            and int(claim.get("subject_entity_id") or 0) == world_owner_entity_id
         ]
         report["seed_claim_count"] = len(seed_claims)
         if not seed_claims:
@@ -4875,6 +4949,7 @@ class MemoryNodeManager:
         for entity_id, changed_claims in changed_by_entity.items():
             related_claims = self._retrieve_related_derived_explicit_claims(
                 entity_id=entity_id,
+                world_owner_entity_id=world_owner_entity_id,
                 changed_claims=changed_claims,
             )
             report["input_claim_count"] += len(changed_claims) + len(related_claims)
@@ -4909,9 +4984,10 @@ class MemoryNodeManager:
         self,
         *,
         entity_id: int,
+        world_owner_entity_id: int,
         changed_claims: Sequence[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
-        """Load historical active explicit claims touching the anchor entity."""
+        """Load user-self explicit claims touching the anchor entity."""
         changed_claim_ids = {
             int(claim["id"])
             for claim in changed_claims
@@ -4925,7 +5001,11 @@ class MemoryNodeManager:
             limit=32,
         ):
             claim_id = int(claim["id"])
-            if claim_id not in changed_claim_ids:
+            if (
+                claim_id not in changed_claim_ids
+                and int(claim.get("subject_entity_id") or 0)
+                == int(world_owner_entity_id)
+            ):
                 claims_by_id[claim_id] = claim
         return sorted(
             claims_by_id.values(),
@@ -5111,6 +5191,10 @@ class MemoryNodeManager:
             object_entity_id and object_entity_id not in entity_ids
         ):
             return None
+        if _compact_whitespace(
+            entity_names.get(subject_entity_id) or ""
+        ).lower() != self._world_owner_entity_name.lower():
+            return None
         claim_type = str(raw.get("claim_type") or "").strip().lower()
         if claim_type not in {"affiliation", "relationship", "constraint"}:
             return None
@@ -5232,7 +5316,15 @@ class MemoryNodeManager:
             fact_id = int(fact.get("id") or 0)
             if fact_id <= 0:
                 continue
-            for signal_mapping in self._user_claim_signals_from_fact(fact):
+            for signal_mapping in self._get_user_claim_signals_from_fact(fact):
+                if _compact_whitespace(signal_mapping.get("subject") or "").lower() != (
+                    self._world_owner_entity_name.lower()
+                ):
+                    continue
+                if str(signal_mapping.get("claim_type_hint") or "") not in {
+                    "preference", "behavior_pattern",
+                }:
+                    continue
                 key = (
                     int(signal_mapping["subject_entity_id"]),
                     str(signal_mapping["claim_type_hint"]),
@@ -5283,26 +5375,6 @@ class MemoryNodeManager:
                 return report
             by_id = {int(fact["id"]): fact for fact in evidence_facts}
             applied = self._reconcile_user_claims(outcome, facts_by_id=by_id)
-            for item in applied:
-                claim = item["claim"]
-                if item["effective_origin"] != "inductive":
-                    continue
-                support_ids = self._user_claim_support_ids(claim)
-                if not support_ids:
-                    continue
-                claim_id = int(item["claim_id"])
-                support_summary = self._db.get_user_claim_support_fact_summary(
-                    claim_id
-                )
-                if int(support_summary["support_count"]) <= 0:
-                    continue
-                self._db.upsert_user_claim_induction(
-                    claim_id=claim_id,
-                    condition_text=str(claim.get("metadata", {}).get("condition_text") or ""),
-                    support_count=int(support_summary["support_count"]),
-                    first_observed_at=str(support_summary["first_observed_at"]),
-                    last_observed_at=str(support_summary["last_observed_at"]),
-                )
             report["updated"] += len(applied)
             report["created"] += sum(int(item["created"]) for item in applied)
             report["affected_claim_ids"].extend(
@@ -5318,16 +5390,18 @@ class MemoryNodeManager:
         fact_id: int,
         fact: Dict[str, Any],
     ) -> List[Dict[str, Any]]:
-        """Project one fact's induction-eligible signals into exact group keys."""
+        """Persist every normalized user-claim signal for one fact."""
         updates: List[Dict[str, Any]] = []
         raw_signals = self._normalize_user_claim_signal(
-            fact.get("user_claim_signal"),
+            fact.get("user_claim_signals"),
+            allows_world_owner_reference=(
+                isinstance(fact.get("metadata"), dict)
+                and bool(fact["metadata"].get("has_world_owner_interaction"))
+            ),
         )
         for signal in raw_signals:
             claim_type_hint = str(signal.get("claim_type_hint") or "").lower()
             signal_kind = str(signal.get("signal_kind") or "").lower()
-            if claim_type_hint not in {"preference", "behavior_pattern"}:
-                continue
             if signal_kind not in {"explicit_assertion", "pattern_observation"}:
                 continue
             names = self._entities_for_user_claim_signal(signal, fact)
@@ -5352,11 +5426,22 @@ class MemoryNodeManager:
             claim_anchor_key = self._generate_topic_name_key(claim_anchor)
             if not claim_anchor_key:
                 continue
+            evidence_basis = _compact_whitespace(
+                signal.get("evidence_basis") or ""
+            )
+            signal_fingerprint = hashlib.sha256(
+                "\x1f".join((
+                    signal_kind,
+                    claim_type_hint,
+                    claim_anchor_key,
+                    evidence_basis.lower(),
+                )).encode("utf-8")
+            ).hexdigest()[:16]
             updates.append({
                 "fact_id": int(fact_id),
                 "signal_key": (
                     f"{int(entity_mapping[entity_name])}|{claim_type_hint}|"
-                    f"{claim_anchor_key}"
+                    f"{claim_anchor_key}|{signal_fingerprint}"
                 ),
                 "subject": entity_name,
                 "subject_entity_id": int(entity_mapping[entity_name]),
@@ -5364,12 +5449,10 @@ class MemoryNodeManager:
                 "signal_kind": signal_kind,
                 "claim_anchor": claim_anchor,
                 "claim_anchor_key": claim_anchor_key,
+                "evidence_basis": evidence_basis,
                 "confidence": float(signal.get("confidence") or 0.0),
             })
-        return updates or [{
-            "fact_id": int(fact_id),
-            "signal_key": "__fact__",
-        }]
+        return updates
 
     def _fact_user_intent_signal_mapping_updates(
         self,
@@ -5423,10 +5506,7 @@ class MemoryNodeManager:
                 "evidence_basis": signal["evidence_basis"],
                 "confidence": signal["confidence"],
             })
-        return updates or [{
-            "fact_id": int(fact_id),
-            "signal_key": "__fact__",
-        }]
+        return updates
 
     def _select_inductive_user_claim_evidence_facts(
         self,
@@ -5501,6 +5581,7 @@ class MemoryNodeManager:
         raw = self._call_llm(
             prompt_template.replace("{induction_target}", json.dumps({
                 "subject_entity": group["subject"],
+                "world_owner_entity": self._world_owner_entity_name,
                 "claim_type_hint": group["claim_type_hint"],
                 "claim_anchor": group["claim_anchor"],
             }, ensure_ascii=False, indent=2)).replace("{facts}", json.dumps([
@@ -5538,7 +5619,10 @@ class MemoryNodeManager:
         primary_domain = self._normalize_primary_domain(raw.get("primary_domain"))
         if not primary_domain:
             return None
-        if _compact_whitespace(raw.get("subject_entity") or "") != group["subject"]:
+        if (
+            _compact_whitespace(raw.get("subject_entity") or "") != group["subject"]
+            or group["subject"].lower() != self._world_owner_entity_name.lower()
+        ):
             return None
         predicate = re.sub(r"[^a-z0-9_]+", "_", str(raw.get("predicate") or "").lower()).strip("_")
         if predicate not in {"prefers", "dislikes", "usually_does", "avoids", "has_routine"}:
@@ -5906,7 +5990,7 @@ class MemoryNodeManager:
             "keyword_values": keyword_values,
         }
 
-    def _user_claim_signals_from_fact(self, fact: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def _get_user_claim_signals_from_fact(self, fact: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Read claim-level signals from their normalized fact mapping rows."""
         fact_id = int(fact.get("id") or 0)
         if fact_id <= 0:
@@ -5915,7 +5999,7 @@ class MemoryNodeManager:
             self._db.get_fact_user_claim_signal_mappings(fact_id).values()
         )
 
-    def _user_intent_signals_from_fact(self, fact: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def _get_user_intent_signals_from_fact(self, fact: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Read prospective evidence solely from its normalized mapping rows."""
         fact_id = int(fact.get("id") or 0)
         if fact_id <= 0:
@@ -9409,6 +9493,22 @@ class MemoryNodeManager:
             target_id = int(row.get("object_id"))
         except (TypeError, ValueError):
             return None
+        if object_type == "user_claim":
+            if database is None:
+                return None
+            stored_claims = database.get_user_claims_by_ids([target_id])
+            if not stored_claims:
+                return None
+            subject_id = int(stored_claims[0].get("subject_entity_id") or 0)
+            subject_name = database.get_entity_names_by_ids([subject_id]).get(
+                subject_id, ""
+            )
+            # Ignore legacy rows outside the user-self claim scope without
+            # destructively rewriting a user's existing database.
+            if _compact_whitespace(subject_name).lower() != (
+                self._world_owner_entity_name.lower()
+            ):
+                return None
         if object_type in {"goal", "plan", "work_item"}:
             if database is None:
                 return None

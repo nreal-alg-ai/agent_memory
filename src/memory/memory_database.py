@@ -12,6 +12,7 @@ memory object writes one document there; source tables retain only domain data.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
@@ -318,9 +319,10 @@ class SessionDB:
                 signal_kind TEXT NOT NULL DEFAULT 'none',
                 claim_anchor TEXT NOT NULL DEFAULT '',
                 claim_anchor_key TEXT NOT NULL DEFAULT '',
+                evidence_basis TEXT NOT NULL DEFAULT '',
                 confidence REAL NOT NULL DEFAULT 0.0,
-                processed_for_memory_user_claim INTEGER NOT NULL DEFAULT 0,
-                processed_for_memory_user_claim_induction INTEGER NOT NULL DEFAULT 0,
+                processed_for_explicit_user_claim INTEGER NOT NULL DEFAULT 0,
+                processed_for_inductive_user_claim INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY(fact_id, signal_key),
@@ -425,18 +427,6 @@ class SessionDB:
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY(claim_id, evidence_type, evidence_id, role),
-                FOREIGN KEY(claim_id) REFERENCES memory_user_claims(id) ON DELETE CASCADE
-            );
-
-            CREATE TABLE IF NOT EXISTS memory_user_claim_induction (
-                claim_id INTEGER PRIMARY KEY,
-                condition_text TEXT NOT NULL DEFAULT '',
-                support_count INTEGER NOT NULL DEFAULT 0,
-                first_observed_at TEXT NOT NULL DEFAULT '',
-                last_observed_at TEXT NOT NULL DEFAULT '',
-                consolidation_version TEXT NOT NULL DEFAULT '',
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
                 FOREIGN KEY(claim_id) REFERENCES memory_user_claims(id) ON DELETE CASCADE
             );
 
@@ -612,13 +602,13 @@ class SessionDB:
             ON memory_fact_user_intent_signal_mapping(
                 subject_entity_id, user_intent_anchor_key, evidence_kind, fact_id
             );
-            CREATE INDEX IF NOT EXISTS idx_memory_fact_user_claim_processing
+            CREATE INDEX IF NOT EXISTS idx_memory_fact_explicit_user_claim_processing
             ON memory_fact_user_claim_signal_mapping(
-                processed_for_memory_user_claim, fact_id
+                processed_for_explicit_user_claim, fact_id
             );
-            CREATE INDEX IF NOT EXISTS idx_memory_fact_user_claim_induction_processing
+            CREATE INDEX IF NOT EXISTS idx_memory_fact_inductive_user_claim_processing
             ON memory_fact_user_claim_signal_mapping(
-                processed_for_memory_user_claim_induction, fact_id
+                processed_for_inductive_user_claim, fact_id
             );
             CREATE INDEX IF NOT EXISTS idx_memory_fact_user_intent_update_processing
             ON memory_fact_user_intent_signal_mapping(
@@ -644,8 +634,6 @@ class SessionDB:
             ON memory_user_intent_events(object_type, object_id, effective_at DESC, id DESC);
             """
         )
-        # Intent participants and related parties are stored in the intent
-        # item's details; the standalone relation table is no longer used.
         # These tables belonged to the abandoned read-time user-state snapshot
         # prototype.  User states are now incrementally updated durable objects.
         self._init_identity_fts()
@@ -1263,40 +1251,39 @@ class SessionDB:
     def get_unprocessed_facts(
         self,
         *,
-        processing_target: str = "user_claim",
+        processing_target: str = "explicit_user_claim",
         reference_timestamp: Any,
         limit: int = 100,
         restrict_to_today: bool = True,
         require_episode: bool = False,
     ) -> List[Dict[str, Any]]:
         processing_mappings = {
-            "user_claim": (
+            "explicit_user_claim": (
                 "memory_fact_user_claim_signal_mapping",
-                "processed_for_memory_user_claim",
+                "processed_for_explicit_user_claim",
             ),
-            "user_claim_induction": (
+            "inductive_user_claim": (
                 "memory_fact_user_claim_signal_mapping",
-                "processed_for_memory_user_claim_induction",
+                "processed_for_inductive_user_claim",
             ),
             "user_intent_update": (
                 "memory_fact_user_intent_signal_mapping",
                 "processed_for_memory_user_intent_update",
             ),
         }
-        target = str(processing_target or "user_claim").strip().lower()
+        target = str(processing_target or "explicit_user_claim").strip().lower()
         try:
             processing_table, processing_column = processing_mappings[target]
         except KeyError as exc:
             raise ValueError(
-                "processing_target must be 'user_claim', "
-                "'user_claim_induction', or 'user_intent_update'"
+                "processing_target must be 'explicit_user_claim', "
+                "'inductive_user_claim', or 'user_intent_update'"
             ) from exc
 
-        clauses: List[str] = [f"processing.{processing_column} = 0"]
-        if target == "user_intent_update":
-            # ``__fact__`` records that extraction found no prospective signal;
-            # it is intentionally not work for the prospective projection.
-            clauses.append("processing.signal_key != '__fact__'")
+        clauses: List[str] = [
+            f"processing.{processing_column} = 0",
+            "processing.subject_entity_id IS NOT NULL",
+        ]
         params: List[Any] = []
         if require_episode:
             clauses.append("fact.episode_id IS NOT NULL")
@@ -1451,13 +1438,13 @@ class SessionDB:
         fact_ids: Sequence[int],
     ) -> int:
         processing_mappings = {
-            "user_claim": (
+            "explicit_user_claim": (
                 "memory_fact_user_claim_signal_mapping",
-                "processed_for_memory_user_claim",
+                "processed_for_explicit_user_claim",
             ),
-            "user_claim_induction": (
+            "inductive_user_claim": (
                 "memory_fact_user_claim_signal_mapping",
-                "processed_for_memory_user_claim_induction",
+                "processed_for_inductive_user_claim",
             ),
             "user_intent_update": (
                 "memory_fact_user_intent_signal_mapping",
@@ -1469,8 +1456,8 @@ class SessionDB:
             processing_table, processing_column = processing_mappings[target]
         except KeyError as exc:
             raise ValueError(
-                "processing_target must be 'user_claim', "
-                "'user_claim_induction', or 'user_intent_update'"
+                "processing_target must be 'explicit_user_claim', "
+                "'inductive_user_claim', or 'user_intent_update'"
             ) from exc
         ids = [int(value) for value in fact_ids if value is not None]
         if not ids:
@@ -1506,7 +1493,6 @@ class SessionDB:
             except (KeyError, TypeError, ValueError):
                 continue
             signal_key = str(mapping.get("signal_key") or "").strip()
-            is_sentinel = signal_key == "__fact__"
             try:
                 subject_entity_id = int(mapping["subject_entity_id"])
             except (KeyError, TypeError, ValueError):
@@ -1515,25 +1501,8 @@ class SessionDB:
             signal_kind = str(mapping.get("signal_kind") or "").strip()
             claim_anchor = str(mapping.get("claim_anchor") or "").strip()
             claim_anchor_key = str(mapping.get("claim_anchor_key") or "").strip()
-            if fact_id <= 0:
-                continue
-            if is_sentinel:
-                subject_entity_id = 0
-                claim_type_hint = ""
-                signal_kind = "none"
-                claim_anchor = ""
-                claim_anchor_key = ""
-                has_real_signal = self._conn.execute(
-                    """
-                    SELECT 1 FROM memory_fact_user_claim_signal_mapping
-                    WHERE fact_id = ? AND signal_key != '__fact__'
-                    LIMIT 1
-                    """,
-                    (fact_id,),
-                ).fetchone()
-                if has_real_signal is not None:
-                    continue
-            elif (
+            evidence_basis = str(mapping.get("evidence_basis") or "").strip()
+            if fact_id <= 0 or (
                 subject_entity_id <= 0
                 or not claim_type_hint
                 or not signal_kind
@@ -1542,25 +1511,29 @@ class SessionDB:
             ):
                 continue
             if not signal_key:
+                signal_fingerprint = hashlib.sha256(
+                    "\x1f".join((
+                        signal_kind,
+                        claim_type_hint,
+                        claim_anchor_key,
+                        evidence_basis.lower(),
+                    )).encode("utf-8")
+                ).hexdigest()[:16]
                 signal_key = (
-                    f"{subject_entity_id}|{claim_type_hint}|{claim_anchor_key}"
-                )
-            if not is_sentinel:
-                self._conn.execute(
-                    "DELETE FROM memory_fact_user_claim_signal_mapping "
-                    "WHERE fact_id = ? AND signal_key = '__fact__'",
-                    (fact_id,),
+                    f"{subject_entity_id}|{claim_type_hint}|"
+                    f"{claim_anchor_key}|{signal_fingerprint}"
                 )
             self._conn.execute(
                 """
                 INSERT INTO memory_fact_user_claim_signal_mapping (
                     fact_id, signal_key, subject_entity_id, claim_type_hint,
-                    signal_kind, claim_anchor, claim_anchor_key, confidence,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    signal_kind, claim_anchor, claim_anchor_key, evidence_basis,
+                    confidence, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(fact_id, signal_key) DO UPDATE SET
                     signal_kind = excluded.signal_kind,
                     claim_anchor = excluded.claim_anchor,
+                    evidence_basis = excluded.evidence_basis,
                     confidence = MAX(
                         memory_fact_user_claim_signal_mapping.confidence,
                         excluded.confidence
@@ -1570,7 +1543,7 @@ class SessionDB:
                 (
                     fact_id, signal_key,
                     subject_entity_id or None, claim_type_hint, signal_kind,
-                    claim_anchor, claim_anchor_key,
+                    claim_anchor, claim_anchor_key, evidence_basis,
                     float(mapping.get("confidence") or 0.0), now, now,
                 ),
             )
@@ -1620,9 +1593,11 @@ class SessionDB:
             LEFT JOIN memory_entity_nodes AS entity
                 ON entity.id = signal.subject_entity_id
             WHERE signal.fact_id = ?
-              AND signal.signal_key != '__fact__'
+              AND signal.subject_entity_id IS NOT NULL
             ORDER BY signal.claim_type_hint ASC,
-                     signal.claim_anchor_key ASC
+                     signal.claim_anchor_key ASC,
+                     signal.signal_kind ASC,
+                     signal.signal_key ASC
             """,
             (int(fact_id),),
         ).fetchall()
@@ -1645,7 +1620,6 @@ class SessionDB:
             except (KeyError, TypeError, ValueError):
                 continue
             signal_key = str(mapping.get("signal_key") or "").strip()
-            is_sentinel = signal_key == "__fact__"
             try:
                 subject_entity_id = int(mapping["subject_entity_id"])
             except (KeyError, TypeError, ValueError):
@@ -1661,25 +1635,7 @@ class SessionDB:
                 for value in (mapping.get("candidate_object_types") or [])
                 if str(value).strip().lower() in {"goal", "plan", "work_item"}
             ))
-            if fact_id <= 0:
-                continue
-            if is_sentinel:
-                subject_entity_id = 0
-                evidence_kind = user_role = ""
-                user_intent_anchor = user_intent_anchor_key = ""
-                assertion_source = explicitness = ""
-                candidate_object_types = []
-                has_real_signal = self._conn.execute(
-                    """
-                    SELECT 1 FROM memory_fact_user_intent_signal_mapping
-                    WHERE fact_id = ? AND signal_key != '__fact__'
-                    LIMIT 1
-                    """,
-                    (fact_id,),
-                ).fetchone()
-                if has_real_signal is not None:
-                    continue
-            elif (
+            if fact_id <= 0 or (
                 subject_entity_id <= 0
                 or evidence_kind not in {"goal", "plan", "responsibility", "lifecycle_update"}
                 or user_role not in {"owner", "participant", "responsible"}
@@ -1692,12 +1648,6 @@ class SessionDB:
             if not signal_key:
                 signal_key = (
                     f"{subject_entity_id}|{evidence_kind}|{user_intent_anchor_key}"
-                )
-            if not is_sentinel:
-                self._conn.execute(
-                    "DELETE FROM memory_fact_user_intent_signal_mapping "
-                    "WHERE fact_id = ? AND signal_key = '__fact__'",
-                    (fact_id,),
                 )
             self._conn.execute(
                 """
@@ -1747,7 +1697,7 @@ class SessionDB:
             FROM memory_fact_user_intent_signal_mapping AS signal
             LEFT JOIN memory_entity_nodes AS entity ON entity.id = signal.subject_entity_id
             WHERE signal.fact_id = ?
-              AND signal.signal_key != '__fact__'
+              AND signal.subject_entity_id IS NOT NULL
             ORDER BY signal.evidence_kind, signal.user_intent_anchor_key
             """,
             (int(fact_id),),
@@ -1832,90 +1782,6 @@ class SessionDB:
         )
         self._commit_if_needed()
         return int(cur.lastrowid), True
-
-    def transition_user_claim_status(
-        self,
-        *,
-        target_claim_id: int,
-        new_status: str,
-        trigger_claim_id: Optional[int] = None,
-        semantic_relation: str = "",
-        effective_at: str = "",
-        decision_source: str = "",
-        semantic_confidence: Optional[float] = None,
-        semantic_reason: str = "",
-        policy_reason: str = "",
-        details: Optional[Dict[str, Any]] = None,
-    ) -> bool:
-        """Change a claim status and retain the causally linked history event.
-
-        The event is deliberately written only for an actual status transition;
-        evidence additions and duplicate merges do not make a claim appear to
-        have been abandoned or revived.
-        """
-        target_id = int(target_claim_id)
-        status = str(new_status or "").strip()
-        if not status:
-            return False
-        occurred_at = str(effective_at or "").strip()
-        now = local_now_text()
-        with self.transaction():
-            row = self._conn.execute(
-                "SELECT status FROM memory_user_claims WHERE id = ?",
-                (target_id,),
-            ).fetchone()
-            if not row:
-                return False
-            previous_status = str(row["status"] or "")
-            if previous_status == status:
-                return False
-            # A superseding claim closes the prior claim's validity interval.
-            # We leave valid_to untouched for a weakened claim: it may still
-            # describe a partially valid or temporarily interrupted pattern.
-            if status == "superseded" and occurred_at:
-                self._conn.execute(
-                    """
-                    UPDATE memory_user_claims
-                    SET status = ?,
-                        valid_to = CASE
-                            WHEN valid_to = '' OR valid_to > ? THEN ?
-                            ELSE valid_to
-                        END,
-                        updated_at = ?
-                    WHERE id = ?
-                    """,
-                    (status, occurred_at, occurred_at, now, target_id),
-                )
-            else:
-                self._conn.execute(
-                    "UPDATE memory_user_claims SET status = ?, updated_at = ? WHERE id = ?",
-                    (status, now, target_id),
-                )
-            self._conn.execute(
-                """
-                INSERT INTO memory_user_claim_events (
-                    target_claim_id, trigger_claim_id, event_type,
-                    previous_status, new_status, semantic_relation, effective_at,
-                    decision_source, semantic_confidence, semantic_reason,
-                    policy_reason, details, created_at
-                ) VALUES (?, ?, 'status_transition', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    target_id,
-                    int(trigger_claim_id) if trigger_claim_id is not None else None,
-                    previous_status,
-                    status,
-                    str(semantic_relation or "").strip(),
-                    occurred_at,
-                    str(decision_source or "").strip(),
-                    float(semantic_confidence) if semantic_confidence is not None else None,
-                    str(semantic_reason or "").strip(),
-                    str(policy_reason or "").strip(),
-                    _json_dumps(details or {}),
-                    now,
-                ),
-            )
-        return True
 
     def record_user_claim_relation(
         self,
@@ -2413,28 +2279,6 @@ class SessionDB:
         ).fetchall()
         by_id = {int(row["id"]): self._row_to_dict(row) for row in rows}
         return [by_id[claim_id] for claim_id in ids if claim_id in by_id]
-
-    def get_user_claim_induction_profiles(
-        self,
-        claim_ids: Sequence[int],
-    ) -> Dict[int, Dict[str, Any]]:
-        """Return recurrence details for inductive behavior-pattern claims."""
-        ids = list(dict.fromkeys(
-            int(value)
-            for value in claim_ids or []
-            if str(value).strip().isdigit() and int(value) > 0
-        ))
-        if not ids:
-            return {}
-        placeholders = ",".join("?" for _ in ids)
-        rows = self._conn.execute(
-            f"SELECT * FROM memory_user_claim_induction WHERE claim_id IN ({placeholders})",
-            ids,
-        ).fetchall()
-        return {
-            int(row["claim_id"]): self._row_to_dict(row)
-            for row in rows
-        }
 
     def get_user_states(
         self,
@@ -2994,58 +2838,6 @@ class SessionDB:
             changed += 1
         self._commit_if_needed()
         return changed
-
-    def get_user_claim_support_fact_summary(self, claim_id: int) -> Dict[str, Any]:
-        """Aggregate unique support facts so incremental induction never shrinks counts."""
-        row = self._conn.execute(
-            """
-            SELECT
-                COUNT(DISTINCT evidence_id) AS support_count,
-                MIN(NULLIF(observed_at, '')) AS first_observed_at,
-                MAX(NULLIF(observed_at, '')) AS last_observed_at
-            FROM memory_user_claim_evidence
-            WHERE claim_id = ? AND evidence_type = 'fact' AND role = 'support'
-            """,
-            (int(claim_id),),
-        ).fetchone()
-        return {
-            "support_count": int(row["support_count"] or 0) if row else 0,
-            "first_observed_at": str(row["first_observed_at"] or "") if row else "",
-            "last_observed_at": str(row["last_observed_at"] or "") if row else "",
-        }
-
-    def upsert_user_claim_induction(
-        self,
-        *,
-        claim_id: int,
-        condition_text: str,
-        support_count: int,
-        first_observed_at: str,
-        last_observed_at: str,
-        consolidation_version: str = "v1",
-    ) -> None:
-        now = local_now_text()
-        self._conn.execute(
-            """
-            INSERT INTO memory_user_claim_induction (
-                claim_id, condition_text, support_count,
-                first_observed_at, last_observed_at,
-                consolidation_version, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(claim_id) DO UPDATE SET
-                condition_text = excluded.condition_text,
-                support_count = excluded.support_count,
-                first_observed_at = excluded.first_observed_at,
-                last_observed_at = excluded.last_observed_at,
-                consolidation_version = excluded.consolidation_version,
-                updated_at = excluded.updated_at
-            """,
-            (int(claim_id), str(condition_text or ""),
-             max(0, int(support_count or 0)),
-             str(first_observed_at or ""), str(last_observed_at or ""),
-             str(consolidation_version or "v1"), now, now),
-        )
-        self._commit_if_needed()
 
     def upsert_user_claim_derivation(
         self,
