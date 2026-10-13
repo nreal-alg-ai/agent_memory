@@ -135,7 +135,7 @@ def _estimate_interaction_token_count(text: str) -> int:
 def _unit_text_from_turn(turn: Dict[str, Any]) -> str:
     user_text = _compact_whitespace(turn.get("user_message") or "")
     assistant_text = _compact_whitespace(turn.get("assistant_response") or "")
-    return f"用户本人：{user_text}\n助手：{assistant_text}".strip()
+    return f"speaker_用户本人：{user_text}\nspeaker_助手：{assistant_text}".strip()
 
 def _clipped(value: float, low: float, high: float) -> float:
     return min(high, max(low, value))
@@ -394,12 +394,12 @@ def convert_interaction_turn_to_online_unit(
     ended_ats: List[str] = []
     if user_message:
         texts.append(user_message)
-        speakers.append("用户本人")
+        speakers.append("speaker_用户本人")
         started_ats.append(user_started_at)
         ended_ats.append(user_ended_at)
     if assistant_response:
         texts.append(assistant_response)
-        speakers.append("助手")
+        speakers.append("speaker_助手")
         started_ats.append(assistant_started_at)
         ended_ats.append(assistant_ended_at)
     return MemoryUnit(

@@ -251,7 +251,9 @@ class UserStateResolver:
                     if isinstance(value, (dict, list)) else str(value or "")
                 )
                 prompt = prompt.replace("{" + key + "}", serialized)
-            parsed = self._parse_json_object(self._llm_client.complete(prompt) or "")
+            parsed = self._llm_client.parse_json_object_from_llm_text(
+                self._llm_client.call_llm(prompt) or ""
+            )
             if parsed is None or not isinstance(parsed.get("operations"), list):
                 domain_report.update({
                     "status": "error",
@@ -297,27 +299,6 @@ class UserStateResolver:
         if re.search(r"[\u4e00-\u9fff]", str(text or "")):
             return "zh"
         return "zh"
-
-    @staticmethod
-    def _parse_json_object(text: str) -> Optional[Dict[str, Any]]:
-        raw = str(text or "").strip()
-        if not raw:
-            return None
-        if raw.startswith("```"):
-            start = raw.find("{")
-            end = raw.rfind("}")
-            if start >= 0 and end > start:
-                raw = raw[start : end + 1]
-        else:
-            start = raw.find("{")
-            end = raw.rfind("}")
-            if 0 <= start < end and (start > 0 or end < len(raw) - 1):
-                raw = raw[start : end + 1]
-        try:
-            data = json.loads(raw)
-        except json.JSONDecodeError:
-            return None
-        return data if isinstance(data, dict) else None
 
     def _log_update(self, payload: Dict[str, Any]) -> None:
         record = {"scope": "memory_user_state", "event": "finish", "payload": payload}

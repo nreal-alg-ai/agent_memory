@@ -20,13 +20,10 @@ SRC = REPO_ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from memory.memory_manager import (
-    DEFAULT_LLM_BASE_URL,
-    DEFAULT_LLM_MODEL,
-    MemoryOperationReporter,
-)
-from memory.memory_runtime import MemoryRuntime
+from llm_client import DEFAULT_LLM_BASE_URL, DEFAULT_LLM_MODEL
+from memory.memory_manager import MemoryOperationReporter
 from memory.config import split_memory_config
+from pwm_manager import PersonWorldModel
 
 
 DEFAULT_TEXTGRID = (
@@ -135,6 +132,7 @@ def main() -> None:
     segments = load_textgrid_segments(textgrid_path)
     if not segments:
         raise RuntimeError(f"No non-empty intervals found in TextGrid: {textgrid_path}")
+    segments = normalize_textgrid_speakers(segments)
     if args.segment_limit < 0:
         raise ValueError("--segment-limit must be greater than or equal to 0")
     source_segment_count = len(segments)
@@ -172,7 +170,7 @@ def main() -> None:
     llm_config["llm_api_key"] = expand_env_refs(llm_config["llm_api_key"])
 
     operation_reporter = MemoryOperationReporter()
-    runtime = MemoryRuntime(
+    runtime = PersonWorldModel(
         db_path=db_path,
         memory_runtime_config=memory_runtime_config,
         memory_manager_config=memory_manager_config,
@@ -206,12 +204,7 @@ def main() -> None:
     )
     queued_memory_store_count += int(bool(final_input_flush.get("queued")))
 
-    if (
-        queued_memory_store_count
-        or episode_summary_result.get("queued")
-        or user_claim_submit.get("queued")
-        or user_intent_submit.get("queued")
-    ) and not runtime.wait_for_memory_tasks():
+    if not runtime.wait_for_memory_tasks():
         raise RuntimeError("Timed out while draining queued memory tasks")
 
     store_operation_report = operation_reporter.operation_report("memory_fact_extraction")
@@ -223,11 +216,13 @@ def main() -> None:
         operation_reporter.latest_report("memory_user_intent_update")
         or user_intent_submit
     )
+    user_state_result = operation_reporter.latest_report(
+        "memory_user_state_update"
+    )
     logging.info(
-        "Transcript input complete segments=%s pending=%s queued_memory_stores=%s "
+        "Transcript input complete segments=%s queued_memory_stores=%s "
         "stored_memory_stores=%s",
         len(memory_segments),
-        len(runtime._memory_context_manager.pending_unit_snapshot()),
         queued_memory_store_count,
         store_operation_report["succeeded"],
     )
@@ -249,6 +244,7 @@ def main() -> None:
         "episode_summary_result": episode_summary_result,
         "user_claim_result": user_claim_result,
         "user_intent_result": user_intent_result,
+        "user_state_result": user_state_result,
     }
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     logging.info("Wrote report: %s", report_path)
@@ -364,6 +360,31 @@ def load_textgrid_segments(textgrid_path: Path) -> List[TextGridSegment]:
         pending_start = None
         pending_end = None
     return sorted(segments, key=lambda item: (item.start_s, item.end_s, item.speaker))
+
+
+def normalize_textgrid_speakers(
+    segments: Sequence[TextGridSegment],
+) -> List[TextGridSegment]:
+    """Reserve the known wearer label and number the other TextGrid speakers."""
+    wearer_speaker = "N_SPK8013"
+    other_speakers = sorted({
+        segment.speaker for segment in segments
+        if segment.speaker != wearer_speaker
+    })
+    speaker_mapping = {wearer_speaker: "speaker_用户本人"}
+    speaker_mapping.update({
+        speaker: f"speaker_{index}"
+        for index, speaker in enumerate(other_speakers, 1)
+    })
+    return [
+        TextGridSegment(
+            speaker=speaker_mapping[segment.speaker],
+            start_s=segment.start_s,
+            end_s=segment.end_s,
+            text=segment.text,
+        )
+        for segment in segments
+    ]
 
 
 def unescape_text(value: str) -> str:

@@ -88,6 +88,10 @@ class PersonWorldModel:
         return self._task_scheduler
 
     @property
+    def llm_client(self) -> LLMClient:
+        return self._llm_client
+
+    @property
     def database(self) -> SessionDB:
         return self._database
 

@@ -1472,7 +1472,7 @@ class MemoryRuntime:
             entry
             for entry in entries
             if _compact_whitespace(entry.get("speaker") or "")
-            in {"用户本人", "助手"}
+            in {"speaker_用户本人", "speaker_助手"}
         ]
 
     def _iter_time_nearby_transcript_unit_indexes(
@@ -1666,6 +1666,8 @@ class MemoryRuntime:
             or segment.get("speaker_id")
             or "unknown_speaker"
         )
+        if speaker == "speaker_0":
+            speaker = "speaker_用户本人"
         started_at = self._transcript_segment_start_time(segment)
         ended_at = self._transcript_segment_end_time(segment)
         try:

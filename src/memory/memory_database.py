@@ -16,10 +16,11 @@ import hashlib
 import json
 import re
 import sqlite3
+import unicodedata
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -271,8 +272,7 @@ class SessionDB:
                 keywords TEXT NOT NULL DEFAULT '[]',
                 entities TEXT NOT NULL DEFAULT '[]',
                 entity_ids TEXT NOT NULL DEFAULT '[]',
-                fact_root_topic TEXT NOT NULL DEFAULT '',
-                fact_aspect_topic TEXT NOT NULL DEFAULT '',
+                fact_topic TEXT NOT NULL DEFAULT '',
                 event_time_key TEXT NOT NULL DEFAULT '',
                 dialogue_time_key TEXT NOT NULL DEFAULT '',
                 confidence REAL NOT NULL DEFAULT 0.85,
@@ -309,6 +309,24 @@ class SessionDB:
                 name TEXT NOT NULL UNIQUE,
                 type TEXT NOT NULL DEFAULT 'OTHER',
                 created_at TEXT NOT NULL DEFAULT ''
+            );
+
+            CREATE TABLE IF NOT EXISTS memory_owner_entity_aliases (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner_entity_id INTEGER NOT NULL,
+                alias_name TEXT NOT NULL,
+                alias_key TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'candidate',
+                confidence REAL NOT NULL DEFAULT 0.0,
+                evidence_fact_id INTEGER,
+                evidence_type TEXT NOT NULL DEFAULT '',
+                evidence_text TEXT NOT NULL DEFAULT '',
+                source_speaker TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(owner_entity_id, alias_key),
+                FOREIGN KEY(owner_entity_id) REFERENCES memory_entity_nodes(id) ON DELETE CASCADE,
+                FOREIGN KEY(evidence_fact_id) REFERENCES memory_facts(id) ON DELETE SET NULL
             );
 
             CREATE TABLE IF NOT EXISTS memory_fact_user_claim_signal_mapping (
@@ -588,6 +606,8 @@ class SessionDB:
             ON memory_topic_items(topic_kind, last_seen_at DESC);
             CREATE INDEX IF NOT EXISTS idx_memory_user_claims_subject
             ON memory_user_claims(subject_entity_id, claim_type, claim_origin, status);
+            CREATE INDEX IF NOT EXISTS idx_memory_owner_entity_aliases_name
+            ON memory_owner_entity_aliases(alias_key, status);
             CREATE INDEX IF NOT EXISTS idx_memory_user_claim_evidence_claim
             ON memory_user_claim_evidence(claim_id, role, evidence_type);
             CREATE INDEX IF NOT EXISTS idx_memory_user_claim_derivations_claim
@@ -1711,6 +1731,28 @@ class SessionDB:
             mapping["subject_entity"] = str(mapping.get("subject") or "")
             mappings[str(mapping["signal_key"])] = mapping
         return mappings
+
+    def mark_user_intent_signals_processed(
+        self,
+        signal_ids: Sequence[Tuple[int, str]],
+    ) -> int:
+        """Mark only successfully evaluated fact/signal mapping rows."""
+        changed = 0
+        now = local_now_text()
+        for fact_id, signal_key in signal_ids:
+            cursor = self._conn.execute(
+                """
+                UPDATE memory_fact_user_intent_signal_mapping
+                SET processed_for_memory_user_intent_update = 1,
+                    updated_at = ?
+                WHERE fact_id = ? AND signal_key = ?
+                  AND processed_for_memory_user_intent_update = 0
+                """,
+                (now, int(fact_id), str(signal_key)),
+            )
+            changed += int(cursor.rowcount or 0)
+        self._commit_if_needed()
+        return changed
 
     def upsert_user_claim(
         self,
@@ -3001,8 +3043,7 @@ class SessionDB:
         keywords: Sequence[str],
         entities: Sequence[str],
         entity_ids: Optional[Sequence[int]],
-        fact_root_topic: str,
-        fact_aspect_topic: str,
+        fact_topic: str,
         event_time_key: str,
         dialogue_time_key: str,
         confidence: float,
@@ -3027,10 +3068,10 @@ class SessionDB:
             """
             INSERT INTO memory_facts (
                 episode_id, fact_type,
-                summary, keywords, entities, entity_ids, fact_root_topic,
-                fact_aspect_topic, event_time_key, dialogue_time_key,
+                summary, keywords, entities, entity_ids, fact_topic,
+                event_time_key, dialogue_time_key,
                 confidence, importance, metadata, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 episode_id,
@@ -3039,8 +3080,7 @@ class SessionDB:
                 _json_dumps(keyword_values),
                 _json_dumps(list(entities or [])),
                 _json_dumps([int(value) for value in entity_ids or []]),
-                str(fact_root_topic or ""),
-                str(fact_aspect_topic or ""),
+                str(fact_topic or ""),
                 event_time_key,
                 dialogue_time_key,
                 float(confidence),
@@ -3128,6 +3168,106 @@ class SessionDB:
     def add_entity_names(self, names: Iterable[str]) -> Dict[str, int]:
         """Compatibility wrapper for legacy name-only callers."""
         return self.upsert_entity_nodes(names)
+
+    @staticmethod
+    def normalize_owner_alias_key(value: str) -> str:
+        return re.sub(r"\s+", "", unicodedata.normalize("NFKC", value).casefold())
+
+    def get_owner_entity_aliases(
+        self,
+        owner_entity_id: int,
+        *,
+        status: Optional[str] = None,
+        limit: int = 32,
+    ) -> List[Dict[str, Any]]:
+        """Read known names for the database's canonical world owner."""
+        clauses = ["owner_entity_id = ?"]
+        params: List[Any] = [int(owner_entity_id)]
+        if status:
+            clauses.append("status = ?")
+            params.append(str(status))
+        rows = self._conn.execute(
+            f"SELECT * FROM memory_owner_entity_aliases WHERE {' AND '.join(clauses)} "
+            "ORDER BY confidence DESC, updated_at DESC, id DESC LIMIT ?",
+            (*params, max(1, int(limit))),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def upsert_owner_entity_alias(
+        self,
+        *,
+        owner_entity_id: int,
+        alias_name: str,
+        status: str,
+        confidence: float,
+        evidence_fact_id: int,
+        evidence_type: str,
+        evidence_text: str,
+        source_speaker: str,
+    ) -> int:
+        """Keep the strongest observed evidence without downgrading a confirmed alias."""
+        alias_name = str(alias_name or "").strip()
+        alias_key = self.normalize_owner_alias_key(alias_name)
+        if not alias_key or status not in {"candidate", "confirmed"}:
+            raise ValueError("invalid owner alias")
+        now = local_now_text()
+        self._conn.execute(
+            """
+            INSERT INTO memory_owner_entity_aliases (
+                owner_entity_id, alias_name, alias_key, status, confidence,
+                evidence_fact_id, evidence_type, evidence_text, source_speaker,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(owner_entity_id, alias_key) DO UPDATE SET
+                status = CASE
+                    WHEN excluded.status = 'confirmed' THEN 'confirmed'
+                    ELSE memory_owner_entity_aliases.status
+                END,
+                alias_name = CASE
+                    WHEN (excluded.status = 'confirmed' AND memory_owner_entity_aliases.status != 'confirmed')
+                      OR excluded.confidence > memory_owner_entity_aliases.confidence
+                    THEN excluded.alias_name ELSE memory_owner_entity_aliases.alias_name
+                END,
+                evidence_fact_id = CASE
+                    WHEN (excluded.status = 'confirmed' AND memory_owner_entity_aliases.status != 'confirmed')
+                      OR excluded.confidence > memory_owner_entity_aliases.confidence
+                    THEN excluded.evidence_fact_id ELSE memory_owner_entity_aliases.evidence_fact_id
+                END,
+                evidence_type = CASE
+                    WHEN (excluded.status = 'confirmed' AND memory_owner_entity_aliases.status != 'confirmed')
+                      OR excluded.confidence > memory_owner_entity_aliases.confidence
+                    THEN excluded.evidence_type ELSE memory_owner_entity_aliases.evidence_type
+                END,
+                evidence_text = CASE
+                    WHEN (excluded.status = 'confirmed' AND memory_owner_entity_aliases.status != 'confirmed')
+                      OR excluded.confidence > memory_owner_entity_aliases.confidence
+                    THEN excluded.evidence_text ELSE memory_owner_entity_aliases.evidence_text
+                END,
+                source_speaker = CASE
+                    WHEN (excluded.status = 'confirmed' AND memory_owner_entity_aliases.status != 'confirmed')
+                      OR excluded.confidence > memory_owner_entity_aliases.confidence
+                    THEN excluded.source_speaker ELSE memory_owner_entity_aliases.source_speaker
+                END,
+                confidence = CASE
+                    WHEN excluded.status = 'confirmed' AND memory_owner_entity_aliases.status != 'confirmed'
+                    THEN excluded.confidence
+                    ELSE MAX(memory_owner_entity_aliases.confidence, excluded.confidence)
+                END,
+                updated_at = excluded.updated_at
+            """,
+            (
+                int(owner_entity_id), alias_name, alias_key, status,
+                max(0.0, min(1.0, float(confidence))), int(evidence_fact_id),
+                str(evidence_type), str(evidence_text), str(source_speaker), now, now,
+            ),
+        )
+        self._commit_if_needed()
+        row = self._conn.execute(
+            "SELECT id FROM memory_owner_entity_aliases "
+            "WHERE owner_entity_id = ? AND alias_key = ?",
+            (int(owner_entity_id), alias_key),
+        ).fetchone()
+        return int(row["id"])
 
     def find_entity_nodes_in_text(
         self,

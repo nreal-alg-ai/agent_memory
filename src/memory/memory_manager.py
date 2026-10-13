@@ -1132,8 +1132,7 @@ class MemoryNodeManager:
         keywords: Sequence[str],
         entities: Sequence[str],
         entity_ids: Sequence[int],
-        fact_root_topic: str,
-        fact_aspect_topic: str,
+        fact_topic: str,
         event_time_key: str,
         dialogue_time_key: str,
         confidence: float,
@@ -1150,11 +1149,10 @@ class MemoryNodeManager:
                 f"summary: {_compact_whitespace(summary)}",
                 f"keywords: {keyword_text}",
                 f"entities: {', '.join(entities or [])}",
-                f"fact_root_topic: {fact_root_topic}",
-                f"fact_aspect_topic: {fact_aspect_topic}",
+                f"fact_topic: {fact_topic}",
             ],
             entity_ids=entity_ids,
-            topic_keys=[fact_root_topic, fact_aspect_topic],
+            topic_keys=[fact_topic],
             time_start=event_time_key or dialogue_time_key,
             time_end=event_time_key or dialogue_time_key,
             confidence=confidence,
@@ -1217,8 +1215,7 @@ class MemoryNodeManager:
                     "keywords": fact.get("keywords") or "",
                     "entities": fact.get("entities") or [],
                     "primary_entity": fact.get("primary_entity"),
-                    "fact_root_topic": fact.get("fact_root_topic") or "",
-                    "fact_aspect_topic": fact.get("fact_aspect_topic") or "",
+                    "fact_topic": fact.get("fact_topic") or "",
                     "user_claim_signals": fact.get("user_claim_signals") or [],
                     "user_intent_signals": fact.get("user_intent_signals") or [],
                     "importance": fact.get("importance"),
@@ -1260,16 +1257,19 @@ class MemoryNodeManager:
             if prompt_language == "en"
             else UNIFIED_MEMORY_EXTRACTION_PROMPT_ZH
         )
-        memory_topic_item_context = (
-            self._collect_memory_topic_item_context(units=current_units)
-            if prompt_language != "en"
-            else {"canonical_topics": [], "aspect_topics": []}
-        )
+        known_world_owner_aliases = [
+            item["alias_name"]
+            for item in self._db.get_owner_entity_aliases(
+                self._intent_world_owner_entity_id(),
+                status="confirmed",
+                limit=128,
+            )
+        ]
         prompt = (
             prompt_template
             .replace(
-                "{existing_memory_topic_items}",
-                self._format_memory_topic_items_for_prompt(memory_topic_item_context),
+                "{known_world_owner_aliases}",
+                json.dumps(known_world_owner_aliases[:32], ensure_ascii=False),
             )
             .replace(
                 "{dialogue_batch}",
@@ -1287,7 +1287,7 @@ class MemoryNodeManager:
             )
         )
         for attempt in range(2):
-            result = self._call_llm(prompt)
+            result = self._llm_client.call_llm(prompt)
             response_text = str(result or "")
             response_chars = len(response_text)
             if not response_text.strip():
@@ -1302,7 +1302,7 @@ class MemoryNodeManager:
                 if attempt == 0:
                     self._logger.debug("Unified memory LLM extraction failed, retrying")
                 continue
-            parsed = self._parse_json_object_from_llm_text(result or "")
+            parsed = self._llm_client.parse_json_object_from_llm_text(result or "")
             if parsed is None:
                 self._log_info("memory_fact_extraction", "llm_output_diagnostics", {
                     "attempt": attempt + 1,
@@ -1318,6 +1318,7 @@ class MemoryNodeManager:
                     parsed,
                     current_units,
                     prompt_language=prompt_language,
+                    known_world_owner_aliases=known_world_owner_aliases,
                     diagnostics=normalization_diagnostics,
                 )
                 self._log_info("memory_fact_extraction", "llm_output_diagnostics", {
@@ -1366,8 +1367,7 @@ class MemoryNodeManager:
                 "id": item.get("id"),
                 "summary": _compact_whitespace(item.get("summary") or item.get("text") or ""),
                 "fact_type": item.get("fact_type") or "",
-                "fact_root_topic": item.get("fact_root_topic") or "",
-                "fact_aspect_topic": item.get("fact_aspect_topic") or "",
+                "fact_topic": item.get("fact_topic") or "",
                 "dialogue_time_key": item.get("dialogue_time_key") or "",
                 "event_time_key": item.get("event_time_key") or "",
             }
@@ -1389,7 +1389,9 @@ class MemoryNodeManager:
         )
         parsed: Dict[str, Any] = {}
         for _ in range(2):
-            parsed = self._parse_json_object_from_llm_text(self._call_llm(prompt) or "") or {}
+            parsed = self._llm_client.parse_json_object_from_llm_text(
+                self._llm_client.call_llm(prompt) or ""
+            ) or {}
             if _compact_whitespace(parsed.get("summary") or ""):
                 break
         summary = _compact_whitespace(parsed.get("summary") or "")
@@ -1407,14 +1409,7 @@ class MemoryNodeManager:
             limit=3,
         )
         if not topics:
-            topics = (
-                self._normalize_unique_labels([
-                    item.get("fact_root_topic")
-                    for item in fact_payload
-                    if item.get("fact_root_topic")
-                ])[:3]
-                or self._topic_candidates(summary)[:3]
-        )
+            topics = self._topic_candidates(summary)[:3]
         participants = self._parse_participants_from_units(unit_list)
         episode_entity_ids: List[int] = []
         for fact in fact_list:
@@ -1458,36 +1453,13 @@ class MemoryNodeManager:
             "ended_at": end,
         }
 
-    def _call_llm(self, prompt: str) -> Optional[str]:
-        return self._llm_client.complete(prompt)
-
-    @staticmethod
-    def _parse_json_object_from_llm_text(text: str) -> Optional[Dict[str, Any]]:
-        raw = str(text or "").strip()
-        if not raw:
-            return None
-        if raw.startswith("```"):
-            start = raw.find("{")
-            end = raw.rfind("}")
-            if start >= 0 and end > start:
-                raw = raw[start : end + 1]
-        else:
-            start = raw.find("{")
-            end = raw.rfind("}")
-            if 0 <= start < end and (start > 0 or end < len(raw) - 1):
-                raw = raw[start : end + 1]
-        try:
-            data = json.loads(raw)
-        except json.JSONDecodeError:
-            return None
-        return data if isinstance(data, dict) else None
-
     def _normalize_memory_fact_extraction_llm_output(
         self,
         data: Dict[str, Any],
         units: Sequence[MemoryUnit],
         *,
         prompt_language: str,
+        known_world_owner_aliases: Sequence[str],
         diagnostics: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
         diagnostics = diagnostics if diagnostics is not None else {}
@@ -1533,6 +1505,7 @@ class MemoryNodeManager:
         dialogue_time_key = _to_timestamp_text(
             units[0].start_time if units else ""
         ) or _now_text()
+        newly_confirmed_aliases: List[str] = []
         for index, raw_fact in enumerate(raw_facts, 1):
             if not isinstance(raw_fact, dict):
                 record_drop("non_object_fact")
@@ -1564,13 +1537,40 @@ class MemoryNodeManager:
             keywords = self._normalize_string_list(raw_fact.get("keywords"), limit=18)
             if not keywords:
                 keywords = self._keywords(text, limit=18)
-            allows_world_owner_reference = self._units_include_world_owner(
-                units,
+            raw_entity_descriptors = self._normalize_entity_descriptors(
+                raw_fact.get("entities"), limit=16,
+            )
+            alias_candidates = self._normalize_world_owner_alias_candidates(
+                raw_fact.get("world_owner_alias_candidates"),
+                fact_text=text,
+                entity_names=[item["name"] for item in raw_entity_descriptors],
+                source_units=units,
+            )
+            confirmed_aliases = self._confirmed_owner_aliases_in_fact(
+                entity_names=[item["name"] for item in raw_entity_descriptors],
+                fact_text=text,
+                confirmed_aliases=[
+                    *known_world_owner_aliases,
+                    *newly_confirmed_aliases,
+                    *(
+                        item["alias_name"] for item in alias_candidates
+                        if item["status"] == "confirmed"
+                    ),
+                ],
+            )
+            owner_alias_reference = bool(confirmed_aliases)
+            allows_world_owner_reference = (
+                self._units_include_world_owner(units) or owner_alias_reference
             )
             entity_descriptors = self._normalize_fact_entity_descriptors(
                 raw_fact.get("entities"),
                 allows_world_owner_reference=allows_world_owner_reference,
             )
+            if owner_alias_reference:
+                self._merge_entity_descriptor(entity_descriptors, {
+                    "name": self._world_owner_entity_name,
+                    "type": "PERSON",
+                })
             entities = [item["name"] for item in entity_descriptors]
             if not entities:
                 entity_descriptors = self._normalize_fact_entity_descriptors(
@@ -1629,20 +1629,23 @@ class MemoryNodeManager:
                 )
                 continue
             fact_topic_fallback = " ".join(keywords[:3]) if keywords else "general"
-            fact_root_topic, fact_aspect_topic = self._normalize_fact_topic_fields(
-                raw_fact.get("fact_root_topic"),
-                raw_fact.get("fact_aspect_topic"),
-                fallback_root_topic=fact_topic_fallback,
-                fallback_aspect_topic=fact_topic_fallback,
+            fact_topic = (
+                self._normalize_topic_name(raw_fact.get("fact_topic"))
+                or self._normalize_topic_name(fact_topic_fallback)
+                or "general"
             )
             user_claim_signals = self._normalize_user_claim_signal(
                 raw_fact.get("user_claim_signals"),
                 allows_world_owner_reference=allows_world_owner_reference,
+                source_units=units,
+                owner_aliases=confirmed_aliases,
             )
             user_intent_signals = self._normalize_user_intent_signals(
                 raw_fact.get("user_intent_signals"),
                 fallback_entity=primary_entity,
                 allows_world_owner_reference=allows_world_owner_reference,
+                source_units=units,
+                owner_aliases=confirmed_aliases,
             )
             event_time_key = _compact_whitespace(raw_fact.get("event_time_key") or "")
             facts.append({
@@ -1656,8 +1659,9 @@ class MemoryNodeManager:
                 "primary_entity": primary_entity,
                 "user_claim_signals": user_claim_signals,
                 "user_intent_signals": user_intent_signals,
-                "fact_root_topic": fact_root_topic,
-                "fact_aspect_topic": fact_aspect_topic,
+                "world_owner_alias_candidates": alias_candidates,
+                "resolved_world_owner_aliases": confirmed_aliases,
+                "fact_topic": fact_topic,
                 "importance": max(0.6, min(1.0, priority / 100.0)),
                 "confidence": 0.9,
                 "metadata": {
@@ -1665,12 +1669,19 @@ class MemoryNodeManager:
                     "priority": priority,
                     "time_confidence": _compact_whitespace(raw_fact.get("time_confidence") or "unknown"),
                     "where": _compact_whitespace(raw_fact.get("where") or ""),
-                    "has_world_owner_interaction": bool(
-                        allows_world_owner_reference
-                        and self._world_owner_entity_name in entities
+                    "has_world_owner_speaker": any(
+                        signal.get("owner_evidence_type") in {
+                            "self_statement", "confirmed_response",
+                        }
+                        for signal in [*user_claim_signals, *user_intent_signals]
                     ),
+                    "has_world_owner_alias_reference": owner_alias_reference,
                 },
             })
+            newly_confirmed_aliases.extend(
+                item["alias_name"] for item in alias_candidates
+                if item["status"] == "confirmed"
+            )
             record_candidate(
                 index=index,
                 raw_fact=raw_fact,
@@ -1691,31 +1702,13 @@ class MemoryNodeManager:
         })
         return {"facts": facts}
 
-    def _normalize_fact_topic_fields(
-        self,
-        root_topic: Any,
-        aspect_topic: Any,
-        *,
-        fallback_root_topic: Any,
-        fallback_aspect_topic: Any,
-    ) -> Tuple[str, str]:
-        normalized_root = (
-            self._normalize_topic_name(root_topic)
-            or self._normalize_topic_name(fallback_root_topic)
-            or "general"
-        )
-        normalized_aspect = (
-            self._normalize_topic_name(aspect_topic)
-            or self._normalize_topic_name(fallback_aspect_topic)
-            or normalized_root
-        )
-        return normalized_root, normalized_aspect
-
     def _normalize_user_claim_signal(
         self,
         value: Any,
         *,
         allows_world_owner_reference: bool = False,
+        source_units: Optional[Sequence[MemoryUnit]] = None,
+        owner_aliases: Sequence[str] = (),
         limit: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         if not isinstance(value, list):
@@ -1787,6 +1780,15 @@ class MemoryNodeManager:
             )
             if not allows_world_owner_reference or not is_owner_reference:
                 continue
+            owner_evidence = self._normalize_user_signal_owner_evidence(
+                raw,
+                source_units=source_units,
+                owner_aliases=owner_aliases,
+            )
+            if owner_evidence is None:
+                continue
+            if owner_evidence["owner_evidence_type"] == "third_party_report":
+                confidence = min(confidence, 0.65)
             entity_name = self._world_owner_entity_name
             entity_type = "PERSON"
             entity_payload = {"name": entity_name, "type": entity_type}
@@ -1805,6 +1807,7 @@ class MemoryNodeManager:
                 "claim_anchor": claim_anchor,
                 "evidence_basis": evidence_basis,
                 "confidence": confidence,
+                **owner_evidence,
             }
             item["entity"] = entity_payload
             normalized.append(item)
@@ -1819,6 +1822,8 @@ class MemoryNodeManager:
         fallback_entity: Optional[Dict[str, str]] = None,
         limit: Optional[int] = None,
         allows_world_owner_reference: bool = False,
+        source_units: Optional[Sequence[MemoryUnit]] = None,
+        owner_aliases: Sequence[str] = (),
     ) -> List[Dict[str, Any]]:
         """Normalize fact-level evidence for the prospective world model."""
         if not isinstance(value, list):
@@ -1891,12 +1896,12 @@ class MemoryNodeManager:
                 )
             else:
                 subject_name = _compact_whitespace(subject)
-            if self._is_world_owner_entity_reference(subject_name):
-                if not allows_world_owner_reference:
-                    continue
-                subject_name = self._world_owner_entity_name
-            elif subject_name.lower() in _AMBIGUOUS_USER_ENTITY_ALIASES:
+            if not allows_world_owner_reference or not (
+                self._is_world_owner_entity_reference(subject_name)
+                or subject_name.lower() == self._world_owner_entity_name.lower()
+            ):
                 continue
+            subject_name = self._world_owner_entity_name
             user_intent_anchor = _compact_whitespace(
                 raw.get("user_intent_anchor") or raw.get("intent_anchor") or ""
             )[:240]
@@ -1905,7 +1910,25 @@ class MemoryNodeManager:
             )[:480]
             if not subject_name or not user_intent_anchor or not evidence_basis:
                 continue
+            owner_evidence = self._normalize_user_signal_owner_evidence(
+                raw,
+                source_units=source_units,
+                owner_aliases=owner_aliases,
+            )
+            if owner_evidence is None:
+                continue
+            if (
+                owner_evidence["owner_evidence_type"] == "confirmed_response"
+                and assertion_source != "self_statement"
+            ):
+                continue
+            if owner_evidence["owner_evidence_type"] == "third_party_report" and (
+                assertion_source != "third_party_report" or explicitness != "reported"
+            ):
+                continue
             confidence = self._clamp_float(raw.get("confidence"), 0.0, 1.0, 0.75)
+            if owner_evidence["owner_evidence_type"] == "third_party_report":
+                confidence = min(confidence, 0.65)
             key = (
                 subject_name.lower(),
                 evidence_kind,
@@ -1924,6 +1947,7 @@ class MemoryNodeManager:
                 "explicitness": explicitness,
                 "evidence_basis": evidence_basis,
                 "confidence": confidence,
+                **owner_evidence,
             })
             if len(normalized) >= max_items:
                 break
@@ -1937,16 +1961,207 @@ class MemoryNodeManager:
 
     @staticmethod
     def _units_include_world_owner(units: Sequence[MemoryUnit]) -> bool:
-        """Return whether this fact task contains the tagged wearer side."""
+        """Return whether this fact task contains a verified wearer speaker."""
         return any(
             isinstance(unit, MemoryUnit)
-            and unit.unit_type == "interaction"
             and any(
-                _compact_whitespace(speaker) == "用户本人"
+                _compact_whitespace(speaker) == "speaker_用户本人"
                 for speaker in unit.speakers or []
             )
             for unit in units or ()
         )
+
+    def _confirmed_owner_aliases_in_fact(
+        self,
+        *,
+        entity_names: Sequence[str],
+        fact_text: str,
+        confirmed_aliases: Sequence[str],
+    ) -> List[str]:
+        """Resolve aliases co-referenced with the wearer, without another DB lookup."""
+        if not any(
+            self._is_world_owner_entity_reference(name)
+            or _compact_whitespace(name).lower() == self._world_owner_entity_name.lower()
+            for name in entity_names
+        ):
+            return []
+        confirmed_keys = {
+            self._db.normalize_owner_alias_key(name)
+            for name in confirmed_aliases
+        }
+        aliases: List[str] = []
+        for name in entity_names:
+            normalized_name = _compact_whitespace(name)
+            if (
+                normalized_name
+                and self._db.normalize_owner_alias_key(normalized_name) in confirmed_keys
+                and normalized_name.casefold() in fact_text.casefold()
+                and normalized_name not in aliases
+            ):
+                aliases.append(normalized_name)
+        return aliases
+
+    def _normalize_world_owner_alias_candidates(
+        self,
+        value: Any,
+        *,
+        fact_text: str,
+        entity_names: Sequence[str],
+        source_units: Sequence[MemoryUnit],
+    ) -> List[Dict[str, Any]]:
+        """Validate proposed owner names against current, speaker-attributed audio text."""
+        if not isinstance(value, list):
+            return []
+        source_entries = [
+            (_compact_whitespace(entry.get("speaker")), _compact_whitespace(entry.get("text")))
+            for unit in source_units
+            for entry in unit.entries()
+        ]
+        entity_keys = {
+            self._db.normalize_owner_alias_key(name)
+            for name in entity_names
+        }
+        candidates: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        for raw in value[:4]:
+            if not isinstance(raw, dict):
+                continue
+            alias_name = _compact_whitespace(raw.get("alias_name") or "")[:80]
+            alias_key = self._db.normalize_owner_alias_key(alias_name)
+            evidence_type = str(raw.get("evidence_type") or "").strip().lower()
+            evidence_text = _compact_whitespace(raw.get("evidence_text") or "")[:480]
+            response_text = _compact_whitespace(raw.get("owner_response_text") or "")[:240]
+            if (
+                len(alias_key) < 2 or alias_key in seen
+                or alias_key not in entity_keys or alias_name not in fact_text
+                or alias_name.lower() in _AMBIGUOUS_USER_ENTITY_ALIASES
+                or self._is_world_owner_entity_reference(alias_name)
+                or evidence_type not in {
+                    "self_identification", "direct_address", "third_party_reference",
+                }
+                or not evidence_text or alias_name not in evidence_text
+            ):
+                continue
+            matching_positions = [
+                index for index, (speaker, text) in enumerate(source_entries)
+                if evidence_text in text and (
+                    speaker == "speaker_用户本人"
+                    if evidence_type == "self_identification"
+                    else speaker not in {"speaker_用户本人", "speaker_助手"}
+                )
+            ]
+            if not matching_positions:
+                continue
+            if evidence_type == "self_identification":
+                if not re.search(
+                    rf"(?:我叫|我是|我的名字(?:是)?|本人叫|my name is|i am|i'm)\s*{re.escape(alias_name)}",
+                    evidence_text,
+                    re.IGNORECASE,
+                ):
+                    continue
+                status = "confirmed"
+                source_speaker = "speaker_用户本人"
+            elif evidence_type == "direct_address":
+                if not response_text or response_text in {
+                    "嗯", "哦", "好", "好的", "知道了", "收到", "明白了",
+                } or not any(
+                    speaker == "speaker_用户本人" and response_text in text
+                    for position in matching_positions
+                    for speaker, text in source_entries[position + 1:]
+                ):
+                    continue
+                status = "confirmed"
+                source_speaker = source_entries[matching_positions[0]][0]
+            else:
+                if response_text:
+                    continue
+                status = "candidate"
+                source_speaker = source_entries[matching_positions[0]][0]
+            seen.add(alias_key)
+            candidates.append({
+                "alias_name": alias_name,
+                "status": status,
+                "confidence": self._clamp_float(raw.get("confidence"), 0.0, 1.0, 0.75),
+                "evidence_type": evidence_type,
+                "evidence_text": evidence_text,
+                "source_speaker": source_speaker,
+            })
+        return candidates
+
+    def _normalize_user_signal_owner_evidence(
+        self,
+        signal: Dict[str, Any],
+        *,
+        source_units: Optional[Sequence[MemoryUnit]],
+        owner_aliases: Sequence[str] = (),
+    ) -> Optional[Dict[str, str]]:
+        """Validate the attributed quote, preserving whether it is hearsay."""
+        evidence_type = str(signal.get("owner_evidence_type") or "").strip().lower()
+        if evidence_type not in {"self_statement", "confirmed_response", "third_party_report"}:
+            return None
+        owner_text = _compact_whitespace(
+            signal.get("owner_evidence_text") or ""
+        ).strip("\"'“”")
+        other_text = _compact_whitespace(
+            signal.get("other_evidence_text") or ""
+        ).strip("\"'“”")
+        if evidence_type == "third_party_report":
+            if (
+                owner_text or not other_text or not any(
+                    self._db.normalize_owner_alias_key(alias)
+                    in self._db.normalize_owner_alias_key(other_text)
+                    for alias in owner_aliases
+                )
+            ):
+                return None
+            if source_units is not None and not any(
+                _compact_whitespace(entry.get("speaker") or "")
+                not in {"speaker_用户本人", "speaker_助手"}
+                and other_text in _compact_whitespace(entry.get("text") or "")
+                for unit in source_units for entry in unit.entries()
+            ):
+                return None
+            return {
+                "owner_evidence_type": evidence_type,
+                "owner_evidence_text": "",
+                "other_evidence_text": other_text,
+            }
+        if not owner_text or (
+            evidence_type == "confirmed_response" and not other_text
+        ) or (
+            evidence_type == "self_statement" and other_text
+        ):
+            return None
+        if evidence_type == "confirmed_response" and owner_text in {
+            "嗯", "哦", "好", "好的", "知道了", "收到", "明白了",
+        }:
+            return None
+        if source_units is not None:
+            source_entries = [
+                (
+                    _compact_whitespace(entry.get("speaker") or ""),
+                    _compact_whitespace(entry.get("text") or ""),
+                )
+                for unit in source_units
+                for entry in unit.entries()
+            ]
+            owner_positions = [
+                index for index, (speaker, text) in enumerate(source_entries)
+                if speaker == "speaker_用户本人" and owner_text in text
+            ]
+            if not owner_positions:
+                return None
+            if evidence_type == "confirmed_response" and not any(
+                speaker != "speaker_用户本人" and other_text in text
+                for owner_position in owner_positions
+                for speaker, text in source_entries[:owner_position]
+            ):
+                return None
+        return {
+            "owner_evidence_type": evidence_type,
+            "owner_evidence_text": owner_text,
+            "other_evidence_text": other_text,
+        }
 
     def _normalize_fact_entity_descriptors(
         self,
@@ -1988,8 +2203,8 @@ class MemoryNodeManager:
     ) -> str:
         is_en = prompt_language == "en"
         time_label = "Conversation timestamp" if is_en else "对话发生时间"
-        user_label = "user self" if is_en else "用户本人"
-        assistant_label = "Assistant" if is_en else "助手"
+        user_label = "speaker_用户本人"
+        assistant_label = "speaker_助手"
         blocks: List[str] = []
         for index, turn in enumerate(turns, 1):
             blocks.append(
@@ -2160,17 +2375,11 @@ class MemoryNodeManager:
         normalized_fact_id = int(fact_id or 0)
         normalized_episode_id = int(episode_id or 0)
         updates: List[Dict[str, Any]] = []
-        canonical_keys: set[str] = set()
-
         def add(topic_kind: str, value: Any) -> None:
             topic_name = self._normalize_topic_name(value)
             if not topic_name or not self._is_indexable_memory_topic(topic_name):
                 return
             topic_key = self._generate_topic_name_key(topic_name)
-            if topic_kind == "aspect" and topic_key in canonical_keys:
-                # An aspect equal to its fact root adds no finer-grained
-                # vocabulary and would only duplicate prompt candidates.
-                return
             item: Dict[str, Any] = {
                 "topic_kind": topic_kind,
                 "topic_name": topic_name,
@@ -2186,9 +2395,6 @@ class MemoryNodeManager:
                 updates.append(item)
 
         for topic in canonical_topics or ():
-            topic_name = self._normalize_topic_name(topic)
-            if topic_name and self._is_indexable_memory_topic(topic_name):
-                canonical_keys.add(self._generate_topic_name_key(topic_name))
             add("canonical", topic)
         # Aspect topics are defined only by facts. Episode callers therefore
         # leave this sequence empty.
@@ -2196,100 +2402,6 @@ class MemoryNodeManager:
             for topic in aspect_topics or ():
                 add("aspect", topic)
         return updates
-
-    def _collect_memory_topic_item_context(
-        self,
-        *,
-        units: Sequence[MemoryUnit],
-        canonical_limit: int = 12,
-        aspect_limit: int = 12,
-    ) -> Dict[str, List[str]]:
-        """Return only topic names lexically related to the incoming evidence."""
-        query_text = " ".join(
-            _compact_whitespace(unit.text)
-            for unit in units or ()
-            if isinstance(unit, MemoryUnit)
-        )
-        query_terms = self._lexical_search_terms_for_text(
-            query_text,
-            limit=24,
-            preserve_phrase=False,
-        )
-        if not query_terms:
-            return {"canonical_topics": [], "aspect_topics": []}
-        try:
-            rows = self._db.list_memory_topic_items(limit=240)
-        except Exception as exc:
-            self._logger.debug("Failed to load memory topic item context: %s", exc)
-            return {"canonical_topics": [], "aspect_topics": []}
-
-        ranked: List[Tuple[float, Dict[str, Any]]] = []
-        query_key = self._generate_topic_name_key(query_text)
-        for row in rows:
-            topic_name = self._normalize_topic_name(row.get("topic_name") or "")
-            topic_key = self._generate_topic_name_key(topic_name) if topic_name else ""
-            if not topic_name or not topic_key:
-                continue
-            score = self._topic_name_best_pair_similarity(
-                query_terms,
-                [topic_name],
-            )
-            if query_key and topic_key and topic_key in query_key:
-                score = max(score, 0.9)
-            if score < 0.5:
-                continue
-            ranked.append((score, row))
-
-        result: Dict[str, List[str]] = {
-            "canonical_topics": [],
-            "aspect_topics": [],
-        }
-        limits = {
-            "canonical": max(1, int(canonical_limit or 12)),
-            "aspect": max(1, int(aspect_limit or 12)),
-        }
-        for _score, row in sorted(
-            ranked,
-            key=lambda item: (
-                item[0],
-                str(item[1].get("last_seen_at") or ""),
-                int(item[1].get("fact_occurrence_count") or 0)
-                + int(item[1].get("episode_occurrence_count") or 0),
-            ),
-            reverse=True,
-        ):
-            kind = str(row.get("topic_kind") or "").strip().lower()
-            result_key = f"{kind}_topics"
-            topic_name = self._normalize_topic_name(row.get("topic_name") or "")
-            if (
-                kind not in limits
-                or not topic_name
-                or topic_name in result[result_key]
-                or len(result[result_key]) >= limits[kind]
-            ):
-                continue
-            result[result_key].append(topic_name)
-        return result
-
-    @staticmethod
-    def _format_memory_topic_items_for_prompt(
-        topic_items: Dict[str, List[str]],
-        *,
-        max_chars: int = 1200,
-    ) -> str:
-        payload = {
-            "canonical_topics": list(topic_items.get("canonical_topics") or []),
-            "aspect_topics": list(topic_items.get("aspect_topics") or []),
-        }
-        while payload["canonical_topics"] or payload["aspect_topics"]:
-            text = json.dumps(payload, ensure_ascii=False, indent=2)
-            if len(text) <= max_chars:
-                return text
-            if len(payload["aspect_topics"]) >= len(payload["canonical_topics"]):
-                payload["aspect_topics"].pop()
-            else:
-                payload["canonical_topics"].pop()
-        return "[]"
 
     def _normalize_episode_canonical_topics(
         self,
@@ -2510,6 +2622,13 @@ class MemoryNodeManager:
         user_intent_signal_mapping_updates: List[Dict[str, Any]] = []
         user_claim_signal_fact_ids: List[int] = []
         user_intent_signal_fact_ids: List[int] = []
+        owner_entity_id = self._intent_world_owner_entity_id()
+        stored_confirmed_alias_keys = {
+            str(row["alias_key"])
+            for row in self._db.get_owner_entity_aliases(
+                owner_entity_id, status="confirmed", limit=4096,
+            )
+        }
         for fact in facts:
             keywords = self._normalize_string_list(
                 fact.get("keywords"),
@@ -2521,18 +2640,29 @@ class MemoryNodeManager:
             entity_descriptors = list(fact.get("entity_descriptors") or [])
             raw_metadata = fact.get("metadata")
             metadata = dict(raw_metadata) if isinstance(raw_metadata, dict) else {}
+            resolved_world_owner_aliases = list(fact["resolved_world_owner_aliases"])
             fallback_topics = self._topic_candidates(fact["summary"])
-            fact_root_topic = self._normalize_topic_name(
-                fact.get("fact_root_topic")
-                or next(iter(episode_context_topics or []), "")
-            ) or self._normalize_topic_name(
-                fallback_topics[0] if fallback_topics else ""
-            ) or "general"
-            fact_aspect_topic = self._normalize_topic_name(
-                fact.get("fact_aspect_topic")
-                or fact_root_topic
-            ) or fact_root_topic
-            entity_mapping = self._db.upsert_entity_nodes(entity_descriptors)
+            fact_topic = (
+                self._normalize_topic_name(fact.get("fact_topic"))
+                or self._normalize_topic_name(
+                    fallback_topics[0] if fallback_topics else ""
+                )
+                or "general"
+            )
+            owner_alias_keys = {
+                self._db.normalize_owner_alias_key(alias)
+                for alias in resolved_world_owner_aliases
+            }
+            entity_mapping = self._db.upsert_entity_nodes([
+                descriptor for descriptor in entity_descriptors
+                if self._db.normalize_owner_alias_key(descriptor.get("name") or "")
+                not in owner_alias_keys
+            ])
+            if owner_alias_keys:
+                for descriptor in entity_descriptors:
+                    name = str(descriptor.get("name") or "")
+                    if self._db.normalize_owner_alias_key(name) in owner_alias_keys:
+                        entity_mapping[name] = owner_entity_id
             entity_ids = [
                 entity_mapping[entity_name]
                 for entity_name in fact_entities
@@ -2551,22 +2681,43 @@ class MemoryNodeManager:
                 keywords=keywords,
                 entities=fact_entities,
                 entity_ids=entity_ids,
-                fact_root_topic=fact_root_topic,
-                fact_aspect_topic=fact_aspect_topic,
+                fact_topic=fact_topic,
                 event_time_key=fact.get("event_time_key") or "",
                 dialogue_time_key=fact.get("dialogue_time_key") or "",
                 confidence=fact["confidence"],
                 importance=fact["importance"],
                 metadata=fact_metadata,
             )
+            confirmed_candidates_by_key = {
+                self._db.normalize_owner_alias_key(alias["alias_name"]): alias
+                for alias in fact.get("world_owner_alias_candidates") or []
+                if isinstance(alias, dict) and alias.get("status") == "confirmed"
+            }
+            for alias_name in resolved_world_owner_aliases:
+                alias_key = self._db.normalize_owner_alias_key(alias_name)
+                alias = confirmed_candidates_by_key.get(alias_key)
+                if alias_key in stored_confirmed_alias_keys or alias is None:
+                    # Known aliases need no new row, and fresh aliases need
+                    # current-fact confirmation evidence before persistence.
+                    continue
+                self._db.upsert_owner_entity_alias(
+                    owner_entity_id=owner_entity_id,
+                    alias_name=alias_name,
+                    status="confirmed",
+                    confidence=alias["confidence"],
+                    evidence_fact_id=fact_id,
+                    evidence_type=alias["evidence_type"],
+                    evidence_text=alias["evidence_text"],
+                    source_speaker=alias["source_speaker"],
+                )
+                stored_confirmed_alias_keys.add(alias_key)
             self._upsert_fact_recall_document(
                 fact_id=fact_id,
                 summary=fact["summary"],
                 keywords=keywords,
                 entities=fact_entities,
                 entity_ids=entity_ids,
-                fact_root_topic=fact_root_topic,
-                fact_aspect_topic=fact_aspect_topic,
+                fact_topic=fact_topic,
                 event_time_key=fact.get("event_time_key") or "",
                 dialogue_time_key=fact.get("dialogue_time_key") or "",
                 confidence=float(fact["confidence"]),
@@ -2587,8 +2738,8 @@ class MemoryNodeManager:
                 user_intent_signal_fact_ids.append(fact_id)
             topic_item_updates.extend(
                 self._build_memory_topic_item_updates(
-                    canonical_topics=[fact_root_topic],
-                    aspect_topics=[fact_aspect_topic],
+                    canonical_topics=[],
+                    aspect_topics=[fact_topic],
                     fact_id=fact_id,
                 )
             )
@@ -2716,7 +2867,7 @@ class MemoryNodeManager:
         limit: Optional[int] = None,
         reference_timestamp: Optional[Any] = None,
     ) -> Dict[str, Any]:
-        """Settle pending future-facing evidence in isolated evidence groups."""
+        """Extract independent intent signals in bounded LLM batches."""
         limit = max(
             1,
             int(limit or self._memory_cfg.get("user_intent_limit") or 100),
@@ -2732,13 +2883,14 @@ class MemoryNodeManager:
             "status": "empty",
             "seed_fact_count": len(facts),
             "user_intent_signal_count": 0,
-            "evidence_group_count": 0,
+            "signal_batch_count": 0,
             "candidate_count": 0,
             "applied_count": 0,
             "created": 0,
             "updated": 0,
-            "facts_marked_processed": 0,
-            "failed_group_count": 0,
+            "signals_marked_processed": 0,
+            "failed_signal_count": 0,
+            "failed_batch_count": 0,
             "affected_objects": [],
         }
         self._log_user_intent_facts_loaded(
@@ -2753,29 +2905,37 @@ class MemoryNodeManager:
             for fact in facts
             if str(fact.get("id") or "").strip().isdigit()
         }
-        user_intent_signals = [
-            signal
-            for fact in facts_by_id.values()
-            for signal in self._get_user_intent_signals_from_fact(fact)
-        ]
-        report["user_intent_signal_count"] = len(user_intent_signals)
-        if not user_intent_signals:
+        signal_items: List[Dict[str, Any]] = []
+        for fact_id, fact in facts_by_id.items():
+            for signal in self._get_user_intent_signals_from_fact(fact):
+                if int(signal.get("processed_for_memory_user_intent_update") or 0):
+                    continue
+                signal_key = str(signal.get("signal_key") or "")
+                if not signal_key:
+                    continue
+                signal_items.append({
+                    "signal_id": f"{fact_id}:{signal_key}",
+                    "fact_id": fact_id,
+                    "signal_key": signal_key,
+                    "fact": fact,
+                    "signal": signal,
+                })
+        report["user_intent_signal_count"] = len(signal_items)
+        if not signal_items:
             self._log_info("memory_user_intent_update", "finish", report)
             return report
 
         world_owner_id = self._intent_world_owner_entity_id()
-        evidence_groups = self._group_user_intent_signals(
-            user_intent_signals,
-            facts_by_id=facts_by_id,
+        batch_size = max(
+            1,
+            int(self._memory_cfg.get("user_intent_signal_batch_size") or 8),
         )
-        report["evidence_group_count"] = len(evidence_groups)
-        successful_group_fact_ids: set[int] = set()
-        failed_group_fact_ids: set[int] = set()
-        for group_index, group in enumerate(evidence_groups):
-            group_facts = list(group["facts"])
-            group_fact_ids = list(group["fact_ids"])
+        for batch_start in range(0, len(signal_items), batch_size):
+            batch = signal_items[batch_start:batch_start + batch_size]
+            batch_index = batch_start // batch_size
+            report["signal_batch_count"] += 1
             language = self._resolve_prompt_language_from_text("\n".join(
-                str(fact.get("summary") or "") for fact in group_facts
+                str(item["fact"].get("summary") or "") for item in batch
             ))
             prompt_template = (
                 INTENT_EXTRACTION_PROMPT_EN
@@ -2786,102 +2946,146 @@ class MemoryNodeManager:
                 if language == "en"
                 else self._world_owner_entity_name
             )
-            raw = self._call_llm(
-                prompt_template.replace("{world_owner_name}", world_owner_prompt_name)
-                .replace("{reference_timestamp}", str(reference_timestamp))
-                .replace("{facts}", json.dumps(
-                    self._user_intent_group_fact_prompt_views(group),
-                    ensure_ascii=False,
-                    indent=2,
-                ))
-            )
-            parsed = self._parse_json_object_from_llm_text(raw or "")
-            if (
-                parsed is None
-                or not isinstance(parsed, dict)
-                or not isinstance(parsed.get("intent_candidates"), list)
-            ):
-                report["failed_group_count"] += 1
-                failed_group_fact_ids.update(group_fact_ids)
-                self._log_info("memory_user_intent_update", "group_error", {
-                    "group_index": group_index,
-                    "group_key": group["group_key"],
-                    "fact_ids": group_fact_ids,
-                    "error": "invalid_llm_user_intent_extraction_response",
+            batch_error = ""
+            try:
+                raw = self._llm_client.call_llm(
+                    prompt_template.replace("{world_owner_name}", world_owner_prompt_name)
+                    .replace("{reference_timestamp}", str(reference_timestamp))
+                    .replace("{signal_items}", json.dumps(
+                        [self._user_intent_signal_prompt_view(item) for item in batch],
+                        ensure_ascii=False,
+                        indent=2,
+                    ))
+                )
+                parsed = self._llm_client.parse_json_object_from_llm_text(raw or "")
+            except Exception as exc:
+                parsed = None
+                batch_error = str(exc)
+            if not isinstance(parsed, dict) or not isinstance(parsed.get("results"), list):
+                report["failed_batch_count"] += 1
+                report["failed_signal_count"] += len(batch)
+                self._log_info("memory_user_intent_update", "batch_error", {
+                    "batch_index": batch_index,
+                    "signal_ids": [item["signal_id"] for item in batch],
+                    "error": batch_error or "invalid_llm_user_intent_extraction_response",
                 })
                 continue
 
-            group_facts_by_id = {
-                int(fact["id"]): fact
-                for fact in group_facts
-                if str(fact.get("id") or "").strip().isdigit()
-            }
-            entity_ids_by_name: Dict[str, int] = {}
-            for fact in group_facts_by_id.values():
-                for raw_name, raw_entity_id in zip(
-                    fact.get("entities") or [],
-                    fact.get("entity_ids") or [],
+            results_by_id: Dict[str, List[Dict[str, Any]]] = {}
+            for result in parsed["results"]:
+                if isinstance(result, dict):
+                    results_by_id.setdefault(str(result.get("signal_id") or ""), []).append(result)
+            batch_candidates = 0
+            batch_applied = 0
+            for item in batch:
+                signal_id = item["signal_id"]
+                results = results_by_id.get(signal_id) or []
+                if len(results) != 1 or "intent_candidate" not in results[0]:
+                    report["failed_signal_count"] += 1
+                    self._log_info("memory_user_intent_update", "signal_error", {
+                        "signal_id": signal_id,
+                        "error": "missing_or_duplicate_signal_result",
+                    })
+                    continue
+                raw_candidate = results[0]["intent_candidate"]
+                if raw_candidate is None:
+                    with self._db.transaction():
+                        report["signals_marked_processed"] += self._db.mark_user_intent_signals_processed(
+                            [(item["fact_id"], item["signal_key"])]
+                        )
+                    continue
+                fact_id = item["fact_id"]
+                if (
+                    not isinstance(raw_candidate, dict)
+                    or raw_candidate.get("evidence_fact_ids") != [fact_id]
+                    or raw_candidate.get("object_type") not in item["signal"]["candidate_object_types"]
                 ):
-                    entity_name = _compact_whitespace(raw_name)
-                    if not entity_name or entity_name in entity_ids_by_name:
-                        continue
-                    try:
-                        entity_id = int(raw_entity_id)
-                    except (TypeError, ValueError):
-                        continue
-                    if entity_id > 0:
-                        entity_ids_by_name[entity_name] = entity_id
-            candidates = self._normalize_intent_candidates(
-                parsed,
-                facts_by_id=group_facts_by_id,
-                entity_ids=entity_ids_by_name,
-                world_owner_id=world_owner_id,
-            )
-            report["candidate_count"] += len(candidates)
-            decisions = self._reconcile_intent_candidates(
-                candidates,
-                world_owner_id=world_owner_id,
-                prompt_language=language,
-                existing_by_type=self._retrieve_user_intent_related_intent_objects(
-                    candidates,
+                    report["failed_signal_count"] += 1
+                    self._log_info("memory_user_intent_update", "signal_error", {
+                        "signal_id": signal_id,
+                        "error": "invalid_signal_candidate_scope",
+                    })
+                    continue
+                fact = item["fact"]
+                entity_ids_by_name = {
+                    _compact_whitespace(name): int(entity_id)
+                    for name, entity_id in zip(
+                        fact.get("entities") or [], fact.get("entity_ids") or [],
+                    )
+                    if _compact_whitespace(name) and str(entity_id).isdigit()
+                    and int(entity_id) > 0
+                }
+                candidates = self._normalize_intent_candidates(
+                    {"intent_candidates": [raw_candidate]},
+                    facts_by_id={fact_id: fact},
+                    entity_ids=entity_ids_by_name,
                     world_owner_id=world_owner_id,
-                ),
-            )
-            with self._db.transaction():
-                applied = self._apply_intent_candidates(candidates, decisions)
-            successful_group_fact_ids.update(group_fact_ids)
-            report["applied_count"] += len(applied)
-            report["created"] += sum(item["created"] for item in applied)
-            report["updated"] += sum(not item["created"] for item in applied)
-            report["affected_objects"].extend({
-                "object_type": str(item.get("object_type") or ""),
-                "object_id": int(item.get("object_id") or 0),
-            } for item in applied)
-            self._log_info("memory_user_intent_update", "group_finish", {
-                "group_index": group_index,
-                "group_key": group["group_key"],
-                "fact_ids": group_fact_ids,
-                "user_intent_signal_count": len(group["signals"]),
-                "candidate_count": len(candidates),
-                "created": sum(item["created"] for item in applied),
-                "updated": sum(not item["created"] for item in applied),
+                )
+                if len(candidates) != 1:
+                    report["failed_signal_count"] += 1
+                    self._log_info("memory_user_intent_update", "signal_error", {
+                        "signal_id": signal_id,
+                        "error": "invalid_normalized_intent_candidate",
+                    })
+                    continue
+                batch_candidates += 1
+                report["candidate_count"] += 1
+                try:
+                    decisions = self._reconcile_intent_candidates(
+                        candidates,
+                        world_owner_id=world_owner_id,
+                        prompt_language=language,
+                        existing_by_type=self._retrieve_user_intent_related_intent_objects(
+                            candidates,
+                            world_owner_id=world_owner_id,
+                        ),
+                    )
+                    # A lifecycle-only signal can change an existing object,
+                    # but cannot by itself create a new object.
+                    should_apply = not (
+                        item["signal"]["evidence_kind"] == "lifecycle_update"
+                        and decisions.get(0, {}).get("operation") == "create"
+                    )
+                    with self._db.transaction():
+                        applied = (
+                            self._apply_intent_candidates(candidates, decisions)
+                            if should_apply else []
+                        )
+                        marked = self._db.mark_user_intent_signals_processed(
+                            [(fact_id, item["signal_key"])]
+                        )
+                except Exception as exc:
+                    report["failed_signal_count"] += 1
+                    self._log_info("memory_user_intent_update", "signal_error", {
+                        "signal_id": signal_id,
+                        "error": str(exc),
+                    })
+                    continue
+                report["signals_marked_processed"] += marked
+                batch_applied += len(applied)
+                report["applied_count"] += len(applied)
+                report["created"] += sum(result["created"] for result in applied)
+                report["updated"] += sum(not result["created"] for result in applied)
+                report["affected_objects"].extend({
+                    "object_type": str(result.get("object_type") or ""),
+                    "object_id": int(result.get("object_id") or 0),
+                } for result in applied)
+            self._log_info("memory_user_intent_update", "batch_finish", {
+                "batch_index": batch_index,
+                "signal_ids": [item["signal_id"] for item in batch],
+                "candidate_count": batch_candidates,
+                "applied_count": batch_applied,
             })
 
-        completed_group_fact_ids = sorted(
-            successful_group_fact_ids - failed_group_fact_ids
-        )
-        if completed_group_fact_ids:
-            with self._db.transaction():
-                report["facts_marked_processed"] += self._db.mark_facts_processed(
-                    processing_target="user_intent_update",
-                    fact_ids=completed_group_fact_ids,
-                )
-
         report["status"] = (
-            "error" if report["failed_group_count"] == len(evidence_groups)
-            else "ok"
+            "error" if report["failed_signal_count"] == len(signal_items)
+            else "partial" if report["failed_signal_count"] else "ok"
         )
         if report["affected_objects"]:
+            report["affected_objects"] = list({
+                (item["object_type"], item["object_id"]): item
+                for item in report["affected_objects"]
+            }.values())
             report["user_state_update_request"] = {
                 "changed_intent_objects": report["affected_objects"],
                 "reference_timestamp": reference_timestamp,
@@ -2889,73 +3093,23 @@ class MemoryNodeManager:
         self._log_info("memory_user_intent_update", "finish", report)
         return report
 
-    def _group_user_intent_signals(
+    def _user_intent_signal_prompt_view(
         self,
-        user_intent_signals: Sequence[Dict[str, Any]],
-        *,
-        facts_by_id: Dict[int, Dict[str, Any]],
-    ) -> List[Dict[str, Any]]:
-        """Group compatible persisted signals while keeping each prompt small."""
-        groups_by_key: Dict[str, List[Dict[str, Any]]] = {}
-        for signal in user_intent_signals:
-            fact_id = int(signal["fact_id"])
-            if fact_id not in facts_by_id:
-                continue
-            object_key = ",".join(signal["candidate_object_types"])
-            # A group is a bounded extraction batch, not an assertion that its
-            # signals describe the same prospective object.  Anchors remain in
-            # the prompt view as semantic evidence, but must not fragment the
-            # batch merely because the fact extractor phrased them differently.
-            base_key = "|".join((
-                str(signal["subject_entity"]).lower(),
-                object_key,
-            ))
-            groups = groups_by_key.setdefault(base_key, [])
-            target = next((
-                group for group in groups
-                if fact_id in group["fact_ids"] or len(group["fact_ids"]) < 8
-            ), None)
-            if target is None:
-                target = {
-                    "group_key": f"{base_key}#{len(groups) + 1}",
-                    "signals": [],
-                    "fact_ids": [],
-                    "facts": [],
-                }
-                groups.append(target)
-            target["signals"].append(signal)
-            if fact_id not in target["fact_ids"]:
-                target["fact_ids"].append(fact_id)
-                target["facts"].append(facts_by_id[fact_id])
-        return [
-            group
-            for groups in groups_by_key.values()
-            for group in groups
-        ]
-
-    def _user_intent_group_fact_prompt_views(
-        self,
-        group: Dict[str, Any],
-    ) -> List[Dict[str, Any]]:
-        signals_by_fact_id: Dict[int, List[Dict[str, Any]]] = {}
-        for signal in group["signals"]:
-            signals_by_fact_id.setdefault(int(signal["fact_id"]), []).append(signal)
-        views: List[Dict[str, Any]] = []
-        for fact in group["facts"]:
-            view = self._intent_fact_prompt_view(fact)
-            view["user_intent_signals"] = [
-                {
-                    key: signal[key]
-                    for key in (
-                        "evidence_kind", "candidate_object_types", "subject_entity",
-                        "user_role", "user_intent_anchor",
-                        "assertion_source", "explicitness",
-                    )
-                }
-                for signal in signals_by_fact_id.get(int(fact.get("id") or 0), [])
-            ]
-            views.append(view)
-        return views
+        item: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        signal = item["signal"]
+        return {
+            "signal_id": item["signal_id"],
+            "fact": self._intent_fact_prompt_view(item["fact"]),
+            "user_intent_signal": {
+                key: signal.get(key)
+                for key in (
+                    "evidence_kind", "candidate_object_types", "subject_entity",
+                    "user_role", "user_intent_anchor", "assertion_source",
+                    "explicitness", "evidence_basis", "confidence",
+                )
+            },
+        }
 
     def _retrieve_user_intent_related_intent_objects(
         self,
@@ -3118,7 +3272,7 @@ class MemoryNodeManager:
             "event_time": fact.get("event_time_key") or "",
             "dialogue_time": fact.get("dialogue_time_key") or "",
             "keywords": fact.get("keywords") or [],
-            "topics": [fact.get("fact_root_topic") or "", fact.get("fact_aspect_topic") or ""],
+            "topics": [fact.get("fact_topic") or ""],
         }
 
     def _normalize_intent_candidates(
@@ -3177,9 +3331,8 @@ class MemoryNodeManager:
         allows_world_owner_reference = any(
             isinstance(facts_by_id[fact_id].get("metadata"), dict)
             and bool(
-                facts_by_id[fact_id]["metadata"].get(
-                    "has_world_owner_interaction"
-                )
+                facts_by_id[fact_id]["metadata"].get("has_world_owner_speaker")
+                or facts_by_id[fact_id]["metadata"].get("has_world_owner_alias_reference")
             )
             for fact_id in evidence_ids
             if isinstance(facts_by_id.get(fact_id, {}).get("metadata"), dict)
@@ -3367,11 +3520,11 @@ class MemoryNodeManager:
             INTENT_RECONCILIATION_PROMPT_EN
             if prompt_language == "en" else INTENT_RECONCILIATION_PROMPT_ZH
         )
-        raw = self._call_llm(
+        raw = self._llm_client.call_llm(
             prompt_template.replace("{candidates}", json.dumps(candidates, ensure_ascii=False, indent=2))
             .replace("{existing_objects}", json.dumps(existing, ensure_ascii=False, indent=2))
         )
-        parsed = self._parse_json_object_from_llm_text(raw or "")
+        parsed = self._llm_client.parse_json_object_from_llm_text(raw or "")
         if not isinstance(parsed, dict) or not isinstance(parsed.get("decisions"), list):
             return decisions
         valid_ids = {
@@ -3749,7 +3902,7 @@ class MemoryNodeManager:
         metadata = fact.get("metadata") if isinstance(fact.get("metadata"), dict) else {}
         entities = list(fact.get("entities") or [])
         has_world_owner = bool(
-            metadata.get("has_world_owner_interaction")
+            (metadata.get("has_world_owner_speaker") or metadata.get("has_world_owner_alias_reference"))
             and any(
                 _compact_whitespace(entity).lower()
                 == self._world_owner_entity_name.lower()
@@ -3951,7 +4104,7 @@ class MemoryNodeManager:
             for claim in claims
             if str(claim.get("id") or "").strip().isdigit()
         }
-        raw = self._call_llm(
+        raw = self._llm_client.call_llm(
             prompt_template.replace("{candidate_claims}", json.dumps(
                 prompt_candidates, ensure_ascii=False, indent=2,
             )).replace("{existing_claims}", json.dumps(
@@ -3962,7 +4115,7 @@ class MemoryNodeManager:
                 ensure_ascii=False, indent=2,
             ))
         )
-        parsed = self._parse_json_object_from_llm_text(raw or "")
+        parsed = self._llm_client.parse_json_object_from_llm_text(raw or "")
         if not parsed or not isinstance(parsed.get("decisions"), list):
             return [[] for _candidate in candidates]
         else:
@@ -4261,7 +4414,7 @@ class MemoryNodeManager:
             EXPLICIT_USER_CLAIM_EXTRACTION_PROMPT_EN
             if prompt_language == "en" else EXPLICIT_USER_CLAIM_EXTRACTION_PROMPT_ZH
         )
-        raw = self._call_llm(prompt_template.replace(
+        raw = self._llm_client.call_llm(prompt_template.replace(
             "{facts}", json.dumps(
                 [
                     self._claim_fact_prompt_view(fact)
@@ -4270,7 +4423,7 @@ class MemoryNodeManager:
                 ensure_ascii=False, indent=2,
             ),
         ))
-        parsed = self._parse_json_object_from_llm_text(raw or "")
+        parsed = self._llm_client.parse_json_object_from_llm_text(raw or "")
         if parsed is None or not isinstance(parsed.get("claims"), list):
             report["completed"] = False
             report["error"] = "invalid_llm_claim_response"
@@ -4352,9 +4505,8 @@ class MemoryNodeManager:
         if not all(
             isinstance(facts_by_id[fact_id].get("metadata"), dict)
             and bool(
-                facts_by_id[fact_id]["metadata"].get(
-                    "has_world_owner_interaction"
-                )
+                facts_by_id[fact_id]["metadata"].get("has_world_owner_speaker")
+                or facts_by_id[fact_id]["metadata"].get("has_world_owner_alias_reference")
             )
             and subject in (facts_by_id[fact_id].get("entities") or [])
             for fact_id in evidence_ids
@@ -4371,6 +4523,12 @@ class MemoryNodeManager:
         if not object_id and not raw_claim_text:
             return None
         confidence = self._clamp_float(raw.get("confidence"), 0.0, 1.0, 0.7)
+        has_wearer_evidence = any(
+            facts_by_id[fact_id]["metadata"].get("has_world_owner_speaker")
+            for fact_id in evidence_ids
+        )
+        if not has_wearer_evidence:
+            confidence = min(confidence, 0.65)
         claim_text = self._normalize_user_claim_text(
             raw_claim_text,
             subject=subject,
@@ -4387,7 +4545,11 @@ class MemoryNodeManager:
             "claim_type": claim_type,
             "claim_origin": "explicit",
             "primary_domain": primary_domain,
-            "status": "active" if confidence >= self._user_claim_explicit_min_confidence else "candidate",
+            "status": (
+                "active"
+                if has_wearer_evidence and confidence >= self._user_claim_explicit_min_confidence
+                else "candidate"
+            ),
             "confidence": confidence,
             "valid_from": _compact_whitespace(raw.get("valid_from") or ""),
             "valid_to": _compact_whitespace(raw.get("valid_to") or ""),
@@ -4668,7 +4830,7 @@ class MemoryNodeManager:
             DERIVED_USER_CLAIM_EXTRACTION_PROMPT_EN
             if language == "en" else DERIVED_USER_CLAIM_EXTRACTION_PROMPT_ZH
         )
-        raw = self._call_llm(prompt_template.replace(
+        raw = self._llm_client.call_llm(prompt_template.replace(
             "{changed_claims}",
             json.dumps([
                 self._derived_claim_prompt_view(
@@ -4687,7 +4849,7 @@ class MemoryNodeManager:
                 for claim in related_claims
             ], ensure_ascii=False, indent=2),
         ))
-        parsed = self._parse_json_object_from_llm_text(raw or "")
+        parsed = self._llm_client.parse_json_object_from_llm_text(raw or "")
         if parsed is None or not isinstance(parsed.get("claims"), list):
             return None
         return [item for item in parsed["claims"][:16] if isinstance(item, dict)]
@@ -4915,8 +5077,10 @@ class MemoryNodeManager:
             fact.get("user_claim_signals"),
             allows_world_owner_reference=(
                 isinstance(fact.get("metadata"), dict)
-                and bool(fact["metadata"].get("has_world_owner_interaction"))
+                and bool(fact["metadata"].get("has_world_owner_speaker")
+                         or fact["metadata"].get("has_world_owner_alias_reference"))
             ),
+            owner_aliases=fact.get("resolved_world_owner_aliases") or [],
         )
         for signal in raw_signals:
             claim_type_hint = str(signal.get("claim_type_hint") or "").lower()
@@ -4985,8 +5149,10 @@ class MemoryNodeManager:
             fallback_entity=fact.get("primary_entity"),
             allows_world_owner_reference=(
                 isinstance(fact.get("metadata"), dict)
-                and bool(fact["metadata"].get("has_world_owner_interaction"))
+                and bool(fact["metadata"].get("has_world_owner_speaker")
+                         or fact["metadata"].get("has_world_owner_alias_reference"))
             ),
+            owner_aliases=fact.get("resolved_world_owner_aliases") or [],
         )
         fact_entities_by_name = {
             str(descriptor["name"]).lower(): descriptor
@@ -5097,7 +5263,7 @@ class MemoryNodeManager:
             INDUCTIVE_USER_CLAIM_EXTRACTION_PROMPT_EN
             if language == "en" else INDUCTIVE_USER_CLAIM_EXTRACTION_PROMPT_ZH
         )
-        raw = self._call_llm(
+        raw = self._llm_client.call_llm(
             prompt_template.replace("{induction_target}", json.dumps({
                 "subject_entity": group["subject"],
                 "world_owner_entity": self._world_owner_entity_name,
@@ -5107,7 +5273,7 @@ class MemoryNodeManager:
                 self._claim_fact_prompt_view(fact) for fact in facts[:32]
             ], ensure_ascii=False, indent=2))
         )
-        parsed = self._parse_json_object_from_llm_text(raw or "")
+        parsed = self._llm_client.parse_json_object_from_llm_text(raw or "")
         if parsed is None or not isinstance(parsed.get("claims"), list):
             return None
         facts_by_id = {
@@ -5398,7 +5564,7 @@ class MemoryNodeManager:
         allow_substring: bool = True,
         minimum_pair_score: float = 0.5,
     ) -> Dict[str, Any]:
-        """Extract one candidate's canonical topic values and score overlap."""
+        """Extract one candidate's fact topic and score its overlap."""
         raw = (
             candidate.get("_hydrated")
             if isinstance(candidate.get("_hydrated"), dict)
@@ -5415,8 +5581,7 @@ class MemoryNodeManager:
             if topic and topic not in topic_values:
                 topic_values.append(topic)
 
-        extend_values(raw.get("fact_root_topic"))
-        extend_values(raw.get("fact_aspect_topic"))
+        extend_values(raw.get("fact_topic"))
 
         overlap = self._recall_calculate_search_terms_overlap_with_topic_values(
             query_terms,
@@ -5545,86 +5710,6 @@ class MemoryNodeManager:
             if canonical_name and canonical_name.lower() == name.lower():
                 return [canonical_name]
         return []
-
-    def _should_route_fact_to_user_intent_update(self, fact: Dict[str, Any]) -> bool:
-        """Return whether a fact merits semantic review by the intent task.
-
-        This is deliberately a high-recall, deterministic intake gate.  It does
-        not classify a fact as a goal, plan, or work item, and it must not make
-        database changes.  A future intent-extraction task will make that
-        decision using the fact, its source context, and related active objects.
-        """
-        if not isinstance(fact, dict):
-            return False
-        summary = _compact_whitespace(fact.get("summary") or fact.get("text") or "")
-        if not summary:
-            return False
-
-        fact_type = self._normalize_fact_type(fact.get("fact_type"))
-        if fact_type == "recommendation":
-            # Assistant suggestions are not user intent unless a separate fact
-            # records the user's explicit acceptance or commitment.
-            return False
-
-        text = summary.lower()
-
-        lifecycle_markers = (
-            "已完成", "完成了", "做完", "办完", "已经发", "已发", "提交了",
-            "已提交", "取消", "不做了", "不去了", "改期", "改到", "延期", "推迟",
-            "延后", "提前", "受阻", "卡住", "无法", "没法", "等待确认", "等待资料",
-            "completed", "finished", "done", "sent", "submitted", "cancelled",
-            "canceled", "rescheduled", "postponed", "delayed", "blocked",
-            "cannot proceed", "waiting for confirmation",
-        )
-        if any(marker in text for marker in lifecycle_markers):
-            return True
-
-        if fact_type == "commitment":
-            return True
-
-        goal_markers = (
-            "长期目标", "目标是", "目标为", "希望达到", "希望实现", "争取", "致力于",
-            "今年完成", "今年实现", "年内完成", "未来要实现", "want to achieve",
-            "hope to achieve", "aim to", "goal is", "long-term goal", "work toward",
-        )
-        if any(marker in text for marker in goal_markers):
-            return True
-
-        responsibility_markers = (
-            "需要完成", "必须", "负责", "答应", "承诺", "交付", "提交",
-            "交给", "让我", "分配给我", "安排我", "请提醒", "帮我提醒",
-            "need to", "have to", "must", "responsible for", "committed to",
-            "promised to", "deliver", "submit", "assigned me", "remind me",
-        )
-        if any(marker in text for marker in responsibility_markers):
-            return True
-
-        future_time_markers = (
-            "明天", "后天", "今晚", "明晚", "下周", "下个月", "明年", "本周",
-            "这周", "周一", "周二", "周三", "周四", "周五", "周六", "周日", "周末",
-            "tomorrow", "tonight", "next week", "next month", "next year",
-            "this week", "on monday", "on tuesday", "on wednesday", "on thursday",
-            "on friday", "this weekend",
-        )
-        future_activity_markers = (
-            "前往", "去", "参加", "出席", "开会", "会面", "见面", "拜访", "出差",
-            "旅行", "约", "预约", "安排", "活动", "会议", "飞", "乘车",
-            "travel", "go to", "attend", "meet", "visit", "schedule", "book",
-            "appointment", "trip", "flight", "meeting",
-        )
-        if (
-            any(marker in text for marker in future_time_markers)
-            and any(marker in text for marker in future_activity_markers)
-        ):
-            return True
-
-        decision_markers = (
-            "决定", "打算", "准备", "计划", "将要", "要去", "要做",
-            "decided", "planning to", "plan to", "going to", "will ",
-        )
-        return fact_type in {"decision", "action", "instruction"} and any(
-            marker in text for marker in decision_markers
-        )
 
     @staticmethod
     def _is_low_value_followup_question(text: str) -> bool:
@@ -9418,8 +9503,8 @@ class MemoryNodeManager:
             .replace("{query}", str(query or ""))
             .replace("{reference_time}", str(reference_time or ""))
         )
-        result = self._call_llm(prompt)
-        parsed = self._parse_json_object_from_llm_text(result or "")
+        result = self._llm_client.call_llm(prompt)
+        parsed = self._llm_client.parse_json_object_from_llm_text(result or "")
         return parsed if isinstance(parsed, dict) else {}
 
     def _build_recall_search_terms(
@@ -9694,8 +9779,7 @@ class MemoryNodeManager:
                 "dialogue_time": "dialogue_time",
                 "event_time": "event_time",
                 "summary": "summary",
-                "fact_root_topic": "fact_root_topic",
-                "fact_aspect_topic": "fact_aspect_topic",
+                "fact_topic": "fact_topic",
                 "claim": "claim",
                 "claim_origin": "claim_origin",
                 "status": "status",
@@ -9708,8 +9792,7 @@ class MemoryNodeManager:
                 "dialogue_time": "对话时间",
                 "event_time": "事件时间",
                 "summary": "摘要",
-                "fact_root_topic": "事实根主题",
-                "fact_aspect_topic": "事实方面主题",
+                "fact_topic": "事实主题",
                 "claim": "主张",
                 "claim_origin": "来源",
                 "status": "状态",
@@ -9746,7 +9829,7 @@ class MemoryNodeManager:
                         f"   {labels['dialogue_time']}: {dialogue_time}",
                         f"   {labels['event_time']}: {event_time}",
                         f"   {labels['summary']}: {raw.get('summary') or entry.get('summary_for_retrieval') or ''}",
-                        f"   {labels['fact_root_topic']}: {raw.get('fact_root_topic') or ''}; {labels['fact_aspect_topic']}: {raw.get('fact_aspect_topic') or ''}",
+                        f"   {labels['fact_topic']}: {raw.get('fact_topic') or ''}",
                     ]
                 elif group_key == "user_claim":
                     block_lines = [
@@ -9836,20 +9919,6 @@ class MemoryNodeManager:
         topics.append(keywords[0])
         return list(dict.fromkeys(topics))[:3]
     
-    def _infer_fact_type(self, text: str, *, speaker: str) -> str:
-        lower = str(text or "").lower()
-        if any(word in lower for word in ("prefer", "favorite", "like", "dislike", "would rather")):
-            return "preference"
-        if any(word in lower for word in ("decided", "i'll", "i will", "plan to", "going to")):
-            return "decision" if speaker == "user" else "recommendation"
-        if any(word in lower for word in ("need to", "have to", "should", "todo", "pick up", "return")):
-            return "action"
-        if any(word in lower for word in ("recommend", "suggest", "consider", "try")):
-            return "recommendation"
-        if "?" in text:
-            return "request"
-        return "context"
-
     @staticmethod
     def _normalize_priority(value: Any) -> int:
         try:

@@ -225,6 +225,7 @@ memory_manager:
 
   user_claim_limit: 100
   user_intent_limit: 100
+  user_intent_signal_batch_size: 8
   user_state_update_limit: 80
   user_claim_explicit_min_confidence: 0.72
   user_claim_derived_min_confidence: 0.75

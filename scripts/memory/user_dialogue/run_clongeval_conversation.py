@@ -39,6 +39,7 @@ for import_root in (SRC_ROOT, REPO_ROOT, SCRIPT_ROOT):
         sys.path.insert(0, str(import_root))
 
 from memory.memory_manager import MemoryOperationReporter
+from llm_client import LLMClient
 from pwm_manager import PersonWorldModel
 from memory.config import split_memory_config
 from scripts.memory.user_dialogue.test_memory_store_fact_extraction import (
@@ -424,13 +425,18 @@ def build_reader_prompt(query: str, memory_context: str) -> str:
     )
 
 
-def run_reader(manager: Any, query: str, memory_context: str, max_chars: int) -> str:
+def run_reader(
+    llm_client: LLMClient,
+    query: str,
+    memory_context: str,
+    max_chars: int,
+) -> str:
     if not memory_context.strip():
         return ""
-    raw = manager._call_llm(
+    raw = llm_client.call_llm(
         build_reader_prompt(query, truncate_text(memory_context, max_chars))
     )
-    parsed = manager._parse_json_object_from_llm_text(raw or "")
+    parsed = llm_client.parse_json_object_from_llm_text(raw or "")
     if isinstance(parsed, dict):
         return str(parsed.get("answer") or parsed.get("final_answer") or "").strip()
     return str(raw or "").strip()
@@ -680,7 +686,7 @@ def process_context_group(
             hypothesis = ""
             if args.run_reader:
                 hypothesis = run_reader(
-                    manager,
+                    runtime.llm_client,
                     str(record["query"]),
                     recall_context,
                     args.reader_max_context_chars,

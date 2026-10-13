@@ -47,7 +47,7 @@ class LLMClient:
     def set_logger(self, logger: Optional[logging.Logger]) -> None:
         self._logger = logger or logging.getLogger(__name__)
 
-    def complete(self, prompt: str) -> Optional[str]:
+    def call_llm(self, prompt: str) -> Optional[str]:
         if (
             not self._api_key
             or not self._base_url
@@ -111,6 +111,27 @@ class LLMClient:
                 self._logger.warning("Unified memory LLM call failed: %s", exc)
                 return None
         return None
+
+    @staticmethod
+    def parse_json_object_from_llm_text(text: str) -> Optional[Dict[str, Any]]:
+        raw = str(text or "").strip()
+        if not raw:
+            return None
+        if raw.startswith("```"):
+            start = raw.find("{")
+            end = raw.rfind("}")
+            if start >= 0 and end > start:
+                raw = raw[start : end + 1]
+        else:
+            start = raw.find("{")
+            end = raw.rfind("}")
+            if 0 <= start < end and (start > 0 or end < len(raw) - 1):
+                raw = raw[start : end + 1]
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+        return data if isinstance(data, dict) else None
 
     @staticmethod
     def _config_bool(value: Any, default: bool = False) -> bool:
