@@ -195,7 +195,7 @@ def main() -> None:
         tags=["Eval_Ali", textgrid_path.stem],
     )
     final_input_flush = dict(finalization.get("input_flush") or {})
-    episode_summary_result = dict(finalization.get("episode_summary") or {})
+    user_activity_result = dict(finalization.get("user_activity") or {})
     user_claim_submit = dict(
         (finalization.get("derived_tasks") or {}).get("user_claim") or {}
     )
@@ -241,7 +241,7 @@ def main() -> None:
         "memory_operation_report": operation_reporter.snapshot(),
         "ambient_recording_enabled": True,
         "session_start": session_start.isoformat(),
-        "episode_summary_result": episode_summary_result,
+        "user_activity_result": user_activity_result,
         "user_claim_result": user_claim_result,
         "user_intent_result": user_intent_result,
         "user_state_result": user_state_result,

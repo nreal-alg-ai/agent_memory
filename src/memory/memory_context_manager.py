@@ -74,7 +74,7 @@ class FactExtractionWindowConfig:
 
 
 @dataclass
-class EpisodeSummaryConfig:
+class UserActivityConfig:
     max_duration_seconds: float = 1800.0
     max_tokens: int = 6000
     min_tokens_for_duration: int = 1000
@@ -85,13 +85,13 @@ class MemoryContextMangerConfig:
     fact_extraction: FactExtractionWindowConfig = field(
         default_factory=FactExtractionWindowConfig,
     )
-    episode_summary: EpisodeSummaryConfig = field(
-        default_factory=EpisodeSummaryConfig,
+    user_activity: UserActivityConfig = field(
+        default_factory=UserActivityConfig,
     )
 
 
 @dataclass
-class EpisodeSummaryBoundaryDecision:
+class UserActivityBoundaryDecision:
     should_trigger: bool = False
     reason: str = "append"
     accumulated_tokens: int = 0
@@ -203,12 +203,12 @@ def build_memory_context_manager_config(
     fact_extraction_trigger_config = memory_input_config.get("fact_extraction_trigger")
     if not isinstance(fact_extraction_trigger_config, dict):
         fact_extraction_trigger_config = {}
-    episode_summary_trigger_config = memory_input_config.get("episode_summary_trigger")
-    if not isinstance(episode_summary_trigger_config, dict):
-        episode_summary_trigger_config = {}
+    user_activity_trigger_config = memory_input_config.get("user_activity_trigger")
+    if not isinstance(user_activity_trigger_config, dict):
+        user_activity_trigger_config = {}
     return MemoryContextMangerConfig(
         fact_extraction=_build_fact_extraction_window_config(fact_extraction_trigger_config or {}),
-        episode_summary=_build_episode_summary_config(episode_summary_trigger_config or {}),
+        user_activity=_build_user_activity_config(user_activity_trigger_config or {}),
     )
 
 
@@ -311,22 +311,22 @@ def _build_fact_extraction_window_config(
     )
 
 
-def _build_episode_summary_config(
-    episode_summary_config: Dict[str, Any],
-) -> EpisodeSummaryConfig:
-    """Build episode-summary limits from episode-summary settings."""
-    return EpisodeSummaryConfig(
+def _build_user_activity_config(
+    user_activity_config: Dict[str, Any],
+) -> UserActivityConfig:
+    """Build limits for the longer user-activity observation window."""
+    return UserActivityConfig(
         max_duration_seconds=max(
             0.0,
-            float(episode_summary_config.get("max_duration_seconds", 1800.0)),
+            float(user_activity_config.get("max_duration_seconds", 1800.0)),
         ),
         max_tokens=max(
             0,
-            int(episode_summary_config.get("max_tokens", 6000)),
+            int(user_activity_config.get("max_tokens", 6000)),
         ),
         min_tokens_for_duration=max(
             0,
-            int(episode_summary_config.get("min_tokens_for_duration", 1000)),
+            int(user_activity_config.get("min_tokens_for_duration", 1000)),
         ),
     )
 
@@ -603,9 +603,9 @@ class MemoryContextManager:
         self._preceding_context_units: List[MemoryUnit] = []
         self._awaiting_ambient_unit_buffer: List[MemoryUnit] = []
         self._ambient_asr_watermark: Optional[datetime] = None
-        self._episode_started_at: Optional[datetime] = None
-        self._episode_latest_at: Optional[datetime] = None
-        self._episode_token_count = 0
+        self._user_activity_started_at: Optional[datetime] = None
+        self._user_activity_latest_at: Optional[datetime] = None
+        self._user_activity_token_count = 0
 
     def _insert_pending_unit(
         self,
@@ -864,55 +864,55 @@ class MemoryContextManager:
         self,
         units: Sequence[MemoryUnit],
     ) -> None:
-        """Record successfully queued task units in the episode window."""
+        """Record successfully queued fact units in the activity window."""
         for unit in units:
             token_count = max(0, unit.token_count)
             if token_count <= 0:
                 continue
             started_at = self._parse_timestamp(unit.start_time)
             ended_at = self._parse_timestamp(unit.end_time)
-            if self._episode_started_at is None and started_at is not None:
-                self._episode_started_at = started_at
+            if self._user_activity_started_at is None and started_at is not None:
+                self._user_activity_started_at = started_at
             latest_at = ended_at or started_at
             if latest_at is not None and (
-                self._episode_latest_at is None or latest_at > self._episode_latest_at
+                self._user_activity_latest_at is None or latest_at > self._user_activity_latest_at
             ):
-                self._episode_latest_at = latest_at
-            self._episode_token_count += token_count
+                self._user_activity_latest_at = latest_at
+            self._user_activity_token_count += token_count
 
-    def reset_episode_summary_window(self) -> None:
-        self._episode_started_at = None
-        self._episode_latest_at = None
-        self._episode_token_count = 0
+    def reset_user_activity_window(self) -> None:
+        self._user_activity_started_at = None
+        self._user_activity_latest_at = None
+        self._user_activity_token_count = 0
 
-    def has_pending_episode_summary_units(self) -> bool:
-        """Whether successfully queued fact units await episode summarization."""
-        return self._episode_token_count > 0
+    def has_pending_user_activity_units(self) -> bool:
+        """Whether successfully queued fact units await activity observation."""
+        return self._user_activity_token_count > 0
 
-    def evaluate_episode_summary_trigger_decision(self) -> EpisodeSummaryBoundaryDecision:
-        token_count = self._episode_token_count
+    def evaluate_user_activity_trigger_decision(self) -> UserActivityBoundaryDecision:
+        token_count = self._user_activity_token_count
         if token_count <= 0:
-            return EpisodeSummaryBoundaryDecision(accumulated_tokens=token_count)
+            return UserActivityBoundaryDecision(accumulated_tokens=token_count)
         if (
-            self.config.episode_summary.max_tokens > 0
-            and token_count >= self.config.episode_summary.max_tokens
+            self.config.user_activity.max_tokens > 0
+            and token_count >= self.config.user_activity.max_tokens
         ):
-            return EpisodeSummaryBoundaryDecision(True, "max_tokens", token_count)
-        if self._episode_started_at is None or self._episode_latest_at is None:
-            return EpisodeSummaryBoundaryDecision(False, "append", token_count)
+            return UserActivityBoundaryDecision(True, "max_tokens", token_count)
+        if self._user_activity_started_at is None or self._user_activity_latest_at is None:
+            return UserActivityBoundaryDecision(False, "append", token_count)
         elapsed_seconds = max(
             0.0,
-            (self._episode_latest_at - self._episode_started_at).total_seconds(),
+            (self._user_activity_latest_at - self._user_activity_started_at).total_seconds(),
         )
         if (
-            self.config.episode_summary.max_duration_seconds > 0
-            and elapsed_seconds >= self.config.episode_summary.max_duration_seconds
-            and token_count >= self.config.episode_summary.min_tokens_for_duration
+            self.config.user_activity.max_duration_seconds > 0
+            and elapsed_seconds >= self.config.user_activity.max_duration_seconds
+            and token_count >= self.config.user_activity.min_tokens_for_duration
         ):
-            return EpisodeSummaryBoundaryDecision(
+            return UserActivityBoundaryDecision(
                 True, "max_duration", token_count, elapsed_seconds,
             )
-        return EpisodeSummaryBoundaryDecision(False, "append", token_count, elapsed_seconds)
+        return UserActivityBoundaryDecision(False, "append", token_count, elapsed_seconds)
 
     def _evaluate_incoming_unit_for_chapter(
         self,

@@ -72,40 +72,24 @@ ENTITY_EXTRACTION_GUIDANCE_ZH = """实体提取规则:
 每条长期记忆 fact 通常至少包含主体实体（如 用户本人/助手/speaker）和 1-4 个核心语义锚点。"""
 
 
-EPISODE_SUMMARY_PROMPT_ZH = """你是长期记忆系统的 episode 聚合模块。输入是一段连续时间内的原始交互/转写 unit，以及从同一批 unit 中提炼出的高价值 facts。你的任务是生成一段可回顾经历的叙事摘要。
+USER_ACTIVITY_EXTRACTION_PROMPT_ZH = """你是个人世界模型的情境观察模块。根据一个较长连续窗口的原始对话/环境转写 unit，以及这段窗口已经提炼的 facts，描述采集窗口内能够观察到的用户活动或所处情境。这里的“活动”是用户当时在做什么，而不是用户在对话中讲述自己过去做过什么、平时做什么或以后打算做什么。
 
-输入角色：
-- `source_units` 是按时间排列的原始证据，是 episode 内容、先后关系和语气的唯一主要依据。
-- `evidence_facts` 是从这些 unit 中筛出的长期价值锚点，只用于核对重要信息是否被遗漏；绝不能逐条改写、拼接或扩写它们。
+先按时间和单元类型识别实际发生的交互场景，再概括场景中的主要讨论主题。原始 source_units 是活动发生的首要证据；evidence_facts 只能帮助辨认讨论主题和核对细节，不能成为逐条生成活动的清单。activity 的数量应对应可观察的活动场景，而不是 fact 数量。
 
-概念边界：
-- fact 是可独立召回的原子证据，保留可精确引用的事实细节。
-- episode 是一次连续经历的上层叙事，应回答“这段时间发生了什么、围绕什么展开、最后形成什么结论或未决点”。
-- episode 不是长期 state、用户画像、跨经历规律、风险评估或待办事项；不要将一次经历推广成长期结论。
+规则：
+1. 对 interaction 单元，用户与助手持续交谈本身就是可观察的活动。通常将同一连续对话概括为一条“用户本人与助手交谈，主要讨论……”的 activity，user_role 为 participant；可以点出几个有代表性的主题，但不要把每个话题、fact 或话题中提到的行为分别输出为 activity。只有原始 unit 明确显示发生了独立的活动、跨日期/长时间中断或明显的场景切换，才拆成多条。
+2. 对 transcript 单元，概括录音时实际发生的讨论、会议或其他可观察情境。用户本人明确发言或参与时用 participant；只有原始 unit 直接证明用户本人在采集当时实际执行某个非谈话行为时才用 actor；只能确认其接触到环境情境、不能确认本人发言或行动时用 contextual。不能因为其他人谈到用户，就认定用户亲自参与或行动。
+3. 严格区分“采集窗口内观察到的活动”与“活动中提到的内容”；活动发生时间以 source_units 的采集时间为准，不以 fact 的 event_time_key 为准。例如用户说“早上健了身”“最近在学摄影”“明天去黄山”，观察到的是用户正在与助手谈论这些经历或计划，不是窗口内正在健身、摄影或旅行。过去经历、习惯、偏好、假设、建议和未来安排可以作为讨论主题，但不能单独改写成 actor 活动；明确说“我现在正在做饭”等当下行为，才可在证据充分时另记。
+4. 每条 activity_text 先说清用户在窗口内实际参与的活动或所处情境，再简洁说明关键主题；保留“谈论/回忆/计划”和“实际发生”的区别。不要编造动机、情绪、责任、结果或地点。纯唤醒词、寒暄、助手模板回答及没有形成可辨认情境的零散内容可输出空列表。
+5. evidence_fact_ids 只能引用输入中支持主题或活动的 fact ID；仅有 fact 陈述不能证明相关行为发生在采集窗口内。原始 unit 可独立支持观察，因此允许空列表。confidence 为 0 到 1。
+6. 只返回 JSON，不要 markdown 或解释。
 
-生成规则：
-1. 先从原始 unit 恢复这段经历的主线：背景/触发 → 讨论、观察或行动 → 关键转折/态度 → 结果、决定或未决点。没有证据的环节直接省略。
-2. 可以概括多个相关表达，但不要按说话轮次复述，也不要把每条 fact 各写一句。summary 必须比 facts 更连贯、更具上下文，而不是更长的事实清单。
-3. 忽略唤醒词、寒暄、礼貌收尾、重复确认、无信息量的短回应和助手的模板化表述。只保留理解这次经历所需的对象、场景、问题、用户关切、关键回应、决定、约束、结果或开放问题。
-4. `evidence_facts` 中的高价值信息如与原始 unit 一致，应尽量在合适的叙事位置覆盖；如两者存在冲突、歧义或 facts 过度概括，以原始 unit 为准，并保留不确定性。
-5. 保留时间顺序、条件和立场。不能把建议写成决定、把可能/计划写成完成、把助手的观点写成用户的信念，也不能编造因果、责任人、截止时间或结果。
-6. 若同一连续区间存在多个互不相关但有价值的话题，可用一段有层次的概括串联，但不要为了单一主题删除重要内容或虚构关联。
-7. summary 必须是一段简洁、自包含的经历摘要；读者不看 source units 也能理解核心人物/对象、发生过程和结论/未决点。
-8. title 是检索标题：简短、具体、可区分，优先“对象 + 核心事件/问题/决定”，不要使用泛主题标题。
-9. canonical_topics 只输出 1-3 个由原始 source units 支撑的稳定主题。evidence_facts 仅帮助检查重要信息是否覆盖；不要直接把某条 fact 的具体方面当作 episode 主题，也不要将动作、一次性结论、情绪或零散关键词当作主题。
-10. 只返回符合格式的 JSON，不要 markdown、解释文字或额外字段。
+例如 interaction 中用户说“早上健了身”“昨晚看了电影”“明天想去黄山”，应输出一条类似：{"user_activities": [{"activity_text": "用户本人与助手交谈，主要讨论健身经历、电影和黄山旅行计划", "user_role": "participant", "confidence": 0.9, "evidence_fact_ids": []}]}。不要分别输出“用户正在健身”“用户正在看电影”“用户正在去黄山”。
 
-输出格式：
-{
-  "title": "简短具体标题",
-  "summary": "一段自包含、按时间和因果组织的 episode 摘要",
-  "canonical_topics": ["稳定主题1", "稳定主题2"]
-}
-
-原始 source units：
+原始 source_units：
 {source_units}
 
-高价值 evidence facts（仅用于覆盖核对，不要逐条拼接）：
+已提炼 evidence_facts：
 {evidence_facts}
 """
 
@@ -114,12 +98,12 @@ UNIFIED_MEMORY_EXTRACTION_PROMPT_ZH = """你是 AI 眼镜长期记忆系统的�
 
 当前记忆结构：
 - fact：从一批连续证据中提炼出的可追溯、自包含、可独立召回的 narrative fact，是记忆提炼的基本证据单元。
-- episode：由独立模块根据一段连续时间内持久化的原始交互/转写片段生成的更高层经历摘要；已生成 facts 仅作为重要信息覆盖锚点，它不是每个输入批次或每条 fact 的简单副本。
-- memory_topic_items：在 fact 和 episode 落库后保存它们的主题及映射，不保存主题进展、总结或历史事实；本 prompt 不读取已有主题命名候选。
+- user_activity：由较长窗口的原始对话/环境转写和已提炼 facts 生成的、关于用户活动或所处情境的观察；本 prompt 不输出。
+- memory_topic_items：保存 facts 的主题及映射，不保存主题进展、总结或历史事实；本 prompt 不读取已有主题命名候选。
 - user_claim：由用户主张提炼流程从 facts 中形成的、主体固定为“用户本人”的持久主张，可追溯到支撑它的 facts；关系对象可以是其他实体。它不是当前对话的直接证据，也不替代 fact。
 - goal / plan / work_item：由独立的用户意图提炼模块从已落库 facts 中提取，分别表示用户未来目标、明确安排和可闭环责任事项；本 prompt 不输出这些对象。
 
-你现在需要从下面按时间顺序排列的对话/转写证据 unit 批次中提取 Hindsight 风格的高质量 narrative facts。每个 unit 的 `单元类型` 仅用于说明来源：`interaction` 是一轮按顺序保留的用户与助手对话，`transcript` 是环境录音 ASR 转写。episode summary、episode canonical_topics 将由独立模块根据持久化的原始 unit 及已生成 facts 负责，不要在本 prompt 中输出 episode 级字段。
+你现在需要从下面按时间顺序排列的对话/转写证据 unit 批次中提取 Hindsight 风格的高质量 narrative facts。每个 unit 的 `单元类型` 仅用于说明来源：`interaction` 是一轮按顺序保留的用户与助手对话，`transcript` 是环境录音 ASR 转写。较长窗口的情境观察由独立模块负责，不要在本 prompt 中输出 user_activity。
 
 身份边界：
 - “用户本人”仅指 AI 眼镜佩戴者；`speaker_用户本人` 是已确认身份的说话方，英文输出时使用 `user self`。下方已确认别名也指向这一人，但仅当当前 fact 的语境明确指向佩戴者时，才能归入“用户本人”；同名第三人不得归并。`speaker_助手` 对应输出实体“助手”。
@@ -189,9 +173,9 @@ user_claim_signals 输出规则：
 - 第二种情形必须在同一条 fact 的 `text` 中写清其他人提出了什么、用户如何回应以及最终由用户确认或纠正的具体内容；signal 只表达用户最终认可或修正后的主张，不照搬对方未获确认的说法。
 - `owner_evidence_type` 为 `self_statement|confirmed_response|third_party_report`。前两种在 `owner_evidence_text` 中逐字摘取用户本人原话；回应型还须在 `other_evidence_text` 中摘取先前对方原话。第三方报告将 `owner_evidence_text` 置空，`other_evidence_text` 填包含已确认别名的第三方原话。不要引用前置上下文或编造原话。
 - signal 的 `entity` 必须固定指向“用户本人”，不得指向关系对象。用户与他人、组织或项目之间的关系仍可作为用户本人的关系主张；关系另一端应在 fact/entities 及后续 claim 的 object_entity 中表达。
-- `signal_kind` 只能是：`explicit_assertion`（实体明确陈述或可靠记录直接确认的稳定主张）、`pattern_observation`（可在未来与其他 episode 共同支持一个方向明确的规律的观察）。
+- `signal_kind` 只能是：`explicit_assertion`（实体明确陈述或可靠记录直接确认的稳定主张）、`pattern_observation`（可在未来与其他时间窗口的证据共同支持一个方向明确的规律的观察）。
 - `claim_type_hint` 只能是 identity_profile、affiliation、relationship、preference、constraint、behavior_pattern。单次行为不得作为 explicit_assertion 直接生成 behavior_pattern；它至多是 pattern_observation。
-- `claim_anchor` 是简短、稳定的聚合标签，用于把不同 episode 中可能描述同一主张或规律的 facts 收拢，例如“安静旅行偏好”“游泳活动习惯”。它不是完整句子，也不是最终 user_claim。
+- `claim_anchor` 是简短、稳定的聚合标签，用于把不同时间窗口中可能描述同一主张或规律的 facts 收拢，例如“安静旅行偏好”“游泳活动习惯”。它不是完整句子，也不是最终 user_claim。
 - 只有当前 fact 对用户本人的主张或未来规律归纳有实际证据价值时才输出。普通一次性背景、关于第三方自身的主张、临时建议、助手猜测、寒暄和低价值信息输出空数组。
 - 每个 signal 的 `entity.name` 必须原样复用同一 fact 的 `entities` 中某一个实体名称，`entity.type` 也必须与该实体一致。不得为 signal 新增、改写或猜测 fact 未列出的实体；无法对应时不输出该 signal。
 - 信号与 fact 必须严格一致：signal 的实体、主张及其必要限定信息必须由同一 fact 的 `text` 完整支持。回应型的提议和回应都必须写入该 fact；第三方报告必须保留说话人及被报告内容。不得从其他 fact 或前置上下文借用未写入该 fact 的信息；`evidence_basis` 应写清证据来源。
@@ -430,9 +414,9 @@ facts：
 
 INDUCTIVE_USER_CLAIM_EXTRACTION_PROMPT_ZH = """你是个人世界模型的归纳型 user_claim 提炼模块。
 
-输入是用户本人、同一 claim_anchor 下、来自已完成 episode 的可追溯 facts。claim_anchor 只用于召集候选证据，不是结论；你的任务是保守地判断这些证据是否支持用户本人的一条规律，而不是重新复述 facts。
+输入是用户本人、同一 claim_anchor 下、来自不同时间窗口的可追溯 facts。claim_anchor 只用于召集候选证据，不是结论；你的任务是保守地判断这些证据是否支持用户本人的一条规律，而不是重新复述 facts。
 
-归纳型 user_claim 用于表达跨多个事实/episode 反复出现的用户偏好或行为规律。只允许输出 preference 或 behavior_pattern；claim_origin 固定由系统写为 inductive。它不是单次行为事实，也不能代替支撑它的 facts。
+归纳型 user_claim 用于表达跨多个事实和时间窗口反复出现的用户偏好或行为规律。只允许输出 preference 或 behavior_pattern；claim_origin 固定由系统写为 inductive。它不是单次行为事实，也不能代替支撑它的 facts。
 
 硬规则：
 1. 一条 claim 至少需要 3 个不同的 support_fact_ids，且每个 ID 都必须直接支持当前规律。
@@ -462,7 +446,7 @@ INDUCTIVE_USER_CLAIM_EXTRACTION_PROMPT_ZH = """你是个人世界模型的归纳
 候选实体与 claim 聚合线索：
 {induction_target}
 
-episode evidence facts：
+evidence facts：
 {facts}
 """
 
@@ -548,64 +532,78 @@ existing_claims：
 """
 
 
-USER_STATE_UPDATE_PROMPT_ZH = """你负责增量更新个人世界模型中的用户状态（User State）。
+USER_CLAIM_STATE_RESOLUTION_PROMPT_ZH = """你负责根据本轮变化的 user_claim，联合提出旧 claim 状态裁决与 user_state 更新。两项任务相互关联，但**创建新 state 不以旧 state 或 claim 关系事件存在为前提**。
 
-`user_claim` 是可审计的信念与证据账本；`goal`、`plan`、`work_item` 是未来导向对象。你的任务不是复述这些输入，也不是创建它们的副本，而是判断本轮变化是否应当创建或修改一个面向后续预测、决策的用户状态。
+输入含义：`changed_claims` 是本轮状态更新的直接证据；`related_claims` 是通过关系事件关联到的既有 claim；`supporting_claims` 是现有 state 的其他证据；`existing_states` 与 `state_claim_evidence` 描述当前状态及其支撑；`relation_events` 已给出 claim 间的语义关系，无需重新分类。某个列表为空只表示没有这类历史信息，不表示本轮不能创建 state。
 
-状态只有三类：
-1. `enduring_state`：变化慢、跨情境仍大致成立的长期偏好、稳定约束、沟通或决策倾向。单次事件或临时安排通常不足以创建它。
-2. `recurring_state`：反复出现的行为、节律或带条件的模式。`conditions` 应保留关键条件、时间窗口、频率或例外；不能把单次行为写成规律。
-3. `situational_state`：当前阶段暂时成立的关注、压力、约束、准备状态或可用性。必须有合理的有效期、结束条件或可被未来证据改变的空间；不要把每个 goal/plan/work_item 原样复制成 situational_state。
+请按以下顺序思考，最后只输出一次联合结果：
+1. **独立评估新 state。**先逐条阅读 changed_claims，再合并同一状态维度的相关证据，判断是否呈现值得在未来预测或服务决策中使用的长期偏好、稳定约束、行为规律。即使 `existing_states=[]` 且 `relation_events=[]`，也必须完成这一步；有充分证据就输出 `create`，不要机械地返回空 operations。可以由一条直接、明确、具有持续含义的 explicit claim 创建 enduring_state，例如“我一向喜欢早上开会”可形成时间偏好；不要求凑够多条 claim。多条具体偏好也可以汇总为同一维度的 state，但不要为了聚合而混合互不相干的主题。state_text 应表达可复用的状态判断，而非粘贴或逐字改写 claim。
+2. **区分稳定倾向与重复行为。**`enduring_state` 表示跨时间或情境大致有效的偏好、风格、价值取向或长期约束；明确表达的稳定偏好不因只有一次陈述就被视为一次性事件。`recurring_state` 表示有周期、频率、反复行为或明确条件—行为规则的模式；需要 claim 明确陈述习惯/规律，或多次行为证据共同支持。不能因为用户喜欢某项活动、打算做一次、或对一次经历印象深刻，就推断其经常这么做。一次性的目标、计划、行程、近期情绪和能力担忧也不能自动升级为长期 state。只从 claim 创建 enduring_state 或 recurring_state，不创建 situational_state。
+3. **对齐旧 state。**若同一 domain、class、key 的 existing_state 已表达该状态，应根据新证据选择 `reinforce` 或 `revise`，不能重复 `create`。若新证据削弱或否定旧 state，应结合 `state_claim_evidence` 和 supporting_claims 判断 `weaken`、`expire` 或局部 `revise`；一条支撑 claim 失效并不意味着整个 state 失效。没有受影响的旧 state 时，也要保留第 1 步得出的新建结论。
+4. **裁决旧 claim。**只有 relation_events 中“旧 claim 为 target、changed_claim 为 trigger”的 `contradicts` 或 `supersedes`，才可能调整旧 claim 状态。关系事件本身不是失效判决；要结合文本、来源（通常 explicit 比 inductive/derived 更直接）、时间和适用条件判断。`contradicts` 最多使旧 claim `weakened`；明确的 `supersedes` 才可使其 `superseded`。在不同条件或时期可以并存时不变更；不要修改 changed_claim 的状态，也不要因为 state 失效就反向认定旧 claim 失效。没有可裁决关系时 `claim_updates=[]`，这不影响 operations 创建或更新 state。
+5. **联合检查。**state 的支撑证据要与本轮 claim 状态裁决一致；被判 superseded 的 claim 不得继续作为有效 support。缺少证据的单个候选 state 可以省略，但不能因另一个候选不成立而放弃本轮所有有根据的 state。
 
-本轮只允许使用 `changed_claims` 与 `changed_intent_objects` 作为 operation 的直接 evidence。`active_intent_objects` 仅用于理解当前背景，不能单独作为 evidence。已有状态在 `existing_states` 中：若本轮证据在更新已有状态，必须填写其 id；不要为同一语义重复创建 state。
+state 操作仅允许 `create|reinforce|revise|weaken|expire`。更新必须引用 existing_states 中的 id；create 的 target_state_id 为 0。state_key 只可取：enduring_state 的 `communication_style|decision_style|value_priority|risk_preference|privacy_preference|time_preference|work_style|lifestyle_preference|long_term_constraint`，或 recurring_state 的 `daily_routine|weekly_routine|work_routine|health_routine|social_routine|conditional_behavior`。更新时保持目标 state_class 和 state_key。不得跨出本轮 state_domain。
 
-本轮 `state_domain` 由系统固定指定。你只能创建或更新该领域内的状态；不得根据输入中的其他领域信息创建、修改或引用其他领域的 state。`general` 仅表示真正跨领域的用户状态，不是领域不明确时的兜底。
+每条 state 操作的 evidence 只可引用输入 claim，格式为 `evidence_type=user_claim`、`evidence_id`、`role=change_trigger|support|counterexample|context`、`weight`。必须引用至少一条 changed_claims 作为触发；仍被列为 support 的 claim 不得在本轮被判 superseded。expire/weaken 可以引用反例，但不应把反例写成支持。每项都要给出简短理由、0-1 的 confidence。只有逐项评估后确实没有合格操作时，operations 才输出空数组。只返回 JSON：
+{
+  "claim_updates": [
+    {"claim_id": 1, "new_status": "weakened|superseded", "relation_event_id": 1, "reason": "为什么本轮证据足以改变旧 claim"}
+  ],
+  "operations": [
+    {
+      "operation": "create|reinforce|revise|weaken|expire",
+      "target_state_id": 0,
+      "state_class": "enduring_state|recurring_state",
+      "state_key": "受控选项",
+      "state_text": "完整的聚合状态陈述",
+      "conditions": {},
+      "valid_from": "", "valid_to": "", "confidence": 0.8,
+      "evidence": [{"evidence_type": "user_claim", "evidence_id": 1, "role": "change_trigger|support|counterexample|context", "weight": 1.0}],
+      "reason": "为什么该 state 需要变化"
+    }
+  ]
+}
 
-operation 只能为：
-- `create`：创建此前不存在的状态；target_state_id 必须为 0。
-- `reinforce`：新证据强化已有状态，通常保持语义不变。
-- `revise`：已有状态的内容、范围、条件或有效期需要实质修正。
-- `weaken`：新证据降低已有状态的适用性或置信度，但不证明它已结束。
-- `expire`：已有状态已经结束、失效或明确不再适用。
-- `no_change`：本轮证据不应改变状态；此类项无需输出。
+reference_time：{reference_time}
+state_domain：{state_domain}
+changed_claims：{changed_claims}
+related_claims：{related_claims}
+supporting_claims：{supporting_claims}
+relation_events：{relation_events}
+existing_states：{existing_states}
+state_claim_evidence：{state_claim_evidence}
+"""
 
-硬规则：
-1. 仅输出有直接输入证据的操作；不做常识补全、人格诊断或自由猜测。
-2. `state_key` 不是自由命名字段，只能从当前 `state_class` 对应的受控选项中选择。更新已有状态时必须保持目标 state 的 state_key；没有适合选项时不输出操作：
-   - `enduring_state`：`communication_style`、`decision_style`、`value_priority`、`risk_preference`、`privacy_preference`、`time_preference`、`work_style`、`lifestyle_preference`、`long_term_constraint`。
-   - `recurring_state`：`daily_routine`、`weekly_routine`、`work_routine`、`health_routine`、`social_routine`、`conditional_behavior`。
-   - `situational_state`：`current_focus`、`current_constraint`、`current_availability`、`current_energy`、`current_stress`、`current_social_engagement`、`current_preparation`。
-   `state_key` 表示稳定的状态维度，不得把具体对象、领域、时间、取值或一次事件写进 key；这些信息必须写入 `state_text` 或 `conditions`。
-3. `state_text` 必须是完整、自包含、可被人阅读的中文陈述，表达聚合后的状态而不是逐条粘贴 claim。
-4. evidence 中每一项必须来自允许的本轮变化对象，格式为 user_claim / goal / plan / work_item 的 id；至少有一条 `change_trigger` 或 `support`。
-5. 对 evidence 不足、相互矛盾且无法判断、或只意味着一次性事实的输入，宁可不输出操作。
-6. `runtime_context` 当前可能为空；仅当其中信息明确给出且与本轮证据一致时，才能将其写入 conditions，不能自行臆造情境。
-7. confidence 表示该状态操作在给定证据下的可信程度，范围 0 到 1。
-8. 本轮 domain 为 `state_domain`，所有操作均由系统写入该 domain；不要输出跨领域操作。
-9. 只返回 JSON。
 
-输出：
+USER_ACTIVITY_STATE_UPDATE_PROMPT_ZH = """你负责根据新生成的“用户情境观察”（user activity）增量更新 situational_state。
+
+本次触发入口是新 activity。activity 描述用户在一个连续时间窗口内实际参与的事情；facts 提供窗口中的具体证据；related_intents 是与这些 facts 有直接证据关联的、当前仍活跃的 goal/plan/work_item，只作为该情境的补充背景。activity 的 `user_role` 中，`actor` 表示证据支持用户本人正在做该事，`participant` 表示用户参与其中，`contextual` 仅表示周边背景，不可据此推断用户本人正在执行。不要把 activity、fact 或 intent 原样复制成 state，也不要仅因用户谈到某个话题就假定用户正在持续处理它。
+
+只生成或更新 `situational_state`，不生成 enduring_state 或 recurring_state。只有证据表明用户目前正处于尚未结束的阶段、持续处理某个问题、正在准备某件事、受到当前约束，或处于有明确时效的关注/可用状态时才输出操作。纯闲聊、一次性问答、回忆、偏好表达、已经结束的活动或一次性行程通常不形成 situational_state。没有充分证据时返回空 operations。
+
+每个操作必须至少引用一条本次输入的 `user_activity` 证据。fact 只能来自输入的 linked_facts；goal/plan/work_item 只能来自输入的 related_intents。related_intents 已由系统按与本次 activity 共享 fact evidence 的方式筛选，仍需判断它是否确实描述同一持续情境。不得引用未提供的 ID。activity 是触发与情境锚点，不能单独把一个已结束的活动推断成当前状态。
+
+输出的 `state_domain` 必须从 `allowed_domains` 中选择；更新已有状态时，必须使用相同 domain、class、key 的现有 state ID。state_key 只能取：`current_focus`、`current_constraint`、`current_availability`、`current_energy`、`current_stress`、`current_social_engagement`、`current_preparation`。state_text 应是自包含的当前状态陈述，不要写成历史总结。尽可能给出合理的 valid_to 或 conditions 中的结束条件；不能凭空编造期限。操作仅允许 create、reinforce、revise、weaken、expire；create 的 target_state_id 为 0。
+
+只返回 JSON：
 {
   "operations": [
     {
       "operation": "create|reinforce|revise|weaken|expire",
       "target_state_id": 0,
-      "state_class": "enduring_state|recurring_state|situational_state",
-      "state_key": "从当前 state_class 的受控选项中选择",
-      "state_text": "完整、可阅读的用户状态陈述",
+      "state_domain": "allowed_domains 中的一个值",
+      "state_class": "situational_state",
+      "state_key": "一个受控选项",
+      "state_text": "完整、明确的当前状态陈述",
       "conditions": {},
       "valid_from": "",
       "valid_to": "",
       "confidence": 0.8,
       "evidence": [
-        {
-          "evidence_type": "user_claim|goal|plan|work_item",
-          "evidence_id": 1,
-          "role": "change_trigger|support|counterexample|context",
-          "weight": 1.0
-        }
+        {"evidence_type": "user_activity|fact|goal|plan|work_item", "evidence_id": 1, "role": "change_trigger|support|counterexample|context", "weight": 1.0}
       ],
-      "reason": "简短说明本轮变化如何影响该状态"
+      "reason": "简短说明为什么当前情境支持此操作"
     }
   ]
 }
@@ -613,23 +611,23 @@ operation 只能为：
 reference_time：
 {reference_time}
 
-state_domain：
-{state_domain}
+allowed_domains：
+{allowed_domains}
 
 runtime_context：
 {runtime_context}
 
-existing_states：
+new_activities：
+{activities}
+
+linked_facts：
+{facts}
+
+related_active_intents：
+{related_intents}
+
+existing_situational_states：
 {existing_states}
-
-changed_claims：
-{changed_claims}
-
-changed_intent_objects：
-{changed_intent_objects}
-
-active_intent_objects（仅背景，不可单独作为 evidence）：
-{active_intent_objects}
 """
 
 
@@ -638,14 +636,13 @@ RECALL_QUERY_ANALYSIS_PROMPT_ZH = """你是 AI 眼镜长期记忆系统中的 re
 请先理解当前记忆结构，再分析用户查询的检索方式。
 
 记忆结构：
-1. `fact`：从一次 episode 的对话或全天候转写中提炼出的、可追溯且自包含的 narrative evidence。它保留具体发生了什么、谁参与、时间、地点/场景、原因、观点变化、建议、接受/拒绝、约束、结论和未解决问题等证据。fact 通常带有 `summary`、`keywords`、`entities`、`fact_topic`、`event_time_key` 和 `dialogue_time_key`。
-2. `user_claim`：由 explicit、inductive 或 derived 来源形成的、关于“用户本人”的持久主张，具有状态、置信度和有效时间，并可回溯到支撑 facts。explicit 表示直接陈述或可靠记录确认；inductive 表示跨事实/episode 归纳出的偏好或行为规律；derived 表示由已有主张逻辑推出。关系对象可以是其他实体。它不是单次事件的替代品。
+1. `fact`：从对话或环境转写中提炼出的、可追溯且自包含的 narrative evidence。它保留具体发生了什么、谁参与、时间、地点/场景、原因、观点变化、建议、接受/拒绝、约束、结论和未解决问题等证据。fact 通常带有 `summary`、`keywords`、`entities`、`fact_topic`、`event_time_key` 和 `dialogue_time_key`。
+2. `user_claim`：由 explicit、inductive 或 derived 来源形成的、关于“用户本人”的持久主张，具有状态、置信度和有效时间，并可回溯到支撑 facts。explicit 表示直接陈述或可靠记录确认；inductive 表示跨事实和时间窗口归纳出的偏好或行为规律；derived 表示由已有主张逻辑推出。关系对象可以是其他实体。它不是单次事件的替代品。
 3. `goal`、`plan`、`work_item`：从 facts 中提炼出的未来导向对象，分别表示期望结果、明确安排和可闭环责任事项；其 status 和目标/开始/截止时间具有重要语义。
-4. `episode`：连续原始片段的经历摘要，只用于在 facts 之间建立关联，绝不作为 direct recall object。
 
 判断准则：
 - 只有当 query 明确指向用户与助手的主动对话，才偏向 `assistant_wakeup`；明确指向全天录音、会议、旁听、多人数对话，才偏向 `allday_recording`；不确定时两者都保留。
-- `recall_object_types` 是本次可直接检索的对象类型。必须始终包含 `fact`；仅在 query 明确询问用户本人的稳定主张或规律时加入 `user_claim`；仅在 query 询问未来目标、安排、责任、截止、未完成事项或其状态变化时加入相应的 `goal`、`plan`、`work_item`。绝不能输出 `episode`。
+- `recall_object_types` 是本次可直接检索的对象类型。必须始终包含 `fact`；仅在 query 明确询问用户本人的稳定主张或规律时加入 `user_claim`；仅在 query 询问未来目标、安排、责任、截止、未完成事项或其状态变化时加入相应的 `goal`、`plan`、`work_item`。user_activity 暂不参与召回。
 - 具体发生了什么、日期、地点、人名、原话语义、事件先后和可追溯证据，优先 `fact`。
 - 稳定偏好、长期约束、习惯/流程、关系画像或个人背景，除 `fact` 外可加入 `user_claim`；仍需保留 `fact` 以提供证据。
 - 任务、承诺、未来安排、目标、截止与未完成事项，除 `fact` 外可加入对应 prospective object；仍需保留 `fact` 以提供证据。

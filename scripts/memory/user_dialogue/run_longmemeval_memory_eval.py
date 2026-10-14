@@ -731,7 +731,7 @@ def validate_runtime(manager: Any) -> None:
 
 def db_counts(db: Any) -> Dict[str, int]:
     tables = {
-        "episodes": "memory_episodes",
+        "user_activities": "memory_user_activity_items",
         "facts": "memory_facts",
         "entities": "memory_entity_nodes",
     }
@@ -1203,7 +1203,7 @@ def build_instance_memory_context(
                     or ("ok" if memory_context else "empty")
                 ),
                 "store_turn_calls": store_turn_calls,
-                "store_episode_submitted": stored_pairs,
+                "store_user_activity_submitted": stored_pairs,
                 "store_flushes": stored_pairs,
                 "store_total_elapsed_ms": store_total_elapsed_ms,
                 "derived_total_elapsed_ms": derived_total_elapsed_ms,
@@ -1303,12 +1303,12 @@ def run_instance_memory_context_worker(
         embedding_config=embedding_config,
     )
     logging.info(
-        "[%s/%s] Finished %s: sessions=%s episodes=%s facts=%s states=%s actionable_items=%srecall_chars=%s",
+        "[%s/%s] Finished %s: sessions=%s user_activities=%s facts=%s states=%s actionable_items=%srecall_chars=%s",
         index,
         total,
         question_id,
         result["history_session_count"],
-        result["db_counts"]["episodes"],
+        result["db_counts"]["user_activities"],
         result["db_counts"]["facts"],
         result["db_counts"]["states"],
         result["db_counts"]["actionable_items"],
@@ -1449,12 +1449,12 @@ def main() -> int:
                 )
                 result = memory_results_by_index[index]
                 logging.info(
-                    "[%s/%s] Memory context ready for %s: sessions=%s episodes=%s facts=%s states=%s actionable_items=%srecall_chars=%s",
+                    "[%s/%s] Memory context ready for %s: sessions=%s user_activities=%s facts=%s states=%s actionable_items=%srecall_chars=%s",
                     index,
                     len(selected),
                     question_id,
                     result["history_session_count"],
-                    result["db_counts"]["episodes"],
+                    result["db_counts"]["user_activities"],
                     result["db_counts"]["facts"],
                     result["db_counts"]["states"],
                     result["db_counts"]["actionable_items"],

@@ -1,6 +1,6 @@
 """Runtime adapter between application input events and memory storage.
 
-``MemoryNodeManager`` owns episode persistence, entity-claim updates, and
+``MemoryNodeManager`` owns user-activity persistence, user-claim updates, and
 recall. This
 adapter owns the short-lived interaction buffer and converts frontend-shaped
 turns or transcript segments into typed Manager-facing memory units.
@@ -467,7 +467,7 @@ class _DerivedMemoryTaskScheduler:
 
 
 class MemoryRuntime:
-    """Normalize application input and batch it before episode storage."""
+    """Normalize application input and batch it before user activity extraction."""
 
     def __init__(
         self,
@@ -569,7 +569,7 @@ class MemoryRuntime:
             self._embedding_client,
             memory_context_manager_config,
         )
-        self._episode_tags: List[str] = []
+        self._user_activity_tags: List[str] = []
         scheduler_config = runtime_config.get("derived_task_scheduling")
         self._derived_task_scheduler = _DerivedMemoryTaskScheduler(
             self._memory_manager,
@@ -590,10 +590,23 @@ class MemoryRuntime:
         result = event.get("result")
         if event.get("succeeded") and isinstance(result, dict):
             request = result.get("user_state_update_request")
-            if isinstance(request, dict) and self._user_state_resolver is not None:
+            if (
+                event.get("task_kind") == "memory_user_claim_update"
+                and isinstance(request, dict)
+                and self._user_state_resolver is not None
+            ):
                 self._user_state_resolver.submit_memory_user_state_update_task(
                     **request,
                 )
+            elif (
+                event.get("task_kind") == "memory_user_activity_extraction"
+                and self._user_state_resolver is not None
+            ):
+                activity_ids = result.get("user_activity_item_ids") or []
+                if activity_ids:
+                    self._user_state_resolver.submit_memory_user_state_update_task(
+                        changed_user_activity_ids=activity_ids,
+                    )
         self.handle_task_completion(event)
 
     def handle_task_completion(self, event: Dict[str, Any]) -> None:
@@ -721,12 +734,12 @@ class MemoryRuntime:
         self,
         value: Any,
         *,
-        evaluate_episode_summary: bool = True,
+        evaluate_user_activity: bool = True,
     ) -> Dict[str, Any]:
         """Advance ambient ASR coverage and process newly released input units."""
         self._memory_context_manager.update_ambient_asr_watermark(value)
         return self._process_awaiting_ambient_units(
-            evaluate_episode_summary=evaluate_episode_summary,
+            evaluate_user_activity=evaluate_user_activity,
         )
 
     def _accept_interaction_memory_input(
@@ -820,8 +833,8 @@ class MemoryRuntime:
                 normalized_segment["text"],
             )
 
-        self._episode_tags = sorted(
-            set(self._episode_tags).union(tags)
+        self._user_activity_tags = sorted(
+            set(self._user_activity_tags).union(tags)
         )
         queued = False
         for normalized_segment in normalized_segments:
@@ -860,7 +873,7 @@ class MemoryRuntime:
                 self._memory_context_manager.awaiting_ambient_unit_count(),
             )
             drain_report = self._process_awaiting_ambient_units(
-                evaluate_episode_summary=True,
+                evaluate_user_activity=True,
             )
             queued = bool(drain_report.get("queued")) or queued
             if not drain_report.get("accepted"):
@@ -874,32 +887,32 @@ class MemoryRuntime:
             "reason": "" if queued else "threshold_not_reached",
         }
 
-    def _trigger_memory_episode_summary(
+    def _trigger_memory_user_activity(
         self,
         *,
         reason: str = "explicit",
         tags: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
-        """Queue one completed source episode after its fact-store batches.
+        """Queue activity observation for the completed source window.
 
-        Callers must first submit the episode's final store batch.  The
+        Callers must first submit the window's final fact batch. The
         scheduler's FIFO queue preserves this ordering without this function
         reaching back into runtime input buffers.
         """
-        resolved_tags = list(self._episode_tags if tags is None else tags or [])
+        resolved_tags = list(self._user_activity_tags if tags is None else tags or [])
 
-        if not self._memory_context_manager.has_pending_episode_summary_units():
+        if not self._memory_context_manager.has_pending_user_activity_units():
             return {
                 "queued": False,
-                "reason": "no_pending_episode_summary_units",
+                "reason": "no_pending_user_activity_units",
                 "trigger_reason": reason,
             }
-        report = self._memory_manager.submit_memory_episode_summary_task(
+        report = self._memory_manager.submit_memory_user_activity_extraction_task(
             tags=resolved_tags,
         )
         if bool(report.get("queued")):
-            self._episode_tags = []
-            self._memory_context_manager.reset_episode_summary_window()
+            self._user_activity_tags = []
+            self._memory_context_manager.reset_user_activity_window()
         report["trigger_reason"] = reason
         return report
 
@@ -908,7 +921,7 @@ class MemoryRuntime:
         unit: MemoryUnit,
         *,
         ambient_recording_enabled: bool,
-        evaluate_episode_summary: bool = True,
+        evaluate_user_activity: bool = True,
     ) -> Dict[str, Any]:
         """Append one normalized input unit to the shared semantic buffer."""
         decision = self._memory_context_manager.insert_incoming_unit(
@@ -917,13 +930,13 @@ class MemoryRuntime:
         )
         return self._handle_memory_fact_task_decision(
             decision=decision,
-            evaluate_episode_summary=evaluate_episode_summary,
+            evaluate_user_activity=evaluate_user_activity,
         )
 
     def _process_awaiting_ambient_units(
         self,
         *,
-        evaluate_episode_summary: bool,
+        evaluate_user_activity: bool,
         force: bool = False,
     ) -> Dict[str, Any]:
         """Process boundary results released after ambient ASR coverage advances."""
@@ -936,7 +949,7 @@ class MemoryRuntime:
         ):
             append_report = self._handle_memory_fact_task_decision(
                 decision=decision,
-                evaluate_episode_summary=evaluate_episode_summary,
+                evaluate_user_activity=evaluate_user_activity,
             )
             queued = bool(append_report.get("queued")) or queued
             if not append_report.get("accepted"):
@@ -957,7 +970,7 @@ class MemoryRuntime:
         self,
         *,
         decision: Any,
-        evaluate_episode_summary: bool,
+        evaluate_user_activity: bool,
     ) -> Dict[str, Any]:
         """Log one boundary and schedule fact extraction for sealed chapters."""
         self._logger.info(
@@ -982,21 +995,21 @@ class MemoryRuntime:
                 "queued": False,
                 "reason": str(store_report.get("reason") or "queue_rejected"),
             }
-        episode_summary_report = None
-        episode_decision = self._memory_context_manager.evaluate_episode_summary_trigger_decision()
-        if evaluate_episode_summary and episode_decision.should_trigger:
-            episode_summary_report = self._trigger_memory_episode_summary(
-                reason=f"episode_{episode_decision.reason}",
+        user_activity_report = None
+        activity_decision = self._memory_context_manager.evaluate_user_activity_trigger_decision()
+        if evaluate_user_activity and activity_decision.should_trigger:
+            user_activity_report = self._trigger_memory_user_activity(
+                reason=f"user_activity_{activity_decision.reason}",
             )
         return {
             "accepted": True,
             "queued": True,
             "reason": (
-                "episode_limit"
-                if bool((episode_summary_report or {}).get("queued"))
+                "user_activity_limit"
+                if bool((user_activity_report or {}).get("queued"))
                 else str(store_report.get("reason") or "")
             ),
-            "episode_summary": episode_summary_report,
+            "user_activity": user_activity_report,
         }
 
     def _log_sealed_memory_input_chapters_for_fact_task(
@@ -1062,14 +1075,14 @@ class MemoryRuntime:
         reason: str = "explicit_flush",
         tags: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
-        """Finalize tail input, then append episode and derived-task fences."""
+        """Finalize tail input, then append activity and derived-task fences."""
         queued = False
         completed_unit = self._transcript_unit_assembler.flush()
         if completed_unit is not None:
             append_report = self._append_memory_input_unit(
                 completed_unit,
                 ambient_recording_enabled=self._transcript_ambient_recording_enabled,
-                evaluate_episode_summary=False,
+                evaluate_user_activity=False,
             )
             queued = bool(append_report.get("queued")) or queued
             if not append_report.get("accepted"):
@@ -1078,7 +1091,7 @@ class MemoryRuntime:
                     "reason": str(append_report.get("reason") or "queue_rejected"),
                 }
         drain_report = self._process_awaiting_ambient_units(
-            evaluate_episode_summary=False,
+            evaluate_user_activity=False,
             force=True,
         )
         queued = bool(drain_report.get("queued")) or queued
@@ -1089,7 +1102,7 @@ class MemoryRuntime:
             }
         self._memory_context_manager.seal_pending_units(boundary_reason=reason)
         store_report = self._trigger_memory_store_task_for_sealed_memory_input()
-        episode_summary_report = self._trigger_memory_episode_summary(
+        user_activity_report = self._trigger_memory_user_activity(
             reason=reason,
             tags=tags,
         )
@@ -1098,14 +1111,14 @@ class MemoryRuntime:
             "queued": (
                 bool(store_report.get("queued"))
                 or queued
-                or bool(episode_summary_report.get("queued"))
+                or bool(user_activity_report.get("queued"))
                 or any(
                     bool((report or {}).get("queued"))
                     for report in derived_task_reports.values()
                 )
             ),
             "reason": str(store_report.get("reason") or ""),
-            "episode_summary": episode_summary_report,
+            "user_activity": user_activity_report,
             "derived_tasks": derived_task_reports,
         }
 
@@ -1177,7 +1190,7 @@ class MemoryRuntime:
                 store_completion_context,
             )
             self._memory_context_manager.clear_sealed_chapter_buffers()
-            self._episode_tags = sorted(set(self._episode_tags).union(tags))
+            self._user_activity_tags = sorted(set(self._user_activity_tags).union(tags))
             self._memory_context_manager.record_stored_units(
                 canonical_units,
             )
@@ -1185,7 +1198,7 @@ class MemoryRuntime:
                 canonical_units,
             )
             self._logger.info(
-                "memory episode source queued semantic_unit_count=%s "
+                "memory user activity source queued semantic_unit_count=%s "
                 "preceding_context_unit_count=%s",
                 len(canonical_units),
                 len(preceding_context_units),
@@ -1229,7 +1242,7 @@ class MemoryRuntime:
         reason: str = "explicit_finalize",
         tags: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
-        """Append a final store → episode → derived-task FIFO fence.
+        """Append a final fact → activity → derived-task FIFO fence.
 
         This is the lifecycle operation for a frontend session close or an
         ambient recording stop.  It deliberately does not wait for storage:
@@ -1242,7 +1255,7 @@ class MemoryRuntime:
         )
         return {
             "input_flush": input_flush,
-            "episode_summary": dict(input_flush.get("episode_summary") or {}),
+            "user_activity": dict(input_flush.get("user_activity") or {}),
             "derived_tasks": dict(input_flush.get("derived_tasks") or {}),
         }
     

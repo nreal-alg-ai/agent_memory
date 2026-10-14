@@ -460,9 +460,9 @@ class AmbientAudioRecordingService:
         )
         self._memory_finalized = True
         self._logger.info(
-            "ambient recording memory finalized recording_id=%s episode_summary_queued=%s",
+            "ambient recording memory finalized recording_id=%s user_activity_queued=%s",
             self._recording_id,
-            bool(result.get("episodeSummaryQueued")),
+            bool(result.get("userActivityQueued")),
         )
 
     def _result(self, *, include_completed: bool = False) -> Dict[str, Any]:

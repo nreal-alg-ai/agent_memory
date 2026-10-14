@@ -123,12 +123,12 @@ class PersonWorldModel:
         self,
         value: Any,
         *,
-        evaluate_episode_summary: bool = True,
+        evaluate_user_activity: bool = True,
     ) -> Dict[str, Any]:
         """Release buffered inputs once ambient ASR has covered their time range."""
         return self._memory_runtime.update_ambient_asr_watermark(
             value,
-            evaluate_episode_summary=evaluate_episode_summary,
+            evaluate_user_activity=evaluate_user_activity,
         )
 
     def finalize_memory_session(
@@ -213,7 +213,6 @@ class PersonWorldModel:
                 event.get("succeeded")
                 and event.get("task_kind") in {
                     "memory_user_claim_update",
-                    "memory_user_intent_update",
                 }
                 and isinstance(result, dict)
             ):
@@ -234,6 +233,28 @@ class PersonWorldModel:
                     ):
                         self._logger.warning(
                             "User state update was not queued reason=%s",
+                            submission.get("reason"),
+                        )
+            if (
+                event.get("succeeded")
+                and event.get("task_kind") == "memory_user_activity_extraction"
+                and isinstance(result, dict)
+            ):
+                activity_ids = result.get("user_activity_item_ids") or []
+                if activity_ids:
+                    submission = self._user_state_resolver.submit_memory_user_state_update_task(
+                        changed_user_activity_ids=activity_ids,
+                    )
+                    if (
+                        not submission.get("queued")
+                        and submission.get("reason") not in {
+                            "memory_disabled",
+                            "user_state_update_disabled",
+                            "no_changed_state_evidence",
+                        }
+                    ):
+                        self._logger.warning(
+                            "Activity-based user state update was not queued reason=%s",
                             submission.get("reason"),
                         )
         finally:

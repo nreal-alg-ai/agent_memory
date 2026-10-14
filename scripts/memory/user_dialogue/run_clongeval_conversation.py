@@ -313,7 +313,7 @@ def group_records_by_context(
 def db_counts(db: Any) -> Dict[str, int]:
     counts: Dict[str, int] = {}
     for table in (
-        "memory_episodes",
+        "memory_user_activity_items",
         "memory_facts",
     ):
         row = db._conn.execute(f"SELECT COUNT(*) AS count FROM {table}").fetchone()

@@ -4,8 +4,8 @@
 The public surface mirrors the current project's `MemoryNodeManager`, but the
 internal model is deliberately unified:
 
-1. Submitted source units are organized into `memory_episodes`.
-2. Extracted evidence becomes narrative `memory_facts`.
+1. Submitted source units become narrative `memory_facts`.
+2. Longer source windows and their facts yield grounded user-activity observations.
 3. Traceable explicit and inductive propositions live in entity claims.
 4. The legacy actionable-item projection is temporarily disabled while the
    intent and work-item layer is redesigned.
@@ -44,7 +44,7 @@ from prompts_en import (
     INDUCTIVE_USER_CLAIM_EXTRACTION_PROMPT_EN,
     INTENT_EXTRACTION_PROMPT_EN,
     INTENT_RECONCILIATION_PROMPT_EN,
-    EPISODE_SUMMARY_PROMPT_EN,
+    USER_ACTIVITY_EXTRACTION_PROMPT_EN,
     MEMORY_RETRIEVED_FORMAT_PROMPT_EN,
     MEMORY_RETRIEVED_SECTION_SPECS_EN,
     RECALL_QUERY_ANALYSIS_PROMPT_EN,
@@ -57,7 +57,7 @@ from prompts_zh import (
     INDUCTIVE_USER_CLAIM_EXTRACTION_PROMPT_ZH,
     INTENT_EXTRACTION_PROMPT_ZH,
     INTENT_RECONCILIATION_PROMPT_ZH,
-    EPISODE_SUMMARY_PROMPT_ZH,
+    USER_ACTIVITY_EXTRACTION_PROMPT_ZH,
     MEMORY_RETRIEVED_FORMAT_PROMPT_ZH,
     MEMORY_RETRIEVED_SECTION_SPECS_ZH,
     RECALL_QUERY_ANALYSIS_PROMPT_ZH,
@@ -376,7 +376,7 @@ class MemoryOperationReporter:
                 not in failure_statuses
             )
         if operation_type in {
-            "memory_episode_summary",
+            "memory_user_activity_extraction",
             "memory_user_claim_update",
             "memory_user_intent_update",
             "memory_user_state_update",
@@ -415,7 +415,7 @@ class MemoryOperationReporter:
             ),
             "total_elapsed_ms": elapsed_ms,
         })
-        if operation_type in {"memory_fact_extraction", "memory_episode_summary"}:
+        if operation_type in {"memory_fact_extraction", "memory_user_activity_extraction"}:
             report["stored"] = bool(succeeded and error is None)
         if error is not None:
             report["error_type"] = type(error).__name__
@@ -493,10 +493,6 @@ class MemoryNodeManager:
                 ) or 3
             ),
         )
-        self._user_claim_induction_min_episodes = max(
-            3,
-            int(self._memory_cfg.get("user_claim_induction_min_episodes", 3) or 3),
-        )
         self._user_claim_induction_min_time_windows = max(
             2,
             int(self._memory_cfg.get("user_claim_induction_min_time_windows", 2) or 2),
@@ -511,7 +507,7 @@ class MemoryNodeManager:
             "memory_fact_extraction", self._process_memory_fact_extraction_task,
         )
         self._task_scheduler.register_handler(
-            "memory_episode_summary", self._process_memory_episode_summary_task,
+            "memory_user_activity_extraction", self._process_memory_user_activity_extraction_task,
         )
         self._task_scheduler.register_handler(
             "memory_user_claim_update", self._process_memory_user_claim_update_task,
@@ -626,16 +622,6 @@ class MemoryNodeManager:
             0.0,
             1.0,
             0.5,
-        )
-        self._recall_stage1_episode_propagation_decay = self._clamp_float(
-            recall_value(
-                "recall_stage1_episode_propagation_decay",
-                0.70,
-                stage="stage1",
-            ),
-            0.0,
-            1.0,
-            0.70,
         )
         self._recall_stage1_association_propagation_decay = self._clamp_float(
             recall_value(
@@ -815,7 +801,7 @@ class MemoryNodeManager:
             self._embedding_client = EmbeddingClient(self._embedding_cfg)
         return True
 
-    # ── Store path: source units -> episode -> facts -> index cards ──────
+    # ── Store path: source units -> facts -> user activity ───────────────
 
     @property
     def enabled(self) -> bool:
@@ -881,124 +867,86 @@ class MemoryNodeManager:
             completion_context=completion_context,
         )
 
-    def submit_memory_episode_summary_task(
+    def submit_memory_user_activity_extraction_task(
         self,
         *,
         tags: List[str],
     ) -> Dict[str, Any]:
-        """Queue episode summarization after preceding fact-store tasks."""
+        """Queue a source-window observation after preceding fact tasks."""
         if not self._memory_enabled:
             return self._task_scheduler.reject(
-                "memory_episode_summary", "memory_disabled"
+                "memory_user_activity_extraction", "memory_disabled"
             )
         return self._submit_memory_task(
-            task_kind="memory_episode_summary",
+            task_kind="memory_user_activity_extraction",
             payload={
                 "tags": list(tags or []),
             },
         )
 
-    def _process_memory_episode_summary_task(
+    def _process_memory_user_activity_extraction_task(
         self,
         *,
         tags: List[str],
     ) -> Dict[str, Any]:
-        source_units = self._db.get_unassigned_memory_source_segments(
+        source_units = self._db.get_unprocessed_memory_source_segments_for_user_activity(
             limit=240,
         )
         if not source_units:
             return {
                 "status": "empty",
-                "reason": "no_unassigned_source_units",
-                "new_episode_count": 0,
+                "reason": "no_unprocessed_source_units",
+                "new_user_activity_count": 0,
                 "fact_count": 0,
                 "source_unit_count": 0,
             }
-        source_started_at = _compact_whitespace(
-            source_units[0].start_time
+        source_row_ids = list(dict.fromkeys(
+            int(unit.source_unit_row_id)
+            for unit in source_units
+            if unit.source_unit_row_id is not None
+        ))
+        facts = self._db.get_memory_facts_for_source_segments(
+            source_segment_ids=source_row_ids, limit=240,
         )
-        source_ended_at = _compact_whitespace(
-            source_units[-1].end_time
-            or source_started_at
-        )
-        facts = self._db.get_unassigned_memory_facts_in_time_window(
-            started_at=source_started_at,
-            ended_at=source_ended_at,
-            limit=80,
-        )
-        episode_info = self._generate_episode_from_source_units(
+        activity_items = self._extract_user_activity_from_source_units(
             source_units=source_units,
             facts=facts,
         )
-        if episode_info.get("status") != "ok":
-            return episode_info
+        if activity_items is None:
+            return {"status": "failed", "reason": "invalid_user_activity_response"}
+        source_started_at = _compact_whitespace(source_units[0].start_time) or _now_text()
+        source_ended_at = _compact_whitespace(source_units[-1].end_time) or source_started_at
+        fact_ids = {int(fact["id"]) for fact in facts}
+        activity_ids: List[int] = []
         with self._db.transaction():
-            episode_id = self._db.insert_episode(
-                episode_type="memory",
-                title=episode_info["title"],
-                summary=episode_info["summary"],
-                participants=episode_info.get("participants") or [],
-                started_at=episode_info.get("started_at") or _now_text(),
-                ended_at=episode_info.get("ended_at") or episode_info.get("started_at") or _now_text(),
-                canonical_topics=episode_info.get("canonical_topics") or [],
-                entity_ids=episode_info.get("entity_ids") or [],
-                metadata={
-                    "tags": list(tags or []),
-                    "fact_count": len(facts),
-                    "source_unit_count": len(source_units),
-                    "generated_from_source_units": True,
-                    "evidence_fact_ids": list(episode_info.get("fact_ids") or []),
-                },
+            for item in activity_items:
+                supported_fact_ids = [
+                    int(value) for value in item.get("evidence_fact_ids") or []
+                    if str(value).isdigit() and int(value) in fact_ids
+                ]
+                activity_ids.append(self._db.insert_user_activity_item(
+                    activity_text=item["activity_text"],
+                    user_role=item["user_role"],
+                    confidence=item["confidence"],
+                    started_at=source_started_at,
+                    ended_at=source_ended_at,
+                    evidence_fact_ids=supported_fact_ids,
+                    source_segment_ids=source_row_ids,
+                    metadata={"tags": list(tags or []), "time_scope": "source_window"},
+                ))
+            processed_rows = self._db.mark_memory_source_segments_processed_for_user_activity(
+                source_segment_ids=source_row_ids,
             )
-            self._upsert_episode_recall_document(
-                episode_id=episode_id,
-                title=episode_info["title"],
-                summary=episode_info["summary"],
-                participants=episode_info.get("participants") or [],
-                entity_ids=episode_info.get("entity_ids") or [],
-                canonical_topics=episode_info.get("canonical_topics") or [],
-                started_at=episode_info.get("started_at") or _now_text(),
-                ended_at=(
-                    episode_info.get("ended_at")
-                    or episode_info.get("started_at")
-                    or _now_text()
-                ),
-            )
-            topic_report = self._db.upsert_memory_topic_items(
-                self._build_memory_topic_item_updates(
-                    canonical_topics=episode_info.get("canonical_topics") or [],
-                    episode_id=episode_id,
-                )
-            )
-            attached = self._db.update_facts_episode_id(
-                fact_ids=episode_info.get("fact_ids") or [], episode_id=episode_id,
-            )
-            attached_source_unit_rows = self._db.update_memory_source_segments_episode_id(
-                source_segment_ids=episode_info.get("source_unit_row_ids") or [],
-                episode_id=episode_id,
-            )
-        episode_info.update({
-            "episode_id": episode_id,
-            "fact_count": attached,
-            # Source evidence is expanded from batch rows before episode
-            # generation, so expose the logical unit count rather than
-            # the number of physical persistence rows attached here.
+        report = {
+            "status": "ok",
+            "new_user_activity_count": len(activity_ids),
+            "user_activity_item_ids": activity_ids,
+            "fact_count": len(facts),
             "source_unit_count": len(source_units),
-            "source_unit_row_count": attached_source_unit_rows,
-            "new_episode_count": 1,
-            "topic_items_created": int(topic_report.get("created_count", 0) or 0),
-            "topic_items_updated": int(topic_report.get("updated_count", 0) or 0),
-        })
-        self._log_info("memory_fact_extraction", "episode_summary_generated", {
-            "episode_id": episode_id,
-            "fact_count": attached,
-            "source_unit_count": len(source_units),
-            "source_unit_row_count": attached_source_unit_rows,
-            "title": episode_info.get("title") or "",
-            "topic_items_created": episode_info.get("topic_items_created", 0),
-            "topic_items_updated": episode_info.get("topic_items_updated", 0),
-        })
-        return episode_info
+            "source_unit_row_count": processed_rows,
+        }
+        self._log_info("memory_user_activity_extraction", "finish", report)
+        return report
 
     def _process_memory_fact_extraction_task(
         self,
@@ -1034,10 +982,12 @@ class MemoryNodeManager:
         self._log_extracted_fact_info(facts=facts)
         with self._db.transaction():
             save_fact_info = self._store_extracted_memory_facts_into_db(
-                episode_id=None,
                 facts=facts,
                 tags=tags,
-                episode_context_topics=None,
+            )
+            self._db.insert_fact_source_mappings(
+                fact_ids=save_fact_info.get("fact_ids") or [],
+                source_segment_ids=source_unit_row_ids,
             )
             topic_report = self._db.upsert_memory_topic_items(
                 save_fact_info.get("topic_item_updates") or []
@@ -1157,39 +1107,6 @@ class MemoryNodeManager:
             time_end=event_time_key or dialogue_time_key,
             confidence=confidence,
             importance=importance,
-            metadata={"projection_version": "v1"},
-        )
-
-    def _upsert_episode_recall_document(
-        self,
-        *,
-        episode_id: int,
-        title: str,
-        summary: str,
-        participants: Sequence[str],
-        entity_ids: Sequence[int],
-        canonical_topics: Sequence[str],
-        started_at: str,
-        ended_at: str,
-    ) -> int:
-        """Project one experience-level summary without exposing raw units."""
-        return self._upsert_memory_recall_document(
-            object_type="episode",
-            object_id=episode_id,
-            title=title,
-            summary=summary,
-            identity_lines=[
-                f"title: {_compact_whitespace(title)}",
-                f"summary: {_compact_whitespace(summary)}",
-                f"participants: {', '.join(participants or [])}",
-                f"canonical_topics: {', '.join(canonical_topics or [])}",
-            ],
-            entity_ids=entity_ids,
-            topic_keys=canonical_topics,
-            time_start=started_at,
-            time_end=ended_at,
-            confidence=0.85,
-            importance=0.6,
             metadata={"projection_version": "v1"},
         )
 
@@ -1334,26 +1251,20 @@ class MemoryNodeManager:
                 self._logger.debug("Unified memory LLM extraction failed, retrying")
         return {"facts": []}
 
-    def _generate_episode_from_source_units(
+    def _extract_user_activity_from_source_units(
         self,
         *,
         source_units: Sequence[MemoryUnit],
         facts: Sequence[Dict[str, Any]],
-    ) -> Dict[str, Any]:
-        """Generate an experience-level episode from source evidence.
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Observe what the user is doing across a source window.
 
-        Facts remain compact coverage anchors, but the chronological source
-        units are the authoritative narrative material. This prevents an
-        episode from degrading into a sentence-by-sentence fact concatenation.
+        Raw units are authoritative; facts provide compact evidence anchors.
+        An empty list is valid when the window does not establish user activity.
         """
         unit_list = self._valid_memory_units(source_units)
         if not unit_list:
-            return {
-                "status": "empty",
-                "new_episode_count": 0,
-                "fact_count": 0,
-                "source_unit_count": 0,
-            }
+            return []
         prompt_language = self._resolve_prompt_language_from_memory_units(
             unit_list,
         )
@@ -1378,80 +1289,55 @@ class MemoryNodeManager:
             prompt_language=prompt_language,
         )
         prompt_template = (
-            EPISODE_SUMMARY_PROMPT_EN
+            USER_ACTIVITY_EXTRACTION_PROMPT_EN
             if prompt_language == "en"
-            else EPISODE_SUMMARY_PROMPT_ZH
+            else USER_ACTIVITY_EXTRACTION_PROMPT_ZH
         )
         prompt = (
             prompt_template
             .replace("{source_units}", source_text)
             .replace("{evidence_facts}", json.dumps(fact_payload, ensure_ascii=False))
         )
-        parsed: Dict[str, Any] = {}
+        allowed_fact_ids = {
+            int(item["id"]) for item in fact_list
+            if str(item.get("id") or "").isdigit()
+        }
         for _ in range(2):
             parsed = self._llm_client.parse_json_object_from_llm_text(
                 self._llm_client.call_llm(prompt) or ""
             ) or {}
-            if _compact_whitespace(parsed.get("summary") or ""):
-                break
-        summary = _compact_whitespace(parsed.get("summary") or "")
-        if not summary:
-            summary = self._fallback_generate_episode_summary_from_units(unit_list)
-        title = _compact_whitespace(parsed.get("title") or "")
-        if not title:
-            title = self._fallback_generate_episode_title_from_units(unit_list)
-        source_text_for_topics = " ".join(
-            _compact_whitespace(item.text) for item in unit_list
-        )
-        topics = self._normalize_episode_canonical_topics(
-            parsed.get("canonical_topics"),
-            fallback_text=source_text_for_topics,
-            limit=3,
-        )
-        if not topics:
-            topics = self._topic_candidates(summary)[:3]
-        participants = self._parse_participants_from_units(unit_list)
-        episode_entity_ids: List[int] = []
-        for fact in fact_list:
-            for value in fact.get("entity_ids") or []:
-                try:
-                    entity_id = int(value)
-                except (TypeError, ValueError):
+            raw_items = parsed.get("user_activities")
+            if not isinstance(raw_items, list):
+                continue
+            activities: List[Dict[str, Any]] = []
+            seen: set[str] = set()
+            for raw in raw_items[:12]:
+                if not isinstance(raw, dict):
                     continue
-                if entity_id and entity_id not in episode_entity_ids:
-                    episode_entity_ids.append(entity_id)
-                if len(episode_entity_ids) >= 64:
-                    break
-            if len(episode_entity_ids) >= 64:
-                break
-        start = _compact_whitespace(
-            unit_list[0].start_time,
-        ) or _now_text()
-        end = (
-            _compact_whitespace(unit_list[-1].end_time)
-            or start
-        )
-        return {
-            "status": "ok",
-            "new_episode_count": 0,
-            "title": title,
-            "summary": summary,
-            "canonical_topics": topics,
-            "participants": participants,
-            "entity_ids": episode_entity_ids,
-            "fact_ids": [
-                int(item["id"])
-                for item in fact_list
-                if str(item.get("id", "")).isdigit()
-            ],
-            "source_unit_row_ids": list(dict.fromkeys(
-                int(item.source_unit_row_id)
-                for item in unit_list
-                if item.source_unit_row_id is not None
-            )),
-            "started_at": start,
-            "ended_at": end,
-        }
+                activity_text = _compact_whitespace(raw.get("activity_text") or "")
+                user_role = str(raw.get("user_role") or "").strip().lower()
+                if not activity_text or user_role not in {"actor", "participant", "contextual"}:
+                    continue
+                if activity_text in seen:
+                    continue
+                seen.add(activity_text)
+                raw_evidence_ids = raw.get("evidence_fact_ids")
+                if not isinstance(raw_evidence_ids, list):
+                    raw_evidence_ids = []
+                confidence = self._clamp_float(raw.get("confidence"), 0.0, 1.0, 0.5)
+                if not math.isfinite(confidence):
+                    confidence = 0.5
+                activities.append({
+                    "activity_text": activity_text,
+                    "user_role": user_role,
+                    "confidence": confidence,
+                    "evidence_fact_ids": list(dict.fromkeys(
+                        int(value) for value in raw_evidence_ids
+                        if str(value).isdigit() and int(value) in allowed_fact_ids
+                    )),
+                })
+            return activities
+        return None
 
     def _normalize_memory_fact_extraction_llm_output(
         self,
@@ -2369,11 +2255,9 @@ class MemoryNodeManager:
         canonical_topics: Sequence[Any],
         aspect_topics: Sequence[Any] = (),
         fact_id: Optional[int] = None,
-        episode_id: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """Create compact topic-registry updates from persisted memory fields."""
         normalized_fact_id = int(fact_id or 0)
-        normalized_episode_id = int(episode_id or 0)
         updates: List[Dict[str, Any]] = []
         def add(topic_kind: str, value: Any) -> None:
             topic_name = self._normalize_topic_name(value)
@@ -2385,7 +2269,6 @@ class MemoryNodeManager:
                 "topic_name": topic_name,
                 "topic_key": topic_key,
                 "fact_ids": [normalized_fact_id] if normalized_fact_id > 0 else [],
-                "episode_ids": [normalized_episode_id] if normalized_episode_id > 0 else [],
             }
             if not any(
                 existing["topic_kind"] == topic_kind
@@ -2396,37 +2279,11 @@ class MemoryNodeManager:
 
         for topic in canonical_topics or ():
             add("canonical", topic)
-        # Aspect topics are defined only by facts. Episode callers therefore
-        # leave this sequence empty.
+        # Aspect topics are defined only by facts.
         if normalized_fact_id > 0:
             for topic in aspect_topics or ():
                 add("aspect", topic)
         return updates
-
-    def _normalize_episode_canonical_topics(
-        self,
-        value: Any,
-        *,
-        fallback_text: str,
-        limit: int,
-    ) -> List[str]:
-        raw_topics = self._coerce_topic_list(value)
-        if not raw_topics:
-            raw_topics = self._topic_candidates(fallback_text)
-        normalized: List[str] = []
-        seen: set[str] = set()
-        for raw_topic in raw_topics:
-            topic = self._normalize_topic_name(raw_topic)
-            if not topic:
-                continue
-            key = topic.lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            normalized.append(topic)
-            if len(normalized) >= max(1, int(limit or 5)):
-                break
-        return normalized
 
     @staticmethod
     def _coerce_topic_list(value: Any) -> List[Any]:
@@ -2533,49 +2390,6 @@ class MemoryNodeManager:
         )
         return self._resolve_prompt_language_from_text(text)
 
-    def _episode_title(self, turns: List[Dict[str, Any]]) -> str:
-        for turn in turns:
-            text = turn.get("user_message") or turn.get("assistant_response") or ""
-            if text:
-                return _compact_whitespace(text)[:96]
-        return "assistant interaction episode"
-
-    def _episode_summary(self, turns: List[Dict[str, Any]]) -> str:
-        chunks: List[str] = []
-        for turn in turns[:6]:
-            if turn.get("user_message"):
-                chunks.append(f"User: {turn['user_message']}")
-            if turn.get("assistant_response"):
-                chunks.append(f"Assistant: {turn['assistant_response'][:600]}")
-        return "\n".join(chunks)
-
-    def _fallback_generate_episode_title_from_units(self, units: Sequence[MemoryUnit]) -> str:
-        for unit in units:
-            text = unit.text or ""
-            if text:
-                return _compact_whitespace(text)[:96]
-        return "memory episode"
-
-    def _fallback_generate_episode_summary_from_units(self, units: Sequence[MemoryUnit]) -> str:
-        chunks: List[str] = []
-        for unit in list(units)[:10]:
-            for index, text in enumerate(unit.texts or []):
-                clean_text = _compact_whitespace(text)
-                if not clean_text:
-                    continue
-                speaker = (
-                    unit.speakers[index]
-                    if index < len(unit.speakers)
-                    else "speaker"
-                )
-                started_at = (
-                    unit.started_ats[index]
-                    if index < len(unit.started_ats)
-                    else ""
-                ) or ""
-                chunks.append(f"{started_at} {speaker}: {clean_text[:600]}")
-        return "\n".join(chunks)
-
     def _is_low_value_assistant_closing(self, text: str) -> bool:
         clean = _compact_whitespace(text)
         if not clean:
@@ -2611,10 +2425,8 @@ class MemoryNodeManager:
     def _store_extracted_memory_facts_into_db(
         self,
         *,
-        episode_id: Optional[int],
         facts: List[Dict[str, Any]],
         tags: List[str],
-        episode_context_topics: Optional[Sequence[str]] = None,
     ) -> Dict[str, Any]:
         fact_ids: List[int] = []
         topic_item_updates: List[Dict[str, Any]] = []
@@ -2672,10 +2484,8 @@ class MemoryNodeManager:
                 **metadata,
                 "tags": tags,
                 "entity_descriptors": entity_descriptors,
-                "episode_context_topics": list(episode_context_topics or []),
             }
             fact_id = self._db.insert_fact(
-                episode_id=episode_id,
                 fact_type=fact["fact_type"],
                 summary=fact["summary"],
                 keywords=keywords,
@@ -2760,7 +2570,7 @@ class MemoryNodeManager:
             "user_intent_signal_count": len(user_intent_signal_mapping_updates),
         }
 
-    # ── Entity-claim update: facts/episodes -> entity claims ─────────────
+    # ── User-claim update: facts -> user claims ──────────────────────────
 
     def submit_memory_user_claim_update_task(self, *_, **kwargs: Any) -> Dict[str, Any]:
         """Queue an entity-claim update after accepted memory tasks."""
@@ -2804,7 +2614,7 @@ class MemoryNodeManager:
         reference_timestamp: Optional[Any] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        """Project new facts and completed episodes into entity claims."""
+        """Project new facts into user claims."""
         update_started_at = time.monotonic()
         limit = max(
             1,
@@ -2887,7 +2697,7 @@ class MemoryNodeManager:
             "candidate_count": 0,
             "applied_count": 0,
             "created": 0,
-            "updated": 0,
+            "relations_recorded": 0,
             "signals_marked_processed": 0,
             "failed_signal_count": 0,
             "failed_batch_count": 0,
@@ -3048,7 +2858,15 @@ class MemoryNodeManager:
                     )
                     with self._db.transaction():
                         applied = (
-                            self._apply_intent_candidates(candidates, decisions)
+                            self._apply_intent_candidates(
+                                candidates,
+                                decisions,
+                                observed_at=_to_timestamp_text(
+                                    fact.get("dialogue_time_key")
+                                    or fact.get("event_time_key")
+                                    or reference_timestamp
+                                ),
+                            )
                             if should_apply else []
                         )
                         marked = self._db.mark_user_intent_signals_processed(
@@ -3065,11 +2883,17 @@ class MemoryNodeManager:
                 batch_applied += len(applied)
                 report["applied_count"] += len(applied)
                 report["created"] += sum(result["created"] for result in applied)
-                report["updated"] += sum(not result["created"] for result in applied)
-                report["affected_objects"].extend({
-                    "object_type": str(result.get("object_type") or ""),
-                    "object_id": int(result.get("object_id") or 0),
-                } for result in applied)
+                report["relations_recorded"] += sum(result["related"] for result in applied)
+                for result in applied:
+                    report["affected_objects"].append({
+                        "object_type": result["object_type"],
+                        "object_id": result["object_id"],
+                    })
+                    if result["target_object_id"]:
+                        report["affected_objects"].append({
+                            "object_type": result["object_type"],
+                            "object_id": result["target_object_id"],
+                        })
             self._log_info("memory_user_intent_update", "batch_finish", {
                 "batch_index": batch_index,
                 "signal_ids": [item["signal_id"] for item in batch],
@@ -3086,10 +2910,6 @@ class MemoryNodeManager:
                 (item["object_type"], item["object_id"]): item
                 for item in report["affected_objects"]
             }.values())
-            report["user_state_update_request"] = {
-                "changed_intent_objects": report["affected_objects"],
-                "reference_timestamp": reference_timestamp,
-            }
         self._log_info("memory_user_intent_update", "finish", report)
         return report
 
@@ -3670,6 +3490,8 @@ class MemoryNodeManager:
         self,
         candidates: Sequence[Dict[str, Any]],
         decisions: Dict[int, Dict[str, Any]],
+        *,
+        observed_at: str,
     ) -> List[Dict[str, Any]]:
         applied: List[Dict[str, Any]] = []
         for index, candidate in enumerate(candidates):
@@ -3680,35 +3502,24 @@ class MemoryNodeManager:
             target = self._db.get_intent_object(
                 object_type=object_type, object_id=target_id,
             ) if target_id else None
-            status = self._intent_status_for_operation(object_type, operation, target)
+            status = (
+                "candidate" if target else {
+                    "goal": "active", "plan": "planned", "work_item": "open",
+                }[object_type]
+            )
             payload = self._intent_storage_payload(candidate, status=status)
-            created = target is None
-            if created:
-                object_id = self._db.create_intent_object(
-                    object_type=object_type, payload=payload,
-                )
-                previous_status = ""
-                previous_payload: Dict[str, Any] = {}
-            else:
-                object_id = int(target["id"])
-                previous_status = str(target.get("status") or "")
-                previous_payload = dict(target)
-                update_payload = {
-                    key: value for key, value in payload.items()
-                    if value not in ("", None, 0, {}) or key in {"status", "confidence"}
-                }
-                self._db.update_intent_object(
-                    object_type=object_type, object_id=object_id, payload=update_payload,
-                )
+            object_id = self._db.create_intent_object(
+                object_type=object_type, payload=payload,
+            )
             stored_object = self._db.get_intent_object(
-                object_type=object_type,
-                object_id=object_id,
+                object_type=object_type, object_id=object_id,
             )
             if stored_object:
                 self._sync_user_intent_recall_document(
-                    object_type=object_type,
-                    item=stored_object,
+                    object_type=object_type, item=stored_object,
                 )
+            previous_status = str(target.get("status") or "") if target else ""
+            previous_payload = dict(target) if target else {}
             evidence_role = {
                 "create": "creation", "confirm": "confirmation", "complete": "completion",
                 "cancel": "cancellation", "block": "block",
@@ -3716,30 +3527,31 @@ class MemoryNodeManager:
             self._db.upsert_intent_evidence([{
                 "object_type": object_type, "object_id": object_id,
                 "evidence_type": "fact", "evidence_id": fact_id,
-                "role": evidence_role, "observed_at": self._intent_effective_at(candidate),
+                "role": evidence_role, "observed_at": observed_at,
             } for fact_id in candidate["evidence_fact_ids"]])
             self._db.insert_intent_event(
-                object_type=object_type, object_id=object_id,
-                event_type="create" if created else operation,
-                previous_status=previous_status, new_status=status,
-                previous_payload=previous_payload, new_payload=payload,
+                object_type=object_type,
+                object_id=int(target["id"]) if target else object_id,
+                event_type="relation_observed" if target else "create",
+                trigger_object_id=object_id if target else 0,
+                reconciliation_operation=operation,
+                previous_status=previous_status,
+                new_status=previous_status if target else status,
+                previous_payload=previous_payload,
+                new_payload=candidate if target else stored_object,
                 evidence_fact_ids=candidate["evidence_fact_ids"],
-                effective_at=self._intent_effective_at(candidate),
-                decision_source=str(decision.get("reason") or "intent_reconciliation"),
+                effective_at=observed_at,
+                decision_source="intent_reconciliation",
+                reason=str(decision.get("reason") or ""),
             )
-            applied.append({"object_type": object_type, "object_id": object_id, "created": created})
+            applied.append({
+                "object_type": object_type,
+                "object_id": object_id,
+                "target_object_id": int(target["id"]) if target else 0,
+                "created": True,
+                "related": target is not None,
+            })
         return applied
-
-    @staticmethod
-    def _intent_status_for_operation(
-        object_type: str, operation: str, target: Optional[Dict[str, Any]]) -> str:
-        defaults = {"goal": "active", "plan": "planned", "work_item": "open"}
-        status = str((target or {}).get("status") or defaults[object_type])
-        return {
-            "goal": {"complete": "achieved", "cancel": "abandoned"},
-            "plan": {"complete": "occurred", "cancel": "cancelled", "reschedule": "rescheduled"},
-            "work_item": {"complete": "completed", "cancel": "cancelled", "block": "blocked"},
-        }[object_type].get(operation, status)
 
     def _intent_storage_payload(self, candidate: Dict[str, Any], *, status: str) -> Dict[str, Any]:
         payload = {key: value for key, value in candidate.items() if key in {
@@ -3779,9 +3591,6 @@ class MemoryNodeManager:
                 "beneficiary_entities": candidate.get("beneficiary_names") or [],
                 "delegator_entities": candidate.get("delegator_names") or [],
                 "collaborator_entities": candidate.get("collaborator_names") or [],
-                "completed_at": (
-                    self._intent_effective_at(candidate) if status == "completed" else ""
-                ),
                 "extractor_version": "user_intent_update_v1",
                 "prompt_version": "v1",
             }
@@ -3790,10 +3599,6 @@ class MemoryNodeManager:
             "primary_domain": candidate["primary_domain"],
         })
         return payload
-
-    @staticmethod
-    def _intent_effective_at(candidate: Dict[str, Any]) -> str:
-        return str(candidate.get("due_at") or candidate.get("start_at") or candidate.get("target_at") or "")
 
     @staticmethod
     def _user_claim_types() -> set[str]:
@@ -3808,7 +3613,7 @@ class MemoryNodeManager:
         limit: int,
         reference_timestamp: Any,
     ) -> Dict[str, Any]:
-        """Project facts and completed episodes into traceable claim records."""
+        """Project facts into traceable claim records."""
         disabled = {
             "enabled": 0, "updated": 0, "facts_marked_processed": 0,
         }
@@ -3859,7 +3664,6 @@ class MemoryNodeManager:
             reference_timestamp=reference_timestamp,
             limit=max(1, min(limit, 100)),
             restrict_to_today=False,
-            require_episode=True,
         )
         inductive_report = self._update_inductive_user_claims_from_facts(
             induction_seed_facts,
@@ -5032,10 +4836,6 @@ class MemoryNodeManager:
                 group=group,
                 historical_facts=historical_facts,
             )
-            distinct_episodes = {
-                int(fact["episode_id"]) for fact in evidence_facts
-                if str(fact.get("episode_id") or "").strip().isdigit()
-            }
             time_windows = {
                 str(fact.get("event_time_key") or fact.get("dialogue_time_key") or "")[:10]
                 for fact in evidence_facts
@@ -5043,7 +4843,6 @@ class MemoryNodeManager:
             }
             if (
                 len(evidence_facts) < self._user_claim_induction_min_support_facts
-                or len(distinct_episodes) < self._user_claim_induction_min_episodes
                 or len(time_windows) < self._user_claim_induction_min_time_windows
             ):
                 continue
@@ -5199,7 +4998,7 @@ class MemoryNodeManager:
         group: Dict[str, Any],
         historical_facts: Sequence[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
-        """Keep new group facts, then add bounded episode-diverse history."""
+        """Keep new group facts, then add bounded time-diverse history."""
         seed_by_id = dict(group.get("seed_facts_by_id") or {})
         candidates_by_id = {
             int(fact["id"]): fact
@@ -5221,16 +5020,18 @@ class MemoryNodeManager:
         )
         selected: List[Dict[str, Any]] = []
         selected_ids: set[int] = set()
-        selected_episodes: set[int] = set()
+        selected_time_windows: set[str] = set()
         for fact in ordered:
             fact_id = int(fact["id"])
-            episode_id = int(fact.get("episode_id") or 0)
-            if episode_id > 0 and episode_id in selected_episodes:
+            time_window = str(
+                fact.get("event_time_key") or fact.get("dialogue_time_key") or ""
+            )[:10]
+            if time_window and time_window in selected_time_windows:
                 continue
             selected.append(fact)
             selected_ids.add(fact_id)
-            if episode_id > 0:
-                selected_episodes.add(episode_id)
+            if time_window:
+                selected_time_windows.add(time_window)
             if len(selected) >= self._user_claim_induction_evidence_limit:
                 break
         if len(selected) < self._user_claim_induction_evidence_limit:
@@ -5316,17 +5117,12 @@ class MemoryNodeManager:
             int(value) for value in (raw.get("support_fact_ids") or [])
             if str(value).strip().isdigit() and int(value) in facts_by_id
         ))[:24]
-        episode_ids = {
-            int(facts_by_id[fact_id]["episode_id"]) for fact_id in support_ids
-            if str(facts_by_id[fact_id].get("episode_id") or "").strip().isdigit()
-        }
         windows = {
             str(facts_by_id[fact_id].get("event_time_key") or facts_by_id[fact_id].get("dialogue_time_key") or "")[:10]
             for fact_id in support_ids
         } - {""}
         if (
             len(support_ids) < self._user_claim_induction_min_support_facts
-            or len(episode_ids) < self._user_claim_induction_min_episodes
             or len(windows) < self._user_claim_induction_min_time_windows
         ):
             return None
@@ -5918,9 +5714,6 @@ class MemoryNodeManager:
                     "match": match_details,
                     "bm25_raw_score": item.get("_bm25_score"),
                     "bm25_score": item.get("_recall_bm25_score"),
-                    "episode_seed_targets": list(
-                        item.get("_stage2_episode_seed_targets") or []
-                    ),
                     "accepted": decision.get("accepted"),
                     "decision_reason": decision_reason,
                 })
@@ -6394,9 +6187,7 @@ class MemoryNodeManager:
     ) -> List[Dict[str, Any]]:
         """Retrieve Stage 1 direct seeds for permitted object types.
 
-        Episode documents are intentionally not permitted here. They remain a
-        stored projection but only participate later as fact-association
-        boundaries.
+        User-activity observations are not recall documents in this version.
         """
         seed_search_terms = self._recall_stage1_build_seed_search_terms(
             terms=terms,
@@ -6431,8 +6222,7 @@ class MemoryNodeManager:
         returned, while derived-memory projections can become candidates
         directly.  For an explicit prospective time-slot query, prospective
         object types use a strict time browse instead of lexical terms.
-        Episode is deliberately excluded because it is only a fact-association
-        boundary.
+        User-activity observations are deliberately excluded in this version.
         """
         direct_types = list(dict.fromkeys(
             str(value or "").strip().lower()
@@ -6794,9 +6584,6 @@ class MemoryNodeManager:
         )
         seed_candidate_limits = candidate_limits["seed_limits"]
         selected_candidate_limits = candidate_limits["selected_limits"]
-        association_per_relation_limit = candidate_limits[
-            "association_per_relation_limit"
-        ]
         query_entity_names = self._recall_stage1_resolve_query_entity_names(
             query=original_query,
             database=database,
@@ -6850,9 +6637,6 @@ class MemoryNodeManager:
         association_candidates = (
             self._retrieve_association_candidates_using_seed_candidates(
                 seed_candidates=direct_candidates,
-                temporal_bounds=temporal_bounds,
-                temporal_mode=temporal_mode,
-                limit=association_per_relation_limit,
                 candidate_source_prefix="stage1",
                 database=database,
             )
@@ -7011,17 +6795,8 @@ class MemoryNodeManager:
             raise ValueError(f"Unsupported recall stage: {stage_name}")
         association_candidates = list(association_candidates or [])
         expanded_candidates = list(expanded_candidates or [])
-        association_by_relation = {"same_episode": 0}
-        for candidate in association_candidates:
-            relation = str(
-                candidate.get("_recall_association_relation")
-                or ""
-            )
-            if relation in association_by_relation:
-                association_by_relation[relation] += 1
         payload: Dict[str, Any] = {
             "association_candidate_count": len(association_candidates),
-            "association_by_relation": association_by_relation,
             "expanded_candidate_count": len(expanded_candidates),
             "expanded_by_level": self._recall_count_candidates_by_level(
                 expanded_candidates
@@ -7124,19 +6899,12 @@ class MemoryNodeManager:
         self,
         *,
         seed_candidates: Sequence[Dict[str, Any]],
-        temporal_bounds: RecallTimeBounds,
-        temporal_mode: str,
-        limit: int,
         candidate_source_prefix: str = "stage1",
         database: Optional[SessionDB] = None,
     ) -> List[Dict[str, Any]]:
         """Retrieve all fact associations for accepted direct candidates.
 
-        This is the association orchestrator only.  The two relation families
-        deliberately remain separate: derived-memory evidence is retrieved
-        from explicit mappings, while fact-to-fact expansion uses shared
-        episode membership.  Episode documents themselves are never
-        candidates.
+        Claim and intent candidates expand only to their mapped fact evidence.
         """
         db = database or self._db
         document_evidence_candidates = (
@@ -7146,112 +6914,7 @@ class MemoryNodeManager:
                 database=db,
             )
         )
-        same_episode_candidates = (
-            self._retrieve_same_episode_fact_association_candidates(
-                seed_candidates=seed_candidates,
-                temporal_bounds=temporal_bounds,
-                temporal_mode=temporal_mode,
-                limit=limit,
-                candidate_source_prefix=candidate_source_prefix,
-                database=db,
-            )
-        )
-        return [*document_evidence_candidates, *same_episode_candidates]
-
-    def _retrieve_same_episode_fact_association_candidates(
-        self,
-        *,
-        seed_candidates: Sequence[Dict[str, Any]],
-        temporal_bounds: RecallTimeBounds,
-        temporal_mode: str,
-        limit: int,
-        candidate_source_prefix: str,
-        database: SessionDB,
-    ) -> List[Dict[str, Any]]:
-        """Expand accepted fact seeds with other facts in the same episode."""
-        fact_seed_candidates = [
-            candidate
-            for candidate in seed_candidates or []
-            if str(candidate.get("index_level") or "") == "fact"
-        ]
-        seed_scores: Dict[int, float] = {}
-        for candidate in fact_seed_candidates or []:
-            try:
-                fact_id = int(candidate.get("target_id"))
-            except (TypeError, ValueError):
-                continue
-            seed_scores[fact_id] = max(
-                seed_scores.get(fact_id, 0.0),
-                self._clamp_float(candidate.get("_recall_score"), 0.0, 1.0, 0.0),
-            )
-        if not seed_scores:
-            return []
-
-        per_relation_limit = max(1, int(limit or 24))
-        related_scores: Dict[int, Tuple[str, float]] = {}
-        for pair in database.related_fact_pairs_by_episode_fact_ids(
-            list(seed_scores),
-            limit=per_relation_limit,
-        ):
-            seed_score = seed_scores.get(int(pair["seed_fact_id"]), 0.0)
-            propagated_score = round(
-                seed_score * self._recall_fact_association_decay("same_episode"),
-                4,
-            )
-            related_fact_id = int(pair["related_fact_id"])
-            existing = related_scores.get(related_fact_id)
-            if existing is None or propagated_score > existing[1]:
-                related_scores[related_fact_id] = (
-                    "same_episode",
-                    propagated_score,
-                )
-        if not related_scores:
-            return []
-
-        expanded: List[Dict[str, Any]] = []
-        for fact in database.get_memory_facts_by_ids(list(related_scores)):
-            fact_id = int(fact.get("id") or 0)
-            relation_info = related_scores.get(fact_id)
-            if not relation_info:
-                continue
-            relation, propagated_score = relation_info
-            candidate = self._make_recall_document_candidate(
-                row=fact,
-                object_type="fact",
-                candidate_source=(
-                    f"{candidate_source_prefix}_episode_association"
-                ),
-                temporal_bounds=temporal_bounds,
-                temporal_mode=temporal_mode,
-            )
-            if not candidate:
-                continue
-            candidate["_recall_association_score"] = propagated_score
-            candidate["_recall_association_relation"] = relation
-            candidate["_recall_score"] = propagated_score
-            candidate["evidence"] = ["associative_recall"]
-            candidate["matched"] = True
-            candidate["candidate_score_threshold"] = 0.0
-            candidate["filter_reason"] = ""
-            candidate["has_strong_anchor"] = False
-            candidate["strong_anchor_reasons"] = []
-            match_details_key = (
-                "_recall_stage2_match_details"
-                if candidate_source_prefix == "stage2"
-                else "_recall_fast_match_details"
-            )
-            candidate[match_details_key] = {
-                "topic_match_info": {},
-                "entity_match_info": {},
-                "time_score_info": {},
-                "score_components": {},
-            }
-            candidate["_recall_decision"] = {
-                "accepted": True,
-                "decision_reason": "accepted_associative_recall",
-            }
-            expanded.append(candidate)
-        return expanded
+        return document_evidence_candidates
 
     def _retrieve_evidence_fact_association_candidates(
         self,
@@ -7361,12 +7024,6 @@ class MemoryNodeManager:
             candidates.append(candidate)
         return candidates
 
-    def _recall_fact_association_decay(self, relation: str) -> float:
-        """Return the configured score decay for one fact association edge."""
-        return {
-            "same_episode": self._recall_stage1_episode_propagation_decay,
-        }.get(relation, self._recall_stage1_association_propagation_decay)
-
     @staticmethod
     def _recall_stage1_candidate_limits(
         *,
@@ -7376,8 +7033,7 @@ class MemoryNodeManager:
 
         ``top_k`` controls the fact quota. Derived objects receive small,
         independent quotas only when the Stage 1 query route requests them.
-        Episode is intentionally absent: it is an association boundary, not a
-        direct-recall candidate type.
+        Activity observations are deliberately not direct-recall candidates.
         """
         k = max(1, int(top_k or 1))
         seed_per_level_limit = max(8, min(24, k * 2))
@@ -7392,8 +7048,6 @@ class MemoryNodeManager:
                 "plan": max(4, min(12, k)),
                 "work_item": max(4, min(12, k)),
             },
-            # The association loader applies this limit to same-episode facts.
-            "association_per_relation_limit": max(4, min(12, k)),
             "selected_limits": {
                 "fact": k,
                 "user_claim": max(2, min(4, k)),
@@ -8874,9 +8528,6 @@ class MemoryNodeManager:
         )
         seed_channel_limits = candidate_limits["seed_channel_limits"]
         selected_candidate_limits = candidate_limits["selected_limits"]
-        association_per_relation_limit = candidate_limits[
-            "association_per_relation_limit"
-        ]
         self._log_info("memory_recall_stage2", "query_analyzed", {
             "query_analysis_info": query_analysis_info,
             "temporal_resolution": temporal_resolution,
@@ -8934,9 +8585,6 @@ class MemoryNodeManager:
         association_candidates = (
             self._retrieve_association_candidates_using_seed_candidates(
                 seed_candidates=direct_candidates,
-                temporal_bounds=temporal_bounds,
-                temporal_mode=temporal_mode,
-                limit=association_per_relation_limit,
                 candidate_source_prefix="stage2",
                 database=database,
             )
@@ -9052,7 +8700,6 @@ class MemoryNodeManager:
             if query_end and time_start and time_start > str(query_end):
                 return None
             hydrated = dict(row)
-            hydrated.pop("episode_id", None)
             hydrated.pop("embedding", None)
             hydrated.pop("identity_text_embedding", None)
             hydrated.pop("canonical_name_embedding", None)
@@ -10120,8 +9767,6 @@ class MemoryNodeManager:
                 "stage2_lexical": dict(seed_limits),
                 "stage2_embedding": dict(seed_limits),
             },
-            # Applied to same-episode fact expansion.
-            "association_per_relation_limit": max(4, min(12, k)),
             "selected_limits": {
                 "fact": k,
             },

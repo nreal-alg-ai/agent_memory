@@ -384,7 +384,7 @@ def paired_dialog_turns(turns: Sequence[Dict[str, Any]], date_text: str) -> Tupl
 
 def db_counts(db: Any) -> Dict[str, int]:
     tables = {
-        "episodes": "memory_episodes",
+        "user_activities": "memory_user_activity_items",
         "facts": "memory_facts",
         "entities": "memory_entity_nodes",
     }

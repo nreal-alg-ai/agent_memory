@@ -178,7 +178,7 @@ memory_runtime:
       absolute_surprise_weight: 0.8
       cohesion_drop_weight: 0.8
       length_weight: 0.4
-    episode_summary_trigger:
+    user_activity_trigger:
       max_duration_seconds: 1800.0
       max_tokens: 6000
       min_tokens_for_duration: 1000
@@ -231,7 +231,6 @@ memory_manager:
   user_claim_derived_min_confidence: 0.75
   user_claim_signal_max_per_fact: 3
   user_claim_induction_min_support_facts: 3
-  user_claim_induction_min_episodes: 3
   user_claim_induction_min_time_windows: 2
   user_claim_induction_evidence_limit: 16
   

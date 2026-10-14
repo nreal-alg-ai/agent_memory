@@ -72,40 +72,24 @@ Entities must come from explicit conversation content or be directly determined 
 Each retained memory fact should usually include a subject entity, such as user self/assistant/speaker, plus 1-4 core semantic anchors."""
 
 
-EPISODE_SUMMARY_PROMPT_EN = """You are the episode aggregation module for a long-term memory system. The input contains raw interaction/transcript units from one continuous interval and high-value facts extracted from the same evidence. Generate a narrative summary of one reviewable experience.
+USER_ACTIVITY_EXTRACTION_PROMPT_EN = """You are the situational-observation module of a personal world model. Given chronological dialogue or ambient-transcript units and extracted facts, describe the user's activity or situation observable during the capture window. An activity is what the user was doing then, not what they reported doing earlier, usually do, or intend to do later.
 
-Input roles:
-- `source_units` are chronological source evidence and the sole primary basis for the episode's content, ordering, and stance.
-- `evidence_facts` are durable coverage anchors selected from those units. Use them only to check that important information is not missed; never rewrite, concatenate, or expand them one by one.
+First identify the interaction scene from unit types and chronology, then summarize its main discussion topics. Raw source_units are primary evidence that an activity occurred; evidence_facts only help identify topics and check details. Do not generate one activity per fact. The number of activities should reflect distinct observable scenes, not the number of facts.
 
-Conceptual boundaries:
-- A fact is an independently retrievable atomic evidence unit containing precise details.
-- An episode is a higher-level narrative of what happened during one continuous experience: what unfolded, what it centered on, and what conclusion or open point remained.
-- An episode is not a long-term state, user profile, cross-experience pattern, risk assessment, or actionable item. Never generalize one episode into a durable conclusion.
+Rules:
+1. For interaction units, an ongoing conversation with the assistant is itself the observable activity. Usually summarize a continuous conversation as one activity such as "The user talked with the assistant, mainly about ...", with user_role participant. Mention a few representative topics, but do not turn each topic, fact, or behavior mentioned in the conversation into a separate activity. Split only when the raw units show a distinct activity, a new day or long interruption, or a clear scene change.
+2. For transcript units, describe the discussion, meeting, or other situation actually taking place during recording. Use participant when the user demonstrably speaks or participates; use actor only when raw units directly establish that the user actually performed a non-conversational action during capture; use contextual when the recording only establishes exposure to a situation, not personal speech or action. Being mentioned by others does not prove participation or action.
+3. Strictly distinguish observed activity from its subject matter. The activity time comes from source_units capture times, not a fact's event_time_key. If the user says "I exercised this morning", "I've been learning photography", or "I plan to visit a mountain tomorrow", the observable activity is talking about those matters, not exercising, taking photographs, or traveling during this window. Past events, habits, preferences, hypotheticals, advice, and future plans may be discussion topics but not separate actor activities. A clearly contemporaneous statement such as "I am cooking right now" can support an additional action if evidence is sufficient.
+4. Each activity_text must first state the activity or situation occurring in the window, then concisely name its main topics. Preserve the distinction between discussing, recalling, planning, and actually doing. Do not invent motives, emotions, duties, outcomes, or locations. Wake words, greetings, templated assistant replies, and fragments without an identifiable scene may yield an empty list.
+5. evidence_fact_ids may reference only supplied facts supporting the scene or its topics; a fact alone cannot establish that a mentioned behavior happened during the capture window. Raw units may independently support the observation, so the list may be empty. confidence is between 0 and 1.
+6. Return JSON only.
 
-Generation rules:
-1. Reconstruct the experience from source units: context/trigger -> discussion, observation, or action -> meaningful turn or stance -> result, decision, or unresolved point. Omit any unsupported step.
-2. Abstract related expressions, but do not replay every turn or write one sentence per fact. The summary must be more coherent and contextual than the facts, not a longer fact list.
-3. Ignore wake words, greetings, courtesy closings, repetitions, empty acknowledgements, and templated assistant language. Retain only the people/objects, setting, issue, user concern, key response, decision, constraint, outcome, or open question needed to understand the experience.
-4. Cover high-value information in `evidence_facts` where it agrees with source units. If facts conflict with, overstate, or leave ambiguity in the source, follow the source and preserve uncertainty.
-5. Preserve chronology, conditions, and speaker stance. Do not turn advice into a decision, a possibility or plan into completion, an assistant view into a user belief, or invent causality, owners, deadlines, or outcomes.
-6. If the continuous interval contains several unrelated but valuable topics, connect them with a structured summary without forcing a causal link or omitting important content.
-7. summary must be one concise, self-contained experience narrative: understandable without source units and clear about the central people/objects, progression, and conclusion/open point.
-8. title is a short, concrete, distinguishable retrieval title. Prefer "object + core event/problem/decision" over broad labels.
-9. canonical_topics contains only 1-3 stable topics supported by the original source units. Evidence facts help check coverage, but their specific fact topics are not automatically episode topics. Never use an action, one-off conclusion, emotion, or isolated keyword as a topic.
-10. Return JSON matching the schema exactly. No markdown, explanation, or extra fields.
+For an interaction in which the user says they exercised this morning, saw a movie last night, and might visit a mountain tomorrow, output one activity such as: {"user_activities": [{"activity_text": "The user talked with the assistant about exercise, a movie, and plans for a mountain trip", "user_role": "participant", "confidence": 0.9, "evidence_fact_ids": []}]}. Do not output separate activities saying the user is exercising, watching a movie, or traveling.
 
-Output schema:
-{
-  "title": "short specific title",
-  "summary": "self-contained episode summary",
-  "canonical_topics": ["stable topic 1", "stable topic 2"]
-}
-
-Raw source units:
+Raw source_units:
 {source_units}
 
-High-value evidence facts (coverage checks only; do not concatenate):
+Extracted evidence_facts:
 {evidence_facts}
 """
 
@@ -113,13 +97,13 @@ High-value evidence facts (coverage checks only; do not concatenate):
 UNIFIED_MEMORY_EXTRACTION_PROMPT_EN = """You are the memory extraction module for a unified AI-glasses memory system inspired by MemPalace.
 
 Current memory structure:
-- fact: a traceable, self-contained, independently retrievable narrative evidence unit extracted from a continuous evidence batch. Facts are persisted first and may be assigned to an episode later.
-- episode: a higher-level experience summary generated by a separate module from persisted raw interaction/transcript segments in one continuous interval; newly generated facts are coverage anchors only, so it is not a copy of each input batch or fact.
-- memory_topic_items: a topic registry populated after facts and episodes are stored. It records their topics and mappings, not a topic summary or state; this prompt does not read existing topic names.
+- fact: a traceable, self-contained, independently retrievable narrative evidence unit extracted from a continuous evidence batch.
+- user_activity: a grounded observation of user activity or surrounding context generated from a longer window of source units and facts by a separate module; do not output it here.
+- memory_topic_items: a topic registry populated from facts. It records fact-topic mappings, not a topic summary or state; this prompt does not read existing topic names.
 - user_claim: a durable proposition about user self produced by the user-claim extraction pipeline and traceable to supporting facts; relation objects may be other entities. It is not direct evidence from the current dialogue and does not replace facts.
 - goal / plan / work_item: future desired outcomes, explicit arrangements, and closed-loop responsibilities extracted by a separate Intent & Execution task after facts are stored. Do not output them here.
 
-Your task now is to extract Hindsight-style high-quality narrative facts from the chronological dialogue/transcript evidence-unit batch below. Each unit's `Unit type` only identifies its source: `interaction` is one ordered user-and-assistant exchange, while `transcript` is ambient-recording ASR text. Episode summary and episode canonical_topics are generated by a separate module from persisted source units with extracted facts as coverage anchors; do not output episode-level fields in this prompt.
+Your task now is to extract Hindsight-style high-quality narrative facts from the chronological dialogue/transcript evidence-unit batch below. Each unit's `Unit type` only identifies its source: `interaction` is one ordered user-and-assistant exchange, while `transcript` is ambient-recording ASR text. Longer-window situational observations are generated separately; do not output user_activity here.
 
 Identity boundary:
 - `user self` refers only to the AI-glasses wearer. `speaker_用户本人` is a verified wearer speaker; confirmed names listed below may also refer to the same person when the current fact's context resolves that mention unambiguously. In Chinese output use `用户本人`; `speaker_助手` corresponds to the assistant. Never merge a namesake with the wearer.
@@ -184,9 +168,9 @@ user_claim_signals rules:
 - Emit a signal only when this fact's entities contain user self and either (1) `speaker_用户本人` directly states the proposition, (2) the wearer clearly confirms or corrects another speaker's specific proposition, or (3) a third party explicitly describes the wearer through a confirmed alias. The third case is a `third_party_report`, not a wearer assertion; a namesake, unrelated wearer utterance, or vague acknowledgment is insufficient.
 - `owner_evidence_type` is `self_statement|confirmed_response|third_party_report`. The first two require an exact wearer quote in `owner_evidence_text`; the response case also requires an earlier other-speaker quote. A third-party report has empty `owner_evidence_text` and an exact other-speaker quote containing the confirmed alias in `other_evidence_text`. Never invent quotes or quote preceding context.
 - The signal's `entity` must always identify user self, never the other end of a relationship. A relationship involving user self may be signalled; its other person, organization, or project remains a fact entity and may later be the claim's object_entity.
-- `signal_kind` must be one of: `explicit_assertion` (a durable proposition directly stated by an entity or confirmed by a reliable record), or `pattern_observation` (an observation that may later support one directionally specific pattern together with other episodes).
+- `signal_kind` must be one of: `explicit_assertion` (a durable proposition directly stated by an entity or confirmed by a reliable record), or `pattern_observation` (an observation that may later support one directionally specific pattern together with evidence from other time windows).
 - `claim_type_hint` must be one of: identity_profile, affiliation, relationship, preference, constraint, behavior_pattern. A single action must not become an explicit_assertion for behavior_pattern; at most it is a pattern_observation.
-- `claim_anchor` is a short, stable grouping label that can collect facts from different episodes about one possible claim or pattern, such as "quiet travel preference" or "swimming routine". It is neither a sentence nor the final user_claim.
+- `claim_anchor` is a short, stable grouping label that can collect facts from different time windows about one possible claim or pattern, such as "quiet travel preference" or "swimming routine". It is neither a sentence nor the final user_claim.
 - Output signals only when this fact has concrete evidence value for a claim about user self or later pattern induction. Use an empty array for one-off background, claims about third parties themselves, temporary suggestions, assistant speculation, pleasantries, and low-value content.
 - Each signal's `entity.name` must exactly reuse one entity name from the same fact's `entities`, and its `entity.type` must match that entity's type. Do not add, rewrite, or guess an entity that is not listed by the fact; omit the signal when no such entity exists.
 - Signal-to-fact grounding is mandatory: the signal's entity, proposition, and necessary qualifiers must be fully supported by the same fact's `text`. A response-based signal must preserve both the earlier statement and wearer response there. Do not borrow information omitted from this fact from another fact or preceding context. `evidence_basis` must explain how the wearer's utterance supports the final proposition; otherwise omit the signal.
@@ -384,9 +368,9 @@ facts:
 
 INDUCTIVE_USER_CLAIM_EXTRACTION_PROMPT_EN = """You conservatively extract inductive user_claims about user self for a personal world model.
 
-Input facts are traceable observations for one entity and one claim_anchor, drawn from completed episodes. The claim_anchor only gathers candidate evidence; it is not a conclusion. Decide whether the evidence supports a pattern; do not summarize facts.
+Input facts are traceable observations for one entity and one claim_anchor, drawn from different time windows. The claim_anchor only gathers candidate evidence; it is not a conclusion. Decide whether the evidence supports a pattern; do not summarize facts.
 
-An inductive user_claim expresses a preference or behavioral pattern supported by repeated evidence across facts or episodes. Only preference and behavior_pattern claims are allowed; the system sets `claim_origin` to `inductive`. It is not a one-time event fact and does not replace its supporting facts.
+An inductive user_claim expresses a preference or behavioral pattern supported by repeated evidence across facts and time windows. Only preference and behavior_pattern claims are allowed; the system sets `claim_origin` to `inductive`. It is not a one-time event fact and does not replace its supporting facts.
 
 Hard rules:
 1. A claim requires at least three distinct support_fact_ids, and every cited ID must directly support the proposed pattern.
@@ -414,7 +398,7 @@ Output:
 candidate entity and claim grouping hint:
 {induction_target}
 
-episode evidence facts:
+evidence facts:
 {facts}
 """
 
@@ -494,96 +478,73 @@ existing_claims:
 """
 
 
-USER_STATE_UPDATE_PROMPT_EN = """Incrementally update User State in a personal world model.
+USER_CLAIM_STATE_RESOLUTION_PROMPT_EN = """Jointly propose old-claim status decisions and user-state updates from changed user claims. Creating a state does not require an existing state or a claim relation event.
 
-`user_claim` is the auditable belief/evidence ledger. `goal`, `plan`, and
-`work_item` are future-oriented objects. Do not restate them or make a copy of
-them. Decide whether this update should create or modify a user state that is
-useful for later prediction and decisions.
+Inputs: changed_claims are direct evidence for this update; related_claims are existing claims reached through relation events; supporting_claims provide additional evidence for existing states. existing_states and state_claim_evidence describe current states and their support. The relations in relation_events are already classified; do not classify them again. An empty history list does not prohibit state creation.
 
-There are exactly three state classes:
-1. `enduring_state`: a slowly changing, broadly applicable long-term
-   preference, durable constraint, communication tendency, or decision style.
-   A one-off event or temporary arrangement is normally insufficient.
-2. `recurring_state`: a repeated behavior, rhythm, or conditional pattern.
-   `conditions` should retain important conditions, time windows, frequency,
-   or exceptions. Never turn one occurrence into a pattern.
-3. `situational_state`: a temporary current concern, pressure, constraint,
-   preparation state, or availability. It needs a plausible validity window,
-   ending condition, or room to change with future evidence. Do not copy every
-   goal/plan/work item into a situational state.
+Reason in this order, then return one joint result:
+1. Independently assess new states. Read every changed claim and combine evidence concerning the same state dimension. Ask whether it supports a durable preference, stable constraint, or behavioral pattern useful for future prediction or service decisions. Do this even when existing_states=[] and relation_events=[]; emit create when evidence suffices rather than returning empty operations automatically. One direct, unambiguous explicit claim with durable meaning may establish an enduring_state, such as "I have always preferred morning meetings" establishing a time preference; multiple claims are not mandatory. Related concrete preferences may be aggregated, but do not mix unrelated subjects merely to create an aggregate. State text should express a reusable judgment, not paste or closely paraphrase claims.
+2. Distinguish durable tendencies from repetition. enduring_state covers preferences, styles, values, or constraints that broadly persist across time or situations. An explicit stable preference is not a one-off event merely because it was said once. recurring_state requires an explicitly stated habit/rule or multiple observations supporting periodic, frequent, repeated, or conditional behavior. Liking an activity, planning it once, or remembering an experience does not prove repetition. A one-time goal, plan, trip, recent emotion, or concern about ability does not automatically become a durable state. Create only enduring_state or recurring_state from claims, not situational_state.
+3. Align with existing states. If an existing state in the same domain, class, and key already expresses the conclusion, reinforce or revise it rather than creating a duplicate. If new evidence challenges a state, examine all state_claim_evidence and supporting_claims before weakening, expiring, or partially revising it. Losing one support claim does not necessarily invalidate the state. Do not abandon a justified create decision merely because no old state is affected.
+4. Decide old-claim status. Only a contradicts or supersedes event with an old target claim and a changed trigger claim may justify an old-claim update. The relation alone is not a status decision: consider text, origin (explicit is usually more direct than inductive or derived), time, and conditions. Contradicts may at most weaken; only an unambiguous supersedes may supersede. Claims valid under different conditions or times may coexist. Do not alter changed claims or invalidate an old claim merely because an aggregate state fails. If there is no eligible relation, claim_updates=[]; this does not prevent state operations.
+5. Check joint consistency. A claim proposed as superseded cannot remain effective support for a state. Omit individual state candidates lacking evidence, but do not discard other supported states in the same update.
 
-Only `changed_claims` and `changed_intent_objects` may be direct evidence for
-an operation. `active_intent_objects` is background only and cannot by itself
-be cited as evidence. Existing states appear in `existing_states`: use their
-id when updating them and do not create a duplicate state for the same meaning.
+State operations are create|reinforce|revise|weaken|expire. Existing-state updates must use its id; create uses target_state_id=0. Controlled enduring_state keys: communication_style|decision_style|value_priority|risk_preference|privacy_preference|time_preference|work_style|lifestyle_preference|long_term_constraint. Controlled recurring_state keys: daily_routine|weekly_routine|work_routine|health_routine|social_routine|conditional_behavior. Preserve an existing state's class and key; stay within state_domain.
 
-The system fixes `state_domain` for this update. Create or update only states
-in that domain; do not use evidence from another domain to create, change, or
-reference another domain's state. `general` is only for genuinely cross-domain
-user states, never a fallback for an uncertain domain.
+Each state operation cites input claims only, with evidence_type=user_claim, evidence_id, role=change_trigger|support|counterexample|context, and weight. Cite at least one changed claim as the trigger. A claim proposed as superseded cannot remain support in this update. Counterexamples must not be mislabeled as support. Include concise reasons and confidence in [0,1]. Return an empty operations array only after assessing every changed claim and finding no justified operation. Return JSON only:
+{
+  "claim_updates": [{"claim_id": 1, "new_status": "weakened|superseded", "relation_event_id": 1, "reason": "why this evidence changes the old claim"}],
+  "operations": [{
+    "operation": "create|reinforce|revise|weaken|expire",
+    "target_state_id": 0,
+    "state_class": "enduring_state|recurring_state",
+    "state_key": "controlled option",
+    "state_text": "complete aggregate user-state statement",
+    "conditions": {}, "valid_from": "", "valid_to": "", "confidence": 0.8,
+    "evidence": [{"evidence_type": "user_claim", "evidence_id": 1, "role": "change_trigger|support|counterexample|context", "weight": 1.0}],
+    "reason": "why the state changes"
+  }]
+}
 
-Allowed operations:
-- `create`: create a previously absent state; target_state_id must be 0.
-- `reinforce`: new evidence strengthens an existing state without materially
-  changing its meaning.
-- `revise`: content, scope, conditions, or validity of an existing state needs
-  a material correction.
-- `weaken`: new evidence lowers applicability/confidence but does not prove the
-  state ended.
-- `expire`: the state ended, became invalid, or is explicitly no longer valid.
-- `no_change`: the evidence should not change a state; omit it from output.
+reference_time: {reference_time}
+state_domain: {state_domain}
+changed_claims: {changed_claims}
+related_claims: {related_claims}
+supporting_claims: {supporting_claims}
+relation_events: {relation_events}
+existing_states: {existing_states}
+state_claim_evidence: {state_claim_evidence}
+"""
 
-Hard rules:
-1. Output an operation only when directly supported by input evidence. Do not
-   use common-sense completion, personality diagnosis, or speculation.
-2. `state_key` is not free-form. Select only from the controlled options for
-   the given `state_class`; preserve the target state key for an update. If no
-   option fits, output no operation:
-   - `enduring_state`: `communication_style`, `decision_style`,
-     `value_priority`, `risk_preference`, `privacy_preference`,
-     `time_preference`, `work_style`, `lifestyle_preference`,
-     `long_term_constraint`.
-   - `recurring_state`: `daily_routine`, `weekly_routine`, `work_routine`,
-     `health_routine`, `social_routine`, `conditional_behavior`.
-   - `situational_state`: `current_focus`, `current_constraint`,
-     `current_availability`, `current_energy`, `current_stress`,
-     `current_social_engagement`, `current_preparation`.
-   A state key is a stable state dimension. Never encode a concrete object,
-   domain, time, value, or one-time event in it; express those in `state_text`
-   or `conditions` instead.
-3. `state_text` is a complete, self-contained, reader-facing statement of the
-   aggregated state, not a pasted list of claims.
-4. Every evidence item must be an allowed changed object. Include at least one
-   `change_trigger` or `support` item.
-5. If evidence is insufficient, unresolvedly contradictory, or only describes
-   a one-time fact, output no operation.
-6. `runtime_context` may be empty. Use it in conditions only when it is
-   explicitly supplied and consistent with the changed evidence.
-7. confidence is in [0, 1].
-8. The system writes every operation into this update's `state_domain`; never
-   output a cross-domain operation. Return JSON only.
 
-Output:
+USER_ACTIVITY_STATE_UPDATE_PROMPT_EN = """Incrementally update situational_state from newly generated user activity observations.
+
+This update is triggered by new activity. An activity describes what the user actually participated in during a continuous time window. Facts provide concrete evidence from that window. Related intents are currently active goals/plans/work items with direct evidence links to those facts; they are supplemental context only. For `user_role`, `actor` means evidence supports that the user is doing the activity, `participant` means the user is involved, and `contextual` is background only and must not be used to infer that the user is doing it. Do not copy an activity, fact, or intent into a state, and do not assume that mentioning a topic means the user is currently working on it.
+
+Create or update only `situational_state`; do not create enduring_state or recurring_state here. Emit an operation only when evidence indicates that the user is in an unfinished phase, is continuing to handle an issue, is preparing for something, is subject to a current constraint, or has a time-bounded current concern/availability. Chit-chat, one-off Q&A, reminiscence, preference statements, completed activities, and one-time itineraries normally do not warrant a situational state. Return an empty operations list when evidence is insufficient.
+
+Every operation must cite at least one `user_activity` item from this input. Facts may only be cited from `linked_facts`; goals/plans/work items may only be cited from `related_active_intents`. Related intents were prefiltered by the system because they share fact evidence with the activity; still decide whether they describe the same ongoing situation. Never cite an ID not supplied here. Activity is the trigger and situation anchor; do not infer that a completed activity is still current.
+
+Choose `state_domain` only from `allowed_domains`. When updating an existing state, use the ID of an existing state with the same domain, class, and key. `state_key` must be one of: `current_focus`, `current_constraint`, `current_availability`, `current_energy`, `current_stress`, `current_social_engagement`, `current_preparation`. `state_text` must be a self-contained description of the current state, not a historical summary. Provide a plausible `valid_to` or ending condition when evidence supports it; do not invent a deadline. Allowed operations are create, reinforce, revise, weaken, expire; `target_state_id` is 0 for create.
+
+Return JSON only:
 {
   "operations": [
     {
       "operation": "create|reinforce|revise|weaken|expire",
       "target_state_id": 0,
-      "state_class": "enduring_state|recurring_state|situational_state",
-      "state_key": "one controlled option for the state_class",
-      "state_text": "complete reader-facing user-state statement",
+      "state_domain": "one allowed_domains value",
+      "state_class": "situational_state",
+      "state_key": "one controlled option",
+      "state_text": "complete and explicit current-state statement",
       "conditions": {},
       "valid_from": "",
       "valid_to": "",
       "confidence": 0.8,
-      "evidence": [{
-        "evidence_type": "user_claim|goal|plan|work_item",
-        "evidence_id": 1,
-        "role": "change_trigger|support|counterexample|context",
-        "weight": 1.0
-      }],
-      "reason": "brief explanation of how this update changes the state"
+      "evidence": [
+        {"evidence_type": "user_activity|fact|goal|plan|work_item", "evidence_id": 1, "role": "change_trigger|support|counterexample|context", "weight": 1.0}
+      ],
+      "reason": "brief reason why this situation supports the operation"
     }
   ]
 }
@@ -591,23 +552,23 @@ Output:
 reference_time:
 {reference_time}
 
-state_domain:
-{state_domain}
+allowed_domains:
+{allowed_domains}
 
 runtime_context:
 {runtime_context}
 
-existing_states:
+new_activities:
+{activities}
+
+linked_facts:
+{facts}
+
+related_active_intents:
+{related_intents}
+
+existing_situational_states:
 {existing_states}
-
-changed_claims:
-{changed_claims}
-
-changed_intent_objects:
-{changed_intent_objects}
-
-active_intent_objects (background only; not direct evidence):
-{active_intent_objects}
 """
 
 
@@ -616,13 +577,12 @@ RECALL_QUERY_ANALYSIS_PROMPT_EN = """You are the recall query analyzer for the A
 Understand the memory structure before analyzing the query. 
 
 Memory structure:
-1. `fact`: traceable, self-contained narrative evidence extracted from one conversation episode or all-day transcript. It preserves what happened, participants, time, place or scene, reasons, viewpoint changes, suggestions, acceptance or rejection, constraints, conclusions, and unresolved questions. Facts usually include `summary`, `keywords`, `entities`, `fact_topic`, `event_time_key`, and `dialogue_time_key`.
-2. `user_claim`: a durable proposition about user self with status, confidence, validity time, and traceable supporting facts. Its origin is explicit (directly stated or confirmed by reliable records), inductive (a preference or behavior pattern inferred across facts/episodes), or derived (logically entailed by existing claims). Relation objects may be other entities. It does not replace one-time event facts.
+1. `fact`: traceable, self-contained narrative evidence extracted from dialogue or ambient transcripts. It preserves what happened, participants, time, place or scene, reasons, viewpoint changes, suggestions, acceptance or rejection, constraints, conclusions, and unresolved questions. Facts usually include `summary`, `keywords`, `entities`, `fact_topic`, `event_time_key`, and `dialogue_time_key`.
+2. `user_claim`: a durable proposition about user self with status, confidence, validity time, and traceable supporting facts. Its origin is explicit (directly stated or confirmed by reliable records), inductive (a preference or behavior pattern inferred across facts and time windows), or derived (logically entailed by existing claims). Relation objects may be other entities. It does not replace one-time event facts.
 3. `goal`, `plan`, and `work_item`: future-oriented objects extracted from facts, respectively representing a desired outcome, an explicit arrangement, and a closed-loop responsibility. Their status and target/start/due times are meaningful.
-4. `episode`: a continuous-experience summary used only as an association boundary between facts. It must never be a direct recall object.
 
 Guidance:
-- `recall_object_types` lists object types eligible for direct retrieval. It must always include `fact`; add `user_claim` only when the query asks about the user's durable claims or patterns; add the relevant `goal`, `plan`, or `work_item` only for future goals, arrangements, responsibilities, deadlines, unfinished work, or their lifecycle. Never output `episode`.
+- `recall_object_types` lists object types eligible for direct retrieval. It must always include `fact`; add `user_claim` only when the query asks about the user's durable claims or patterns; add the relevant `goal`, `plan`, or `work_item` only for future goals, arrangements, responsibilities, deadlines, unfinished work, or their lifecycle. user_activity is not retrieved in this version.
 - Prefer `fact` for what happened, dates, places, people, exact evidence, event order, and traceable details.
 - For stable preferences, durable constraints, routines, relationships, or profiles, add `user_claim` alongside the supporting facts.
 - For tasks, commitments, future arrangements, goals, deadlines, or unfinished work, add the relevant prospective object alongside the supporting facts.
