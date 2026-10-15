@@ -168,18 +168,26 @@ fact_type 判别规则：
 11. 只返回 JSON，不要 markdown。
 
 user_claim_signals 输出规则：
-- `user_claim_signals` 是当前 fact 对“用户本人为主体”的 user_claim 提供的零到多个结构化证据提示，不是最终 claim，也不能直接决定与已有 claim 的关系。所有 signal 的主体必须是“用户本人”；其他人、组织、产品用户或环境录音 speaker 的主张不能进入该字段。
+- `user_claim_signals` 只为后续的显式 user_claim 提炼提供证据路由提示，不是最终 claim，也不能直接决定与已有 claim 的关系；它不用于归纳/inductive claim。所有 signal 的主体必须是“用户本人”；其他人、组织、产品用户或环境录音 speaker 的主张不能进入该字段。
 - 仅当 fact 的 entities 包含“用户本人”，且存在以下证据之一时输出：① `speaker_用户本人` 直接陈述；② 其他人先提出明确主张，用户本人随后明确确认或纠正；③ 第三方明确谈到已确认别名所指向的佩戴者。第三种只能作为 `third_party_report` 证据，不能冒充用户本人自述；同名对象、模糊应声或礼貌回应不能生成 signal。
 - 第二种情形必须在同一条 fact 的 `text` 中写清其他人提出了什么、用户如何回应以及最终由用户确认或纠正的具体内容；signal 只表达用户最终认可或修正后的主张，不照搬对方未获确认的说法。
 - `owner_evidence_type` 为 `self_statement|confirmed_response|third_party_report`。前两种在 `owner_evidence_text` 中逐字摘取用户本人原话；回应型还须在 `other_evidence_text` 中摘取先前对方原话。第三方报告将 `owner_evidence_text` 置空，`other_evidence_text` 填包含已确认别名的第三方原话。不要引用前置上下文或编造原话。
-- signal 的 `entity` 必须固定指向“用户本人”，不得指向关系对象。用户与他人、组织或项目之间的关系仍可作为用户本人的关系主张；关系另一端应在 fact/entities 及后续 claim 的 object_entity 中表达。
-- `signal_kind` 只能是：`explicit_assertion`（实体明确陈述或可靠记录直接确认的稳定主张）、`pattern_observation`（可在未来与其他时间窗口的证据共同支持一个方向明确的规律的观察）。
-- `claim_type_hint` 只能是 identity_profile、affiliation、relationship、preference、constraint、behavior_pattern。单次行为不得作为 explicit_assertion 直接生成 behavior_pattern；它至多是 pattern_observation。
-- `claim_anchor` 是简短、稳定的聚合标签，用于把不同时间窗口中可能描述同一主张或规律的 facts 收拢，例如“安静旅行偏好”“游泳活动习惯”。它不是完整句子，也不是最终 user_claim。
-- 只有当前 fact 对用户本人的主张或未来规律归纳有实际证据价值时才输出。普通一次性背景、关于第三方自身的主张、临时建议、助手猜测、寒暄和低价值信息输出空数组。
-- 每个 signal 的 `entity.name` 必须原样复用同一 fact 的 `entities` 中某一个实体名称，`entity.type` 也必须与该实体一致。不得为 signal 新增、改写或猜测 fact 未列出的实体；无法对应时不输出该 signal。
-- 信号与 fact 必须严格一致：signal 的实体、主张及其必要限定信息必须由同一 fact 的 `text` 完整支持。回应型的提议和回应都必须写入该 fact；第三方报告必须保留说话人及被报告内容。不得从其他 fact 或前置上下文借用未写入该 fact 的信息；`evidence_basis` 应写清证据来源。
-- 每条 fact 最多输出 3 个 signal。每个 signal 必须包含 entity、signal_kind、claim_type_hint、claim_anchor、owner_evidence_type、owner_evidence_text、other_evidence_text、evidence_basis、confidence；其中 evidence_basis 必须引用当前 fact `text` 中可直接定位的具体证据。
+- `subject_entity` 必须固定填写“用户本人”，不得填写关系对象。用户与他人、组织或项目之间的关系仍可作为用户本人的关系主张；关系另一端应在 fact/entities 及后续 claim 的 object_entity 中表达。
+- 仅当当前 fact 明确表达或清晰确认了一项关于用户本人的主张时才输出 `user_claim_signals`；不要把供跨事件归纳的观察线索放入其中。独立发生的具体行为由 `user_action_signals` 表达，不要重复输出为 `user_claim_signals`。
+- `claim_type_hint` 只能是 identity_profile、affiliation、relationship、preference、constraint、behavior_pattern。`behavior_pattern` 仅用于用户本人明确自述或确认的规律/惯例，例如“我每周三都跑步”；不得从几次离散行为观察中推断。
+- `claim_anchor` 是供显式 claim 提炼识别主张主题的简短标签，例如“安静旅行偏好”“每周三跑步惯例”。它不是用于累积行为样本的分组键，也不是完整句子或最终 user_claim。
+- 只有当前 fact 对用户本人的明确主张有实际证据价值时才输出。普通一次性背景、关于第三方自身的主张、临时建议、助手猜测、仅由行为重复推断出的规律、寒暄和低价值信息输出空数组。
+- 每个 signal 的 `subject_entity` 必须与同一 fact 的 `entities` 中“用户本人”一致；fact 未将用户本人列为实体时不输出该 signal。不得为 signal 新增、改写或猜测 fact 未列出的实体。
+- 信号与 fact 必须严格一致：signal 的主体、主张及其必要限定信息必须由同一 fact 的 `text` 完整支持。回应型的提议和回应都必须写入该 fact；第三方报告必须保留说话人及被报告内容。不得从其他 fact 或前置上下文借用未写入该 fact 的信息；`evidence_basis` 应写清证据来源。
+- 每条 fact 最多输出 3 个 signal。每个 signal 必须包含 subject_entity、claim_type_hint、claim_anchor、owner_evidence_type、owner_evidence_text、other_evidence_text、evidence_basis、confidence；其中 evidence_basis 必须引用当前 fact `text` 中可直接定位的具体证据。
+
+user_action_signals 输出规则：
+- `user_action_signals` 只提示当前 fact 中用户本人一次具体的已发生或正在发生的行为、选择或实质性参与；不是习惯、偏好或归纳结论。它与本次采集期间“用户与助手交谈”的 user_activity 不同：谈论某项行为不等于执行该行为。
+- `subject_entity` 固定为“用户本人”，且必须出现在同一 fact 的 `entities` 中。`primary_entity` 不必是用户本人；不能把产品用户、其他人或未经确认的环境录音 speaker 当作本人。
+- `action_kind` 只能是 `action|choice|participation`，分别表示具体执行、在真实选项中作出选择、实际参加会议/活动等。`action_text` 应写清具体做了什么及已知时间/对象，且必须由同一 fact 的 `text` 直接支持；不得从别的 fact、前置上下文或常识补全。
+- 用户本人自述已发生行为、明确确认自己做过的行为，或第三方用已确认别名明确报告本人的已发生行为，可以输出。`owner_evidence_type` 使用 `self_statement|confirmed_response|third_party_report`，原话字段与 user_claim_signals 相同；第三方报告不能改写成本人自述。
+- 对未来计划/建议/假设、单纯提问或谈论、助手或第三方自己的行为输出空数组。“我每周三都跑步”是规律自述，不得拆成多次行为；只有文本另外明确描述一次具体发生的跑步时才可为该次事件输出 signal。普通用户—助手对话本身不要输出 action signal。
+- 每条 fact 最多输出 3 个 signal。每个 signal 都包含 subject_entity、action_kind、action_text、owner_evidence_type、owner_evidence_text、other_evidence_text、evidence_basis、confidence；evidence_basis 必须指出同一 fact 中支撑该行为的具体内容。事件时间沿用 fact 的 event_time_key，不在 signal 中重复输出。
 
 user_intent_signals 输出规则：
 - `user_intent_signals` 是当前 fact 对用户未来世界的证据提示，不是最终 goal、plan 或 work_item，也不能直接决定创建、更新或覆盖已有对象。
@@ -218,14 +226,25 @@ user_intent_signals 输出规则：
       ],
       "user_claim_signals": [
         {
-          "entity": {"name": "必须原样取自本 fact entities 的实体名" ,"type": "必须与该 fact entities 中同名实体的类型一致"},
-          "signal_kind": "explicit_assertion|pattern_observation",
+          "subject_entity": "用户本人",
           "claim_type_hint": "identity_profile|affiliation|relationship|preference|constraint|behavior_pattern",
-          "claim_anchor": "用于跨 fact 聚合的具体主张或规律标签",
+          "claim_anchor": "用于识别显式主张主题的简短标签",
           "owner_evidence_type": "self_statement|confirmed_response|third_party_report",
           "owner_evidence_text": "本人发言摘取 speaker_用户本人 原话；第三方报告为空",
           "other_evidence_text": "回应型或第三方报告摘取其他说话人原话；直接陈述型为空",
           "evidence_basis": "当前 fact 中支持该 signal 的具体证据",
+          "confidence": 0.8
+        }
+      ],
+      "user_action_signals": [
+        {
+          "subject_entity": "用户本人",
+          "action_kind": "action|choice|participation",
+          "action_text": "用户本人已发生或正在发生的一次具体行为/选择/参与",
+          "owner_evidence_type": "self_statement|confirmed_response|third_party_report",
+          "owner_evidence_text": "本人发言摘取 speaker_用户本人 原话；第三方报告为空",
+          "other_evidence_text": "回应型或第三方报告摘取其他说话人原话；直接陈述型为空",
+          "evidence_basis": "当前 fact 中直接支持该次行为的具体证据",
           "confidence": 0.8
         }
       ],
@@ -366,7 +385,7 @@ existing objects：
 
 EXPLICIT_USER_CLAIM_EXTRACTION_PROMPT_ZH = """你是个人世界模型的显式 user_claim 提炼模块。
 
-输入是已经落库、可追溯的 narrative facts。每条 fact 都可能带有零到多个 `user_claim_signals`，包含该 fact 的候选主张类型、signal_kind、聚合标签和证据定位。你必须查看全部 signals，但它们只是候选提示，不是额外事实或最终结论；最终 claim 必须由对应 fact 的 `summary` 直接支持，并通过 `evidence_fact_ids` 指向事实依据。`explicit_assertion` 可以提示显式主张候选；`pattern_observation` 只能提示观察线索，不能单独推出偏好、习惯或人格规律。用户本人直接陈述，或明确确认/纠正他人的具体说法，都可构成显式主张；仅有他人陈述、模糊应声、单次行为、建议或助手推测则不行。回应型 fact 必须完整保留他人的说法与用户本人的最终立场。
+输入是已经落库、可追溯的 narrative facts。每条 fact 都可能带有零到多个 `user_claim_signals`，包含该 fact 的候选主张类型、聚合标签和证据定位。你必须查看全部 signals，但它们只是候选提示，不是额外事实或最终结论；最终 claim 必须由对应 fact 的 `summary` 直接支持，并通过 `evidence_fact_ids` 指向事实依据。单次行为只能作为观察线索，不能单独推出偏好、习惯或人格规律。用户本人直接陈述，或明确确认/纠正他人的具体说法，都可构成显式主张；仅有他人陈述、模糊应声、单次行为、建议或助手推测则不行。回应型 fact 必须完整保留他人的说法与用户本人的最终立场。
 
 本流程生成的 claim_origin 由系统标记为 `explicit`，不需要在输出中提供该字段。
 

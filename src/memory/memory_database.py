@@ -354,11 +354,30 @@ class SessionDB:
                 signal_key TEXT NOT NULL,
                 subject_entity_id INTEGER,
                 claim_type_hint TEXT NOT NULL DEFAULT '',
-                signal_kind TEXT NOT NULL DEFAULT 'none',
                 claim_anchor TEXT NOT NULL DEFAULT '',
                 claim_anchor_key TEXT NOT NULL DEFAULT '',
                 evidence_basis TEXT NOT NULL DEFAULT '',
                 confidence REAL NOT NULL DEFAULT 0.0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(fact_id, signal_key),
+                FOREIGN KEY(fact_id) REFERENCES memory_facts(id) ON DELETE CASCADE,
+                FOREIGN KEY(subject_entity_id) REFERENCES memory_entity_nodes(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS memory_fact_user_action_signals (
+                signal_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                fact_id INTEGER NOT NULL,
+                signal_key TEXT NOT NULL,
+                subject_entity_id INTEGER NOT NULL,
+                action_kind TEXT NOT NULL CHECK(action_kind IN ('action', 'choice', 'participation')),
+                action_text TEXT NOT NULL CHECK(length(trim(action_text)) > 0),
+                event_time_key TEXT NOT NULL DEFAULT '',
+                owner_evidence_type TEXT NOT NULL,
+                owner_evidence_text TEXT NOT NULL DEFAULT '',
+                other_evidence_text TEXT NOT NULL DEFAULT '',
+                evidence_basis TEXT NOT NULL DEFAULT '',
+                confidence REAL NOT NULL DEFAULT 0.0 CHECK(confidence BETWEEN 0.0 AND 1.0),
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 UNIQUE(fact_id, signal_key),
@@ -624,6 +643,8 @@ class SessionDB:
             ON memory_fact_user_claim_signals(
                 subject_entity_id, claim_type_hint, claim_anchor_key, fact_id
             );
+            CREATE INDEX IF NOT EXISTS idx_memory_fact_user_action_signals_subject_time
+            ON memory_fact_user_action_signals(subject_entity_id, event_time_key, fact_id);
             CREATE INDEX IF NOT EXISTS idx_memory_fact_user_intent_signals_group
             ON memory_fact_user_intent_signals(
                 subject_entity_id, user_intent_anchor_key, evidence_kind, fact_id
@@ -1315,7 +1336,11 @@ class SessionDB:
             if str(value).strip().isdigit() and int(value) > 0
         })
         if fact_ids is not None and not ids:
-            return {"claim_signal_ids": [], "intent_signal_ids": []}
+            return {
+                "claim_signal_ids": [],
+                "intent_signal_ids": [],
+                "action_signal_ids": [],
+            }
         condition = (
             f"AND fact_id IN ({','.join('?' for _ in ids)})" if fact_ids is not None
             else ""
@@ -1331,9 +1356,15 @@ class SessionDB:
             f"WHERE subject_entity_id IS NOT NULL {condition} ORDER BY fact_id, signal_key",
             ids,
         ).fetchall()
+        action_rows = self._conn.execute(
+            "SELECT signal_id FROM memory_fact_user_action_signals "
+            f"WHERE subject_entity_id IS NOT NULL {condition} ORDER BY fact_id, signal_key",
+            ids,
+        ).fetchall()
         return {
             "claim_signal_ids": [int(row["signal_id"]) for row in claim_rows],
             "intent_signal_ids": [int(row["signal_id"]) for row in intent_rows],
+            "action_signal_ids": [int(row["signal_id"]) for row in action_rows],
         }
 
     def get_user_signal_mappings_by_ids(
@@ -1342,6 +1373,7 @@ class SessionDB:
         table = {
             "claim": "memory_fact_user_claim_signals",
             "intent": "memory_fact_user_intent_signals",
+            "action": "memory_fact_user_action_signals",
         }.get(signal_type)
         if table is None:
             raise ValueError(f"Unknown signal type: {signal_type}")
@@ -1363,6 +1395,7 @@ class SessionDB:
         table = {
             "claim": "memory_fact_user_claim_signals",
             "intent": "memory_fact_user_intent_signals",
+            "action": "memory_fact_user_action_signals",
         }.get(signal_type)
         if table is None:
             raise ValueError(f"Unknown signal type: {signal_type}")
@@ -1378,11 +1411,63 @@ class SessionDB:
             ).fetchall())
         return rows
 
+    def upsert_fact_user_action_signals(
+        self,
+        signals: Sequence[Dict[str, Any]],
+    ) -> int:
+        """Persist fact-grounded user actions without creating a claim."""
+        now = local_now_text()
+        changed = 0
+        for signal in signals or []:
+            self._conn.execute(
+                """
+                INSERT INTO memory_fact_user_action_signals (
+                    fact_id, signal_key, subject_entity_id, action_kind,
+                    action_text, event_time_key, owner_evidence_type,
+                    owner_evidence_text, other_evidence_text, evidence_basis,
+                    confidence, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(fact_id, signal_key) DO UPDATE SET
+                    action_text = excluded.action_text,
+                    event_time_key = excluded.event_time_key,
+                    owner_evidence_type = excluded.owner_evidence_type,
+                    owner_evidence_text = excluded.owner_evidence_text,
+                    other_evidence_text = excluded.other_evidence_text,
+                    evidence_basis = excluded.evidence_basis,
+                    confidence = excluded.confidence,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    int(signal["fact_id"]), str(signal["signal_key"]),
+                    int(signal["subject_entity_id"]), str(signal["action_kind"]),
+                    str(signal["action_text"]), str(signal.get("event_time_key") or ""),
+                    str(signal["owner_evidence_type"]),
+                    str(signal.get("owner_evidence_text") or ""),
+                    str(signal.get("other_evidence_text") or ""),
+                    str(signal.get("evidence_basis") or ""),
+                    float(signal.get("confidence") or 0.0), now, now,
+                ),
+            )
+            changed += 1
+        self._commit_if_needed()
+        return changed
+
+    def get_fact_user_action_signals(self, fact_id: int) -> List[Dict[str, Any]]:
+        """Read one fact's action evidence for inspection and future consumers."""
+        if int(fact_id or 0) <= 0:
+            return []
+        rows = self._conn.execute(
+            "SELECT * FROM memory_fact_user_action_signals "
+            "WHERE fact_id = ? ORDER BY signal_id",
+            (int(fact_id),),
+        ).fetchall()
+        return [self._row_to_dict(row) for row in rows]
+
     def upsert_fact_user_claim_signal_mappings(
         self,
         mappings: Sequence[Dict[str, Any]],
     ) -> int:
-        """Index fact-level claim signals for exact induction-group expansion."""
+        """Persist fact-level signals for explicit user-claim extraction."""
         now = local_now_text()
         changed = 0
         for mapping in mappings or []:
@@ -1396,14 +1481,12 @@ class SessionDB:
             except (KeyError, TypeError, ValueError):
                 subject_entity_id = 0
             claim_type_hint = str(mapping.get("claim_type_hint") or "").strip()
-            signal_kind = str(mapping.get("signal_kind") or "").strip()
             claim_anchor = str(mapping.get("claim_anchor") or "").strip()
             claim_anchor_key = str(mapping.get("claim_anchor_key") or "").strip()
             evidence_basis = str(mapping.get("evidence_basis") or "").strip()
             if fact_id <= 0 or (
                 subject_entity_id <= 0
                 or not claim_type_hint
-                or not signal_kind
                 or not claim_anchor
                 or not claim_anchor_key
             ):
@@ -1411,7 +1494,6 @@ class SessionDB:
             if not signal_key:
                 signal_fingerprint = hashlib.sha256(
                     "\x1f".join((
-                        signal_kind,
                         claim_type_hint,
                         claim_anchor_key,
                         evidence_basis.lower(),
@@ -1425,11 +1507,10 @@ class SessionDB:
                 """
                 INSERT INTO memory_fact_user_claim_signals (
                     fact_id, signal_key, subject_entity_id, claim_type_hint,
-                    signal_kind, claim_anchor, claim_anchor_key, evidence_basis,
+                    claim_anchor, claim_anchor_key, evidence_basis,
                     confidence, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(fact_id, signal_key) DO UPDATE SET
-                    signal_kind = excluded.signal_kind,
                     claim_anchor = excluded.claim_anchor,
                     evidence_basis = excluded.evidence_basis,
                     confidence = MAX(
@@ -1440,7 +1521,7 @@ class SessionDB:
                 """,
                 (
                     fact_id, signal_key,
-                    subject_entity_id or None, claim_type_hint, signal_kind,
+                    subject_entity_id or None, claim_type_hint,
                     claim_anchor, claim_anchor_key, evidence_basis,
                     float(mapping.get("confidence") or 0.0), now, now,
                 ),
@@ -1493,7 +1574,6 @@ class SessionDB:
               AND signal.subject_entity_id IS NOT NULL
             ORDER BY signal.claim_type_hint ASC,
                      signal.claim_anchor_key ASC,
-                     signal.signal_kind ASC,
                      signal.signal_key ASC
             """,
             (int(fact_id),),

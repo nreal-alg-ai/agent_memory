@@ -164,17 +164,25 @@ Rules:
 13. Return JSON only. No markdown.
 
 user_claim_signals rules:
-- `user_claim_signals` may contain zero or more structured evidence hints for user_claims whose subject is user self. They are not final claims and must not decide relations to existing claims. Every signal must concern user self as its subject; claims about other people, organizations, product users, or ambient speakers must not be routed here.
+- `user_claim_signals` are evidence-routing hints only for explicit user-claim extraction. They are not final claims and must not decide relations to existing claims; they are not used to induce claims from repeated events. Every signal must concern user self as its subject; claims about other people, organizations, product users, or ambient speakers must not be routed here.
 - Emit a signal only when this fact's entities contain user self and either (1) `speaker_用户本人` directly states the proposition, (2) the wearer clearly confirms or corrects another speaker's specific proposition, or (3) a third party explicitly describes the wearer through a confirmed alias. The third case is a `third_party_report`, not a wearer assertion; a namesake, unrelated wearer utterance, or vague acknowledgment is insufficient.
 - `owner_evidence_type` is `self_statement|confirmed_response|third_party_report`. The first two require an exact wearer quote in `owner_evidence_text`; the response case also requires an earlier other-speaker quote. A third-party report has empty `owner_evidence_text` and an exact other-speaker quote containing the confirmed alias in `other_evidence_text`. Never invent quotes or quote preceding context.
-- The signal's `entity` must always identify user self, never the other end of a relationship. A relationship involving user self may be signalled; its other person, organization, or project remains a fact entity and may later be the claim's object_entity.
-- `signal_kind` must be one of: `explicit_assertion` (a durable proposition directly stated by an entity or confirmed by a reliable record), or `pattern_observation` (an observation that may later support one directionally specific pattern together with evidence from other time windows).
-- `claim_type_hint` must be one of: identity_profile, affiliation, relationship, preference, constraint, behavior_pattern. A single action must not become an explicit_assertion for behavior_pattern; at most it is a pattern_observation.
-- `claim_anchor` is a short, stable grouping label that can collect facts from different time windows about one possible claim or pattern, such as "quiet travel preference" or "swimming routine". It is neither a sentence nor the final user_claim.
-- Output signals only when this fact has concrete evidence value for a claim about user self or later pattern induction. Use an empty array for one-off background, claims about third parties themselves, temporary suggestions, assistant speculation, pleasantries, and low-value content.
-- Each signal's `entity.name` must exactly reuse one entity name from the same fact's `entities`, and its `entity.type` must match that entity's type. Do not add, rewrite, or guess an entity that is not listed by the fact; omit the signal when no such entity exists.
-- Signal-to-fact grounding is mandatory: the signal's entity, proposition, and necessary qualifiers must be fully supported by the same fact's `text`. A response-based signal must preserve both the earlier statement and wearer response there. Do not borrow information omitted from this fact from another fact or preceding context. `evidence_basis` must explain how the wearer's utterance supports the final proposition; otherwise omit the signal.
-- Return at most 3 signals per fact. Every signal must contain entity, signal_kind, claim_type_hint, claim_anchor, owner_evidence_type, owner_evidence_text, other_evidence_text, evidence_basis, and confidence.
+- `subject_entity` must always be `user self`, never the other end of a relationship. A relationship involving user self may be signalled; its other person, organization, or project remains a fact entity and may later be the claim's object_entity.
+- Emit `user_claim_signals` only when this fact explicitly states or clearly confirms a proposition about user self; do not place observations intended for cross-event induction here. A specific standalone action belongs in `user_action_signals`, not duplicated as a user-claim signal.
+- `claim_type_hint` must be one of: identity_profile, affiliation, relationship, preference, constraint, behavior_pattern. Use `behavior_pattern` only when the wearer explicitly states or confirms a routine or regular behavior, such as "I run every Wednesday"; never infer it from a sequence of separate observed actions.
+- `claim_anchor` is a short label identifying the subject of an explicit claim, such as "quiet travel preference" or "Wednesday running routine". It is not a key for accumulating behavioral samples, a full sentence, or the final user_claim.
+- Output signals only when this fact has concrete evidence for an explicit claim about user self. Use an empty array for one-off background, claims about third parties themselves, temporary suggestions, assistant speculation, patterns inferred only from repeated actions, pleasantries, and low-value content.
+- Each signal's `subject_entity` must identify user self in the same fact's `entities`; omit the signal when that fact does not list user self. Do not add, rewrite, or guess an entity that is not listed by the fact.
+- Signal-to-fact grounding is mandatory: the signal's subject, proposition, and necessary qualifiers must be fully supported by the same fact's `text`. A response-based signal must preserve both the earlier statement and wearer response there. Do not borrow information omitted from this fact from another fact or preceding context. `evidence_basis` must explain how the wearer's utterance supports the final proposition; otherwise omit the signal.
+- Return at most 3 signals per fact. Every signal must contain subject_entity, claim_type_hint, claim_anchor, owner_evidence_type, owner_evidence_text, other_evidence_text, evidence_basis, and confidence.
+
+user_action_signals rules:
+- `user_action_signals` identify a specific completed or ongoing action, real choice, or substantive participation by user self in this fact. They are not habits, preferences, or inductive conclusions. Discussing an activity is not performing it; the separate user_activity module summarizes the capture-window situation.
+- `subject_entity` is always `user self` and must be in this fact's `entities`. The fact's `primary_entity` need not be user self. Never substitute a product user, another person, or an unverified ambient speaker for the wearer.
+- `action_kind` is `action|choice|participation`: concrete performance, a choice among real options, or actual participation in a meeting/activity. `action_text` must specify what the wearer did and any supported time/object; this same fact's `text` must directly support it. Do not borrow content from other facts, preceding context, or general knowledge.
+- A wearer report of a past action, a clear confirmation that the wearer did something, or a third-party report of a completed wearer action through a confirmed alias may qualify. Use `owner_evidence_type=self_statement|confirmed_response|third_party_report` and the same exact-quote rules as user_claim_signals. Do not turn a third-party report into a wearer assertion.
+- Return an empty array for future plans, suggestions, hypotheticals, merely asking or discussing, and assistant/third-party actions. "I run every Wednesday" is a reported routine, not multiple observed actions; emit a signal only if the text separately establishes a specific occurrence. Ordinary wearer–assistant conversation itself is not an action signal.
+- Return at most 3 signals per fact. Each has subject_entity, action_kind, action_text, owner_evidence_type, owner_evidence_text, other_evidence_text, evidence_basis, and confidence. evidence_basis must identify the supporting content in this fact. The signal inherits the fact's event_time_key; do not output another time field.
 
 user_intent_signals rules:
 - `user_intent_signals` are structured hints that this fact is evidence about the wearer's future world. They are not final goals, plans, or work items, and must not directly create, update, or override an existing object.
@@ -211,14 +219,25 @@ Output schema:
       }],
       "user_claim_signals": [
         {
-          "entity": {"name": "an entity name copied exactly from this fact's entities", "type": "the type of that same entity in this fact's entities"},
-          "signal_kind": "explicit_assertion|pattern_observation",
+          "subject_entity": "user self",
           "claim_type_hint": "identity_profile|affiliation|relationship|preference|constraint|behavior_pattern",
-          "claim_anchor": "specific claim or pattern grouping label",
+          "claim_anchor": "short label identifying the explicit claim subject",
           "owner_evidence_type": "self_statement|confirmed_response|third_party_report",
           "owner_evidence_text": "exact wearer quote for self/response; empty for third-party report",
           "other_evidence_text": "exact other-speaker quote for response/report; otherwise empty",
           "evidence_basis": "specific evidence from this fact supporting the signal",
+          "confidence": 0.8
+        }
+      ],
+      "user_action_signals": [
+        {
+          "subject_entity": "user self",
+          "action_kind": "action|choice|participation",
+          "action_text": "one concrete completed or ongoing wearer action, choice, or participation",
+          "owner_evidence_type": "self_statement|confirmed_response|third_party_report",
+          "owner_evidence_text": "exact wearer quote for self/response; empty for third-party report",
+          "other_evidence_text": "exact other-speaker quote for response/report; otherwise empty",
+          "evidence_basis": "specific evidence in this fact supporting this occurrence",
           "confidence": 0.8
         }
       ],
@@ -329,7 +348,7 @@ existing objects:
 
 EXPLICIT_USER_CLAIM_EXTRACTION_PROMPT_EN = """You extract explicit user_claims for a personal world model.
 
-The input contains stored, traceable narrative facts. Each fact may include zero or more `user_claim_signals` with candidate claim types, signal kinds, grouping labels, and evidence pointers. Inspect all signals, but treat them only as candidate hints, never as additional facts or final conclusions. Every emitted claim must be directly supported by the corresponding fact summary and cite its factual basis in `evidence_fact_ids`. An `explicit_assertion` may point to a direct-claim candidate; a `pattern_observation` is only an observational hint and cannot by itself establish a preference, habit, or behavioral rule. A proposition directly stated by the wearer, or clearly confirmed or corrected by the wearer in response to another person's specific statement, can support an explicit claim. Another person's statement alone, a vague acknowledgment, a one-off action, a recommendation, or assistant speculation cannot. A response-based fact must preserve both the earlier statement and the wearer's final position.
+The input contains stored, traceable narrative facts. Each fact may include zero or more `user_claim_signals` with candidate claim types, grouping labels, and evidence pointers. Inspect all signals, but treat them only as candidate hints, never as additional facts or final conclusions. Every emitted claim must be directly supported by the corresponding fact summary and cite its factual basis in `evidence_fact_ids`. A one-off action is only an observational hint and cannot by itself establish a preference, habit, or behavioral rule. A proposition directly stated by the wearer, or clearly confirmed or corrected by the wearer in response to another person's specific statement, can support an explicit claim. Another person's statement alone, a vague acknowledgment, a one-off action, a recommendation, or assistant speculation cannot. A response-based fact must preserve both the earlier statement and the wearer's final position.
 
 The system assigns `claim_origin=explicit` to claims from this process; do not include that field in the output.
 

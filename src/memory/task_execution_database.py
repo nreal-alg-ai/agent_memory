@@ -38,16 +38,17 @@ class TaskExecutionDB:
     _SIGNAL_BATCHES = {
         "claim": "user_claim_signal_consolidation_task_info",
         "intent": "user_intent_signal_consolidation_task_info",
+        "action": "user_action_signal_consolidation_task_info",
     }
     _PENDING_COLUMNS = {
         "explicit_user_claim": (
-            "claim", "pending_explicit_signal_ids", "processed_explicit_user_claim",
-        ),
-        "inductive_user_claim": (
-            "claim", "pending_inductive_signal_ids", "processed_inductive_user_claim",
+            "claim", "pending_user_claim_signal_ids", "processed_explicit_user_claim",
         ),
         "user_intent_update": (
             "intent", "pending_user_intent_signal_ids", "processed_user_intent",
+        ),
+        "user_action_signal_consolidation": (
+            "action", "pending_user_action_signal_ids", "processed_user_action",
         ),
     }
 
@@ -62,10 +63,12 @@ class TaskExecutionDB:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA busy_timeout=30000")
         self._conn.execute("PRAGMA journal_mode=WAL")
+        self._remove_inductive_claim_signal_tracking()
         for table, required_column in (
             ("task_signal_progress", None),
             ("user_claim_signal_consolidation_task_info", "signal_ids"),
             ("user_intent_signal_consolidation_task_info", "signal_ids"),
+            ("user_action_signal_consolidation_task_info", "signal_ids"),
             ("user_claim_consolidation_task_info", "claim_ids"),
         ):
             exists = self._conn.execute(
@@ -95,16 +98,14 @@ class TaskExecutionDB:
                 batch_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 source_task_id TEXT NOT NULL UNIQUE,
                 signal_ids TEXT NOT NULL DEFAULT '[]',
-                pending_explicit_signal_ids TEXT NOT NULL DEFAULT '[]',
-                pending_inductive_signal_ids TEXT NOT NULL DEFAULT '[]',
+                pending_user_claim_signal_ids TEXT NOT NULL DEFAULT '[]',
                 processed_explicit_user_claim INTEGER NOT NULL DEFAULT 0,
-                processed_inductive_user_claim INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_claim_signal_batches_pending
             ON user_claim_signal_consolidation_task_info(
-                processed_explicit_user_claim, processed_inductive_user_claim, batch_id
+                processed_explicit_user_claim, batch_id
             );
             CREATE TABLE IF NOT EXISTS user_intent_signal_consolidation_task_info (
                 batch_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -118,6 +119,19 @@ class TaskExecutionDB:
             CREATE INDEX IF NOT EXISTS idx_intent_signal_batches_pending
             ON user_intent_signal_consolidation_task_info(
                 processed_user_intent, batch_id
+            );
+            CREATE TABLE IF NOT EXISTS user_action_signal_consolidation_task_info (
+                batch_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_task_id TEXT NOT NULL UNIQUE,
+                signal_ids TEXT NOT NULL DEFAULT '[]',
+                pending_user_action_signal_ids TEXT NOT NULL DEFAULT '[]',
+                processed_user_action INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_action_signal_batches_pending
+            ON user_action_signal_consolidation_task_info(
+                processed_user_action, batch_id
             );
             CREATE TABLE IF NOT EXISTS user_claim_consolidation_task_info (
                 batch_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -136,6 +150,63 @@ class TaskExecutionDB:
             signal_type: self._load_registered_signal_ids(table)
             for signal_type, table in self._SIGNAL_BATCHES.items()
         }
+
+    def _remove_inductive_claim_signal_tracking(self) -> None:
+        """Drop obsolete inductive checkpoints while preserving explicit work."""
+        exists = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='user_claim_signal_consolidation_task_info'",
+        ).fetchone()
+        if not exists:
+            return
+        columns = {
+            row["name"] for row in self._conn.execute(
+                "PRAGMA table_info(user_claim_signal_consolidation_task_info)"
+            )
+        }
+        retired = {
+            "pending_inductive_signal_ids", "processed_inductive_user_claim",
+        }
+        if not (columns & retired):
+            return
+        required = {
+            "batch_id", "source_task_id", "signal_ids",
+            "pending_user_claim_signal_ids", "processed_explicit_user_claim",
+            "created_at", "updated_at",
+        }
+        if not required.issubset(columns):
+            raise RuntimeError(
+                "task_scheduler.db has an unsupported user-claim signal schema; "
+                "back it up and use a fresh task database"
+            )
+        with self._conn:
+            self._conn.execute("DROP INDEX IF EXISTS idx_claim_signal_batches_pending")
+            self._conn.execute(
+                """CREATE TABLE user_claim_signal_consolidation_task_info_new (
+                    batch_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source_task_id TEXT NOT NULL UNIQUE,
+                    signal_ids TEXT NOT NULL DEFAULT '[]',
+                    pending_user_claim_signal_ids TEXT NOT NULL DEFAULT '[]',
+                    processed_explicit_user_claim INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )"""
+            )
+            self._conn.execute(
+                """INSERT INTO user_claim_signal_consolidation_task_info_new
+                   (batch_id, source_task_id, signal_ids,
+                    pending_user_claim_signal_ids, processed_explicit_user_claim,
+                    created_at, updated_at)
+                   SELECT batch_id, source_task_id, signal_ids,
+                          pending_user_claim_signal_ids, processed_explicit_user_claim,
+                          created_at, updated_at
+                   FROM user_claim_signal_consolidation_task_info"""
+            )
+            self._conn.execute("DROP TABLE user_claim_signal_consolidation_task_info")
+            self._conn.execute(
+                "ALTER TABLE user_claim_signal_consolidation_task_info_new "
+                "RENAME TO user_claim_signal_consolidation_task_info"
+            )
 
     @_locked
     def close(self) -> None:
@@ -193,25 +264,40 @@ class TaskExecutionDB:
         if signal_type == "claim":
             if existing:
                 all_ids = _ids(existing["signal_ids"]) + new_ids
-                explicit = _ids(existing["pending_explicit_signal_ids"]) + new_ids
-                inductive = _ids(existing["pending_inductive_signal_ids"]) + new_ids
+                explicit = _ids(existing["pending_user_claim_signal_ids"]) + new_ids
                 self._conn.execute(
                     f"""UPDATE {table} SET signal_ids=?,
-                        pending_explicit_signal_ids=?, pending_inductive_signal_ids=?,
-                        processed_explicit_user_claim=0,
-                        processed_inductive_user_claim=0, updated_at=?
+                        pending_user_claim_signal_ids=?,
+                        processed_explicit_user_claim=0, updated_at=?
                         WHERE batch_id=?""",
-                    (json.dumps(all_ids), json.dumps(explicit), json.dumps(inductive),
-                     now, existing["batch_id"]),
+                    (json.dumps(all_ids), json.dumps(explicit), now, existing["batch_id"]),
                 )
             else:
                 values = json.dumps(new_ids)
                 self._conn.execute(
                     f"""INSERT INTO {table}
-                        (source_task_id, signal_ids, pending_explicit_signal_ids,
-                         pending_inductive_signal_ids, created_at, updated_at)
-                        VALUES (?, ?, ?, ?, ?, ?)""",
-                    (source, values, values, values, now, now),
+                        (source_task_id, signal_ids, pending_user_claim_signal_ids,
+                         created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?)""",
+                    (source, values, values, now, now),
+                )
+        elif signal_type == "action":
+            if existing:
+                all_ids = _ids(existing["signal_ids"]) + new_ids
+                pending = _ids(existing["pending_user_action_signal_ids"]) + new_ids
+                self._conn.execute(
+                    f"""UPDATE {table} SET signal_ids=?,
+                        pending_user_action_signal_ids=?, processed_user_action=0,
+                        updated_at=? WHERE batch_id=?""",
+                    (json.dumps(all_ids), json.dumps(pending), now, existing["batch_id"]),
+                )
+            else:
+                values = json.dumps(new_ids)
+                self._conn.execute(
+                    f"""INSERT INTO {table}
+                        (source_task_id, signal_ids, pending_user_action_signal_ids,
+                         created_at, updated_at) VALUES (?, ?, ?, ?, ?)""",
+                    (source, values, values, now, now),
                 )
         elif existing:
             all_ids = _ids(existing["signal_ids"]) + new_ids
@@ -238,6 +324,7 @@ class TaskExecutionDB:
         *,
         claim_signal_ids: Sequence[int],
         intent_signal_ids: Sequence[int],
+        action_signal_ids: Sequence[int] = (),
         source_task_id: str = "",
     ) -> int:
         """Append only IDs absent from prior producer batches."""
@@ -248,9 +335,13 @@ class TaskExecutionDB:
             intent_added = self._register_signal_batch(
                 "intent", intent_signal_ids, source_task_id,
             )
+            action_added = self._register_signal_batch(
+                "action", action_signal_ids, source_task_id,
+            )
         self._registered_signal_ids["claim"].update(claim_added)
         self._registered_signal_ids["intent"].update(intent_added)
-        return len(claim_added) + len(intent_added)
+        self._registered_signal_ids["action"].update(action_added)
+        return len(claim_added) + len(intent_added) + len(action_added)
 
     @_locked
     def pending_signal_ids(self, target: str) -> List[int]:

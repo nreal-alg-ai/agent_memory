@@ -747,6 +747,7 @@ class MemoryRuntime:
                 len(preceding_context_units),
             )
         return {
+            **queue_report,
             "queued": queued,
             "reason": "" if queued else str(queue_report.get("reason") or "queue_rejected"),
         }
