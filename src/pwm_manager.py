@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 from llm_client import LLMClient
 from memory.memory_database import SessionDB
-from memory.memory_manager import MemoryNodeManager, MemoryOperationReporter
+from memory.memory_manager import MemoryNodeManager
 from memory.memory_runtime import MemoryRuntime
-from memory.task_scheduler import TaskScheduler
+from memory.task_scheduler import TaskOperationReporter, TaskScheduler
 from user_state import UserStateResolver
 
 
@@ -23,13 +24,13 @@ class PersonWorldModel:
         db_path: Path | str,
         memory_runtime_config: Optional[Dict[str, Any]] = None,
         memory_manager_config: Optional[Dict[str, Any]] = None,
-        operation_reporter: Optional[MemoryOperationReporter] = None,
+        operation_reporter: Optional[TaskOperationReporter] = None,
         logger: Optional[logging.Logger] = None,
     ) -> None:
         self._logger = logger or logging.getLogger(__name__)
         manager_config = dict(memory_manager_config or {})
         resolved_db_path = Path(db_path).expanduser().resolve()
-        self._operation_reporter = operation_reporter or MemoryOperationReporter()
+        self._operation_reporter = operation_reporter or TaskOperationReporter()
         self._database = SessionDB(resolved_db_path)
         try:
             self._llm_client = LLMClient(
@@ -37,11 +38,15 @@ class PersonWorldModel:
                 logger=self._logger.getChild("llm_client"),
             )
             # The worker starts on the first submission, after both domains
-            # and the completion listener have been initialized.
+            # and their follow-up submission gates have been initialized.
             self._task_scheduler = TaskScheduler(
                 operation_reporter=self._operation_reporter,
                 maxsize=int(manager_config.get("task_queue_maxsize", 100) or 100),
                 logger=self._logger.getChild("task_scheduler"),
+                claim_state_database=self._database,
+                task_scheduling_config=(
+                    (memory_runtime_config or {}).get("task_scheduling")
+                ),
             )
             self._memory_runtime = MemoryRuntime(
                 db_path=resolved_db_path,
@@ -62,10 +67,10 @@ class PersonWorldModel:
                 ),
                 logger=self._logger.getChild("user_state_resolver"),
             )
-            self._task_scheduler.register_completion_listener(
-                self._handle_task_completion
-            )
+            self._task_scheduler.start()
         except Exception:
+            if hasattr(self, "_task_scheduler"):
+                self._task_scheduler.shutdown(wait=True, timeout=0)
             self._database.close()
             raise
         self._closed = False
@@ -96,7 +101,7 @@ class PersonWorldModel:
         return self._database
 
     @property
-    def operation_reporter(self) -> MemoryOperationReporter:
+    def operation_reporter(self) -> TaskOperationReporter:
         return self._operation_reporter
 
     def accept_memory_input(
@@ -144,8 +149,8 @@ class PersonWorldModel:
         input_flush = report.get("input_flush") or {}
         subreports = [
             input_flush,
-            input_flush.get("episode_summary") or {},
-            *((input_flush.get("derived_tasks") or {}).values()),
+            input_flush.get("user_activity") or {},
+            *((input_flush.get("fact_followup_tasks") or {}).values()),
         ]
         if not any(
             item.get("reason") in {
@@ -188,6 +193,12 @@ class PersonWorldModel:
     def wait_for_memory_tasks(self, timeout: Optional[float] = None) -> bool:
         return self._task_scheduler.flush(timeout=timeout)
 
+    def trigger_user_state_time_tick(
+        self, *, now: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
+        """Evaluate the thirty-minute claim-to-state update window now."""
+        return self._task_scheduler.trigger_user_state_time_tick(now=now)
+
     def get_user_states(
         self,
         *,
@@ -205,60 +216,6 @@ class PersonWorldModel:
                 state_classes=state_classes,
                 statuses=statuses,
             )
-
-    def _handle_task_completion(self, event: Dict[str, Any]) -> None:
-        result = event.get("result")
-        try:
-            if (
-                event.get("succeeded")
-                and event.get("task_kind") in {
-                    "memory_user_claim_update",
-                }
-                and isinstance(result, dict)
-            ):
-                request = result.get("user_state_update_request")
-                if isinstance(request, dict):
-                    submission = (
-                        self._user_state_resolver.submit_memory_user_state_update_task(
-                            **request
-                        )
-                    )
-                    if (
-                        not submission.get("queued")
-                        and submission.get("reason") not in {
-                            "memory_disabled",
-                            "user_state_update_disabled",
-                            "no_changed_state_evidence",
-                        }
-                    ):
-                        self._logger.warning(
-                            "User state update was not queued reason=%s",
-                            submission.get("reason"),
-                        )
-            if (
-                event.get("succeeded")
-                and event.get("task_kind") == "memory_user_activity_extraction"
-                and isinstance(result, dict)
-            ):
-                activity_ids = result.get("user_activity_item_ids") or []
-                if activity_ids:
-                    submission = self._user_state_resolver.submit_memory_user_state_update_task(
-                        changed_user_activity_ids=activity_ids,
-                    )
-                    if (
-                        not submission.get("queued")
-                        and submission.get("reason") not in {
-                            "memory_disabled",
-                            "user_state_update_disabled",
-                            "no_changed_state_evidence",
-                        }
-                    ):
-                        self._logger.warning(
-                            "Activity-based user state update was not queued reason=%s",
-                            submission.get("reason"),
-                        )
-        finally:
-            self._memory_runtime.handle_task_completion(event)
 
     def close(self, timeout: Optional[float] = 30.0) -> None:
         if self._closed:
@@ -283,9 +240,6 @@ class PersonWorldModel:
                     raise RuntimeError("PWM task worker did not stop cleanly")
                 safe_to_close_database = True
             finally:
-                self._task_scheduler.unregister_completion_listener(
-                    self._handle_task_completion
-                )
                 if safe_to_close_database:
                     self._database.close()
                     self._closed = True

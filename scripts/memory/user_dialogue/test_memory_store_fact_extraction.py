@@ -29,7 +29,8 @@ for import_root in (SRC_ROOT, REPO_ROOT):
         sys.path.insert(0, str(import_root))
 
 from llm_client import DEFAULT_LLM_BASE_URL, DEFAULT_LLM_MODEL
-from memory.memory_manager import MemoryNodeManager, MemoryOperationReporter
+from memory.memory_manager import MemoryNodeManager
+from memory.task_scheduler import TaskOperationReporter
 from pwm_manager import PersonWorldModel
 from memory.config import split_memory_config
 from memory.utils import _as_embedding_vector
@@ -572,7 +573,7 @@ def main() -> int:
         memory_log_path,
         args.manager_log_level,
     )
-    operation_reporter = MemoryOperationReporter()
+    operation_reporter = TaskOperationReporter()
     runtime = PersonWorldModel(
         db_path=db_path,
         memory_runtime_config=memory_runtime_config,
@@ -666,7 +667,7 @@ def main() -> int:
     memory_operation_report = operation_reporter.snapshot()
     operation_counts = memory_operation_report.get("counts") or {}
     store_operation_report = operation_counts.get("memory_fact_extraction") or {}
-    derived_reports = [
+    post_store_reports = [
         operation_counts.get(kind) or {}
         for kind in (
             "memory_user_claim_update",
@@ -691,9 +692,9 @@ def main() -> int:
         "fact_tasks_submitted": int(store_operation_report.get("submitted") or 0),
         "fact_tasks_succeeded": int(store_operation_report.get("succeeded") or 0),
         "store_total_elapsed_ms": float(store_operation_report.get("total_elapsed_ms") or 0.0),
-        "derived_task_runs": sum(int(item.get("submitted") or 0) for item in derived_reports),
-        "derived_total_elapsed_ms": sum(
-            float(item.get("total_elapsed_ms") or 0.0) for item in derived_reports
+        "post_store_task_runs": sum(int(item.get("submitted") or 0) for item in post_store_reports),
+        "post_store_total_elapsed_ms": sum(
+            float(item.get("total_elapsed_ms") or 0.0) for item in post_store_reports
         ),
         "llm_model": args.llm_model,
         "llm_base_url": args.llm_base_url,

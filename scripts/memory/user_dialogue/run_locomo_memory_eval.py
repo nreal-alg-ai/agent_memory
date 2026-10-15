@@ -34,7 +34,7 @@ for import_root in (SRC_ROOT, REPO_ROOT):
         sys.path.insert(0, str(import_root))
 
 from llm_client import DEFAULT_LLM_BASE_URL, DEFAULT_LLM_MODEL
-from memory.memory_manager import MemoryOperationReporter
+from memory.task_scheduler import TaskOperationReporter
 from pwm_manager import PersonWorldModel
 from memory.config import split_memory_config
 from memory.utils import _as_embedding_vector
@@ -464,7 +464,7 @@ def build_sample_memory_context(
     ) as (memory_log_path, memory_logger):
         runtime: Optional[PersonWorldModel] = None
         try:
-            operation_reporter = MemoryOperationReporter()
+            operation_reporter = TaskOperationReporter()
             runtime = PersonWorldModel(
                 db_path=db_path,
                 memory_runtime_config=memory_runtime_config,
@@ -480,7 +480,7 @@ def build_sample_memory_context(
             memory_operation_report = operation_reporter.snapshot()
             operation_counts = memory_operation_report.get("counts") or {}
             store_operation_report = operation_counts.get("memory_fact_extraction") or {}
-            derived_reports = [
+            post_store_reports = [
                 operation_counts.get(kind) or {}
                 for kind in (
                     "memory_user_claim_update",
@@ -494,9 +494,9 @@ def build_sample_memory_context(
                 int(store_operation_report.get("succeeded") or 0),
                 replay_stats.orphan_dialog_turns,
             )
-            derived_task_runs = sum(int(item.get("submitted") or 0) for item in derived_reports)
-            derived_total_elapsed_ms = sum(
-                float(item.get("total_elapsed_ms") or 0.0) for item in derived_reports
+            post_store_task_runs = sum(int(item.get("submitted") or 0) for item in post_store_reports)
+            post_store_total_elapsed_ms = sum(
+                float(item.get("total_elapsed_ms") or 0.0) for item in post_store_reports
             )
             counts = db_counts(db)
             recall_time_end = format_memory_time(
@@ -548,19 +548,19 @@ def build_sample_memory_context(
                     "replayed_turn_pairs": replay_stats.turn_pairs_total,
                     "turn_pairs_with_stored_facts": replay_stats.stored_pairs,
                     "orphan_dialog_turns": replay_stats.orphan_dialog_turns,
-                    "derived_task_runs": derived_task_runs,
+                    "post_store_task_runs": post_store_task_runs,
                     "db_counts": counts,
                     "store_turn_calls": replay_stats.turn_pairs_total,
                     "store_flushes": int(store_operation_report.get("submitted") or 0),
                     "store_total_elapsed_ms": float(store_operation_report.get("total_elapsed_ms") or 0.0),
-                    "derived_total_elapsed_ms": derived_total_elapsed_ms,
+                    "post_store_total_elapsed_ms": post_store_total_elapsed_ms,
                     "recall_total_elapsed_ms": float(
                         operation_reporter.operation_report("recall").get("total_elapsed_ms") or 0.0
                     ),
                     "memory_operation_report": operation_reporter.snapshot(),
                     "memory_total_elapsed_ms": round(
                         float(store_operation_report.get("total_elapsed_ms") or 0.0)
-                        + derived_total_elapsed_ms
+                        + post_store_total_elapsed_ms
                         + float(operation_reporter.operation_report("recall").get("total_elapsed_ms") or 0.0),
                         2,
                     ),

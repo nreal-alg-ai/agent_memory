@@ -2,7 +2,7 @@
 """Run project memory retrieval on LongMemEval and emit evaluator JSONL.
 
 This script builds an isolated memory DB per benchmark instance, replays the
-timestamped history through ``PersonWorldModel``, completes derived tasks, recalls memory
+timestamped history through ``PersonWorldModel``, completes follow-up tasks, recalls memory
 for the benchmark question, and uses a reader LLM to produce a final
 ``hypothesis`` answer. It can also reuse an existing per-question memory DB to
 run only recall and reader answering.
@@ -37,7 +37,7 @@ for import_root in (SRC_ROOT, REPO_ROOT):
         sys.path.insert(0, str(import_root))
 
 from llm_client import DEFAULT_LLM_BASE_URL, DEFAULT_LLM_MODEL
-from memory.memory_manager import MemoryOperationReporter
+from memory.task_scheduler import TaskOperationReporter
 from pwm_manager import PersonWorldModel
 from memory.config import split_memory_config
 from memory.utils import _as_embedding_vector
@@ -83,7 +83,7 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Reuse existing per-question DBs from "
             "<dir>/<question_id>/memory.db. When set, skip history replay, "
-            "store, and derived updates; only rerun recall and reader answering."
+            "store, and follow-up updates; only rerun recall and reader answering."
         ),
     )
     parser.add_argument("--log-path", type=Path)
@@ -1107,7 +1107,7 @@ def build_instance_memory_context(
         )
         runtime: Optional[PersonWorldModel] = None
         try:
-            operation_reporter = MemoryOperationReporter()
+            operation_reporter = TaskOperationReporter()
             runtime = PersonWorldModel(
                 db_path=db_path,
                 memory_runtime_config=memory_runtime_config,
@@ -1147,7 +1147,7 @@ def build_instance_memory_context(
             memory_operation_report = operation_reporter.snapshot()
             operation_counts = memory_operation_report.get("counts") or {}
             store_operation_report = operation_counts.get("memory_fact_extraction") or {}
-            derived_reports = [
+            post_store_reports = [
                 operation_counts.get(kind) or {}
                 for kind in (
                     "memory_user_claim_update",
@@ -1158,12 +1158,12 @@ def build_instance_memory_context(
             recall_operation_report = operation_counts.get("recall") or {}
             store_turn_calls = replay_stats.turn_pairs_total
             stored_pairs = int(store_operation_report.get("submitted") or 0)
-            derived_task_runs = sum(int(item.get("submitted") or 0) for item in derived_reports)
+            post_store_task_runs = sum(int(item.get("submitted") or 0) for item in post_store_reports)
             store_total_elapsed_ms = float(
                 store_operation_report.get("total_elapsed_ms") or 0.0
             )
-            derived_total_elapsed_ms = sum(
-                float(item.get("total_elapsed_ms") or 0.0) for item in derived_reports
+            post_store_total_elapsed_ms = sum(
+                float(item.get("total_elapsed_ms") or 0.0) for item in post_store_reports
             )
             recall_total_elapsed_ms = float(
                 recall_operation_report.get("total_elapsed_ms")
@@ -1183,7 +1183,7 @@ def build_instance_memory_context(
                 "turn_pairs_with_stored_facts": stored_pairs,
                 "skipped_assistant_only_turns": replay_stats.skipped_assistant_only,
                 "orphan_user_chunks": replay_stats.orphan_user_chunks,
-                "derived_task_runs": derived_task_runs,
+                "post_store_task_runs": post_store_task_runs,
                 "db_path": str(db_path),
                 "reused_existing_db": reused_existing_db,
                 "memory_log_path": str(memory_log_path),
@@ -1206,11 +1206,11 @@ def build_instance_memory_context(
                 "store_user_activity_submitted": stored_pairs,
                 "store_flushes": stored_pairs,
                 "store_total_elapsed_ms": store_total_elapsed_ms,
-                "derived_total_elapsed_ms": derived_total_elapsed_ms,
+                "post_store_total_elapsed_ms": post_store_total_elapsed_ms,
                 "recall_total_elapsed_ms": recall_total_elapsed_ms,
                 "memory_total_elapsed_ms": round(
                     store_total_elapsed_ms
-                    + derived_total_elapsed_ms
+                    + post_store_total_elapsed_ms
                     + recall_total_elapsed_ms,
                     2,
                 ),

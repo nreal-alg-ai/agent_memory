@@ -105,6 +105,9 @@ class UserStateResolver:
             or "source"
         ).strip().lower()
         self._task_scheduler.register_handler(self.TASK_KIND, self.process_update_task)
+        self._task_scheduler.register_followup_submitter(
+            self.TASK_KIND, self.submit_memory_user_state_update_task,
+        )
 
     @staticmethod
     def _config_bool(value: Any, default: bool = False) -> bool:

@@ -419,9 +419,9 @@ class AgentMemoryRuntime:
         holder.active_ambient_recording_ids.discard(recording_id)
         input_flush = dict(finalization.get("input_flush") or {})
         user_activity = dict(finalization.get("user_activity") or {})
-        derived_tasks = dict(finalization.get("derived_tasks") or {})
-        user_claim = dict(derived_tasks.get("user_claim") or {})
-        user_intent = dict(derived_tasks.get("user_intent") or {})
+        followup_tasks = dict(finalization.get("fact_followup_tasks") or {})
+        user_claim = dict(followup_tasks.get("memory_user_claim_update") or {})
+        user_intent = dict(followup_tasks.get("memory_user_intent_update") or {})
         result = {
             "finalized": bool(user_activity.get("queued")),
             "recordingId": recording_id,
@@ -470,10 +470,10 @@ class AgentMemoryRuntime:
             )
             input_flush = dict(finalization.get("input_flush") or {})
             user_activity = dict(finalization.get("user_activity") or {})
-            derived_tasks = dict(finalization.get("derived_tasks") or {})
-            user_claim = dict(derived_tasks.get("user_claim") or {})
+            followup_tasks = dict(finalization.get("fact_followup_tasks") or {})
+            user_claim = dict(followup_tasks.get("memory_user_claim_update") or {})
             user_intent = dict(
-                derived_tasks.get("user_intent") or {}
+                followup_tasks.get("memory_user_intent_update") or {}
             )
         else:
             input_flushed = holder.runtime.flush_pending_memory_inputs()

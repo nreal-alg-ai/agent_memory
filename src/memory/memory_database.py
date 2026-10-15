@@ -234,15 +234,21 @@ class SessionDB:
             self._conn.commit()
 
     def _init_schema(self) -> None:
-        legacy_episode_table = self._conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'memory_episodes'"
-        ).fetchone()
-        if legacy_episode_table:
-            self._conn.close()
-            raise RuntimeError(
-                "This database uses the retired memory_episodes schema. "
-                "Back up the database and use a fresh path for memory_user_activity_items."
-            )
+        for table in (
+            "memory_fact_user_claim_signals",
+            "memory_fact_user_intent_signals",
+        ):
+            if self._conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                (table,),
+            ).fetchone() and "signal_id" not in {
+                row["name"] for row in self._conn.execute(f"PRAGMA table_info({table})")
+            }:
+                self._conn.close()
+                raise RuntimeError(
+                    f"{table} uses the retired schema without signal_id; "
+                    "back up the database and use a fresh path"
+                )
         self._conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS memory_user_activity_items (
@@ -342,7 +348,8 @@ class SessionDB:
                 FOREIGN KEY(evidence_fact_id) REFERENCES memory_facts(id) ON DELETE SET NULL
             );
 
-            CREATE TABLE IF NOT EXISTS memory_fact_user_claim_signal_mapping (
+            CREATE TABLE IF NOT EXISTS memory_fact_user_claim_signals (
+                signal_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 fact_id INTEGER NOT NULL,
                 signal_key TEXT NOT NULL,
                 subject_entity_id INTEGER,
@@ -352,16 +359,15 @@ class SessionDB:
                 claim_anchor_key TEXT NOT NULL DEFAULT '',
                 evidence_basis TEXT NOT NULL DEFAULT '',
                 confidence REAL NOT NULL DEFAULT 0.0,
-                processed_for_explicit_user_claim INTEGER NOT NULL DEFAULT 0,
-                processed_for_inductive_user_claim INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
-                PRIMARY KEY(fact_id, signal_key),
+                UNIQUE(fact_id, signal_key),
                 FOREIGN KEY(fact_id) REFERENCES memory_facts(id) ON DELETE CASCADE,
                 FOREIGN KEY(subject_entity_id) REFERENCES memory_entity_nodes(id) ON DELETE CASCADE
             );
 
-            CREATE TABLE IF NOT EXISTS memory_fact_user_intent_signal_mapping (
+            CREATE TABLE IF NOT EXISTS memory_fact_user_intent_signals (
+                signal_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 fact_id INTEGER NOT NULL,
                 signal_key TEXT NOT NULL,
                 subject_entity_id INTEGER,
@@ -375,10 +381,9 @@ class SessionDB:
                 explicitness TEXT NOT NULL DEFAULT '',
                 evidence_basis TEXT NOT NULL DEFAULT '',
                 confidence REAL NOT NULL DEFAULT 0.0,
-                processed_for_memory_user_intent_update INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
-                PRIMARY KEY(fact_id, signal_key),
+                UNIQUE(fact_id, signal_key),
                 FOREIGN KEY(fact_id) REFERENCES memory_facts(id) ON DELETE CASCADE,
                 FOREIGN KEY(subject_entity_id) REFERENCES memory_entity_nodes(id) ON DELETE CASCADE
             );
@@ -615,25 +620,13 @@ class SessionDB:
             ON memory_user_claim_derivations(claim_id, status, updated_at);
             CREATE INDEX IF NOT EXISTS idx_memory_user_claim_premises_claim
             ON memory_user_claim_premises(premise_claim_id, derivation_id);
-            CREATE INDEX IF NOT EXISTS idx_memory_fact_user_claim_signal_group
-            ON memory_fact_user_claim_signal_mapping(
+            CREATE INDEX IF NOT EXISTS idx_memory_fact_user_claim_signals_group
+            ON memory_fact_user_claim_signals(
                 subject_entity_id, claim_type_hint, claim_anchor_key, fact_id
             );
-            CREATE INDEX IF NOT EXISTS idx_memory_fact_user_intent_signal_group
-            ON memory_fact_user_intent_signal_mapping(
+            CREATE INDEX IF NOT EXISTS idx_memory_fact_user_intent_signals_group
+            ON memory_fact_user_intent_signals(
                 subject_entity_id, user_intent_anchor_key, evidence_kind, fact_id
-            );
-            CREATE INDEX IF NOT EXISTS idx_memory_fact_explicit_user_claim_processing
-            ON memory_fact_user_claim_signal_mapping(
-                processed_for_explicit_user_claim, fact_id
-            );
-            CREATE INDEX IF NOT EXISTS idx_memory_fact_inductive_user_claim_processing
-            ON memory_fact_user_claim_signal_mapping(
-                processed_for_inductive_user_claim, fact_id
-            );
-            CREATE INDEX IF NOT EXISTS idx_memory_fact_user_intent_update_processing
-            ON memory_fact_user_intent_signal_mapping(
-                processed_for_memory_user_intent_update, fact_id
             );
             CREATE INDEX IF NOT EXISTS idx_memory_user_claim_events_target
             ON memory_user_claim_events(target_claim_id, effective_at DESC, id DESC);
@@ -1313,109 +1306,77 @@ class SessionDB:
         ).fetchall()
         return [self._row_to_dict(row) for row in rows]
 
-    def get_unprocessed_facts(
-        self,
-        *,
-        processing_target: str = "explicit_user_claim",
-        reference_timestamp: Any,
-        limit: int = 100,
-        restrict_to_today: bool = True,
-    ) -> List[Dict[str, Any]]:
-        processing_mappings = {
-            "explicit_user_claim": (
-                "memory_fact_user_claim_signal_mapping",
-                "processed_for_explicit_user_claim",
-            ),
-            "inductive_user_claim": (
-                "memory_fact_user_claim_signal_mapping",
-                "processed_for_inductive_user_claim",
-            ),
-            "user_intent_update": (
-                "memory_fact_user_intent_signal_mapping",
-                "processed_for_memory_user_intent_update",
-            ),
-        }
-        target = str(processing_target or "explicit_user_claim").strip().lower()
-        try:
-            processing_table, processing_column = processing_mappings[target]
-        except KeyError as exc:
-            raise ValueError(
-                "processing_target must be 'explicit_user_claim', "
-                "'inductive_user_claim', or 'user_intent_update'"
-            ) from exc
-
-        clauses: List[str] = [
-            f"processing.{processing_column} = 0",
-            "processing.subject_entity_id IS NOT NULL",
-        ]
-        params: List[Any] = []
-        if restrict_to_today:
-            local_now = _coerce_reference_datetime(reference_timestamp).astimezone()
-            event_date = local_now.date().isoformat()
-            clauses.append("substr(fact.created_at, 1, 10) = ?")
-            params.append(event_date)
-        where = "WHERE " + " AND ".join(clauses) if clauses else ""
-        rows = self._conn.execute(
-            f"""
-            SELECT DISTINCT fact.*
-            FROM memory_facts AS fact
-            JOIN {processing_table} AS processing ON processing.fact_id = fact.id
-            {where}
-            ORDER BY replace(substr(fact.created_at, 1, 19), 'T', ' ') ASC, fact.id ASC
-            LIMIT ?
-            """,
-            (*params, max(1, int(limit or 100))),
-        ).fetchall()
-        return [self._row_to_dict(row) for row in rows]
-
-    def mark_facts_processed(
-        self,
-        *,
-        processing_target: str,
-        fact_ids: Sequence[int],
-    ) -> int:
-        processing_mappings = {
-            "explicit_user_claim": (
-                "memory_fact_user_claim_signal_mapping",
-                "processed_for_explicit_user_claim",
-            ),
-            "inductive_user_claim": (
-                "memory_fact_user_claim_signal_mapping",
-                "processed_for_inductive_user_claim",
-            ),
-            "user_intent_update": (
-                "memory_fact_user_intent_signal_mapping",
-                "processed_for_memory_user_intent_update",
-            ),
-        }
-        target = str(processing_target or "").strip().lower()
-        try:
-            processing_table, processing_column = processing_mappings[target]
-        except KeyError as exc:
-            raise ValueError(
-                "processing_target must be 'explicit_user_claim', "
-                "'inductive_user_claim', or 'user_intent_update'"
-            ) from exc
-        ids = [int(value) for value in fact_ids if value is not None]
-        if not ids:
-            return 0
-        placeholders = ",".join("?" for _ in ids)
-        affected_fact_count = int(self._conn.execute(
-            f"SELECT COUNT(DISTINCT fact_id) FROM {processing_table} "
-            f"WHERE fact_id IN ({placeholders})",
-            ids,
-        ).fetchone()[0] or 0)
-        cur = self._conn.execute(
-            f"""
-            UPDATE {processing_table}
-            SET {processing_column} = 1,
-                updated_at = ?
-            WHERE fact_id IN ({placeholders})
-            """,
-            (local_now_text(), *ids),
+    def get_user_signal_batches(
+        self, fact_ids: Optional[Sequence[int]] = None,
+    ) -> Dict[str, List[int]]:
+        """Return stable signal IDs; signal content remains in the memory DB."""
+        ids = sorted({
+            int(value) for value in fact_ids or []
+            if str(value).strip().isdigit() and int(value) > 0
+        })
+        if fact_ids is not None and not ids:
+            return {"claim_signal_ids": [], "intent_signal_ids": []}
+        condition = (
+            f"AND fact_id IN ({','.join('?' for _ in ids)})" if fact_ids is not None
+            else ""
         )
-        self._commit_if_needed()
-        return affected_fact_count
+        claim_rows = self._conn.execute(
+            "SELECT signal_id FROM memory_fact_user_claim_signals "
+            f"WHERE subject_entity_id IS NOT NULL {condition} "
+            "ORDER BY fact_id, signal_key",
+            ids,
+        ).fetchall()
+        intent_rows = self._conn.execute(
+            "SELECT signal_id FROM memory_fact_user_intent_signals "
+            f"WHERE subject_entity_id IS NOT NULL {condition} ORDER BY fact_id, signal_key",
+            ids,
+        ).fetchall()
+        return {
+            "claim_signal_ids": [int(row["signal_id"]) for row in claim_rows],
+            "intent_signal_ids": [int(row["signal_id"]) for row in intent_rows],
+        }
+
+    def get_user_signal_mappings_by_ids(
+        self, signal_type: str, signal_ids: Sequence[int],
+    ) -> List[Dict[str, Any]]:
+        table = {
+            "claim": "memory_fact_user_claim_signals",
+            "intent": "memory_fact_user_intent_signals",
+        }.get(signal_type)
+        if table is None:
+            raise ValueError(f"Unknown signal type: {signal_type}")
+        ids = sorted({int(value) for value in signal_ids if int(value) > 0})
+        rows: List[Dict[str, Any]] = []
+        for offset in range(0, len(ids), 500):
+            chunk = ids[offset:offset + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            rows.extend(dict(row) for row in self._conn.execute(
+                f"SELECT signal_id, fact_id, signal_key FROM {table} "
+                f"WHERE signal_id IN ({placeholders}) ORDER BY signal_id",
+                chunk,
+            ).fetchall())
+        return rows
+
+    def get_user_signal_mappings_by_fact_ids(
+        self, signal_type: str, fact_ids: Sequence[int],
+    ) -> List[Dict[str, Any]]:
+        table = {
+            "claim": "memory_fact_user_claim_signals",
+            "intent": "memory_fact_user_intent_signals",
+        }.get(signal_type)
+        if table is None:
+            raise ValueError(f"Unknown signal type: {signal_type}")
+        ids = sorted({int(value) for value in fact_ids if int(value) > 0})
+        rows: List[Dict[str, Any]] = []
+        for offset in range(0, len(ids), 500):
+            chunk = ids[offset:offset + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            rows.extend(dict(row) for row in self._conn.execute(
+                f"SELECT signal_id, fact_id, signal_key FROM {table} "
+                f"WHERE fact_id IN ({placeholders}) ORDER BY fact_id, signal_id",
+                chunk,
+            ).fetchall())
+        return rows
 
     def upsert_fact_user_claim_signal_mappings(
         self,
@@ -1462,7 +1423,7 @@ class SessionDB:
                 )
             self._conn.execute(
                 """
-                INSERT INTO memory_fact_user_claim_signal_mapping (
+                INSERT INTO memory_fact_user_claim_signals (
                     fact_id, signal_key, subject_entity_id, claim_type_hint,
                     signal_kind, claim_anchor, claim_anchor_key, evidence_basis,
                     confidence, created_at, updated_at
@@ -1472,7 +1433,7 @@ class SessionDB:
                     claim_anchor = excluded.claim_anchor,
                     evidence_basis = excluded.evidence_basis,
                     confidence = MAX(
-                        memory_fact_user_claim_signal_mapping.confidence,
+                        memory_fact_user_claim_signals.confidence,
                         excluded.confidence
                     ),
                     updated_at = excluded.updated_at
@@ -1500,7 +1461,7 @@ class SessionDB:
         rows = self._conn.execute(
             """
             SELECT fact.*
-            FROM memory_fact_user_claim_signal_mapping AS signal
+            FROM memory_fact_user_claim_signals AS signal
             JOIN memory_facts AS fact ON fact.id = signal.fact_id
             WHERE signal.subject_entity_id = ?
               AND signal.claim_type_hint = ?
@@ -1525,7 +1486,7 @@ class SessionDB:
         rows = self._conn.execute(
             """
             SELECT signal.*, entity.name AS subject
-            FROM memory_fact_user_claim_signal_mapping AS signal
+            FROM memory_fact_user_claim_signals AS signal
             LEFT JOIN memory_entity_nodes AS entity
                 ON entity.id = signal.subject_entity_id
             WHERE signal.fact_id = ?
@@ -1587,7 +1548,7 @@ class SessionDB:
                 )
             self._conn.execute(
                 """
-                INSERT INTO memory_fact_user_intent_signal_mapping (
+                INSERT INTO memory_fact_user_intent_signals (
                     fact_id, signal_key, subject_entity_id, evidence_kind,
                     candidate_object_types, operation_hint, user_role,
                     user_intent_anchor, user_intent_anchor_key,
@@ -1602,7 +1563,7 @@ class SessionDB:
                     explicitness = excluded.explicitness,
                     evidence_basis = excluded.evidence_basis,
                     confidence = MAX(
-                        memory_fact_user_intent_signal_mapping.confidence,
+                        memory_fact_user_intent_signals.confidence,
                         excluded.confidence
                     ),
                     updated_at = excluded.updated_at
@@ -1630,7 +1591,7 @@ class SessionDB:
         rows = self._conn.execute(
             """
             SELECT signal.*, entity.name AS subject
-            FROM memory_fact_user_intent_signal_mapping AS signal
+            FROM memory_fact_user_intent_signals AS signal
             LEFT JOIN memory_entity_nodes AS entity ON entity.id = signal.subject_entity_id
             WHERE signal.fact_id = ?
               AND signal.subject_entity_id IS NOT NULL
@@ -1647,28 +1608,6 @@ class SessionDB:
             mapping["subject_entity"] = str(mapping.get("subject") or "")
             mappings[str(mapping["signal_key"])] = mapping
         return mappings
-
-    def mark_user_intent_signals_processed(
-        self,
-        signal_ids: Sequence[Tuple[int, str]],
-    ) -> int:
-        """Mark only successfully evaluated fact/signal mapping rows."""
-        changed = 0
-        now = local_now_text()
-        for fact_id, signal_key in signal_ids:
-            cursor = self._conn.execute(
-                """
-                UPDATE memory_fact_user_intent_signal_mapping
-                SET processed_for_memory_user_intent_update = 1,
-                    updated_at = ?
-                WHERE fact_id = ? AND signal_key = ?
-                  AND processed_for_memory_user_intent_update = 0
-                """,
-                (now, int(fact_id), str(signal_key)),
-            )
-            changed += int(cursor.rowcount or 0)
-        self._commit_if_needed()
-        return changed
 
     def upsert_user_claim(
         self,

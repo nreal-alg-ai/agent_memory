@@ -19,7 +19,6 @@ import json
 import logging
 import math
 import re
-import threading
 import time
 from collections import Counter
 from datetime import datetime, timedelta, timezone
@@ -165,262 +164,6 @@ def _compact_whitespace(text: str) -> str:
     return re.sub(r"\s+", " ", str(text or "")).strip()
 
 
-class MemoryOperationReporter:
-    """Collect asynchronous memory operation results for benchmark callers."""
-
-    def __init__(self, *, recent_task_limit: int = 200) -> None:
-        self._lock = threading.Lock()
-        self._task_seq = 0
-        self._recent_task_limit = max(1, int(recent_task_limit or 200))
-        self._counts: Dict[str, Dict[str, Any]] = {}
-        self._latest_reports: Dict[str, Dict[str, Any]] = {}
-        self._recent_tasks: List[Dict[str, Any]] = []
-
-    @staticmethod
-    def _empty_counts() -> Dict[str, Any]:
-        return {
-            "submitted": 0,
-            "completed": 0,
-            "succeeded": 0,
-            "failed": 0,
-            "rejected": 0,
-            "inflight": 0,
-            "total_elapsed_ms": 0.0,
-        }
-
-    def next_task_id(self, operation_type: str) -> str:
-        clean_type = str(operation_type or "memory_task").strip() or "memory_task"
-        with self._lock:
-            self._task_seq += 1
-            return f"{clean_type}-{self._task_seq}"
-
-    def on_task_submitted(
-        self,
-        *,
-        operation_type: str,
-        task_id: str,
-        payload: Optional[Dict[str, Any]] = None,
-    ) -> None:
-        safe_payload = self._json_compatible(payload or {})
-        with self._lock:
-            counts = self._counts.setdefault(operation_type, self._empty_counts())
-            counts["submitted"] += 1
-            counts["inflight"] += 1
-            self._append_recent_locked({
-                "event": "submitted",
-                "operation_type": operation_type,
-                "task_id": task_id,
-                "payload": safe_payload,
-                "timestamp": _now_text(),
-            })
-
-    def on_task_rejected(
-        self,
-        *,
-        operation_type: str,
-        task_id: str,
-        reason: str,
-    ) -> None:
-        report = {
-            "accepted": False,
-            "status": "rejected",
-            "reason": reason,
-            "task_id": task_id,
-        }
-        with self._lock:
-            counts = self._counts.setdefault(operation_type, self._empty_counts())
-            counts["rejected"] += 1
-            self._latest_reports[operation_type] = dict(report)
-            self._append_recent_locked({
-                "event": "rejected",
-                "operation_type": operation_type,
-                "task_id": task_id,
-                "reason": reason,
-                "timestamp": _now_text(),
-            })
-
-    def on_task_finished(
-        self,
-        *,
-        operation_type: str,
-        task_id: str,
-        started_at: float,
-        result: Any = None,
-        error: Optional[BaseException] = None,
-    ) -> bool:
-        elapsed_ms = round((time.monotonic() - started_at) * 1000, 2)
-        succeeded = error is None and self._operation_succeeded(operation_type, result)
-        report = self._operation_result_report(
-            operation_type=operation_type,
-            task_id=task_id,
-            result=result,
-            error=error,
-            succeeded=succeeded,
-            elapsed_ms=elapsed_ms,
-        )
-        with self._lock:
-            counts = self._counts.setdefault(operation_type, self._empty_counts())
-            counts["completed"] += 1
-            counts["inflight"] = max(0, int(counts.get("inflight") or 0) - 1)
-            counts["total_elapsed_ms"] = round(
-                float(counts.get("total_elapsed_ms") or 0.0) + elapsed_ms,
-                2,
-            )
-            counts["succeeded" if succeeded else "failed"] += 1
-            self._latest_reports[operation_type] = dict(report)
-            recent_event = {
-                "event": "finished",
-                "operation_type": operation_type,
-                "task_id": task_id,
-                "status": report.get("status"),
-                "succeeded": succeeded,
-                "elapsed_ms": elapsed_ms,
-                "timestamp": _now_text(),
-            }
-            if error is not None:
-                recent_event["error"] = str(error)
-                recent_event["error_type"] = type(error).__name__
-            self._append_recent_locked(recent_event)
-        return succeeded
-
-    def on_recall_finished(self, report: Dict[str, Any]) -> None:
-        elapsed_ms = float(report.get("elapsed_ms") or 0.0)
-        status = str(report.get("status") or "").strip().lower()
-        succeeded = status not in {"error", "failed"}
-        recall_report = {
-            key: value
-            for key, value in report.items()
-            if key != "memory_context"
-        }
-        with self._lock:
-            counts = self._counts.setdefault("recall", self._empty_counts())
-            counts["submitted"] += 1
-            counts["completed"] += 1
-            counts["total_elapsed_ms"] = round(
-                float(counts.get("total_elapsed_ms") or 0.0) + elapsed_ms,
-                2,
-            )
-            counts["succeeded" if succeeded else "failed"] += 1
-            self._latest_reports["recall"] = recall_report
-            self._append_recent_locked({
-                "event": "finished",
-                "operation_type": "recall",
-                "task_id": f"recall-{counts['completed']}",
-                "status": recall_report.get("status"),
-                "actual_recall_mode": recall_report.get("actual_recall_mode"),
-                "elapsed_ms": elapsed_ms,
-                "timestamp": _now_text(),
-            })
-
-    def operation_report(self, operation_type: str) -> Dict[str, Any]:
-        with self._lock:
-            counts = dict(
-                self._counts.get(operation_type) or self._empty_counts()
-            )
-            latest = self._latest_reports.get(operation_type)
-        if latest:
-            counts["latest_report"] = dict(latest)
-        return counts
-
-    def latest_report(self, operation_type: str) -> Dict[str, Any]:
-        with self._lock:
-            return dict(self._latest_reports.get(operation_type) or {})
-
-    def snapshot(self) -> Dict[str, Any]:
-        with self._lock:
-            return {
-                "counts": {
-                    key: dict(value)
-                    for key, value in self._counts.items()
-                },
-                "latest_reports": {
-                    key: dict(value)
-                    for key, value in self._latest_reports.items()
-                },
-                "recent_tasks": [dict(item) for item in self._recent_tasks],
-            }
-
-    def _append_recent_locked(self, event: Dict[str, Any]) -> None:
-        self._recent_tasks.append(event)
-        if len(self._recent_tasks) > self._recent_task_limit:
-            del self._recent_tasks[: len(self._recent_tasks) - self._recent_task_limit]
-
-    @classmethod
-    def _json_compatible(cls, value: Any) -> Any:
-        if value is None or isinstance(value, (str, int, float, bool)):
-            return value
-        if isinstance(value, datetime):
-            return _to_timestamp_text(value)
-        if isinstance(value, dict):
-            return {
-                str(key): cls._json_compatible(item)
-                for key, item in value.items()
-            }
-        if isinstance(value, (list, tuple)):
-            return [cls._json_compatible(item) for item in value]
-        return str(value)
-
-    @staticmethod
-    def _operation_succeeded(operation_type: str, result: Any) -> bool:
-        failure_statuses = {
-            "failed",
-            "skipped",
-            "error",
-            "queue_rejected",
-        }
-        if operation_type == "memory_fact_extraction":
-            if not isinstance(result, dict):
-                return bool(result)
-            return (
-                str(result.get("status") or "ok").strip().lower()
-                not in failure_statuses
-            )
-        if operation_type in {
-            "memory_user_activity_extraction",
-            "memory_user_claim_update",
-            "memory_user_intent_update",
-            "memory_user_state_update",
-        }:
-            if not isinstance(result, dict):
-                return False
-            return (
-                str(result.get("status") or "ok").strip().lower()
-                not in failure_statuses
-            )
-        return True
-
-    @staticmethod
-    def _operation_result_report(
-        *,
-        operation_type: str,
-        task_id: str,
-        result: Any,
-        error: Optional[BaseException],
-        succeeded: bool,
-        elapsed_ms: float,
-    ) -> Dict[str, Any]:
-        if isinstance(result, dict):
-            report = dict(result)
-        else:
-            report = {"result": result}
-        result_status = str(report.get("status") or "").strip().lower()
-        report.update({
-            "accepted": True,
-            "task_id": task_id,
-            "operation_type": operation_type,
-            "status": (
-                "failed"
-                if error is not None or not succeeded
-                else (result_status or "ok")
-            ),
-            "total_elapsed_ms": elapsed_ms,
-        })
-        if operation_type in {"memory_fact_extraction", "memory_user_activity_extraction"}:
-            report["stored"] = bool(succeeded and error is None)
-        if error is not None:
-            report["error_type"] = type(error).__name__
-            report["error"] = str(error)
-        return report
 
 
 class MemoryNodeManager:
@@ -514,6 +257,12 @@ class MemoryNodeManager:
         )
         self._task_scheduler.register_handler(
             "memory_user_intent_update", self._process_memory_user_intent_update_task,
+        )
+        self._task_scheduler.register_followup_submitter(
+            "memory_user_claim_update", self.submit_memory_user_claim_update_task,
+        )
+        self._task_scheduler.register_followup_submitter(
+            "memory_user_intent_update", self.submit_memory_user_intent_update_task,
         )
 
     def _initialize_recall_config(self) -> None:
@@ -2631,6 +2380,20 @@ class MemoryNodeManager:
                 limit=limit,
                 reference_timestamp=reference_timestamp,
             )
+            affected_claim_ids = list(claim_report.get("affected_claim_ids") or [])
+        claim_report["explicit"]["facts_marked_processed"] = (
+            self._task_scheduler.mark_signal_facts_completed(
+                "explicit_user_claim",
+                claim_report.pop("_completed_explicit_fact_ids", []),
+            )
+        )
+        claim_report["inductive"]["facts_marked_processed"] = (
+            self._task_scheduler.mark_signal_facts_completed(
+                "inductive_user_claim",
+                claim_report.pop("_completed_inductive_fact_ids", []),
+            )
+        )
+        self._log_info("memory_user_claim", "user_claim_update_finish", claim_report)
         report = {
             "status": (
                 "ok"
@@ -2661,13 +2424,8 @@ class MemoryNodeManager:
                 2,
             ),
         }
-        affected_claim_ids = list(claim_report.get("affected_claim_ids") or [])
         report["affected_claim_ids"] = affected_claim_ids
-        if affected_claim_ids:
-            report["user_state_update_request"] = {
-                "changed_claim_ids": affected_claim_ids,
-                "reference_timestamp": reference_timestamp,
-            }
+        report["reference_timestamp"] = reference_timestamp
         self._log_info("memory_user_claim", "finish", report)
         return report
 
@@ -2683,11 +2441,11 @@ class MemoryNodeManager:
             int(limit or self._memory_cfg.get("user_intent_limit") or 100),
         )
         reference_timestamp = reference_timestamp or _now_text()
-        facts = self._db.get_unprocessed_facts(
-            processing_target="user_intent_update",
-            reference_timestamp=reference_timestamp,
-            limit=limit,
-            restrict_to_today=False,
+        pending_signals = set(
+            self._task_scheduler.pending_user_intent_signals(fact_limit=limit)
+        )
+        facts = self._db.get_memory_facts_by_ids(
+            sorted({fact_id for fact_id, _ in pending_signals})
         )
         report: Dict[str, Any] = {
             "status": "empty",
@@ -2718,10 +2476,8 @@ class MemoryNodeManager:
         signal_items: List[Dict[str, Any]] = []
         for fact_id, fact in facts_by_id.items():
             for signal in self._get_user_intent_signals_from_fact(fact):
-                if int(signal.get("processed_for_memory_user_intent_update") or 0):
-                    continue
                 signal_key = str(signal.get("signal_key") or "")
-                if not signal_key:
+                if (fact_id, signal_key) not in pending_signals:
                     continue
                 signal_items.append({
                     "signal_id": f"{fact_id}:{signal_key}",
@@ -2799,10 +2555,11 @@ class MemoryNodeManager:
                     continue
                 raw_candidate = results[0]["intent_candidate"]
                 if raw_candidate is None:
-                    with self._db.transaction():
-                        report["signals_marked_processed"] += self._db.mark_user_intent_signals_processed(
+                    report["signals_marked_processed"] += (
+                        self._task_scheduler.mark_user_intent_signals_completed(
                             [(item["fact_id"], item["signal_key"])]
                         )
+                    )
                     continue
                 fact_id = item["fact_id"]
                 if (
@@ -2869,9 +2626,9 @@ class MemoryNodeManager:
                             )
                             if should_apply else []
                         )
-                        marked = self._db.mark_user_intent_signals_processed(
-                            [(fact_id, item["signal_key"])]
-                        )
+                    marked = self._task_scheduler.mark_user_intent_signals_completed(
+                        [(fact_id, item["signal_key"])]
+                    )
                 except Exception as exc:
                     report["failed_signal_count"] += 1
                     self._log_info("memory_user_intent_update", "signal_error", {
@@ -3624,14 +3381,10 @@ class MemoryNodeManager:
                 "inductive": dict(disabled),
             }
 
-        explicit_facts = self._db.get_unprocessed_facts(
-            processing_target="explicit_user_claim",
-            limit=limit,
-            reference_timestamp=reference_timestamp,
-            # ``created_at`` is wall-clock persistence time, whereas the
-            # reference timestamp is source event time.  Processing flags
-            # already provide the intended incremental boundary.
-            restrict_to_today=False,
+        explicit_facts = self._db.get_memory_facts_by_ids(
+            self._task_scheduler.pending_signal_fact_ids(
+                "explicit_user_claim", limit=limit,
+            )
         )
         explicit_report = self._update_explicit_user_claims_from_facts(explicit_facts)
         explicit_completed = bool(explicit_report.pop("completed", False))
@@ -3651,31 +3404,24 @@ class MemoryNodeManager:
         # A valid empty result is a completed projection.  If either the
         # explicit or directly-derived pass fails, leave these facts pending so
         # the idempotent claim reconciliation can retry the full local chain.
-        if explicit_completed and derived_completed:
-            explicit_report["facts_marked_processed"] = self._db.mark_facts_processed(
-                processing_target="explicit_user_claim",
-                fact_ids=[fact.get("id") for fact in explicit_facts],
-            )
-        else:
-            explicit_report["facts_marked_processed"] = 0
+        completed_explicit_fact_ids = (
+            [int(fact["id"]) for fact in explicit_facts]
+            if explicit_completed and derived_completed else []
+        )
 
-        induction_seed_facts = self._db.get_unprocessed_facts(
-            processing_target="inductive_user_claim",
-            reference_timestamp=reference_timestamp,
-            limit=max(1, min(limit, 100)),
-            restrict_to_today=False,
+        induction_seed_facts = self._db.get_memory_facts_by_ids(
+            self._task_scheduler.pending_signal_fact_ids(
+                "inductive_user_claim", limit=max(1, min(limit, 100)),
+            )
         )
         inductive_report = self._update_inductive_user_claims_from_facts(
             induction_seed_facts,
         )
         inductive_completed = bool(inductive_report.pop("completed", False))
-        if inductive_completed:
-            inductive_report["facts_marked_processed"] = self._db.mark_facts_processed(
-                processing_target="inductive_user_claim",
-                fact_ids=[fact.get("id") for fact in induction_seed_facts],
-            )
-        else:
-            inductive_report["facts_marked_processed"] = 0
+        completed_inductive_fact_ids = (
+            [int(fact["id"]) for fact in induction_seed_facts]
+            if inductive_completed else []
+        )
         source_reports: List[Dict[str, Any]] = []
         if explicit_completed and derived_completed:
             source_reports.extend((explicit_report, derived_report))
@@ -3687,16 +3433,13 @@ class MemoryNodeManager:
             for value in source_report.get("affected_claim_ids") or []
             if str(value).strip().isdigit() and int(value) > 0
         })
-        self._log_info("memory_user_claim", "user_claim_update_finish", {
-            "explicit": explicit_report,
-            "derived": derived_report,
-            "inductive": inductive_report,
-        })
         return {
             "explicit": explicit_report,
             "derived": derived_report,
             "inductive": inductive_report,
             "affected_claim_ids": all_affected_claim_ids,
+            "_completed_explicit_fact_ids": completed_explicit_fact_ids,
+            "_completed_inductive_fact_ids": completed_inductive_fact_ids,
         }
 
     def _claim_fact_prompt_view(

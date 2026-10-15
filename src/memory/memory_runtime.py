@@ -11,7 +11,6 @@ from __future__ import annotations
 import logging
 import json
 import re
-import threading
 from datetime import datetime
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -21,14 +20,13 @@ from .embedding_client import EmbeddingClient
 from .memory_database import SessionDB
 
 from .memory_manager import (
-    MemoryOperationReporter,
     MemoryNodeManager,
     _compact_whitespace,
     _now_text,
     _to_timestamp_text,
 )
 from llm_client import LLMClient
-from .task_scheduler import TaskScheduler
+from .task_scheduler import TaskOperationReporter, TaskScheduler
 from .memory_context_manager import (
     MemoryContextManager,
     TranscriptUnitAssembler,
@@ -47,425 +45,6 @@ _MEMORY_INPUT_DEDUP_MIN_TEXT_CHARS = 8
 _MEMORY_INPUT_DEDUP_MAX_TIME_GAP_SECONDS = 120.0
 _MEMORY_INPUT_DEDUP_MIN_FUZZY_RATIO = 0.90
 
-
-class _DerivedMemoryTaskScheduler:
-    """Schedule claim and intent projections after committed facts.
-
-    The manager owns extraction and persistence.  This runtime-local helper
-    merely coalesces successful store completions into follow-up tasks.  It
-    deliberately has no timer yet: a task is scheduled when a batch threshold
-    is reached, and session finalization always installs a FIFO drain fence.
-    """
-
-    _KIND_TO_TASK = {
-        "user_claim": "memory_user_claim_update",
-        "user_intent": "memory_user_intent_update",
-    }
-
-    def __init__(
-        self,
-        manager: MemoryNodeManager,
-        *,
-        config: Optional[Dict[str, Any]] = None,
-        logger: Optional[logging.Logger] = None,
-    ) -> None:
-        self._manager = manager
-        self._logger = logger or logging.getLogger(__name__)
-        settings = dict(config or {})
-        self._thresholds = {
-            "user_claim": {
-                "default": {
-                    "batches": max(1, int(
-                        settings.get("user_claim_min_signal_batches", 4) or 4
-                    )),
-                    "facts": max(1, int(
-                        settings.get("user_claim_min_signal_facts", 8) or 8
-                    )),
-                },
-                "interaction": {
-                    "batches": max(1, int(
-                        settings.get(
-                            "interaction_user_claim_min_signal_batches", 3
-                        ) or 3
-                    )),
-                    "facts": max(1, int(
-                        settings.get(
-                            "interaction_user_claim_min_signal_facts", 5
-                        ) or 5
-                    )),
-                },
-            },
-            "user_intent": {
-                "default": {
-                    "batches": max(1, int(
-                        settings.get(
-                            "user_intent_min_signal_batches", 4
-                        ) or 4
-                    )),
-                    "facts": max(1, int(
-                        settings.get(
-                            "user_intent_min_signal_facts", 5
-                        ) or 5
-                    )),
-                },
-                "interaction": {
-                    "batches": max(1, int(
-                        settings.get(
-                            "interaction_user_intent_min_signal_batches", 3
-                        ) or 3
-                    )),
-                    "facts": max(1, int(
-                        settings.get(
-                            "interaction_user_intent_min_signal_facts", 3
-                        ) or 3
-                    )),
-                },
-            },
-        }
-        self._lock = threading.RLock()
-        self._state = {
-            kind: {
-                "generation": 0,
-                "completed_generation": 0,
-                "unscheduled_signal_batches": 0,
-                "unscheduled_signal_facts": 0,
-                "unscheduled_contains_interaction": False,
-                "task_pending": False,
-            }
-            for kind in self._KIND_TO_TASK
-        }
-        self._force_pending_kinds: set[str] = set()
-        self._force_failed_kinds: set[str] = set()
-        # This is event time from accepted source input, never wall-clock task
-        # execution time.  It lets benchmark replays and delayed ASR preserve
-        # the same temporal reference across derived projections.
-        self._latest_input_time_end = ""
-
-    def record_memory_store_submission(
-        self,
-        completion_context: Optional[Dict[str, Any]],
-    ) -> None:
-        """Record a queued store batch's source-time high-water mark.
-
-        Submission is recorded in addition to task completion: a derived task
-        may be appended after a completed store while later store batches are
-        already waiting ahead of it in the shared scheduler's FIFO queue.
-        """
-        context = (
-            dict(completion_context)
-            if isinstance(completion_context, dict)
-            else {}
-        )
-        with self._lock:
-            self._record_input_time_end_locked(context.get("input_time_end"))
-
-    def on_task_completion(self, event: Dict[str, Any]) -> None:
-        """Consume a memory completion event on the shared scheduler worker."""
-        task_kind = str(event.get("task_kind") or "")
-        result = event.get("result")
-        if task_kind == "memory_fact_extraction":
-            if not event.get("succeeded") or not isinstance(result, dict):
-                return
-            self._record_store_completion(
-                result,
-                completion_context=event.get("completion_context"),
-            )
-            return
-
-        completion_context = event.get("completion_context")
-        if not isinstance(completion_context, dict):
-            return
-        scheduler_context = completion_context.get("derived_task_scheduler")
-        if not isinstance(scheduler_context, dict):
-            return
-        kind = str(scheduler_context.get("kind") or "")
-        if self._KIND_TO_TASK.get(kind) != task_kind:
-            return
-        if bool(scheduler_context.get("force_drain")):
-            self._finish_force_drain(
-                kind,
-                succeeded=bool(event.get("succeeded")),
-            )
-            return
-        if not bool(scheduler_context.get("automatic")):
-            return
-        self._finish_automatic_task(kind, succeeded=bool(event.get("succeeded")))
-
-    def force_drain(
-        self,
-        *,
-        reference_timestamp: Optional[Any] = None,
-    ) -> Dict[str, Dict[str, Any]]:
-        """Append both projections after all previously queued memory work.
-
-        This is intentionally unconditional.  The tasks query unprocessed
-        signal mappings themselves, while the force marker suppresses an
-        otherwise redundant automatic task from store completions that occur
-        before this FIFO fence is reached.
-        """
-        with self._lock:
-            self._force_pending_kinds = set(self._KIND_TO_TASK)
-            self._force_failed_kinds.clear()
-            self._record_input_time_end_locked(reference_timestamp)
-            resolved_reference_timestamp = self._latest_input_time_end
-        reports = {
-            "user_claim": self._manager.submit_memory_user_claim_update_task(
-                reference_timestamp=resolved_reference_timestamp or None,
-                completion_context={
-                    "derived_task_scheduler": {
-                        "kind": "user_claim",
-                        "force_drain": True,
-                        "reference_timestamp": resolved_reference_timestamp,
-                    }
-                }
-            ),
-            "user_intent": (
-                self._manager.submit_memory_user_intent_update_task(
-                    reference_timestamp=resolved_reference_timestamp or None,
-                    completion_context={
-                        "derived_task_scheduler": {
-                            "kind": "user_intent",
-                            "force_drain": True,
-                            "reference_timestamp": resolved_reference_timestamp,
-                        }
-                    }
-                )
-            ),
-        }
-        with self._lock:
-            for kind, report in reports.items():
-                if not bool((report or {}).get("queued")):
-                    self._force_pending_kinds.discard(kind)
-                    self._force_failed_kinds.add(kind)
-                    self._mark_kind_needing_retry_locked(kind)
-            force_round_finished = not self._force_pending_kinds
-        if force_round_finished:
-            self._finish_force_drain()
-        return reports
-
-    def snapshot(self) -> Dict[str, Any]:
-        """Return scheduler state for diagnostics without exposing locks."""
-        with self._lock:
-            return {
-                "thresholds": {
-                    kind: dict(values) for kind, values in self._thresholds.items()
-                },
-                "force_pending_kinds": sorted(self._force_pending_kinds),
-                "force_failed_kinds": sorted(self._force_failed_kinds),
-                "latest_input_time_end": self._latest_input_time_end,
-                "tasks": {
-                    kind: dict(values) for kind, values in self._state.items()
-                },
-            }
-
-    def _record_store_completion(
-        self,
-        result: Dict[str, Any],
-        *,
-        completion_context: Any,
-    ) -> None:
-        context = (
-            dict(completion_context)
-            if isinstance(completion_context, dict)
-            else {}
-        )
-        contains_interaction = bool(context.get("contains_interaction_turn"))
-        signal_stats = {
-            "user_claim": {
-                "signal_count": int(result.get("user_claim_signal_count") or 0),
-                "signal_fact_count": int(
-                    result.get("user_claim_signal_fact_count") or 0
-                ),
-            },
-            "user_intent": {
-                "signal_count": int(
-                    result.get("user_intent_signal_count") or 0
-                ),
-                "signal_fact_count": int(
-                    result.get("user_intent_signal_fact_count") or 0
-                ),
-            },
-        }
-        self._logger.info(
-            "memory store completion observed facts=%s user_claim_signals=%s "
-            "user_claim_signal_facts=%s user_intent_signals=%s "
-            "user_intent_signal_facts=%s contains_interaction_turn=%s "
-            "input_time_end=%s",
-            int(result.get("new_fact_count") or 0),
-            signal_stats["user_claim"]["signal_count"],
-            signal_stats["user_claim"]["signal_fact_count"],
-            signal_stats["user_intent"]["signal_count"],
-            signal_stats["user_intent"]["signal_fact_count"],
-            contains_interaction,
-            context.get("input_time_end") or "",
-        )
-        with self._lock:
-            self._record_input_time_end_locked(context.get("input_time_end"))
-            for kind, stats in signal_stats.items():
-                if stats["signal_count"] <= 0 or stats["signal_fact_count"] <= 0:
-                    continue
-                state = self._state[kind]
-                state["generation"] += 1
-                state["unscheduled_signal_batches"] += 1
-                state["unscheduled_signal_facts"] += stats["signal_fact_count"]
-                state["unscheduled_contains_interaction"] = bool(
-                    state["unscheduled_contains_interaction"]
-                    or contains_interaction
-                )
-        self._schedule_eligible_tasks()
-
-    def _schedule_eligible_tasks(self) -> None:
-        for kind in self._KIND_TO_TASK:
-            self._schedule_kind_if_eligible(kind)
-
-    def _schedule_kind_if_eligible(self, kind: str) -> None:
-        with self._lock:
-            if self._force_pending_kinds or self._state[kind]["task_pending"]:
-                return
-            state = self._state[kind]
-            threshold_key = (
-                "interaction"
-                if state["unscheduled_contains_interaction"]
-                else "default"
-            )
-            threshold = self._thresholds[kind][threshold_key]
-            if (
-                state["unscheduled_signal_batches"] < threshold["batches"]
-                or state["unscheduled_signal_facts"] < threshold["facts"]
-            ):
-                return
-            state["task_pending"] = True
-            target_generation = int(state["generation"])
-            reference_timestamp = self._latest_input_time_end
-
-        completion_context = {
-            "derived_task_scheduler": {
-                "kind": kind,
-                "automatic": True,
-                "target_generation": target_generation,
-                "reference_timestamp": reference_timestamp,
-            }
-        }
-        if kind == "user_claim":
-            report = self._manager.submit_memory_user_claim_update_task(
-                reference_timestamp=reference_timestamp or None,
-                completion_context=completion_context,
-            )
-        else:
-            report = self._manager.submit_memory_user_intent_update_task(
-                reference_timestamp=reference_timestamp or None,
-                completion_context=completion_context,
-            )
-        if bool((report or {}).get("queued")):
-            with self._lock:
-                state = self._state[kind]
-                state["unscheduled_signal_batches"] = 0
-                state["unscheduled_signal_facts"] = 0
-                state["unscheduled_contains_interaction"] = False
-            self._logger.info(
-                "memory derived task scheduled kind=%s target_generation=%s "
-                "reference_timestamp=%s",
-                kind,
-                target_generation,
-                reference_timestamp or "",
-            )
-            return
-        with self._lock:
-            self._state[kind]["task_pending"] = False
-        self._logger.warning(
-            "memory derived task rejected kind=%s reason=%s",
-            kind,
-            (report or {}).get("reason"),
-        )
-
-    def _record_input_time_end_locked(self, value: Any) -> None:
-        """Advance the source-time high-water mark while holding ``_lock``."""
-        candidate = str(value or "").strip()
-        if not candidate:
-            return
-        current = self._latest_input_time_end
-        if not current or self._is_later_timestamp(candidate, current):
-            self._latest_input_time_end = candidate
-
-    @staticmethod
-    def _is_later_timestamp(candidate: str, current: str) -> bool:
-        """Compare ISO-like source timestamps without mixing naïve/aware datetimes."""
-        def epoch(value: str) -> Optional[float]:
-            try:
-                return datetime.fromisoformat(
-                    str(value).strip().replace("Z", "+00:00")
-                ).timestamp()
-            except (TypeError, ValueError, OSError):
-                return None
-
-        candidate_epoch = epoch(candidate)
-        current_epoch = epoch(current)
-        if candidate_epoch is not None and current_epoch is not None:
-            return candidate_epoch > current_epoch
-        return candidate > current
-
-    def _finish_automatic_task(self, kind: str, *, succeeded: bool) -> None:
-        with self._lock:
-            state = self._state[kind]
-            state["task_pending"] = False
-            if succeeded:
-                # FIFO means all store completion events observed before this
-                # task begins are included in the task's DB query.
-                state["completed_generation"] = int(state["generation"])
-                state["unscheduled_signal_batches"] = 0
-                state["unscheduled_signal_facts"] = 0
-                state["unscheduled_contains_interaction"] = False
-            else:
-                self._mark_kind_needing_retry_locked(kind)
-        if succeeded:
-            self._schedule_kind_if_eligible(kind)
-
-    def _finish_force_drain(
-        self,
-        kind: Optional[str] = None,
-        *,
-        succeeded: bool = True,
-    ) -> None:
-        """Settle one force-drain round without discarding failed evidence."""
-        with self._lock:
-            if kind:
-                self._force_pending_kinds.discard(kind)
-                if not succeeded:
-                    self._force_failed_kinds.add(kind)
-                    self._mark_kind_needing_retry_locked(kind)
-            if self._force_pending_kinds:
-                return
-            failed_kinds = set(self._force_failed_kinds)
-            self._force_failed_kinds.clear()
-            for state_kind, state in self._state.items():
-                if state_kind in failed_kinds:
-                    continue
-                state["completed_generation"] = int(state["generation"])
-                state["unscheduled_signal_batches"] = 0
-                state["unscheduled_signal_facts"] = 0
-                state["unscheduled_contains_interaction"] = False
-        if not failed_kinds:
-            self._schedule_eligible_tasks()
-        else:
-            self._logger.warning(
-                "memory derived force drain failed kinds=%s; retained pending evidence",
-                sorted(failed_kinds),
-            )
-
-    def _mark_kind_needing_retry_locked(self, kind: str) -> None:
-        """Preserve enough state for a later store completion or drain retry."""
-        state = self._state[kind]
-        threshold = self._thresholds[kind]["default"]
-        state["unscheduled_signal_batches"] = max(
-            int(state["unscheduled_signal_batches"]),
-            threshold["batches"],
-        )
-        state["unscheduled_signal_facts"] = max(
-            int(state["unscheduled_signal_facts"]),
-            threshold["facts"],
-        )
-
-
 class MemoryRuntime:
     """Normalize application input and batch it before user activity extraction."""
 
@@ -475,7 +54,7 @@ class MemoryRuntime:
         db_path: Path | str,
         memory_runtime_config: Optional[Dict[str, Any]] = None,
         memory_manager_config: Optional[Dict[str, Any]] = None,
-        operation_reporter: Optional[MemoryOperationReporter] = None,
+        operation_reporter: Optional[TaskOperationReporter] = None,
         database: Optional[SessionDB] = None,
         task_scheduler: Optional[TaskScheduler] = None,
         llm_client: Optional[LLMClient] = None,
@@ -484,6 +63,7 @@ class MemoryRuntime:
         """Initialize input batching and its manager, with optional shared resources."""
         self._logger = logger or logging.getLogger(__name__)
         manager_config = dict(memory_manager_config or {})
+        runtime_config = dict(memory_runtime_config or {})
         shared_dependencies = (database, task_scheduler, llm_client)
         if any(item is not None for item in shared_dependencies) and not all(
             item is not None for item in shared_dependencies
@@ -507,7 +87,7 @@ class MemoryRuntime:
         reporter = (
             task_scheduler.operation_reporter
             if task_scheduler is not None
-            else operation_reporter or MemoryOperationReporter()
+            else operation_reporter or TaskOperationReporter()
         )
         configured_embedding = manager_config.get("embedding")
         embedding_config = (
@@ -527,6 +107,10 @@ class MemoryRuntime:
                 operation_reporter=reporter,
                 maxsize=int(manager_config.get("task_queue_maxsize", 100) or 100),
                 logger=self._logger.getChild("task_scheduler"),
+                claim_state_database=database,
+                task_scheduling_config=runtime_config.get(
+                    "task_scheduling"
+                ),
             )
             manager = MemoryNodeManager(
                 database,
@@ -548,11 +132,12 @@ class MemoryRuntime:
                 )
         except Exception:
             if self._owns_shared_resources:
+                if hasattr(self, "_task_scheduler"):
+                    self._task_scheduler.shutdown(wait=True, timeout=0)
                 database.close()
             raise
         self._memory_database = database
         self._memory_manager = manager
-        runtime_config = dict(memory_runtime_config or {})
         self._embedding_client = EmbeddingClient(
             dict(embedding_config or getattr(manager, "_embedding_cfg", {}) or {}),
         )
@@ -570,48 +155,8 @@ class MemoryRuntime:
             memory_context_manager_config,
         )
         self._user_activity_tags: List[str] = []
-        scheduler_config = runtime_config.get("derived_task_scheduling")
-        self._derived_task_scheduler = _DerivedMemoryTaskScheduler(
-            self._memory_manager,
-            config=(
-                dict(scheduler_config)
-                if isinstance(scheduler_config, dict)
-                else None
-            ),
-            logger=self._logger.getChild("derived_task_scheduler"),
-        )
         if self._owns_shared_resources:
-            self._task_scheduler.register_completion_listener(
-                self._handle_task_completion
-            )
-
-    def _handle_task_completion(self, event: Dict[str, Any]) -> None:
-        """Route follow-up work for a standalone MemoryRuntime."""
-        result = event.get("result")
-        if event.get("succeeded") and isinstance(result, dict):
-            request = result.get("user_state_update_request")
-            if (
-                event.get("task_kind") == "memory_user_claim_update"
-                and isinstance(request, dict)
-                and self._user_state_resolver is not None
-            ):
-                self._user_state_resolver.submit_memory_user_state_update_task(
-                    **request,
-                )
-            elif (
-                event.get("task_kind") == "memory_user_activity_extraction"
-                and self._user_state_resolver is not None
-            ):
-                activity_ids = result.get("user_activity_item_ids") or []
-                if activity_ids:
-                    self._user_state_resolver.submit_memory_user_state_update_task(
-                        changed_user_activity_ids=activity_ids,
-                    )
-        self.handle_task_completion(event)
-
-    def handle_task_completion(self, event: Dict[str, Any]) -> None:
-        """Advance claim and intent scheduling after a shared task completes."""
-        self._derived_task_scheduler.on_task_completion(event)
+            self._task_scheduler.start()
 
     def close(self, timeout: Optional[float] = 30.0) -> None:
         """Flush input; standalone runtimes also drain and close owned resources."""
@@ -625,8 +170,8 @@ class MemoryRuntime:
             try:
                 drained = self._task_scheduler.flush(timeout=timeout)
                 if not drained:
-                    # Keep the scheduler accepting work while completion
-                    # listeners enqueue dependent claim/intent/state tasks.
+                    # Keep the scheduler accepting work while completed tasks
+                    # enqueue dependent claim/intent/state tasks.
                     self._logger.warning(
                         "Memory tasks did not drain within timeout=%s; "
                         "continuing to drain before shutdown",
@@ -661,9 +206,6 @@ class MemoryRuntime:
                     )
                 safe_to_close_database = True
             finally:
-                self._task_scheduler.unregister_completion_listener(
-                    self._handle_task_completion
-                )
                 if safe_to_close_database and self._memory_database is not None:
                     self._memory_database.close()
 
@@ -1075,7 +617,7 @@ class MemoryRuntime:
         reason: str = "explicit_flush",
         tags: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
-        """Finalize tail input, then append activity and derived-task fences."""
+        """Finalize tail input, then append activity and fact follow-up fences."""
         queued = False
         completed_unit = self._transcript_unit_assembler.flush()
         if completed_unit is not None:
@@ -1101,12 +643,16 @@ class MemoryRuntime:
                 "reason": str(drain_report.get("reason") or "queue_rejected"),
             }
         self._memory_context_manager.seal_pending_units(boundary_reason=reason)
-        store_report = self._trigger_memory_store_task_for_sealed_memory_input()
-        user_activity_report = self._trigger_memory_user_activity(
-            reason=reason,
-            tags=tags,
+        final_tasks = self._task_scheduler.submit_final_memory_tasks(
+            submit_fact_task=self._trigger_memory_store_task_for_sealed_memory_input,
+            submit_user_activity_task=lambda: self._trigger_memory_user_activity(
+                reason=reason,
+                tags=tags,
+            ),
         )
-        derived_task_reports = self._derived_task_scheduler.force_drain()
+        store_report = final_tasks["fact"]
+        user_activity_report = final_tasks["user_activity"]
+        fact_followup_reports = final_tasks["fact_followup_tasks"]
         return {
             "queued": (
                 bool(store_report.get("queued"))
@@ -1114,12 +660,12 @@ class MemoryRuntime:
                 or bool(user_activity_report.get("queued"))
                 or any(
                     bool((report or {}).get("queued"))
-                    for report in derived_task_reports.values()
+                    for report in fact_followup_reports.values()
                 )
             ),
             "reason": str(store_report.get("reason") or ""),
             "user_activity": user_activity_report,
-            "derived_tasks": derived_task_reports,
+            "fact_followup_tasks": fact_followup_reports,
         }
 
     def _trigger_memory_store_task_for_sealed_memory_input(
@@ -1186,9 +732,6 @@ class MemoryRuntime:
         )
         queued = bool(queue_report.get("queued"))
         if queued:
-            self._derived_task_scheduler.record_memory_store_submission(
-                store_completion_context,
-            )
             self._memory_context_manager.clear_sealed_chapter_buffers()
             self._user_activity_tags = sorted(set(self._user_activity_tags).union(tags))
             self._memory_context_manager.record_stored_units(
@@ -1242,7 +785,7 @@ class MemoryRuntime:
         reason: str = "explicit_finalize",
         tags: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
-        """Append a final fact → activity → derived-task FIFO fence.
+        """Append a final fact → activity → claim → intent FIFO fence.
 
         This is the lifecycle operation for a frontend session close or an
         ambient recording stop.  It deliberately does not wait for storage:
@@ -1256,7 +799,7 @@ class MemoryRuntime:
         return {
             "input_flush": input_flush,
             "user_activity": dict(input_flush.get("user_activity") or {}),
-            "derived_tasks": dict(input_flush.get("derived_tasks") or {}),
+            "fact_followup_tasks": dict(input_flush.get("fact_followup_tasks") or {}),
         }
     
     def trigger_memory_recall(
@@ -1293,9 +836,15 @@ class MemoryRuntime:
         """Wait until all tasks already submitted to the memory manager complete."""
         return self._task_scheduler.flush(timeout=timeout)
 
-    def derived_task_scheduler_snapshot(self) -> Dict[str, Any]:
-        """Return runtime-local derived-task scheduling diagnostics."""
-        return self._derived_task_scheduler.snapshot()
+    def trigger_user_state_time_tick(
+        self, *, now: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
+        """Evaluate pending claim-driven state changes at a time-window tick."""
+        return self._task_scheduler.trigger_user_state_time_tick(now=now)
+
+    def fact_followup_scheduler_snapshot(self) -> Dict[str, Any]:
+        """Return shared scheduler's fact follow-up scheduling diagnostics."""
+        return self._task_scheduler.fact_followup_task_snapshot()
 
     @staticmethod
     def _transcript_segment_text(segment: Dict[str, Any]) -> str:

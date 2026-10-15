@@ -38,7 +38,7 @@ for import_root in (SRC_ROOT, REPO_ROOT, SCRIPT_ROOT):
     if str(import_root) not in sys.path:
         sys.path.insert(0, str(import_root))
 
-from memory.memory_manager import MemoryOperationReporter
+from memory.task_scheduler import TaskOperationReporter
 from llm_client import LLMClient
 from pwm_manager import PersonWorldModel
 from memory.config import split_memory_config
@@ -631,7 +631,7 @@ def process_context_group(
             reused_existing_db,
             db_path,
         )
-        operation_reporter = MemoryOperationReporter()
+        operation_reporter = TaskOperationReporter()
         runtime = PersonWorldModel(
             db_path=db_path,
             memory_runtime_config=memory_runtime_config,
@@ -661,7 +661,7 @@ def process_context_group(
             )
             if not runtime.wait_for_memory_tasks():
                 raise RuntimeError(
-                    "Timed out while draining queued memory store and derived tasks"
+                    "Timed out while draining queued memory store and follow-up tasks"
                 )
         log_memory_index_state(db, f"after_context:{group_id}")
         counts = db_counts(db)

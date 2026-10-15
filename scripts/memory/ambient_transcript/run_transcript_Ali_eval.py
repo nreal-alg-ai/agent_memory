@@ -21,7 +21,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from llm_client import DEFAULT_LLM_BASE_URL, DEFAULT_LLM_MODEL
-from memory.memory_manager import MemoryOperationReporter
+from memory.task_scheduler import TaskOperationReporter
 from memory.config import split_memory_config
 from pwm_manager import PersonWorldModel
 
@@ -169,7 +169,7 @@ def main() -> None:
     llm_config["llm_api_key"] = args.llm_api_key or llm_config.get("llm_api_key") or ""
     llm_config["llm_api_key"] = expand_env_refs(llm_config["llm_api_key"])
 
-    operation_reporter = MemoryOperationReporter()
+    operation_reporter = TaskOperationReporter()
     runtime = PersonWorldModel(
         db_path=db_path,
         memory_runtime_config=memory_runtime_config,
@@ -197,10 +197,10 @@ def main() -> None:
     final_input_flush = dict(finalization.get("input_flush") or {})
     user_activity_result = dict(finalization.get("user_activity") or {})
     user_claim_submit = dict(
-        (finalization.get("derived_tasks") or {}).get("user_claim") or {}
+        (finalization.get("fact_followup_tasks") or {}).get("memory_user_claim_update") or {}
     )
     user_intent_submit = dict(
-        (finalization.get("derived_tasks") or {}).get("user_intent") or {}
+        (finalization.get("fact_followup_tasks") or {}).get("memory_user_intent_update") or {}
     )
     queued_memory_store_count += int(bool(final_input_flush.get("queued")))
 

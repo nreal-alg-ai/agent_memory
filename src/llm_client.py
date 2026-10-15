@@ -6,6 +6,8 @@ import json
 import logging
 import os
 import re
+import time
+import uuid
 from typing import Any, Dict, Optional
 
 import requests
@@ -84,11 +86,23 @@ class LLMClient:
             attempts.append(stripped)
 
         seen = set()
+        call_id = uuid.uuid4().hex[:12]
+        call_started_at = time.monotonic()
+        request_number = 0
         for item in attempts:
             marker = json.dumps(sorted(item.keys()), ensure_ascii=False)
             if marker in seen:
                 continue
             seen.add(marker)
+            request_number += 1
+            request_started_at = time.monotonic()
+            response: Optional[requests.Response] = None
+            self._logger.info(
+                "LLM request started call_id=%s attempt=%s model=%s prompt_chars=%s "
+                "timeout_seconds=%s json_mode=%s thinking=%s",
+                call_id, request_number, self._model, len(prompt), self._timeout,
+                "response_format" in item, "thinking" in item,
+            )
             try:
                 response = requests.post(
                     url,
@@ -103,13 +117,37 @@ class LLMClient:
                     message = choices[0].get("message") or {}
                     content = message.get("content")
                     if content:
+                        self._logger.info(
+                            "LLM request finished call_id=%s attempt=%s outcome=content "
+                            "status_code=%s elapsed_ms=%.1f response_chars=%s",
+                            call_id, request_number, response.status_code,
+                            (time.monotonic() - request_started_at) * 1000,
+                            len(str(content)),
+                        )
                         return str(content)
+                self._logger.warning(
+                    "LLM request finished call_id=%s attempt=%s outcome=empty_content "
+                    "status_code=%s elapsed_ms=%.1f",
+                    call_id, request_number, response.status_code,
+                    (time.monotonic() - request_started_at) * 1000,
+                )
             except requests.RequestException as exc:
                 text = str(exc).lower()
+                self._logger.warning(
+                    "LLM request finished call_id=%s attempt=%s outcome=request_error "
+                    "status_code=%s elapsed_ms=%.1f error_type=%s",
+                    call_id, request_number,
+                    response.status_code if response is not None else None,
+                    (time.monotonic() - request_started_at) * 1000,
+                    type(exc).__name__,
+                )
                 if "response_format" in text or "json" in text or "thinking" in text:
                     continue
-                self._logger.warning("Unified memory LLM call failed: %s", exc)
                 return None
+        self._logger.warning(
+            "LLM call finished call_id=%s outcome=no_content attempts=%s elapsed_ms=%.1f",
+            call_id, request_number, (time.monotonic() - call_started_at) * 1000,
+        )
         return None
 
     @staticmethod
