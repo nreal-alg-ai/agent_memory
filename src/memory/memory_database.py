@@ -368,11 +368,16 @@ class SessionDB:
             CREATE TABLE IF NOT EXISTS memory_fact_user_action_signals (
                 signal_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 fact_id INTEGER NOT NULL,
+                occurrence_group_id INTEGER,
                 signal_key TEXT NOT NULL,
                 subject_entity_id INTEGER NOT NULL,
                 action_kind TEXT NOT NULL CHECK(action_kind IN ('action', 'choice', 'participation')),
                 action_text TEXT NOT NULL CHECK(length(trim(action_text)) > 0),
                 event_time_key TEXT NOT NULL DEFAULT '',
+                occurrence_key TEXT NOT NULL DEFAULT '',
+                time_precision TEXT NOT NULL DEFAULT 'unknown',
+                independence_status TEXT NOT NULL DEFAULT 'unresolved',
+                location TEXT NOT NULL DEFAULT '',
                 owner_evidence_type TEXT NOT NULL,
                 owner_evidence_text TEXT NOT NULL DEFAULT '',
                 other_evidence_text TEXT NOT NULL DEFAULT '',
@@ -443,7 +448,7 @@ class SessionDB:
                 object_entity_id INTEGER NOT NULL DEFAULT 0,
                 claim_text TEXT NOT NULL DEFAULT '',
                 claim_type TEXT NOT NULL,
-                claim_origin TEXT NOT NULL,
+                claim_origin TEXT NOT NULL CHECK(claim_origin IN ('explicit', 'derived')),
                 primary_domain TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL DEFAULT 'candidate',
                 confidence REAL NOT NULL DEFAULT 0.7,
@@ -515,6 +520,30 @@ class SessionDB:
                 created_at TEXT NOT NULL,
                 FOREIGN KEY(target_claim_id) REFERENCES memory_user_claims(id) ON DELETE CASCADE,
                 FOREIGN KEY(trigger_claim_id) REFERENCES memory_user_claims(id) ON DELETE SET NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS memory_user_observed_patterns (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                subject_entity_id INTEGER NOT NULL,
+                pattern_key TEXT NOT NULL,
+                pattern_text TEXT NOT NULL,
+                condition_text TEXT NOT NULL DEFAULT '',
+                primary_domain TEXT NOT NULL DEFAULT '',
+                confidence REAL NOT NULL DEFAULT 0.7,
+                metadata TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(subject_entity_id, pattern_key),
+                FOREIGN KEY(subject_entity_id) REFERENCES memory_entity_nodes(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS memory_user_observed_pattern_occurrences (
+                pattern_id INTEGER NOT NULL,
+                occurrence_group_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY(pattern_id, occurrence_group_id),
+                FOREIGN KEY(pattern_id) REFERENCES memory_user_observed_patterns(id) ON DELETE CASCADE,
+                FOREIGN KEY(occurrence_group_id) REFERENCES memory_fact_user_action_signals(signal_id) ON DELETE CASCADE
             );
 
             CREATE TABLE IF NOT EXISTS memory_user_states (
@@ -631,6 +660,10 @@ class SessionDB:
             ON memory_topic_items(topic_kind, last_seen_at DESC);
             CREATE INDEX IF NOT EXISTS idx_memory_user_claims_subject
             ON memory_user_claims(subject_entity_id, claim_type, claim_origin, status);
+            CREATE INDEX IF NOT EXISTS idx_memory_user_observed_patterns_subject
+            ON memory_user_observed_patterns(subject_entity_id, primary_domain, updated_at);
+            CREATE INDEX IF NOT EXISTS idx_memory_user_observed_pattern_occurrences_group
+            ON memory_user_observed_pattern_occurrences(occurrence_group_id, pattern_id);
             CREATE INDEX IF NOT EXISTS idx_memory_owner_entity_aliases_name
             ON memory_owner_entity_aliases(alias_key, status);
             CREATE INDEX IF NOT EXISTS idx_memory_user_claim_evidence_claim
@@ -645,6 +678,13 @@ class SessionDB:
             );
             CREATE INDEX IF NOT EXISTS idx_memory_fact_user_action_signals_subject_time
             ON memory_fact_user_action_signals(subject_entity_id, event_time_key, fact_id);
+            CREATE INDEX IF NOT EXISTS idx_memory_fact_user_action_signals_occurrence
+            ON memory_fact_user_action_signals(
+                subject_entity_id, occurrence_key, action_kind,
+                time_precision, independence_status
+            );
+            CREATE INDEX IF NOT EXISTS idx_memory_fact_user_action_signals_group
+            ON memory_fact_user_action_signals(occurrence_group_id, signal_id);
             CREATE INDEX IF NOT EXISTS idx_memory_fact_user_intent_signals_group
             ON memory_fact_user_intent_signals(
                 subject_entity_id, user_intent_anchor_key, evidence_kind, fact_id
@@ -1423,13 +1463,14 @@ class SessionDB:
                 """
                 INSERT INTO memory_fact_user_action_signals (
                     fact_id, signal_key, subject_entity_id, action_kind,
-                    action_text, event_time_key, owner_evidence_type,
+                    action_text, event_time_key, location, owner_evidence_type,
                     owner_evidence_text, other_evidence_text, evidence_basis,
                     confidence, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(fact_id, signal_key) DO UPDATE SET
                     action_text = excluded.action_text,
                     event_time_key = excluded.event_time_key,
+                    location = excluded.location,
                     owner_evidence_type = excluded.owner_evidence_type,
                     owner_evidence_text = excluded.owner_evidence_text,
                     other_evidence_text = excluded.other_evidence_text,
@@ -1441,6 +1482,7 @@ class SessionDB:
                     int(signal["fact_id"]), str(signal["signal_key"]),
                     int(signal["subject_entity_id"]), str(signal["action_kind"]),
                     str(signal["action_text"]), str(signal.get("event_time_key") or ""),
+                    str(signal.get("location") or ""),
                     str(signal["owner_evidence_type"]),
                     str(signal.get("owner_evidence_text") or ""),
                     str(signal.get("other_evidence_text") or ""),
@@ -1462,6 +1504,58 @@ class SessionDB:
             (int(fact_id),),
         ).fetchall()
         return [self._row_to_dict(row) for row in rows]
+
+    def get_grouped_user_action_signals(
+        self, *, subject_entity_id: int, action_kind: str, limit: int = 256,
+    ) -> List[Dict[str, Any]]:
+        """Read countable historical action evidence for observed patterns."""
+        rows = self._conn.execute(
+            "SELECT * FROM memory_fact_user_action_signals "
+            "WHERE subject_entity_id = ? AND action_kind = ? "
+            "AND independence_status = 'countable' "
+            "AND occurrence_group_id IS NOT NULL "
+            "ORDER BY signal_id DESC LIMIT ?",
+            (int(subject_entity_id), str(action_kind), max(1, int(limit))),
+        ).fetchall()
+        return [self._row_to_dict(row) for row in rows]
+
+    def get_user_action_occurrence_candidates(
+        self, *, subject_entity_id: int, occurrence_key: str, action_kind: str,
+        time_precision: str, independence_status: str,
+        fact_id: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Read previously grouped signals in the same occurrence window."""
+        same_fact_clause = "AND fact_id = ?" if fact_id is not None else ""
+        params: Tuple[Any, ...] = (
+            int(subject_entity_id), str(occurrence_key), str(action_kind),
+            str(time_precision), str(independence_status),
+        )
+        if fact_id is not None:
+            params += (int(fact_id),)
+        rows = self._conn.execute(
+            "SELECT * FROM memory_fact_user_action_signals "
+            "WHERE subject_entity_id = ? AND occurrence_key = ? "
+            "AND action_kind = ? AND time_precision = ? "
+            f"AND independence_status = ? AND occurrence_group_id IS NOT NULL {same_fact_clause} "
+            "ORDER BY signal_id", params,
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def assign_user_action_occurrence_group(
+        self, *, signal_id: int, occurrence_group_id: int,
+        occurrence_key: str, time_precision: str, independence_status: str,
+    ) -> None:
+        self._conn.execute(
+            "UPDATE memory_fact_user_action_signals SET occurrence_group_id = ?, "
+            "occurrence_key = ?, time_precision = ?, independence_status = ?, "
+            "updated_at = ? WHERE signal_id = ? AND occurrence_group_id IS NULL",
+            (
+                int(occurrence_group_id), str(occurrence_key),
+                str(time_precision), str(independence_status),
+                local_now_text(), int(signal_id),
+            ),
+        )
+        self._commit_if_needed()
 
     def upsert_fact_user_claim_signal_mappings(
         self,
@@ -1530,33 +1624,6 @@ class SessionDB:
         self._commit_if_needed()
         return changed
 
-    def memory_facts_for_user_claim_signal_group(
-        self,
-        *,
-        subject_entity_id: int,
-        claim_type_hint: str,
-        claim_anchor_key: str,
-        limit: int = 64,
-    ) -> List[Dict[str, Any]]:
-        """Load bounded historical facts for one exact induction group."""
-        rows = self._conn.execute(
-            """
-            SELECT fact.*
-            FROM memory_fact_user_claim_signals AS signal
-            JOIN memory_facts AS fact ON fact.id = signal.fact_id
-            WHERE signal.subject_entity_id = ?
-              AND signal.claim_type_hint = ?
-              AND signal.claim_anchor_key = ?
-            ORDER BY fact.dialogue_time_key DESC, fact.id DESC
-            LIMIT ?
-            """,
-            (
-                int(subject_entity_id), str(claim_type_hint or ""),
-                str(claim_anchor_key or ""), max(1, int(limit or 64)),
-            ),
-        ).fetchall()
-        return [self._row_to_dict(row) for row in rows]
-
     def get_fact_user_claim_signal_mappings(
         self,
         fact_id: int,
@@ -1618,7 +1685,10 @@ class SessionDB:
                 or user_role not in {"owner", "participant", "responsible"}
                 or not user_intent_anchor
                 or not user_intent_anchor_key
-                or assertion_source not in {"self_statement", "third_party_report", "observed_event"}
+                or assertion_source not in {
+                    "self_statement", "confirmed_response", "third_party_report",
+                    "observed_event",
+                }
                 or explicitness not in {"direct", "reported", "tentative"}
             ):
                 continue
@@ -1712,6 +1782,9 @@ class SessionDB:
         now = local_now_text()
         object_id = int(object_entity_id or 0)
         subject_id = int(subject_entity_id)
+        origin = str(claim_origin or "").strip().lower()
+        if origin not in {"explicit", "derived"}:
+            raise ValueError("claim_origin must be explicit or derived")
         predicate = str(predicate or "").strip()
         claim_text = re.sub(r"\s+", " ", str(claim_text or "")).strip()
         existing = self._conn.execute(
@@ -1720,7 +1793,7 @@ class SessionDB:
             WHERE subject_entity_id = ? AND predicate = ? AND object_entity_id = ?
               AND claim_text = ? AND claim_type = ? AND claim_origin = ?
             """,
-            (subject_id, predicate, object_id, claim_text, claim_type, claim_origin),
+            (subject_id, predicate, object_id, claim_text, claim_type, origin),
         ).fetchone()
         if existing:
             claim_id = int(existing["id"])
@@ -1752,13 +1825,101 @@ class SessionDB:
             """,
             (
                 subject_id, predicate, object_id, claim_text,
-                claim_type, claim_origin, str(primary_domain or ""), status, float(confidence or 0.0),
+                claim_type, origin, str(primary_domain or ""), status, float(confidence or 0.0),
                 valid_from, valid_to, source_actor_entity_id, extractor_version,
                 prompt_version, _json_dumps(metadata or {}), now, now,
             ),
         )
         self._commit_if_needed()
         return int(cur.lastrowid), True
+
+    def upsert_user_observed_pattern(
+        self, *, subject_entity_id: int, pattern_key: str, pattern_text: str,
+        condition_text: str = "", primary_domain: str = "",
+        confidence: float = 0.7, metadata: Optional[Dict[str, Any]] = None,
+    ) -> tuple[int, bool]:
+        """Create or refresh a repeated-behavior pattern for the user."""
+        now = local_now_text()
+        subject_id = int(subject_entity_id)
+        normalized_key = re.sub(r"\s+", " ", str(pattern_key or "")).strip().lower()
+        text = re.sub(r"\s+", " ", str(pattern_text or "")).strip()
+        if not normalized_key or not text:
+            raise ValueError("pattern_key and pattern_text are required")
+        existing = self._conn.execute(
+            "SELECT id, confidence, metadata FROM memory_user_observed_patterns "
+            "WHERE subject_entity_id = ? AND pattern_key = ?",
+            (subject_id, normalized_key),
+        ).fetchone()
+        merged_metadata = dict(_json_loads(existing["metadata"], {}) or {}) if existing else {}
+        merged_metadata.update(metadata or {})
+        if existing:
+            pattern_id = int(existing["id"])
+            self._conn.execute(
+                "UPDATE memory_user_observed_patterns SET pattern_text = ?, "
+                "condition_text = ?, primary_domain = ?, confidence = ?, "
+                "metadata = ?, updated_at = ? WHERE id = ?",
+                (
+                    text, str(condition_text or ""), str(primary_domain or ""),
+                    max(float(existing["confidence"] or 0.0), float(confidence or 0.0)),
+                    _json_dumps(merged_metadata), now, pattern_id,
+                ),
+            )
+            self._commit_if_needed()
+            return pattern_id, False
+        cur = self._conn.execute(
+            "INSERT INTO memory_user_observed_patterns ("
+            "subject_entity_id, pattern_key, pattern_text, condition_text, "
+            "primary_domain, confidence, metadata, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                subject_id, normalized_key, text, str(condition_text or ""),
+                str(primary_domain or ""), float(confidence or 0.0),
+                _json_dumps(merged_metadata), now, now,
+            ),
+        )
+        self._commit_if_needed()
+        return int(cur.lastrowid), True
+
+    def upsert_user_observed_pattern_occurrences(
+        self, *, pattern_id: int, occurrence_group_ids: Sequence[int],
+    ) -> int:
+        """Attach supporting occurrence groups to an observed pattern."""
+        now = local_now_text()
+        changed = 0
+        for group_id in sorted({int(value) for value in occurrence_group_ids if int(value) > 0}):
+            self._conn.execute(
+                "INSERT OR IGNORE INTO memory_user_observed_pattern_occurrences "
+                "(pattern_id, occurrence_group_id, created_at) VALUES (?, ?, ?)",
+                (int(pattern_id), group_id, now),
+            )
+            changed += int(self._conn.execute("SELECT changes()").fetchone()[0] > 0)
+        self._commit_if_needed()
+        return changed
+
+    def get_user_observed_patterns(
+        self, *, subject_entity_id: Optional[int] = None, limit: int = 200,
+    ) -> List[Dict[str, Any]]:
+        """Read observed patterns together with their supporting occurrences."""
+        where = " WHERE subject_entity_id = ?" if subject_entity_id is not None else ""
+        params: Tuple[Any, ...] = (
+            (int(subject_entity_id), max(1, int(limit)))
+            if subject_entity_id is not None else (max(1, int(limit)),)
+        )
+        rows = self._conn.execute(
+            "SELECT * FROM memory_user_observed_patterns" + where
+            + " ORDER BY updated_at DESC, id DESC LIMIT ?", params,
+        ).fetchall()
+        patterns = [self._row_to_dict(row) for row in rows]
+        for pattern in patterns:
+            evidence = self._conn.execute(
+                "SELECT occurrence_group_id FROM memory_user_observed_pattern_occurrences "
+                "WHERE pattern_id = ? ORDER BY occurrence_group_id",
+                (int(pattern["id"]),),
+            ).fetchall()
+            pattern["support_occurrence_group_ids"] = [
+                int(row["occurrence_group_id"]) for row in evidence
+            ]
+        return patterns
 
     def record_user_claim_relation(
         self,

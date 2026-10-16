@@ -164,21 +164,20 @@ Rules:
 13. Return JSON only. No markdown.
 
 user_claim_signals rules:
-- `user_claim_signals` are evidence-routing hints only for explicit user-claim extraction. They are not final claims and must not decide relations to existing claims; they are not used to induce claims from repeated events. Every signal must concern user self as its subject; claims about other people, organizations, product users, or ambient speakers must not be routed here.
-- Emit a signal only when this fact's entities contain user self and either (1) `speaker_用户本人` directly states the proposition, (2) the wearer clearly confirms or corrects another speaker's specific proposition, or (3) a third party explicitly describes the wearer through a confirmed alias. The third case is a `third_party_report`, not a wearer assertion; a namesake, unrelated wearer utterance, or vague acknowledgment is insufficient.
+- `user_claim_signals` are evidence-routing hints only for explicit user-claim extraction. They are not final claims and must not decide relations to existing claims; they are not used to induce claims from repeated events. Claims about other people, organizations, product users, or ambient speakers must not be routed here.
+- Emit a signal only when (1) `speaker_用户本人` directly states the proposition, (2) the wearer clearly confirms or corrects another speaker's specific proposition, or (3) a third party explicitly describes the wearer through a confirmed alias. The third case is a `third_party_report`, not a wearer assertion; a namesake, unrelated wearer utterance, or vague acknowledgment is insufficient.
 - `owner_evidence_type` is `self_statement|confirmed_response|third_party_report`. The first two require an exact wearer quote in `owner_evidence_text`; the response case also requires an earlier other-speaker quote. A third-party report has empty `owner_evidence_text` and an exact other-speaker quote containing the confirmed alias in `other_evidence_text`. Never invent quotes or quote preceding context.
 - `subject_entity` must always be `user self`, never the other end of a relationship. A relationship involving user self may be signalled; its other person, organization, or project remains a fact entity and may later be the claim's object_entity.
 - Emit `user_claim_signals` only when this fact explicitly states or clearly confirms a proposition about user self; do not place observations intended for cross-event induction here. A specific standalone action belongs in `user_action_signals`, not duplicated as a user-claim signal.
 - `claim_type_hint` must be one of: identity_profile, affiliation, relationship, preference, constraint, behavior_pattern. Use `behavior_pattern` only when the wearer explicitly states or confirms a routine or regular behavior, such as "I run every Wednesday"; never infer it from a sequence of separate observed actions.
 - `claim_anchor` is a short label identifying the subject of an explicit claim, such as "quiet travel preference" or "Wednesday running routine". It is not a key for accumulating behavioral samples, a full sentence, or the final user_claim.
 - Output signals only when this fact has concrete evidence for an explicit claim about user self. Use an empty array for one-off background, claims about third parties themselves, temporary suggestions, assistant speculation, patterns inferred only from repeated actions, pleasantries, and low-value content.
-- Each signal's `subject_entity` must identify user self in the same fact's `entities`; omit the signal when that fact does not list user self. Do not add, rewrite, or guess an entity that is not listed by the fact.
 - Signal-to-fact grounding is mandatory: the signal's subject, proposition, and necessary qualifiers must be fully supported by the same fact's `text`. A response-based signal must preserve both the earlier statement and wearer response there. Do not borrow information omitted from this fact from another fact or preceding context. `evidence_basis` must explain how the wearer's utterance supports the final proposition; otherwise omit the signal.
 - Return at most 3 signals per fact. Every signal must contain subject_entity, claim_type_hint, claim_anchor, owner_evidence_type, owner_evidence_text, other_evidence_text, evidence_basis, and confidence.
 
 user_action_signals rules:
-- `user_action_signals` identify a specific completed or ongoing action, real choice, or substantive participation by user self in this fact. They are not habits, preferences, or inductive conclusions. Discussing an activity is not performing it; the separate user_activity module summarizes the capture-window situation.
-- `subject_entity` is always `user self` and must be in this fact's `entities`. The fact's `primary_entity` need not be user self. Never substitute a product user, another person, or an unverified ambient speaker for the wearer.
+- `user_action_signals` identify a specific completed or ongoing action, real choice, or substantive participation by user self in this fact. They are not habits, preferences, or observed patterns. Discussing an activity is not performing it; the separate user_activity module summarizes the capture-window situation.
+- `subject_entity` is always `user self` and must be in this fact's `entities`. Never substitute a product user, another person, or an unverified ambient speaker for the wearer.
 - `action_kind` is `action|choice|participation`: concrete performance, a choice among real options, or actual participation in a meeting/activity. `action_text` must specify what the wearer did and any supported time/object; this same fact's `text` must directly support it. Do not borrow content from other facts, preceding context, or general knowledge.
 - A wearer report of a past action, a clear confirmation that the wearer did something, or a third-party report of a completed wearer action through a confirmed alias may qualify. Use `owner_evidence_type=self_statement|confirmed_response|third_party_report` and the same exact-quote rules as user_claim_signals. Do not turn a third-party report into a wearer assertion.
 - Return an empty array for future plans, suggestions, hypotheticals, merely asking or discussing, and assistant/third-party actions. "I run every Wednesday" is a reported routine, not multiple observed actions; emit a signal only if the text separately establishes a specific occurrence. Ordinary wearer–assistant conversation itself is not an action signal.
@@ -188,13 +187,13 @@ user_intent_signals rules:
 - `user_intent_signals` are structured hints that this fact is evidence about the wearer's future world. They are not final goals, plans, or work items, and must not directly create, update, or override an existing object.
 - Record only user self's future-facing information: `subject_entity` must always be exactly `user self` (use `用户本人` in Chinese output). Never use another person, team, organization, product user, or ambient-recording speaker as the subject.
 - Output a signal when the wearer directly expresses or clearly confirms a future goal, arrangement, responsibility, or lifecycle change. A third party may also explicitly report an arrangement or responsibility concerning the wearer through a confirmed alias; mark this `third_party_report` and never turn an assignment, guess, or suggestion into the wearer's own commitment. Preserve speaker attribution in this fact.
-- `owner_evidence_type` is `self_statement|confirmed_response|third_party_report`. The first two require an exact wearer quote in `owner_evidence_text`; response-based signals also need an earlier other-speaker quote. Third-party reports have empty `owner_evidence_text` and an exact quote containing the confirmed alias in `other_evidence_text`.
+- `assertion_source` also identifies the evidence source: `self_statement|confirmed_response|third_party_report|observed_event`. Wearer statements and confirmations require an exact wearer quote in `owner_evidence_text`; confirmations also need the earlier other-speaker quote. Third-party reports have empty `owner_evidence_text` and an exact quote containing the confirmed alias in `other_evidence_text`. Use `observed_event` only for an objective event explicitly recorded in the same fact, with both quote fields empty.
 - `evidence_kind` must be one of goal, plan, responsibility, or lifecycle_update. `candidate_object_types` may contain only goal, plan, and work_item. A third-party report about a goal or responsibility is only a hint, not proof that the wearer set the goal or accepted a commitment.
 - `user_role` must be owner, participant, or responsible: user self respectively owns the goal, participates in the arrangement, or bears the responsibility. Do not output a signal for a product user, customer, consumer, or an ambient speaker merely mentioned in the evidence.
-- `assertion_source` must be self_statement, third_party_report, or observed_event; `explicitness` must be direct, reported, or tentative. For a third-party report use `assertion_source=third_party_report` and `explicitness=reported`. When the wearer accepts another person's proposal, use self_statement. Assistant suggestions, open hypotheticals, and speculation do not themselves create signals.
+- `explicitness` must be direct, reported, or tentative. For a third-party report use `assertion_source=third_party_report` and `explicitness=reported`. When the wearer accepts another person's proposal, use `assertion_source=confirmed_response`. Assistant suggestions, open hypotheticals, and speculation do not themselves create signals.
 - `user_intent_anchor` is a short, stable grouping label for the goal, event, or responsibility, such as "Tianjin client meeting", "half-marathon training goal", or "client report delivery". It is not a full sentence or the final object description.
 - Signal-to-fact grounding is mandatory: the future goal, arrangement, responsibility, or lifecycle change itself must be explicitly retained in the same fact's `text`. Do not attach information found elsewhere in the raw unit batch to a fact that does not preserve it; output an empty array when the fact text cannot independently support the signal.
-- Return at most 2 signals per fact. Every signal must include subject_entity, evidence_kind, candidate_object_types, user_role, user_intent_anchor, assertion_source, explicitness, owner_evidence_type, owner_evidence_text, other_evidence_text, evidence_basis, and confidence. evidence_basis must be concrete evidence directly locatable in this fact's `text`.
+- Return at most 2 signals per fact. Every signal must include subject_entity, evidence_kind, candidate_object_types, user_role, user_intent_anchor, assertion_source, explicitness, owner_evidence_text, other_evidence_text, evidence_basis, and confidence. evidence_basis must be concrete evidence directly locatable in this fact's `text`.
 
 Output schema:
 {
@@ -248,9 +247,8 @@ Output schema:
           "candidate_object_types": ["goal|plan|work_item"],
           "user_role": "owner|participant|responsible",
           "user_intent_anchor": "a stable label for grouping the goal, arrangement, or responsibility",
-          "assertion_source": "self_statement|third_party_report|observed_event",
+          "assertion_source": "self_statement|confirmed_response|third_party_report|observed_event",
           "explicitness": "direct|reported|tentative",
-          "owner_evidence_type": "self_statement|confirmed_response|third_party_report",
           "owner_evidence_text": "exact wearer quote for self/response; empty for third-party report",
           "other_evidence_text": "exact other-speaker quote for response/report; otherwise empty",
           "evidence_basis": "concrete evidence from this fact supporting the signal",
@@ -352,12 +350,12 @@ The input contains stored, traceable narrative facts. Each fact may include zero
 
 The system assigns `claim_origin=explicit` to claims from this process; do not include that field in the output.
 
-`user_claim` is a durable proposition about user self that remains traceable to facts; it is not a retelling of a one-time event and does not replace the underlying evidence. Every claim's `subject_entity` must be the non-empty `world_owner_entity` explicitly marked in its evidence fact (user self). Never create a user_claim whose subject is another person, organization, product user, or ambient speaker. Other entities may be the `object_entity` of a relation involving user self. If no evidence fact explicitly identifies `world_owner_entity`, return no claim. Allowed explicit claim_type values are identity_profile, affiliation, relationship, preference, and constraint. Behavioral regularities (`behavior_pattern`) are not extracted by this prompt; they are handled by induction.
+`user_claim` is a durable proposition about user self that remains traceable to facts; it is not a retelling of a one-time event and does not replace the underlying evidence. Every claim's `subject_entity` must be the non-empty `world_owner_entity` explicitly marked in its evidence fact (user self). Never create a user_claim whose subject is another person, organization, product user, or ambient speaker. Other entities may be the `object_entity` of a relation involving user self. If no evidence fact explicitly identifies `world_owner_entity`, return no claim. Allowed explicit claim_type values are identity_profile, affiliation, relationship, preference, constraint, and behavior_pattern. Use behavior_pattern only for a continuing behavior, habit, or routine explicitly stated or confirmed by the wearer, such as "I run every Wednesday". Do not infer a pattern from observed actions; cross-event patterns are stored separately as `user_observed_pattern`.
 
 Rules:
 1. subject_entity must exactly equal `world_owner_entity` on every cited evidence fact; never use a third party as subject. Any object_entity must occur in input fact entities.
 2. evidence_fact_ids must cite only input fact IDs and each claim needs direct evidence.
-3. Use concise stable lowercase predicates, such as has_role, works_with, member_of, located_in, prefers, dislikes, requires, cannot, has_constraint.
+3. Use concise stable lowercase predicates, such as has_role, works_with, member_of, located_in, prefers, dislikes, requires, cannot, has_constraint, usually_does, and has_routine.
 4. Use object_entity for relational claims. For non-relational claims, express the attribute, value, and relevant qualification completely in claim_text.
 5. claim_text is a complete, self-contained, reader-facing proposition with its subject, predicate, and value.
 6. Encode negation in predicate and claim_text, such as dislikes, cannot, or is_not_member_of; do not output a standalone positive/negative field. Return no claim without direct evidence.
@@ -368,7 +366,7 @@ Output:
 {
   "claims": [{
     "subject_entity": "",
-    "claim_type": "identity_profile|affiliation|relationship|preference|constraint",
+    "claim_type": "identity_profile|affiliation|relationship|preference|constraint|behavior_pattern",
     "primary_domain": "general|health|work|life|information|finance|family|learning|social|interest|travel",
     "predicate": "",
     "object_entity": "",
@@ -385,40 +383,38 @@ facts:
 """
 
 
-INDUCTIVE_USER_CLAIM_EXTRACTION_PROMPT_EN = """You conservatively extract inductive user_claims about user self for a personal world model.
+USER_OBSERVED_PATTERN_EXTRACTION_PROMPT_EN = """You conservatively extract user_observed_patterns about the user for a personal world model.
 
-Input facts are traceable observations for one entity and one claim_anchor, drawn from different time windows. The claim_anchor only gathers candidate evidence; it is not a conclusion. Decide whether the evidence supports a pattern; do not summarize facts.
+Input is a set of user actions already grouped by real-world occurrence. Each occurrence has one representative signal; several facts about one occurrence do not count as repeated behavior. Infer whether independent occurrences support a behavioral pattern, including its demonstrated conditions.
 
-An inductive user_claim expresses a preference or behavioral pattern supported by repeated evidence across facts and time windows. Only preference and behavior_pattern claims are allowed; the system sets `claim_origin` to `inductive`. It is not a one-time event fact and does not replace its supporting facts.
+A user_observed_pattern describes a behavioral pattern observed across independent actions. It is not an explicit claim by the user and does not imply that the user endorses the pattern. A habit explicitly stated by the user belongs in explicit user_claims.
 
 Hard rules:
-1. A claim requires at least three distinct support_fact_ids, and every cited ID must directly support the proposed pattern.
+1. A pattern requires at least three distinct support_occurrence_group_ids, each directly supporting it, including at least one new_occurrence_group_id.
 2. A single statement, event, plan, task, or assistant recommendation is not a pattern.
-3. Do not turn an isolated behavior into a preference. Cite only facts that directly support the proposed pattern in support_fact_ids; other facts need not be labeled as counterexamples.
-4. subject_entity must equal the given user-self subject and `world_owner_entity`; never produce a pattern about another entity. predicate is one of prefers, dislikes, usually_does, avoids, has_routine.
-5. claim_text is a complete reader-facing pattern proposition with its subject, property, and value.
+3. Do not infer preferences from isolated behavior or use transcript time as event time.
+4. subject_entity must equal the given user-self subject and `world_owner_entity`.
+5. pattern_text is a complete reader-facing behavioral pattern description with its subject.
 6. `primary_domain` must be one of `general|health|work|life|information|finance|family|learning|social|interest|travel`; choose the most specific user-life domain, and use `general` only for genuinely cross-domain patterns.
-7. Evidence IDs must be input IDs. An empty list is correct. Return JSON only.
+7. Day-of-week, time-of-day, place, and other conditions require support from several independent occurrences. Evidence IDs must be input IDs. An empty list is correct. Return JSON only.
 
 Output:
 {
-  "claims": [{
+  "patterns": [{
     "subject_entity": "",
-    "claim_type": "preference|behavior_pattern",
     "primary_domain": "general|health|work|life|information|finance|family|learning|social|interest|travel",
-    "predicate": "prefers|dislikes|usually_does|avoids|has_routine",
-    "claim_text": "complete pattern proposition with subject and meaning",
+    "pattern_text": "complete behavioral pattern description with its subject",
     "condition_text": "",
-    "support_fact_ids": [1, 2, 3],
+    "support_occurrence_group_ids": [1, 2, 3],
     "confidence": 0.8
   }]
 }
 
-candidate entity and claim grouping hint:
-{induction_target}
+Pattern extraction target and new occurrences:
+{pattern_target}
 
-evidence facts:
-{facts}
+Independent action occurrences:
+{action_occurrences}
 """
 
 
@@ -505,7 +501,7 @@ Reason in this order, then return one joint result:
 1. Independently assess new states. Read every changed claim and combine evidence concerning the same state dimension. Ask whether it supports a durable preference, stable constraint, or behavioral pattern useful for future prediction or service decisions. Do this even when existing_states=[] and relation_events=[]; emit create when evidence suffices rather than returning empty operations automatically. One direct, unambiguous explicit claim with durable meaning may establish an enduring_state, such as "I have always preferred morning meetings" establishing a time preference; multiple claims are not mandatory. Related concrete preferences may be aggregated, but do not mix unrelated subjects merely to create an aggregate. State text should express a reusable judgment, not paste or closely paraphrase claims.
 2. Distinguish durable tendencies from repetition. enduring_state covers preferences, styles, values, or constraints that broadly persist across time or situations. An explicit stable preference is not a one-off event merely because it was said once. recurring_state requires an explicitly stated habit/rule or multiple observations supporting periodic, frequent, repeated, or conditional behavior. Liking an activity, planning it once, or remembering an experience does not prove repetition. A one-time goal, plan, trip, recent emotion, or concern about ability does not automatically become a durable state. Create only enduring_state or recurring_state from claims, not situational_state.
 3. Align with existing states. If an existing state in the same domain, class, and key already expresses the conclusion, reinforce or revise it rather than creating a duplicate. If new evidence challenges a state, examine all state_claim_evidence and supporting_claims before weakening, expiring, or partially revising it. Losing one support claim does not necessarily invalidate the state. Do not abandon a justified create decision merely because no old state is affected.
-4. Decide old-claim status. Only a contradicts or supersedes event with an old target claim and a changed trigger claim may justify an old-claim update. The relation alone is not a status decision: consider text, origin (explicit is usually more direct than inductive or derived), time, and conditions. Contradicts may at most weaken; only an unambiguous supersedes may supersede. Claims valid under different conditions or times may coexist. Do not alter changed claims or invalidate an old claim merely because an aggregate state fails. If there is no eligible relation, claim_updates=[]; this does not prevent state operations.
+4. Decide old-claim status. Only a contradicts or supersedes event with an old target claim and a changed trigger claim may justify an old-claim update. The relation alone is not a status decision: consider text, origin (explicit is usually more direct than derived), time, and conditions. Contradicts may at most weaken; only an unambiguous supersedes may supersede. Claims valid under different conditions or times may coexist. Do not alter changed claims or invalidate an old claim merely because an aggregate state fails. If there is no eligible relation, claim_updates=[]; this does not prevent state operations.
 5. Check joint consistency. A claim proposed as superseded cannot remain effective support for a state. Omit individual state candidates lacking evidence, but do not discard other supported states in the same update.
 
 State operations are create|reinforce|revise|weaken|expire. Existing-state updates must use its id; create uses target_state_id=0. Controlled enduring_state keys: communication_style|decision_style|value_priority|risk_preference|privacy_preference|time_preference|work_style|lifestyle_preference|long_term_constraint. Controlled recurring_state keys: daily_routine|weekly_routine|work_routine|health_routine|social_routine|conditional_behavior. Preserve an existing state's class and key; stay within state_domain.
@@ -597,7 +593,7 @@ Understand the memory structure before analyzing the query.
 
 Memory structure:
 1. `fact`: traceable, self-contained narrative evidence extracted from dialogue or ambient transcripts. It preserves what happened, participants, time, place or scene, reasons, viewpoint changes, suggestions, acceptance or rejection, constraints, conclusions, and unresolved questions. Facts usually include `summary`, `keywords`, `entities`, `fact_topic`, `event_time_key`, and `dialogue_time_key`.
-2. `user_claim`: a durable proposition about user self with status, confidence, validity time, and traceable supporting facts. Its origin is explicit (directly stated or confirmed by reliable records), inductive (a preference or behavior pattern inferred across facts and time windows), or derived (logically entailed by existing claims). Relation objects may be other entities. It does not replace one-time event facts.
+2. `user_claim`: a durable proposition about user self with status, confidence, validity time, and traceable supporting facts. Its origin is explicit (directly stated or confirmed by reliable records) or derived (logically entailed by existing claims). Repeated behavior observations are stored separately as `user_observed_pattern`. Relation objects may be other entities. Claims do not replace one-time event facts.
 3. `goal`, `plan`, and `work_item`: future-oriented objects extracted from facts, respectively representing a desired outcome, an explicit arrangement, and a closed-loop responsibility. Their status and target/start/due times are meaningful.
 
 Guidance:

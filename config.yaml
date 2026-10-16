@@ -195,6 +195,12 @@ memory_runtime:
     user_intent_min_signal_facts: 5
     interaction_user_intent_min_signal_batches: 3
     interaction_user_intent_min_signal_facts: 3
+    # Action signals are grouped into independent occurrences only when this
+    # separate observed-pattern follow-up task runs.
+    user_action_min_signal_batches: 4
+    user_action_min_signal_facts: 8
+    interaction_user_action_min_signal_batches: 3
+    interaction_user_action_min_signal_facts: 5
     # Claim-to-state projection is evaluated every 30 minutes. Distinct changed
     # claims carry over between windows; low-volume changes flush after 2 hours.
     user_state_claim_window_seconds: 1800
@@ -206,6 +212,7 @@ memory_runtime:
 memory_manager:
   memory_enabled: true
   enable_memory_user_claim_update: true
+  enable_memory_user_observed_pattern_update: true
   enable_memory_user_intent_update: true
   enable_memory_user_state_update: true
   llm:
@@ -230,15 +237,16 @@ memory_manager:
   task_queue_maxsize: 100
 
   user_claim_limit: 100
+  user_observed_pattern_limit: 100
   user_intent_limit: 100
   user_intent_signal_batch_size: 8
   user_state_update_limit: 80
   user_claim_explicit_min_confidence: 0.72
   user_claim_derived_min_confidence: 0.75
   user_claim_signal_max_per_fact: 3
-  user_claim_induction_min_support_facts: 3
-  user_claim_induction_min_time_windows: 2
-  user_claim_induction_evidence_limit: 16
+  user_observed_pattern_min_occurrences: 3
+  user_observed_pattern_min_time_windows: 2
+  user_observed_pattern_occurrence_limit: 16
   
   recall:  
     recall_top_k: 8

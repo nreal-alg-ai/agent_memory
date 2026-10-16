@@ -168,8 +168,8 @@ fact_type 判别规则：
 11. 只返回 JSON，不要 markdown。
 
 user_claim_signals 输出规则：
-- `user_claim_signals` 只为后续的显式 user_claim 提炼提供证据路由提示，不是最终 claim，也不能直接决定与已有 claim 的关系；它不用于归纳/inductive claim。所有 signal 的主体必须是“用户本人”；其他人、组织、产品用户或环境录音 speaker 的主张不能进入该字段。
-- 仅当 fact 的 entities 包含“用户本人”，且存在以下证据之一时输出：① `speaker_用户本人` 直接陈述；② 其他人先提出明确主张，用户本人随后明确确认或纠正；③ 第三方明确谈到已确认别名所指向的佩戴者。第三种只能作为 `third_party_report` 证据，不能冒充用户本人自述；同名对象、模糊应声或礼貌回应不能生成 signal。
+- `user_claim_signals` 只为后续的显式 user_claim 提炼提供证据路由提示，不是最终 claim，也不能直接决定与已有 claim 的关系；它不用于生成 `user_observed_pattern`。其他人、组织、产品用户或环境录音 speaker 的主张不能进入该字段。
+- 仅当存在以下证据之一时输出：① `speaker_用户本人` 直接陈述；② 其他人先提出明确主张，用户本人随后明确确认或纠正；③ 第三方明确谈到已确认别名所指向的佩戴者。第三种只能作为 `third_party_report` 证据，不能冒充用户本人自述；同名对象、模糊应声或礼貌回应不能生成 signal。
 - 第二种情形必须在同一条 fact 的 `text` 中写清其他人提出了什么、用户如何回应以及最终由用户确认或纠正的具体内容；signal 只表达用户最终认可或修正后的主张，不照搬对方未获确认的说法。
 - `owner_evidence_type` 为 `self_statement|confirmed_response|third_party_report`。前两种在 `owner_evidence_text` 中逐字摘取用户本人原话；回应型还须在 `other_evidence_text` 中摘取先前对方原话。第三方报告将 `owner_evidence_text` 置空，`other_evidence_text` 填包含已确认别名的第三方原话。不要引用前置上下文或编造原话。
 - `subject_entity` 必须固定填写“用户本人”，不得填写关系对象。用户与他人、组织或项目之间的关系仍可作为用户本人的关系主张；关系另一端应在 fact/entities 及后续 claim 的 object_entity 中表达。
@@ -177,13 +177,12 @@ user_claim_signals 输出规则：
 - `claim_type_hint` 只能是 identity_profile、affiliation、relationship、preference、constraint、behavior_pattern。`behavior_pattern` 仅用于用户本人明确自述或确认的规律/惯例，例如“我每周三都跑步”；不得从几次离散行为观察中推断。
 - `claim_anchor` 是供显式 claim 提炼识别主张主题的简短标签，例如“安静旅行偏好”“每周三跑步惯例”。它不是用于累积行为样本的分组键，也不是完整句子或最终 user_claim。
 - 只有当前 fact 对用户本人的明确主张有实际证据价值时才输出。普通一次性背景、关于第三方自身的主张、临时建议、助手猜测、仅由行为重复推断出的规律、寒暄和低价值信息输出空数组。
-- 每个 signal 的 `subject_entity` 必须与同一 fact 的 `entities` 中“用户本人”一致；fact 未将用户本人列为实体时不输出该 signal。不得为 signal 新增、改写或猜测 fact 未列出的实体。
 - 信号与 fact 必须严格一致：signal 的主体、主张及其必要限定信息必须由同一 fact 的 `text` 完整支持。回应型的提议和回应都必须写入该 fact；第三方报告必须保留说话人及被报告内容。不得从其他 fact 或前置上下文借用未写入该 fact 的信息；`evidence_basis` 应写清证据来源。
 - 每条 fact 最多输出 3 个 signal。每个 signal 必须包含 subject_entity、claim_type_hint、claim_anchor、owner_evidence_type、owner_evidence_text、other_evidence_text、evidence_basis、confidence；其中 evidence_basis 必须引用当前 fact `text` 中可直接定位的具体证据。
 
 user_action_signals 输出规则：
 - `user_action_signals` 只提示当前 fact 中用户本人一次具体的已发生或正在发生的行为、选择或实质性参与；不是习惯、偏好或归纳结论。它与本次采集期间“用户与助手交谈”的 user_activity 不同：谈论某项行为不等于执行该行为。
-- `subject_entity` 固定为“用户本人”，且必须出现在同一 fact 的 `entities` 中。`primary_entity` 不必是用户本人；不能把产品用户、其他人或未经确认的环境录音 speaker 当作本人。
+- `subject_entity` 固定为“用户本人”，且必须出现在同一 fact 的 `entities` 中；不能把产品用户、其他人或未经确认的环境录音 speaker 当作本人。
 - `action_kind` 只能是 `action|choice|participation`，分别表示具体执行、在真实选项中作出选择、实际参加会议/活动等。`action_text` 应写清具体做了什么及已知时间/对象，且必须由同一 fact 的 `text` 直接支持；不得从别的 fact、前置上下文或常识补全。
 - 用户本人自述已发生行为、明确确认自己做过的行为，或第三方用已确认别名明确报告本人的已发生行为，可以输出。`owner_evidence_type` 使用 `self_statement|confirmed_response|third_party_report`，原话字段与 user_claim_signals 相同；第三方报告不能改写成本人自述。
 - 对未来计划/建议/假设、单纯提问或谈论、助手或第三方自己的行为输出空数组。“我每周三都跑步”是规律自述，不得拆成多次行为；只有文本另外明确描述一次具体发生的跑步时才可为该次事件输出 signal。普通用户—助手对话本身不要输出 action signal。
@@ -193,13 +192,13 @@ user_intent_signals 输出规则：
 - `user_intent_signals` 是当前 fact 对用户未来世界的证据提示，不是最终 goal、plan 或 work_item，也不能直接决定创建、更新或覆盖已有对象。
 - 只记录“用户本人”的未来导向信息：`subject_entity` 必须固定填写“用户本人”（英文输出填写 `user self`），不得填写任何其他人、团队、组织、产品用户或环境录音 speaker。
 - 当用户本人直接表达未来目标、安排、责任或生命周期变化，或明确接受、承诺、确认或修正他人提出的事项时，可输出 signal。第三方明确谈到已确认别名所指向佩戴者的未来安排或责任时，也可输出 `third_party_report` signal，但不得把对方指派、猜测或建议写成用户本人承诺；同一 fact 的 `text` 必须保留说话人与具体内容。
-- `owner_evidence_type` 为 `self_statement|confirmed_response|third_party_report`。前两种在 `owner_evidence_text` 中摘取用户本人原话；回应型还要在 `other_evidence_text` 中摘取先前对方原话。第三方报告的 `owner_evidence_text` 为空，`other_evidence_text` 是包含已确认别名的第三方原话；不得编造用户回应。
+- `assertion_source` 同时标明证据来源：`self_statement|confirmed_response|third_party_report|observed_event`。本人自述与确认回应在 `owner_evidence_text` 中摘取用户本人原话；确认回应还要在 `other_evidence_text` 中摘取先前对方原话。第三方报告的 `owner_evidence_text` 为空，`other_evidence_text` 是包含已确认别名的第三方原话；不得编造用户回应。`observed_event` 仅用于同一 fact 明确记录的客观事件，两项原话字段留空。
 - `evidence_kind` 只能是 `goal`、`plan`、`responsibility`、`lifecycle_update`。`candidate_object_types` 只能包含 goal、plan、work_item；第三方关于目标或责任的报告只是线索，不能单独证明用户已设定目标或承担承诺。
 - `user_role` 只能是 owner、participant、responsible，表示用户本人分别是目标拥有者、安排参与者或责任承担者。产品用户、客户、消费者或环境录音中的未知说话人只是被顺带提及时不得输出 signal。
-- `assertion_source` 只能是 self_statement、third_party_report、observed_event；`explicitness` 只能是 direct、reported、tentative。第三方报告须填 `assertion_source=third_party_report` 与 `explicitness=reported`；对方提出事项而用户明确接受时，来源是用户回应，填写 self_statement。助手建议、开放假设、条件讨论和推测本身不得输出 signal。
+- `explicitness` 只能是 direct、reported、tentative。第三方报告须填 `assertion_source=third_party_report` 与 `explicitness=reported`；对方提出事项而用户明确接受时填写 `assertion_source=confirmed_response`。助手建议、开放假设、条件讨论和推测本身不得输出 signal。
 - `user_intent_anchor` 是简短、稳定的事件/事项/目标聚合标签，例如“天津客户会议”“半马训练目标”“客户报告交付”；它不是完整句子，也不是最终对象描述。
 - 信号与 fact 必须严格一致：future goal、安排、责任或生命周期变化本身必须明确写在同一 fact 的 `text` 中。不得因为原始 unit 批次中存在相关内容，就把它挂到未保留该内容的 fact 上；无法由该 fact `text` 独立支撑时输出空数组。
-- 每条 fact 最多输出 2 个 signal。每个 signal 必须包含 subject_entity、evidence_kind、candidate_object_types、user_role、user_intent_anchor、assertion_source、explicitness、owner_evidence_type、owner_evidence_text、other_evidence_text、evidence_basis、confidence；其中 evidence_basis 必须是当前 fact `text` 中可直接定位的内容。
+- 每条 fact 最多输出 2 个 signal。每个 signal 必须包含 subject_entity、evidence_kind、candidate_object_types、user_role、user_intent_anchor、assertion_source、explicitness、owner_evidence_text、other_evidence_text、evidence_basis、confidence；其中 evidence_basis 必须是当前 fact `text` 中可直接定位的内容。
 
 输出格式：
 {
@@ -255,9 +254,8 @@ user_intent_signals 输出规则：
           "candidate_object_types": ["goal|plan|work_item"],
           "user_role": "owner|participant|responsible",
           "user_intent_anchor": "用于跨 fact 聚合的目标、安排或事项标签",
-          "assertion_source": "self_statement|third_party_report|observed_event",
+          "assertion_source": "self_statement|confirmed_response|third_party_report|observed_event",
           "explicitness": "direct|reported|tentative",
-          "owner_evidence_type": "self_statement|confirmed_response|third_party_report",
           "owner_evidence_text": "本人发言摘取 speaker_用户本人 原话；第三方报告为空",
           "other_evidence_text": "回应型或第三方报告摘取其他说话人原话；直接陈述型为空",
           "evidence_basis": "当前 fact 中支持该 signal 的具体证据",
@@ -395,12 +393,12 @@ EXPLICIT_USER_CLAIM_EXTRACTION_PROMPT_ZH = """你是个人世界模型的显式 
 - relationship：人与人/组织/项目的明确关系；
 - preference：明确喜欢、厌恶、优先选择；
 - constraint：明确限制、禁止、能力边界、持续条件；
-- 行为规律 `behavior_pattern` 不由本 prompt 提炼，只能由后续归纳流程产生。
+- behavior_pattern：用户本人明确自述或确认的持续行为、习惯或惯例，例如“我每周三都跑步”。不得根据观察到的行为自行归纳规律；这种跨事件模式单独保存为 `user_observed_pattern`。
 
 规则：
 1. 每条 claim 的 subject_entity 必须等于其证据 fact 中非空的 `world_owner_entity`；不能把第三方设为 subject。object_entity（如有）必须来自输入 facts 的 entities；不能凭空造实体。
 2. evidence_fact_ids 必须只引用输入 fact_id。每条 claim 至少引用一个直接支持它的 fact。
-3. predicate 使用简短、稳定的小写英文键，例如 has_role、works_with、member_of、located_in、prefers、dislikes、requires、cannot、has_constraint。
+3. predicate 使用简短、稳定的小写英文键，例如 has_role、works_with、member_of、located_in、prefers、dislikes、requires、cannot、has_constraint、usually_does、has_routine。
 4. 关系型主张使用 object_entity；非关系主张的属性、值和限定条件必须完整写入 claim_text。
 5. claim_text 是给人阅读的完整、自包含陈述，必须明确主语、关系/属性和值，例如“用户明确偏好安静、节奏较慢的旅行方式”。
 6. 否定语义必须写入 predicate 与 claim_text，例如 dislikes、cannot、is_not_member_of；不要输出独立的正负字段。没有直接明示时不要输出。
@@ -413,7 +411,7 @@ EXPLICIT_USER_CLAIM_EXTRACTION_PROMPT_ZH = """你是个人世界模型的显式 
   "claims": [
     {
       "subject_entity": "",
-      "claim_type": "identity_profile|affiliation|relationship|preference|constraint",
+      "claim_type": "identity_profile|affiliation|relationship|preference|constraint|behavior_pattern",
       "primary_domain": "general|health|work|life|information|finance|family|learning|social|interest|travel",
       "predicate": "",
       "object_entity": "",
@@ -431,42 +429,40 @@ facts：
 """
 
 
-INDUCTIVE_USER_CLAIM_EXTRACTION_PROMPT_ZH = """你是个人世界模型的归纳型 user_claim 提炼模块。
+USER_OBSERVED_PATTERN_EXTRACTION_PROMPT_ZH = """你是个人世界模型的 user_observed_pattern 提炼模块。
 
-输入是用户本人、同一 claim_anchor 下、来自不同时间窗口的可追溯 facts。claim_anchor 只用于召集候选证据，不是结论；你的任务是保守地判断这些证据是否支持用户本人的一条规律，而不是重新复述 facts。
+输入是用户本人跨时间的行为信号，已按现实中的同一次行为归并为 occurrence。每个 occurrence 只有一条代表信号；相同 occurrence_group_id 的多条 fact 不算多次行为。你需要判断这些独立行为是否支持用户本人的行为规律，并关注“在什么前提或情境下做了这个动作”。
 
-归纳型 user_claim 用于表达跨多个事实和时间窗口反复出现的用户偏好或行为规律。只允许输出 preference 或 behavior_pattern；claim_origin 固定由系统写为 inductive。它不是单次行为事实，也不能代替支撑它的 facts。
+user_observed_pattern 表达从多次独立行为事件中观察到的用户行为模式。它不是用户明确表达的主张，也不代表用户一定认同该模式。用户直接自述的习惯应留在 explicit user_claim 中。
 
 硬规则：
-1. 一条 claim 至少需要 3 个不同的 support_fact_ids，且每个 ID 都必须直接支持当前规律。
+1. 一条 pattern 至少需要 3 个不同的 support_occurrence_group_ids，且每个 ID 都必须直接支持当前模式；必须包含至少一个 new_occurrence_group_ids。
 2. 单次表达、一次事件、计划、任务、助手建议不能归纳为规律。
-3. 不要把偶然行为升级为偏好。只引用直接支持当前规律的 support_fact_ids；其他事实不需要标注为反例。
-4. subject_entity 必须等于输入中的用户本人（world_owner_entity），不得输出关于其他主体的规律。predicate 使用 prefers、dislikes、usually_does、avoids、has_routine 之一。
-5. claim_text 必须是一条带实体主体、属性和值的完整规律陈述；condition_text 为空或简短条件。
+3. 不要把偶然行为升级为偏好；只能从可计数的独立事件归纳行为规律。不要把语料记录时间当成事件发生时间。
+4. subject_entity 必须等于输入中的用户本人（world_owner_entity），不得输出关于其他主体的模式。
+5. pattern_text 必须是带主体且语义完整的行为模式描述；condition_text 为空或简短条件。
 6. `primary_domain` 必须为 `general|health|work|life|information|finance|family|learning|social|interest|travel` 之一，表示该规律主要涉及的用户生活领域；优先选择最具体领域，`general` 只用于真正跨领域的规律。
-7. evidence IDs 必须来自输入。输出空数组是正确结果。只返回 JSON。
+7. 规律涉及星期、时段、地点或前提时，必须得到多个独立 occurrence 的支持；不能凭一个样例泛化条件。evidence IDs 必须来自输入。输出空数组是正确结果。只返回 JSON。
 
 输出：
 {
-  "claims": [
+  "patterns": [
     {
       "subject_entity": "",
-      "claim_type": "preference|behavior_pattern",
       "primary_domain": "general|health|work|life|information|finance|family|learning|social|interest|travel",
-      "predicate": "prefers|dislikes|usually_does|avoids|has_routine",
-      "claim_text": "包含主体和完整规律语义的陈述",
+      "pattern_text": "包含主体和完整行为模式语义的陈述",
       "condition_text": "",
-      "support_fact_ids": [1, 2, 3],
+      "support_occurrence_group_ids": [1, 2, 3],
       "confidence": 0.8
     }
   ]
 }
 
-候选实体与 claim 聚合线索：
-{induction_target}
+模式提炼目标与本批新增事件：
+{pattern_target}
 
-evidence facts：
-{facts}
+独立行为事件：
+{action_occurrences}
 """
 
 
@@ -559,7 +555,7 @@ USER_CLAIM_STATE_RESOLUTION_PROMPT_ZH = """你负责根据本轮变化的 user_c
 1. **独立评估新 state。**先逐条阅读 changed_claims，再合并同一状态维度的相关证据，判断是否呈现值得在未来预测或服务决策中使用的长期偏好、稳定约束、行为规律。即使 `existing_states=[]` 且 `relation_events=[]`，也必须完成这一步；有充分证据就输出 `create`，不要机械地返回空 operations。可以由一条直接、明确、具有持续含义的 explicit claim 创建 enduring_state，例如“我一向喜欢早上开会”可形成时间偏好；不要求凑够多条 claim。多条具体偏好也可以汇总为同一维度的 state，但不要为了聚合而混合互不相干的主题。state_text 应表达可复用的状态判断，而非粘贴或逐字改写 claim。
 2. **区分稳定倾向与重复行为。**`enduring_state` 表示跨时间或情境大致有效的偏好、风格、价值取向或长期约束；明确表达的稳定偏好不因只有一次陈述就被视为一次性事件。`recurring_state` 表示有周期、频率、反复行为或明确条件—行为规则的模式；需要 claim 明确陈述习惯/规律，或多次行为证据共同支持。不能因为用户喜欢某项活动、打算做一次、或对一次经历印象深刻，就推断其经常这么做。一次性的目标、计划、行程、近期情绪和能力担忧也不能自动升级为长期 state。只从 claim 创建 enduring_state 或 recurring_state，不创建 situational_state。
 3. **对齐旧 state。**若同一 domain、class、key 的 existing_state 已表达该状态，应根据新证据选择 `reinforce` 或 `revise`，不能重复 `create`。若新证据削弱或否定旧 state，应结合 `state_claim_evidence` 和 supporting_claims 判断 `weaken`、`expire` 或局部 `revise`；一条支撑 claim 失效并不意味着整个 state 失效。没有受影响的旧 state 时，也要保留第 1 步得出的新建结论。
-4. **裁决旧 claim。**只有 relation_events 中“旧 claim 为 target、changed_claim 为 trigger”的 `contradicts` 或 `supersedes`，才可能调整旧 claim 状态。关系事件本身不是失效判决；要结合文本、来源（通常 explicit 比 inductive/derived 更直接）、时间和适用条件判断。`contradicts` 最多使旧 claim `weakened`；明确的 `supersedes` 才可使其 `superseded`。在不同条件或时期可以并存时不变更；不要修改 changed_claim 的状态，也不要因为 state 失效就反向认定旧 claim 失效。没有可裁决关系时 `claim_updates=[]`，这不影响 operations 创建或更新 state。
+4. **裁决旧 claim。**只有 relation_events 中“旧 claim 为 target、changed_claim 为 trigger”的 `contradicts` 或 `supersedes`，才可能调整旧 claim 状态。关系事件本身不是失效判决；要结合文本、来源（通常 explicit 比 derived 更直接）、时间和适用条件判断。`contradicts` 最多使旧 claim `weakened`；明确的 `supersedes` 才可使其 `superseded`。在不同条件或时期可以并存时不变更；不要修改 changed_claim 的状态，也不要因为 state 失效就反向认定旧 claim 失效。没有可裁决关系时 `claim_updates=[]`，这不影响 operations 创建或更新 state。
 5. **联合检查。**state 的支撑证据要与本轮 claim 状态裁决一致；被判 superseded 的 claim 不得继续作为有效 support。缺少证据的单个候选 state 可以省略，但不能因另一个候选不成立而放弃本轮所有有根据的 state。
 
 state 操作仅允许 `create|reinforce|revise|weaken|expire`。更新必须引用 existing_states 中的 id；create 的 target_state_id 为 0。state_key 只可取：enduring_state 的 `communication_style|decision_style|value_priority|risk_preference|privacy_preference|time_preference|work_style|lifestyle_preference|long_term_constraint`，或 recurring_state 的 `daily_routine|weekly_routine|work_routine|health_routine|social_routine|conditional_behavior`。更新时保持目标 state_class 和 state_key。不得跨出本轮 state_domain。
@@ -656,7 +652,7 @@ RECALL_QUERY_ANALYSIS_PROMPT_ZH = """你是 AI 眼镜长期记忆系统中的 re
 
 记忆结构：
 1. `fact`：从对话或环境转写中提炼出的、可追溯且自包含的 narrative evidence。它保留具体发生了什么、谁参与、时间、地点/场景、原因、观点变化、建议、接受/拒绝、约束、结论和未解决问题等证据。fact 通常带有 `summary`、`keywords`、`entities`、`fact_topic`、`event_time_key` 和 `dialogue_time_key`。
-2. `user_claim`：由 explicit、inductive 或 derived 来源形成的、关于“用户本人”的持久主张，具有状态、置信度和有效时间，并可回溯到支撑 facts。explicit 表示直接陈述或可靠记录确认；inductive 表示跨事实和时间窗口归纳出的偏好或行为规律；derived 表示由已有主张逻辑推出。关系对象可以是其他实体。它不是单次事件的替代品。
+2. `user_claim`：由 explicit 或 derived 来源形成的、关于“用户本人”的持久主张，具有状态、置信度和有效时间，并可回溯到支撑 facts。explicit 表示直接陈述或可靠记录确认；derived 表示由已有主张逻辑推出。跨事件观察到的行为模式单独保存为 `user_observed_pattern`。关系对象可以是其他实体。user_claim 不是单次事件的替代品。
 3. `goal`、`plan`、`work_item`：从 facts 中提炼出的未来导向对象，分别表示期望结果、明确安排和可闭环责任事项；其 status 和目标/开始/截止时间具有重要语义。
 
 判断准则：

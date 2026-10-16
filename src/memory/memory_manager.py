@@ -6,7 +6,7 @@ internal model is deliberately unified:
 
 1. Submitted source units become narrative `memory_facts`.
 2. Longer source windows and their facts yield grounded user-activity observations.
-3. Traceable explicit and inductive propositions live in entity claims.
+3. Explicit and derived propositions live in user claims; repeated action patterns live separately.
 4. The legacy actionable-item projection is temporarily disabled while the
    intent and work-item layer is redesigned.
 
@@ -40,7 +40,7 @@ from prompts_en import (
     DERIVED_USER_CLAIM_EXTRACTION_PROMPT_EN,
     USER_CLAIM_RECONCILIATION_PROMPT_EN,
     EXPLICIT_USER_CLAIM_EXTRACTION_PROMPT_EN,
-    INDUCTIVE_USER_CLAIM_EXTRACTION_PROMPT_EN,
+    USER_OBSERVED_PATTERN_EXTRACTION_PROMPT_EN,
     INTENT_EXTRACTION_PROMPT_EN,
     INTENT_RECONCILIATION_PROMPT_EN,
     USER_ACTIVITY_EXTRACTION_PROMPT_EN,
@@ -53,7 +53,7 @@ from prompts_zh import (
     DERIVED_USER_CLAIM_EXTRACTION_PROMPT_ZH,
     USER_CLAIM_RECONCILIATION_PROMPT_ZH,
     EXPLICIT_USER_CLAIM_EXTRACTION_PROMPT_ZH,
-    INDUCTIVE_USER_CLAIM_EXTRACTION_PROMPT_ZH,
+    USER_OBSERVED_PATTERN_EXTRACTION_PROMPT_ZH,
     INTENT_EXTRACTION_PROMPT_ZH,
     INTENT_RECONCILIATION_PROMPT_ZH,
     USER_ACTIVITY_EXTRACTION_PROMPT_ZH,
@@ -63,6 +63,14 @@ from prompts_zh import (
     UNIFIED_MEMORY_EXTRACTION_PROMPT_ZH,
 )
 from .utils import _cal_embedding_cosine_similarity
+from .user_action_occurrences import (
+    describes_aggregate_action,
+    has_vague_occurrence_time,
+    occurrence_profile,
+    potential_same_occurrence,
+    same_action,
+    same_occurrence,
+)
 from user_state import UserStateResolver
 
 RecallTimeBounds = Optional[Tuple[Optional[str], Optional[str]]]
@@ -200,6 +208,10 @@ class MemoryNodeManager:
             self._memory_cfg.get("enable_memory_user_claim_update", True),
             True,
         )
+        self._enable_memory_user_observed_pattern_update = self._config_bool(
+            self._memory_cfg.get("enable_memory_user_observed_pattern_update", True),
+            True,
+        )
         self._enable_memory_user_intent_update = self._config_bool(
             self._memory_cfg.get("enable_memory_user_intent_update", True),
             True,
@@ -228,21 +240,21 @@ class MemoryNodeManager:
             1.0,
             0.75,
         )
-        self._user_claim_induction_min_support_facts = max(
+        self._user_observed_pattern_min_occurrences = max(
             3,
             int(
                 self._memory_cfg.get(
-                    "user_claim_induction_min_support_facts", 3,
+                    "user_observed_pattern_min_occurrences", 3,
                 ) or 3
             ),
         )
-        self._user_claim_induction_min_time_windows = max(
+        self._user_observed_pattern_min_time_windows = max(
             2,
-            int(self._memory_cfg.get("user_claim_induction_min_time_windows", 2) or 2),
+            int(self._memory_cfg.get("user_observed_pattern_min_time_windows", 2) or 2),
         )
-        self._user_claim_induction_evidence_limit = max(
-            self._user_claim_induction_min_support_facts,
-            int(self._memory_cfg.get("user_claim_induction_evidence_limit", 16) or 16),
+        self._user_observed_pattern_occurrence_limit = max(
+            self._user_observed_pattern_min_occurrences,
+            int(self._memory_cfg.get("user_observed_pattern_occurrence_limit", 16) or 16),
         )
         self._initialize_recall_config()
         self._embedding_client: Optional[EmbeddingClient] = None
@@ -256,10 +268,18 @@ class MemoryNodeManager:
             "memory_user_claim_update", self._process_memory_user_claim_update_task,
         )
         self._task_scheduler.register_handler(
+            "memory_user_observed_pattern_update",
+            self._process_memory_user_observed_pattern_update_task,
+        )
+        self._task_scheduler.register_handler(
             "memory_user_intent_update", self._process_memory_user_intent_update_task,
         )
         self._task_scheduler.register_followup_submitter(
             "memory_user_claim_update", self.submit_memory_user_claim_update_task,
+        )
+        self._task_scheduler.register_followup_submitter(
+            "memory_user_observed_pattern_update",
+            self.submit_memory_user_observed_pattern_update_task,
         )
         self._task_scheduler.register_followup_submitter(
             "memory_user_intent_update", self.submit_memory_user_intent_update_task,
@@ -1319,11 +1339,26 @@ class MemoryNodeManager:
                     "priority": priority,
                     "time_confidence": _compact_whitespace(raw_fact.get("time_confidence") or "unknown"),
                     "where": _compact_whitespace(raw_fact.get("where") or ""),
-                    "has_world_owner_speaker": any(
-                        signal.get("owner_evidence_type") in {
-                            "self_statement", "confirmed_response",
-                        }
-                        for signal in [*user_claim_signals, *user_intent_signals]
+                    "has_world_owner_speaker": (
+                        any(
+                            signal.get("owner_evidence_type") in {
+                                "self_statement", "confirmed_response",
+                            }
+                            for signal in user_claim_signals
+                        )
+                        or any(
+                            signal.get("assertion_source") in {
+                                "self_statement", "confirmed_response",
+                            }
+                            for signal in user_intent_signals
+                        )
+                        or (
+                            self._units_include_world_owner(units)
+                            and any(
+                                signal.get("assertion_source") == "observed_event"
+                                for signal in user_intent_signals
+                            )
+                        )
                     ),
                     "has_world_owner_alias_reference": owner_alias_reference,
                 },
@@ -1527,14 +1562,6 @@ class MemoryNodeManager:
         )
         if max_items <= 0:
             return []
-        evidence_kind_aliases = {
-            "goal_expression": "goal",
-            "future_plan": "plan",
-            "responsibility_commitment": "responsibility",
-            "work_item": "responsibility",
-            "plan_lifecycle_update": "lifecycle_update",
-            "work_item_lifecycle_update": "lifecycle_update",
-        }
         default_object_types = {
             "goal": ["goal"],
             "plan": ["plan"],
@@ -1546,15 +1573,7 @@ class MemoryNodeManager:
         for raw in value:
             if not isinstance(raw, dict):
                 continue
-            evidence_kind = evidence_kind_aliases.get(
-                str(
-                    raw.get("evidence_kind")
-                    or raw.get("signal_type")
-                    or raw.get("type")
-                    or ""
-                ).strip().lower(),
-                str(raw.get("evidence_kind") or "").strip().lower(),
-            )
+            evidence_kind = str(raw.get("evidence_kind") or "").strip().lower()
             if evidence_kind not in default_object_types:
                 continue
             raw_object_types = raw.get("candidate_object_types")
@@ -1572,7 +1591,8 @@ class MemoryNodeManager:
                 continue
             assertion_source = str(raw.get("assertion_source") or "").strip().lower()
             if assertion_source not in {
-                "self_statement", "third_party_report", "observed_event",
+                "self_statement", "confirmed_response", "third_party_report",
+                "observed_event",
             }:
                 continue
             explicitness = str(raw.get("explicitness") or "").strip().lower()
@@ -1599,24 +1619,26 @@ class MemoryNodeManager:
             )[:480]
             if not subject_name or not user_intent_anchor or not evidence_basis:
                 continue
-            owner_evidence = self._normalize_user_signal_owner_evidence(
-                raw,
-                source_units=source_units,
-                owner_aliases=owner_aliases,
-            )
-            if owner_evidence is None:
-                continue
-            if (
-                owner_evidence["owner_evidence_type"] == "confirmed_response"
-                and assertion_source != "self_statement"
-            ):
-                continue
-            if owner_evidence["owner_evidence_type"] == "third_party_report" and (
-                assertion_source != "third_party_report" or explicitness != "reported"
-            ):
+            if assertion_source == "observed_event":
+                if raw.get("owner_evidence_text") or raw.get("other_evidence_text"):
+                    continue
+                owner_evidence = {
+                    "owner_evidence_text": "",
+                    "other_evidence_text": "",
+                }
+            else:
+                owner_evidence = self._normalize_user_signal_owner_evidence(
+                    {**raw, "owner_evidence_type": assertion_source},
+                    source_units=source_units,
+                    owner_aliases=owner_aliases,
+                )
+                if owner_evidence is None:
+                    continue
+                owner_evidence.pop("owner_evidence_type")
+            if assertion_source == "third_party_report" and explicitness != "reported":
                 continue
             confidence = self._clamp_float(raw.get("confidence"), 0.0, 1.0, 0.75)
-            if owner_evidence["owner_evidence_type"] == "third_party_report":
+            if assertion_source == "third_party_report":
                 confidence = min(confidence, 0.65)
             key = (
                 subject_name.lower(),
@@ -2386,6 +2408,94 @@ class MemoryNodeManager:
             "user_intent_signal_count": len(user_intent_signal_mapping_updates),
         }
 
+    def _group_user_action_signals_by_occurrence(
+        self, signal_ids: Sequence[int],
+    ) -> Dict[str, int]:
+        """Group pending signals when the observed-pattern task consumes them."""
+        if not signal_ids:
+            return {"created_count": 0, "merged_count": 0}
+        mappings = self._db.get_user_signal_mappings_by_ids("action", signal_ids)
+        selected = {int(item["signal_id"]) for item in mappings}
+        facts_by_id = {
+            int(fact["id"]): fact
+            for fact in self._db.get_memory_facts_by_ids(
+                [int(item["fact_id"]) for item in mappings]
+            )
+        }
+        created_count = merged_count = 0
+        for fact_id in sorted({int(item["fact_id"]) for item in mappings}):
+            fact = facts_by_id.get(fact_id) or {}
+            metadata = fact.get("metadata") or {}
+            for signal in self._db.get_fact_user_action_signals(fact_id):
+                if (int(signal["signal_id"]) not in selected
+                        or signal.get("occurrence_group_id") is not None):
+                    continue
+                profile = occurrence_profile(
+                    signal.get("event_time_key"),
+                    metadata.get("time_confidence"),
+                )
+                if (
+                    describes_aggregate_action(signal.get("action_text"))
+                    or has_vague_occurrence_time(signal.get("action_text"))
+                ):
+                    profile["independence_status"] = "unresolved"
+                candidate = {
+                    **signal, **profile,
+                    "location": signal.get("location") or "",
+                }
+                grouped_signals = self._db.get_user_action_occurrence_candidates(
+                    subject_entity_id=int(signal["subject_entity_id"]),
+                    occurrence_key=profile["occurrence_key"],
+                    action_kind=str(signal["action_kind"]),
+                    time_precision=profile["time_precision"],
+                    independence_status=profile["independence_status"],
+                    fact_id=(
+                        fact_id if profile["independence_status"] != "countable"
+                        else None
+                    ),
+                )
+                match = next(
+                    (grouped for grouped in grouped_signals
+                     if same_occurrence(candidate, grouped)), None,
+                )
+                if match is None and profile["independence_status"] == "countable":
+                    # Only compare paraphrases inside the same known occurrence
+                    # window. A loose embedding match alone never groups signals.
+                    for grouped in grouped_signals:
+                        if not potential_same_occurrence(candidate, grouped):
+                            continue
+                        try:
+                            left = self._generate_embedding_vector(
+                                str(candidate["action_text"])
+                            )
+                            right = self._generate_embedding_vector(
+                                str(grouped["action_text"])
+                            )
+                            similarity = (
+                                _cal_embedding_cosine_similarity(left, right)
+                                if left is not None and right is not None else 0.0
+                            )
+                        except Exception as exc:
+                            self._logger.warning(
+                                "user action occurrence match unavailable: %s", exc,
+                            )
+                            break
+                        if similarity >= 0.91:
+                            match = grouped
+                            break
+                if match is None:
+                    occurrence_group_id = int(signal["signal_id"])
+                    created_count += 1
+                else:
+                    occurrence_group_id = int(match["occurrence_group_id"])
+                    merged_count += 1
+                self._db.assign_user_action_occurrence_group(
+                    signal_id=int(signal["signal_id"]),
+                    occurrence_group_id=occurrence_group_id,
+                    **profile,
+                )
+        return {"created_count": created_count, "merged_count": merged_count}
+
     # ── User-claim update: facts -> user claims ──────────────────────────
 
     def submit_memory_user_claim_update_task(self, *_, **kwargs: Any) -> Dict[str, Any]:
@@ -2405,6 +2515,64 @@ class MemoryNodeManager:
                 else None
             ),
         )
+
+    def submit_memory_user_observed_pattern_update_task(
+        self, *_, **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """Queue action-signal consolidation and observed-pattern extraction."""
+        completion_context = kwargs.pop("completion_context", None)
+        if (not self._memory_enabled
+                or not self._enable_memory_user_observed_pattern_update):
+            return self._task_scheduler.reject(
+                "memory_user_observed_pattern_update",
+                "memory_disabled" if not self._memory_enabled
+                else "user_observed_pattern_update_disabled",
+            )
+        kwargs.setdefault(
+            "limit", self._memory_cfg.get("user_observed_pattern_limit") or 100,
+        )
+        return self._submit_memory_task(
+            task_kind="memory_user_observed_pattern_update",
+            payload=dict(kwargs),
+            completion_context=(
+                dict(completion_context)
+                if isinstance(completion_context, dict) else None
+            ),
+        )
+
+    def _process_memory_user_observed_pattern_update_task(
+        self, *, signal_ids: Optional[Sequence[int]] = None,
+        reference_timestamp: Optional[Any] = None,
+        **_: Any,
+    ) -> Dict[str, Any]:
+        """Consolidate pending actions, then infer repeatable user patterns."""
+        selected_ids = sorted({int(value) for value in signal_ids or [] if int(value) > 0})
+        if not selected_ids:
+            return {"status": "empty", "signal_count": 0,
+                    "user_observed_pattern_ids": [], "_completed_signal_ids": []}
+        started_at = time.monotonic()
+        with self._db.transaction():
+            grouping = self._group_user_action_signals_by_occurrence(selected_ids)
+            update = self._update_user_observed_patterns_from_action_signals(
+                selected_ids,
+            )
+        completed = bool(update.get("completed"))
+        report = {
+            "status": "ok" if completed else "failed",
+            "signal_count": len(selected_ids),
+            "occurrence_groups_created": grouping["created_count"],
+            "signals_merged": grouping["merged_count"],
+            "user_observed_patterns_created": int(update.get("created") or 0),
+            "user_observed_patterns_updated": int(update.get("updated") or 0),
+            "user_observed_pattern_ids": update.get("pattern_ids") or [],
+            "reference_timestamp": reference_timestamp,
+            "total_elapsed_ms": round((time.monotonic() - started_at) * 1000, 2),
+            "_completed_signal_ids": selected_ids if completed else [],
+        }
+        if update.get("error"):
+            report["error"] = update["error"]
+        self._log_info("memory_user_observed_pattern_update", "finish", report)
+        return report
 
     def submit_memory_user_intent_update_task(self, *_, **kwargs: Any) -> Dict[str, Any]:
         """Queue a future-commitment projection after committed fact evidence."""
@@ -3583,7 +3751,7 @@ class MemoryNodeManager:
     @staticmethod
     def _user_claim_origin_priority(origin: Any) -> int:
         """Return a deterministic ordering hint for claim-relation retrieval."""
-        return {"explicit": 3, "inductive": 2, "derived": 1}.get(
+        return {"explicit": 2, "derived": 1}.get(
             str(origin or "").strip().lower(),
             0,
         )
@@ -4071,7 +4239,7 @@ class MemoryNodeManager:
         if not isinstance(raw, dict):
             return None
         claim_type = str(raw.get("claim_type") or "").strip().lower()
-        if claim_type not in self._user_claim_types() - {"behavior_pattern"}:
+        if claim_type not in self._user_claim_types():
             return None
         evidence_ids = list(dict.fromkeys(
             int(value) for value in (raw.get("evidence_fact_ids") or [])
@@ -4566,88 +4734,99 @@ class MemoryNodeManager:
         })
         return (starts[-1] if starts else "", ends[0] if ends else "")
 
-    def _update_inductive_user_claims_from_facts(
-        self,
-        seed_facts: Sequence[Dict[str, Any]],
-        *,
-        selected_signal_ids: set[int],
+    def _update_user_observed_patterns_from_action_signals(
+        self, signal_ids: Sequence[int],
     ) -> Dict[str, Any]:
-        """Use new facts to trigger bounded, exact-group evidence expansion."""
+        """Infer patterns from independent, time-grounded action occurrences."""
+        selected = {int(value) for value in signal_ids}
+        mappings = self._db.get_user_signal_mappings_by_ids("action", signal_ids)
+        seed_signals = [
+            signal
+            for fact_id in {int(item["fact_id"]) for item in mappings}
+            for signal in self._db.get_fact_user_action_signals(fact_id)
+            if int(signal["signal_id"]) in selected
+            and signal.get("independence_status") == "countable"
+        ]
         report: Dict[str, Any] = {
-            "enabled": 1, "seed_fact_count": len(seed_facts), "candidate_count": 0,
-            "updated": 0, "created": 0, "affected_claim_ids": [], "completed": True,
+            "candidate_count": 0, "updated": 0, "created": 0,
+            "pattern_ids": [], "completed": True,
         }
-        if not seed_facts:
-            return report
-        groups: Dict[Tuple[int, str, str], Dict[str, Any]] = {}
-        for fact in seed_facts:
-            fact_id = int(fact.get("id") or 0)
-            if fact_id <= 0:
-                continue
-            for signal_mapping in self._get_user_claim_signals_from_fact(fact):
-                if int(signal_mapping.get("signal_id") or 0) not in selected_signal_ids:
-                    continue
-                if _compact_whitespace(signal_mapping.get("subject") or "").lower() != (
-                    self._world_owner_entity_name.lower()
-                ):
-                    continue
-                if str(signal_mapping.get("claim_type_hint") or "") not in {
-                    "preference", "behavior_pattern",
-                }:
-                    continue
-                key = (
-                    int(signal_mapping["subject_entity_id"]),
-                    str(signal_mapping["claim_type_hint"]),
-                    str(signal_mapping["claim_anchor_key"]),
-                )
-                group = groups.setdefault(key, {
-                    "subject": signal_mapping["subject"],
-                    "subject_entity_id": int(signal_mapping["subject_entity_id"]),
-                    "claim_type_hint": signal_mapping["claim_type_hint"],
-                    "claim_anchor": signal_mapping["claim_anchor"],
-                    "claim_anchor_key": signal_mapping["claim_anchor_key"],
-                    "seed_facts_by_id": {},
-                })
-                group["seed_facts_by_id"][fact_id] = fact
-        report["candidate_count"] = len(groups)
-        for group in list(groups.values())[:12]:
-            historical_facts = self._db.memory_facts_for_user_claim_signal_group(
-                subject_entity_id=int(group["subject_entity_id"]),
-                claim_type_hint=str(group["claim_type_hint"]),
-                claim_anchor_key=str(group["claim_anchor_key"]),
-                limit=max(64, self._user_claim_induction_evidence_limit * 4),
+        seeds_by_kind: Dict[Tuple[int, str], List[Dict[str, Any]]] = {}
+        for signal in seed_signals:
+            seeds_by_kind.setdefault(
+                (int(signal["subject_entity_id"]), str(signal["action_kind"])),
+                [],
+            ).append(signal)
+        for (subject_id, action_kind), seeds in seeds_by_kind.items():
+            history = self._db.get_grouped_user_action_signals(
+                subject_entity_id=subject_id, action_kind=action_kind,
+                limit=max(128, self._user_observed_pattern_occurrence_limit * 8),
             )
-            evidence_facts = self._select_inductive_user_claim_evidence_facts(
-                group=group,
-                historical_facts=historical_facts,
-            )
-            time_windows = {
-                str(fact.get("event_time_key") or fact.get("dialogue_time_key") or "")[:10]
-                for fact in evidence_facts
-                if str(fact.get("event_time_key") or fact.get("dialogue_time_key") or "")
+            # One row per real occurrence, with new evidence always retained.
+            by_group = {
+                int(signal["occurrence_group_id"]): signal
+                for signal in history if signal.get("occurrence_group_id")
             }
-            if (
-                len(evidence_facts) < self._user_claim_induction_min_support_facts
-                or len(time_windows) < self._user_claim_induction_min_time_windows
-            ):
+            by_group.update({
+                int(signal["occurrence_group_id"]): signal
+                for signal in seeds if signal.get("occurrence_group_id")
+            })
+            seed_groups = {
+                int(signal["occurrence_group_id"])
+                for signal in seeds if signal.get("occurrence_group_id")
+            }
+            ordered = sorted(
+                by_group.values(),
+                key=lambda signal: (
+                    int(signal["occurrence_group_id"]) not in seed_groups,
+                    not any(same_action(signal["action_text"], seed["action_text"])
+                            for seed in seeds),
+                    -int(signal["signal_id"]),
+                ),
+            )[:self._user_observed_pattern_occurrence_limit]
+            windows = {
+                str(signal.get("occurrence_key") or "")[:10]
+                for signal in ordered if signal.get("occurrence_key")
+            }
+            if (len(ordered) < self._user_observed_pattern_min_occurrences
+                    or len(windows) < self._user_observed_pattern_min_time_windows):
                 continue
-            outcome = self._extract_inductive_user_claims(
-                group=group, facts=evidence_facts,
+            report["candidate_count"] += 1
+            facts_by_id = {
+                int(fact["id"]): fact
+                for fact in self._db.get_memory_facts_by_ids(
+                    [int(signal["fact_id"]) for signal in ordered]
+                )
+            }
+            patterns = self._extract_user_observed_patterns(
+                subject_entity_id=subject_id, action_kind=action_kind,
+                seed_group_ids=seed_groups, signals=ordered, facts_by_id=facts_by_id,
             )
-            if outcome is None:
-                report["completed"] = False
-                report["error"] = "invalid_llm_induction_response"
+            if patterns is None:
+                report.update(completed=False, error="invalid_observed_pattern_response")
                 return report
-            by_id = {int(fact["id"]): fact for fact in evidence_facts}
-            applied = self._reconcile_user_claims(outcome, facts_by_id=by_id)
-            report["updated"] += len(applied)
-            report["created"] += sum(int(item["created"]) for item in applied)
-            report["affected_claim_ids"].extend(
-                int(item["claim_id"])
-                for item in applied
-                if int(item.get("claim_id") or 0) > 0
-            )
-        report["affected_claim_ids"] = sorted(set(report["affected_claim_ids"]))
+            for pattern in patterns:
+                pattern_id, created = self._db.upsert_user_observed_pattern(
+                    subject_entity_id=subject_id,
+                    pattern_key=":".join((
+                        pattern["primary_domain"],
+                        self._generate_topic_name_key(pattern["condition_text"]),
+                        self._generate_topic_name_key(pattern["pattern_text"]),
+                    )),
+                    pattern_text=pattern["pattern_text"],
+                    condition_text=pattern["condition_text"],
+                    primary_domain=pattern["primary_domain"],
+                    confidence=pattern["confidence"],
+                    metadata={"action_kind": action_kind},
+                )
+                self._db.upsert_user_observed_pattern_occurrences(
+                    pattern_id=pattern_id,
+                    occurrence_group_ids=pattern["support_occurrence_group_ids"],
+                )
+                report["created"] += int(created)
+                report["updated"] += int(not created)
+                report["pattern_ids"].append(pattern_id)
+        report["pattern_ids"] = sorted(set(report["pattern_ids"]))
         return report
 
     def _fact_user_claim_signal_mapping_updates(
@@ -4751,6 +4930,10 @@ class MemoryNodeManager:
                 "action_kind": action_kind,
                 "action_text": action_text,
                 "event_time_key": str(fact.get("event_time_key") or ""),
+                "time_confidence": str(
+                    (fact.get("metadata") or {}).get("time_confidence") or "unknown"
+                ),
+                "location": str((fact.get("metadata") or {}).get("where") or ""),
                 "owner_evidence_type": owner_evidence_type,
                 "owner_evidence_text": signal.get("owner_evidence_text") or "",
                 "other_evidence_text": signal.get("other_evidence_text") or "",
@@ -4815,162 +4998,103 @@ class MemoryNodeManager:
             })
         return updates
 
-    def _select_inductive_user_claim_evidence_facts(
+    def _extract_user_observed_patterns(
         self,
         *,
-        group: Dict[str, Any],
-        historical_facts: Sequence[Dict[str, Any]],
-    ) -> List[Dict[str, Any]]:
-        """Keep new group facts, then add bounded time-diverse history."""
-        seed_by_id = dict(group.get("seed_facts_by_id") or {})
-        candidates_by_id = {
-            int(fact["id"]): fact
-            for fact in [*seed_by_id.values(), *historical_facts]
-            if str(fact.get("id") or "").strip().isdigit()
-        }
-        seed_ids = set(seed_by_id)
-
-        ordered = sorted(
-            candidates_by_id.values(),
-            key=lambda fact: (
-                str(fact.get("event_time_key") or fact.get("dialogue_time_key") or ""),
-                int(fact.get("id") or 0),
-            ),
-            reverse=True,
-        )
-        ordered.sort(
-            key=lambda fact: int(fact.get("id") or 0) not in seed_ids
-        )
-        selected: List[Dict[str, Any]] = []
-        selected_ids: set[int] = set()
-        selected_time_windows: set[str] = set()
-        for fact in ordered:
-            fact_id = int(fact["id"])
-            time_window = str(
-                fact.get("event_time_key") or fact.get("dialogue_time_key") or ""
-            )[:10]
-            if time_window and time_window in selected_time_windows:
-                continue
-            selected.append(fact)
-            selected_ids.add(fact_id)
-            if time_window:
-                selected_time_windows.add(time_window)
-            if len(selected) >= self._user_claim_induction_evidence_limit:
-                break
-        if len(selected) < self._user_claim_induction_evidence_limit:
-            for fact in ordered:
-                fact_id = int(fact["id"])
-                if fact_id in selected_ids:
-                    continue
-                selected.append(fact)
-                selected_ids.add(fact_id)
-                if len(selected) >= self._user_claim_induction_evidence_limit:
-                    break
-        return sorted(
-            selected,
-            key=lambda fact: (
-                str(fact.get("event_time_key") or fact.get("dialogue_time_key") or ""),
-                int(fact.get("id") or 0),
-            ),
-        )
-
-    def _extract_inductive_user_claims(
-        self,
-        *,
-        group: Dict[str, Any],
-        facts: Sequence[Dict[str, Any]],
+        subject_entity_id: int,
+        action_kind: str,
+        seed_group_ids: set[int],
+        signals: Sequence[Dict[str, Any]],
+        facts_by_id: Dict[int, Dict[str, Any]],
     ) -> Optional[List[Dict[str, Any]]]:
         language = self._resolve_prompt_language_from_text(
-            "\n".join(str(fact.get("summary") or "") for fact in facts[:16])
+            "\n".join(str(signal.get("action_text") or "") for signal in signals)
         )
         prompt_template = (
-            INDUCTIVE_USER_CLAIM_EXTRACTION_PROMPT_EN
-            if language == "en" else INDUCTIVE_USER_CLAIM_EXTRACTION_PROMPT_ZH
+            USER_OBSERVED_PATTERN_EXTRACTION_PROMPT_EN
+            if language == "en" else USER_OBSERVED_PATTERN_EXTRACTION_PROMPT_ZH
         )
         raw = self._llm_client.call_llm(
-            prompt_template.replace("{induction_target}", json.dumps({
-                "subject_entity": group["subject"],
+            prompt_template.replace("{pattern_target}", json.dumps({
+                "subject_entity": self._world_owner_entity_name,
+                "subject_entity_id": subject_entity_id,
                 "world_owner_entity": self._world_owner_entity_name,
-                "claim_type_hint": group["claim_type_hint"],
-                "claim_anchor": group["claim_anchor"],
-            }, ensure_ascii=False, indent=2)).replace("{facts}", json.dumps([
-                self._claim_fact_prompt_view(fact) for fact in facts[:32]
+                "action_kind": action_kind,
+                "new_occurrence_group_ids": sorted(seed_group_ids),
+            }, ensure_ascii=False, indent=2)).replace("{action_occurrences}", json.dumps([
+                {
+                    "occurrence_group_id": int(signal["occurrence_group_id"]),
+                    "event_time": signal.get("occurrence_key") or "",
+                    "action_text": signal.get("action_text") or "",
+                    "location": signal.get("location") or "",
+                    "fact_id": int(signal["fact_id"]),
+                    "fact_summary": (
+                        facts_by_id.get(int(signal["fact_id"])) or {}
+                    ).get("summary") or "",
+                }
+                for signal in signals
             ], ensure_ascii=False, indent=2))
         )
         parsed = self._llm_client.parse_json_object_from_llm_text(raw or "")
-        if parsed is None or not isinstance(parsed.get("claims"), list):
+        if parsed is None or not isinstance(parsed.get("patterns"), list):
             return None
-        facts_by_id = {
-            int(fact["id"]): fact for fact in facts
-            if str(fact.get("id") or "").strip().isdigit()
+        signals_by_group = {
+            int(signal["occurrence_group_id"]): signal for signal in signals
         }
         result: List[Dict[str, Any]] = []
-        for raw_claim in parsed["claims"][:4]:
-            claim = self._normalize_inductive_user_claim(
-                raw_claim, group=group, facts_by_id=facts_by_id,
+        for raw_pattern in parsed["patterns"][:4]:
+            pattern = self._normalize_user_observed_pattern(
+                raw_pattern,
+                subject_entity_id=subject_entity_id,
+                seed_group_ids=seed_group_ids,
+                signals_by_group=signals_by_group,
             )
-            if claim:
-                result.append(claim)
+            if pattern:
+                result.append(pattern)
         return result
 
-    def _normalize_inductive_user_claim(
+    def _normalize_user_observed_pattern(
         self,
         raw: Any,
         *,
-        group: Dict[str, Any],
-        facts_by_id: Dict[int, Dict[str, Any]],
+        subject_entity_id: int,
+        seed_group_ids: set[int],
+        signals_by_group: Dict[int, Dict[str, Any]],
     ) -> Optional[Dict[str, Any]]:
         if not isinstance(raw, dict):
-            return None
-        claim_type = str(raw.get("claim_type") or "").strip().lower()
-        if claim_type not in {"preference", "behavior_pattern"}:
             return None
         primary_domain = self._normalize_primary_domain(raw.get("primary_domain"))
         if not primary_domain:
             return None
         if (
-            _compact_whitespace(raw.get("subject_entity") or "") != group["subject"]
-            or group["subject"].lower() != self._world_owner_entity_name.lower()
+            _compact_whitespace(raw.get("subject_entity") or "")
+            != self._world_owner_entity_name
         ):
             return None
-        predicate = re.sub(r"[^a-z0-9_]+", "_", str(raw.get("predicate") or "").lower()).strip("_")
-        if predicate not in {"prefers", "dislikes", "usually_does", "avoids", "has_routine"}:
-            return None
-        support_ids = list(dict.fromkeys(
-            int(value) for value in (raw.get("support_fact_ids") or [])
-            if str(value).strip().isdigit() and int(value) in facts_by_id
+        group_ids = list(dict.fromkeys(
+            int(value) for value in (raw.get("support_occurrence_group_ids") or [])
+            if str(value).strip().isdigit() and int(value) in signals_by_group
         ))[:24]
         windows = {
-            str(facts_by_id[fact_id].get("event_time_key") or facts_by_id[fact_id].get("dialogue_time_key") or "")[:10]
-            for fact_id in support_ids
+            str(signals_by_group[group_id].get("occurrence_key") or "")[:10]
+            for group_id in group_ids
         } - {""}
         if (
-            len(support_ids) < self._user_claim_induction_min_support_facts
-            or len(windows) < self._user_claim_induction_min_time_windows
+            len(group_ids) < self._user_observed_pattern_min_occurrences
+            or len(windows) < self._user_observed_pattern_min_time_windows
+            or not seed_group_ids.intersection(group_ids)
         ):
             return None
-        raw_claim_text = _compact_whitespace(raw.get("claim_text") or "")
-        if not raw_claim_text:
+        pattern_text = _compact_whitespace(raw.get("pattern_text") or "")[:480]
+        if not pattern_text:
             return None
         confidence = self._clamp_float(raw.get("confidence"), 0.0, 1.0, 0.7)
-        claim_text = self._normalize_user_claim_text(
-            raw_claim_text,
-            subject=group["subject"],
-            predicate=predicate,
-        )
         return {
-            "subject_entity_id": group["subject_entity_id"], "predicate": predicate,
-            "claim_text": claim_text,
-            "claim_type": claim_type, "claim_origin": "inductive",
+            "pattern_text": pattern_text,
+            "condition_text": _compact_whitespace(raw.get("condition_text") or "")[:240],
             "primary_domain": primary_domain,
-            "status": "active",
             "confidence": confidence,
-            "extractor_version": "user_claim_induction_v1", "prompt_version": "v1",
-            "metadata": {
-                "condition_text": _compact_whitespace(raw.get("condition_text") or ""),
-                "claim_anchor": group["claim_anchor"],
-            },
-            "support_fact_ids": support_ids,
+            "support_occurrence_group_ids": group_ids,
         }
 
     @staticmethod

@@ -241,6 +241,7 @@ class TaskOperationReporter:
         if operation_type in {
             "memory_user_activity_extraction",
             "memory_user_claim_update",
+            "memory_user_observed_pattern_update",
             "memory_user_intent_update",
             "memory_user_state_update",
         }:
@@ -291,6 +292,7 @@ class TaskScheduler:
 
     _FACT_FOLLOWUP_TASK_KINDS = (
         "memory_user_claim_update",
+        "memory_user_observed_pattern_update",
         "memory_user_intent_update",
     )
 
@@ -375,6 +377,16 @@ class TaskScheduler:
                     "facts": max(1, int(settings.get("interaction_user_intent_min_signal_facts", 3) or 3)),
                 },
             },
+            "memory_user_observed_pattern_update": {
+                "default": {
+                    "batches": max(1, int(settings.get("user_action_min_signal_batches", 4) or 4)),
+                    "facts": max(1, int(settings.get("user_action_min_signal_facts", 8) or 8)),
+                },
+                "interaction": {
+                    "batches": max(1, int(settings.get("interaction_user_action_min_signal_batches", 3) or 3)),
+                    "facts": max(1, int(settings.get("interaction_user_action_min_signal_facts", 5) or 5)),
+                },
+            },
         }
         self._fact_followup_state = {
             task_kind: {
@@ -439,6 +451,11 @@ class TaskScheduler:
                 prepared["signal_ids"] = self._select_pending_signal_ids(
                     "user_intent_update", fact_limit=limit,
                 )
+        elif task_kind == "memory_user_observed_pattern_update":
+            if "signal_ids" not in prepared:
+                prepared["signal_ids"] = self._select_pending_signal_ids(
+                    "user_action_signal_consolidation", fact_limit=limit,
+                )
         return prepared
 
     def _complete_signal_task_result(
@@ -475,6 +492,16 @@ class TaskScheduler:
                     [int(value) for value in completed if int(value) in selected],
                 )
             )
+        elif task_kind == "memory_user_observed_pattern_update":
+            selected = {int(value) for value in payload.get("signal_ids") or []}
+            completed = result.pop("_completed_signal_ids", [])
+            if str(result.get("status") or "").lower() in {"ok", "empty"}:
+                result["signals_marked_processed"] = len(
+                    self._task_execution_db.mark_signal_ids_completed(
+                        "user_action_signal_consolidation",
+                        [int(value) for value in completed if int(value) in selected],
+                    )
+                )
 
     def record_pending_user_state_claims(
         self, claim_ids: List[int], *, reference_timestamp: Any = None,
@@ -894,10 +921,11 @@ class TaskScheduler:
                 followup_reports = self._submit_final_fact_followup_tasks()
         self._logger.info(
             "final memory flush submitted fact_queued=%s activity_queued=%s "
-            "claim_queued=%s intent_queued=%s",
+            "claim_queued=%s observed_pattern_queued=%s intent_queued=%s",
             bool(fact_report.get("queued")),
             bool(user_activity_report.get("queued")),
             bool(followup_reports["memory_user_claim_update"].get("queued")),
+            bool(followup_reports["memory_user_observed_pattern_update"].get("queued")),
             bool(followup_reports["memory_user_intent_update"].get("queued")),
         )
         return {
@@ -960,7 +988,7 @@ class TaskScheduler:
         elif task_kind == "memory_user_state_update":
             self._process_user_state_update_follow_up_steps(event)
         elif task_kind in self._FACT_FOLLOWUP_TASK_KINDS:
-            self._process_user_claim_or_intent_update_follow_up_steps(event)
+            self._process_fact_followup_task_completion(event)
 
     def _process_fact_extraction_follow_up_steps(self, event: Dict[str, Any]) -> None:
         try:
@@ -1035,7 +1063,7 @@ class TaskScheduler:
         ):
             self.trigger_user_state_time_tick(force=True)
 
-    def _process_user_claim_or_intent_update_follow_up_steps(
+    def _process_fact_followup_task_completion(
         self, event: Dict[str, Any],
     ) -> None:
         task_kind = str(event.get("task_kind") or "")
@@ -1090,16 +1118,23 @@ class TaskScheduler:
                 "signal_count": int(result.get("user_intent_signal_count") or 0),
                 "signal_fact_count": int(result.get("user_intent_signal_fact_count") or 0),
             },
+            "memory_user_observed_pattern_update": {
+                "signal_count": int(result.get("user_action_signal_count") or 0),
+                "signal_fact_count": int(result.get("user_action_signal_fact_count") or 0),
+            },
         }
         self._logger.info(
             "memory store completion observed facts=%s user_claim_signals=%s "
             "user_claim_signal_facts=%s user_intent_signals=%s "
-            "user_intent_signal_facts=%s contains_interaction_turn=%s input_time_end=%s",
+            "user_intent_signal_facts=%s user_action_signals=%s "
+            "user_action_signal_facts=%s contains_interaction_turn=%s input_time_end=%s",
             int(result.get("new_fact_count") or 0),
             signal_stats["memory_user_claim_update"]["signal_count"],
             signal_stats["memory_user_claim_update"]["signal_fact_count"],
             signal_stats["memory_user_intent_update"]["signal_count"],
             signal_stats["memory_user_intent_update"]["signal_fact_count"],
+            signal_stats["memory_user_observed_pattern_update"]["signal_count"],
+            signal_stats["memory_user_observed_pattern_update"]["signal_fact_count"],
             contains_interaction,
             context.get("input_time_end") or "",
         )

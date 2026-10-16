@@ -63,7 +63,6 @@ class TaskExecutionDB:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA busy_timeout=30000")
         self._conn.execute("PRAGMA journal_mode=WAL")
-        self._remove_inductive_claim_signal_tracking()
         for table, required_column in (
             ("task_signal_progress", None),
             ("user_claim_signal_consolidation_task_info", "signal_ids"),
@@ -150,63 +149,6 @@ class TaskExecutionDB:
             signal_type: self._load_registered_signal_ids(table)
             for signal_type, table in self._SIGNAL_BATCHES.items()
         }
-
-    def _remove_inductive_claim_signal_tracking(self) -> None:
-        """Drop obsolete inductive checkpoints while preserving explicit work."""
-        exists = self._conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' "
-            "AND name='user_claim_signal_consolidation_task_info'",
-        ).fetchone()
-        if not exists:
-            return
-        columns = {
-            row["name"] for row in self._conn.execute(
-                "PRAGMA table_info(user_claim_signal_consolidation_task_info)"
-            )
-        }
-        retired = {
-            "pending_inductive_signal_ids", "processed_inductive_user_claim",
-        }
-        if not (columns & retired):
-            return
-        required = {
-            "batch_id", "source_task_id", "signal_ids",
-            "pending_user_claim_signal_ids", "processed_explicit_user_claim",
-            "created_at", "updated_at",
-        }
-        if not required.issubset(columns):
-            raise RuntimeError(
-                "task_scheduler.db has an unsupported user-claim signal schema; "
-                "back it up and use a fresh task database"
-            )
-        with self._conn:
-            self._conn.execute("DROP INDEX IF EXISTS idx_claim_signal_batches_pending")
-            self._conn.execute(
-                """CREATE TABLE user_claim_signal_consolidation_task_info_new (
-                    batch_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    source_task_id TEXT NOT NULL UNIQUE,
-                    signal_ids TEXT NOT NULL DEFAULT '[]',
-                    pending_user_claim_signal_ids TEXT NOT NULL DEFAULT '[]',
-                    processed_explicit_user_claim INTEGER NOT NULL DEFAULT 0,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                )"""
-            )
-            self._conn.execute(
-                """INSERT INTO user_claim_signal_consolidation_task_info_new
-                   (batch_id, source_task_id, signal_ids,
-                    pending_user_claim_signal_ids, processed_explicit_user_claim,
-                    created_at, updated_at)
-                   SELECT batch_id, source_task_id, signal_ids,
-                          pending_user_claim_signal_ids, processed_explicit_user_claim,
-                          created_at, updated_at
-                   FROM user_claim_signal_consolidation_task_info"""
-            )
-            self._conn.execute("DROP TABLE user_claim_signal_consolidation_task_info")
-            self._conn.execute(
-                "ALTER TABLE user_claim_signal_consolidation_task_info_new "
-                "RENAME TO user_claim_signal_consolidation_task_info"
-            )
 
     @_locked
     def close(self) -> None:
