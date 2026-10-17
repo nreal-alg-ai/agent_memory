@@ -111,6 +111,7 @@ class MemoryRuntime:
                 task_scheduling_config=runtime_config.get(
                     "task_scheduling"
                 ),
+                memory_enabled=manager_config.get("memory_enabled", True),
             )
             manager = MemoryNodeManager(
                 database,
@@ -449,8 +450,9 @@ class MemoryRuntime:
                 "reason": "no_pending_user_activity_units",
                 "trigger_reason": reason,
             }
-        report = self._memory_manager.submit_memory_user_activity_extraction_task(
-            tags=resolved_tags,
+        report = self._task_scheduler.submit(
+            "memory_user_activity_extraction",
+            {"tags": resolved_tags},
         )
         if bool(report.get("queued")):
             self._user_activity_tags = []
@@ -724,11 +726,15 @@ class MemoryRuntime:
         store_completion_context = self._memory_store_completion_context(
             canonical_units,
         )
-        queue_report = self._memory_manager.submit_memory_fact_extraction_task(
-            units=canonical_units,
-            preceding_context_units=preceding_context_units,
-            tags=sorted(tags),
+        queue_report = self._task_scheduler.submit(
+            "memory_fact_extraction",
+            {
+                "units": canonical_units,
+                "preceding_context_units": preceding_context_units,
+                "tags": sorted(tags),
+            },
             completion_context=store_completion_context,
+            report_payload={"tags": sorted(tags)},
         )
         queued = bool(queue_report.get("queued"))
         if queued:

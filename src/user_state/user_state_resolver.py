@@ -84,17 +84,10 @@ class UserStateResolver:
         logger: Optional[logging.Logger] = None,
     ) -> None:
         self._db = db
-        self._task_scheduler = task_scheduler
         self._llm_client = llm_client
         self._world_owner_entity_name = str(world_owner_entity_name or "用户本人").strip()
         self._logger = logger or logging.getLogger(__name__)
         config = dict(memory_config or {})
-        self._memory_enabled = self._config_bool(
-            config.get("memory_enabled"), True,
-        )
-        self._enabled = self._config_bool(
-            config.get("enable_memory_user_state_update"), True,
-        )
         self._update_limit = max(
             1,
             int(config.get("user_state_update_limit", 80) or 80),
@@ -104,78 +97,10 @@ class UserStateResolver:
             or config.get("prompt_language_mode")
             or "source"
         ).strip().lower()
-        self._task_scheduler.register_handler(self.TASK_KIND, self.process_update_task)
-        self._task_scheduler.register_followup_submitter(
-            self.TASK_KIND, self.submit_memory_user_state_update_task,
-        )
-
-    @staticmethod
-    def _config_bool(value: Any, default: bool = False) -> bool:
-        if value is None:
-            return default
-        if isinstance(value, bool):
-            return value
-        if isinstance(value, (int, float)):
-            return bool(value)
-        text = str(value).strip().lower()
-        if text in {"1", "true", "yes", "y", "on", "enable", "enabled"}:
-            return True
-        if text in {"0", "false", "no", "n", "off", "disable", "disabled"}:
-            return False
-        return default
+        task_scheduler.register_handler(self.TASK_KIND, self.process_update_task)
 
     def set_logger(self, logger: Optional[logging.Logger]) -> None:
         self._logger = logger or logging.getLogger(__name__)
-
-    def submit_memory_user_state_update_task(
-        self,
-        *,
-        changed_claim_ids: Optional[Sequence[int]] = None,
-        changed_user_activity_ids: Optional[Sequence[int]] = None,
-        reference_timestamp: Optional[Any] = None,
-        runtime_context: Optional[Dict[str, Any]] = None,
-        completion_context: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        """Validate and enqueue a user-state update on the shared FIFO."""
-        if not self._memory_enabled or not self._enabled:
-            return self._task_scheduler.reject(
-                self.TASK_KIND,
-                "memory_disabled" if not self._memory_enabled
-                else "user_state_update_disabled",
-            )
-        claim_ids = sorted({
-            int(value)
-            for value in changed_claim_ids or []
-            if str(value).strip().isdigit() and int(value) > 0
-        })
-        activity_ids = sorted({
-            int(value)
-            for value in changed_user_activity_ids or []
-            if str(value).strip().isdigit() and int(value) > 0
-        })
-        if not claim_ids and not activity_ids:
-            return self._task_scheduler.reject(
-                self.TASK_KIND, "no_changed_state_evidence"
-            )
-
-        payload = {
-            "changed_claim_ids": claim_ids,
-            "changed_user_activity_ids": activity_ids,
-            "reference_timestamp": reference_timestamp,
-            "runtime_context": dict(runtime_context or {}),
-        }
-        submission = self._task_scheduler.submit(
-            self.TASK_KIND,
-            payload,
-            completion_context=completion_context,
-        )
-        if not submission["queued"]:
-            self._logger.warning(
-                "User state task rejected reason=%s task_id=%s",
-                submission["reason"],
-                submission["task_id"],
-            )
-        return submission
 
     def process_update_task(
         self,

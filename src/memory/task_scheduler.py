@@ -16,7 +16,6 @@ if TYPE_CHECKING:
 
 
 TaskHandler = Callable[..., Any]
-FollowupSubmitter = Callable[..., Dict[str, Any]]
 
 
 def _report_now_text() -> str:
@@ -305,6 +304,7 @@ class TaskScheduler:
         worker_name: str = "memory-task-worker",
         task_scheduling_config: Optional[Dict[str, Any]] = None,
         claim_state_database: Optional[SessionDB] = None,
+        memory_enabled: Any = True,
     ) -> None:
         self._operation_reporter = operation_reporter
         self._handlers: Dict[str, TaskHandler] = {}
@@ -317,13 +317,27 @@ class TaskScheduler:
         self._worker_lock = threading.Lock()
         self._execution_lock = threading.RLock()
         self._shutdown_event = threading.Event()
-        self._followup_submitters: Dict[str, FollowupSubmitter] = {}
         self._fact_followup_lock = threading.RLock()
         settings = dict(
             task_scheduling_config
             if isinstance(task_scheduling_config, dict)
             else {}
         )
+        self._memory_enabled = self._config_bool(memory_enabled, True)
+        self._task_enabled = {
+            "memory_user_claim_update": self._config_bool(
+                settings.get("enable_memory_user_claim_update"), True,
+            ),
+            "memory_user_observed_pattern_update": self._config_bool(
+                settings.get("enable_memory_user_observed_pattern_update"), True,
+            ),
+            "memory_user_intent_update": self._config_bool(
+                settings.get("enable_memory_user_intent_update"), True,
+            ),
+            "memory_user_state_update": self._config_bool(
+                settings.get("enable_memory_user_state_update"), True,
+            ),
+        }
         self._claim_state_database = claim_state_database
         self._task_execution_db: Optional[TaskExecutionDB] = None
         if claim_state_database is not None and hasattr(claim_state_database, "db_path"):
@@ -413,7 +427,7 @@ class TaskScheduler:
         """Reporter shared with synchronous operations such as recall."""
         return self._operation_reporter
 
-    def _select_pending_signal_ids(self, target: str, *, fact_limit: int) -> List[int]:
+    def _select_pending_signal_ids(self, target: str) -> List[int]:
         if self._task_execution_db is None or self._claim_state_database is None:
             return []
         signal_type = {
@@ -421,40 +435,34 @@ class TaskScheduler:
             "user_action_signal_consolidation": "action",
         }.get(target, "claim")
         pending_ids = self._task_execution_db.pending_signal_ids(target)
-        mappings = self._claim_state_database.get_user_signal_mappings_by_ids(
+        pending_signals = self._claim_state_database.get_user_signals_by_ids(
             signal_type, pending_ids,
         )
-        missing = set(pending_ids) - {int(row["signal_id"]) for row in mappings}
+        valid_ids = {int(row["signal_id"]) for row in pending_signals}
+        missing = set(pending_ids) - valid_ids
         if missing:
             self._task_execution_db.mark_signal_ids_completed(target, sorted(missing))
-        selected_facts = set(list(dict.fromkeys(
-            int(row["fact_id"]) for row in mappings
-        ))[:max(1, fact_limit)])
-        return [
-            int(row["signal_id"]) for row in mappings
-            if int(row["fact_id"]) in selected_facts
-        ]
+        return [signal_id for signal_id in pending_ids if signal_id in valid_ids]
 
     def _prepare_signal_task_payload(
         self, task_kind: str, payload: Dict[str, Any],
     ) -> Dict[str, Any]:
-        """Freeze pending signal IDs when a claim/intent task is submitted."""
+        """Freeze pending signal IDs; task handlers enforce their own limits."""
         prepared = dict(payload)
-        limit = max(1, int(prepared.get("limit") or 100))
         if task_kind == "memory_user_claim_update":
-            if "explicit_signal_ids" not in prepared:
-                prepared["explicit_signal_ids"] = self._select_pending_signal_ids(
-                    "explicit_user_claim", fact_limit=limit,
+            if "signal_ids" not in prepared:
+                prepared["signal_ids"] = self._select_pending_signal_ids(
+                    "explicit_user_claim",
                 )
         elif task_kind == "memory_user_intent_update":
             if "signal_ids" not in prepared:
                 prepared["signal_ids"] = self._select_pending_signal_ids(
-                    "user_intent_update", fact_limit=limit,
+                    "user_intent_update",
                 )
         elif task_kind == "memory_user_observed_pattern_update":
             if "signal_ids" not in prepared:
                 prepared["signal_ids"] = self._select_pending_signal_ids(
-                    "user_action_signal_consolidation", fact_limit=limit,
+                    "user_action_signal_consolidation",
                 )
         return prepared
 
@@ -462,27 +470,19 @@ class TaskScheduler:
         self, task_kind: str, payload: Dict[str, Any], result: Any,
     ) -> None:
         """Acknowledge only IDs from this task's snapshot that the handler completed."""
-        if (not isinstance(result, dict) or self._task_execution_db is None
-                or self._claim_state_database is None):
+        if not isinstance(result, dict) or self._task_execution_db is None:
             return
         if task_kind == "memory_user_claim_update":
-            completed_facts = {
+            selected = {int(value) for value in payload.get("signal_ids") or []}
+            completed_signal_ids = {
                 int(value)
-                for value in result.pop("_completed_explicit_fact_ids", [])
+                for value in result.pop("_completed_signal_ids", [])
             }
-            mappings = self._claim_state_database.get_user_signal_mappings_by_ids(
-                "claim", payload.get("explicit_signal_ids") or [],
-            )
             completed = self._task_execution_db.mark_signal_ids_completed(
                 "explicit_user_claim",
-                [int(row["signal_id"]) for row in mappings
-                 if int(row["fact_id"]) in completed_facts],
+                sorted(completed_signal_ids & selected),
             )
-            completed_ids = set(completed)
-            result["facts_marked_processed_for_explicit_user_claim"] = len({
-                int(row["fact_id"]) for row in mappings
-                if int(row["signal_id"]) in completed_ids
-            })
+            result["signals_marked_processed"] = len(completed)
         elif task_kind == "memory_user_intent_update":
             selected = {int(value) for value in payload.get("signal_ids") or []}
             completed = result.pop("_completed_signal_ids", [])
@@ -522,17 +522,23 @@ class TaskScheduler:
                 raise ValueError(f"Task handler already registered: {task_kind}")
             self._handlers[task_kind] = handler
 
-    def register_followup_submitter(
-        self, task_kind: str, submitter: FollowupSubmitter,
-    ) -> None:
-        """Register the domain's submission gate for dependent tasks."""
-        with self._worker_lock:
-            if task_kind in self._followup_submitters:
-                raise ValueError(f"Follow-up submitter already registered: {task_kind}")
-            self._followup_submitters[task_kind] = submitter
+    @staticmethod
+    def _config_bool(value: Any, default: bool = False) -> bool:
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        text = str(value).strip().lower()
+        if text in {"1", "true", "yes", "y", "on", "enable", "enabled"}:
+            return True
+        if text in {"0", "false", "no", "n", "off", "disable", "disabled"}:
+            return False
+        return default
 
     def start(self) -> None:
-        """Start the shared worker after all handlers and submitters are ready."""
+        """Start the shared worker after all task handlers are registered."""
         with self._worker_lock:
             if not self._shutdown_event.is_set():
                 self._ensure_worker_locked()
@@ -552,6 +558,10 @@ class TaskScheduler:
             task_id = self._operation_reporter.next_task_id(task_kind)
             if self._shutdown_event.is_set():
                 reason = "worker_shutdown"
+            elif not self._memory_enabled:
+                reason = "memory_disabled"
+            elif task_kind in self._task_enabled and not self._task_enabled[task_kind]:
+                reason = "task_disabled"
             elif task_kind not in self._handlers:
                 reason = "task_handler_not_registered"
             else:
@@ -862,13 +872,22 @@ class TaskScheduler:
                     newest["reference_timestamp"] or self._latest_input_time_end or None
                 )
                 self._claim_state_task_pending = True
-        report = self._submit_followup(
+        state_payload = {
+            "changed_claim_ids": [claim_id for claim_id, _ in versions],
+            "changed_user_activity_ids": [],
+            "reference_timestamp": reference_timestamp,
+            "runtime_context": {},
+        }
+        report = self.submit(
             "memory_user_state_update",
-            changed_claim_ids=[claim_id for claim_id, _ in versions],
-            reference_timestamp=reference_timestamp,
+            state_payload,
             completion_context={
                 "claim_state_window_versions": versions,
                 "claim_state_final_flush": force,
+            },
+            report_payload={
+                "changed_claim_ids": state_payload["changed_claim_ids"],
+                "reference_timestamp": reference_timestamp,
             },
         )
         if not report.get("queued"):
@@ -939,9 +958,12 @@ class TaskScheduler:
             resolved_timestamp = self._latest_input_time_end
         reports: Dict[str, Dict[str, Any]] = {}
         for task_kind in self._FACT_FOLLOWUP_TASK_KINDS:
-            reports[task_kind] = self._submit_followup(
+            payload: Dict[str, Any] = {
+                "reference_timestamp": resolved_timestamp or None,
+            }
+            reports[task_kind] = self.submit(
                 task_kind,
-                reference_timestamp=resolved_timestamp or None,
+                payload,
                 completion_context={
                     "fact_followup_scheduler": {
                         "task_kind": task_kind,
@@ -949,6 +971,7 @@ class TaskScheduler:
                         "reference_timestamp": resolved_timestamp,
                     }
                 },
+                report_payload=payload,
             )
             if not bool(reports[task_kind].get("queued")):
                 self._finish_final_fact_followup_task(task_kind, succeeded=False)
@@ -968,16 +991,6 @@ class TaskScheduler:
                     kind: dict(values) for kind, values in self._fact_followup_state.items()
                 },
             }
-
-    def _submit_followup(self, task_kind: str, **kwargs: Any) -> Dict[str, Any]:
-        submitter = self._followup_submitters.get(task_kind)
-        if submitter is None:
-            return self.reject(task_kind, "followup_submitter_not_registered")
-        try:
-            return submitter(**kwargs)
-        except Exception:
-            self._logger.exception("Follow-up submission failed kind=%s", task_kind)
-            return self.reject(task_kind, "followup_submission_failed")
 
     def _handle_completed_task(self, event: Dict[str, Any]) -> None:
         task_kind = str(event.get("task_kind") or "")
@@ -1021,9 +1034,23 @@ class TaskScheduler:
             return
         activity_ids = result.get("user_activity_item_ids") or []
         if activity_ids:
-            self._submit_followup(
+            payload = {
+                "changed_claim_ids": [],
+                "changed_user_activity_ids": sorted({
+                    int(value) for value in activity_ids
+                    if str(value).strip().isdigit() and int(value) > 0
+                }),
+                "reference_timestamp": None,
+                "runtime_context": {},
+            }
+            self.submit(
                 "memory_user_state_update",
-                changed_user_activity_ids=activity_ids,
+                payload,
+                report_payload={
+                    "changed_user_activity_ids": payload[
+                        "changed_user_activity_ids"
+                    ],
+                },
             )
 
     def _process_user_state_update_follow_up_steps(self, event: Dict[str, Any]) -> None:
@@ -1085,11 +1112,18 @@ class TaskScheduler:
             return
         if task_kind not in self._FACT_FOLLOWUP_TASK_KINDS:
             return
+        progress_count = self._fact_followup_progress_count(event.get("result"))
+        has_pending = self._has_pending_fact_followup_signals(task_kind)
+        completed_successfully = bool(event.get("succeeded")) and (
+            not has_pending or progress_count > 0
+        )
         if bool(followup_context.get("final_flush")):
-            self._finish_final_fact_followup_task(
-                task_kind, succeeded=bool(event.get("succeeded")),
+            fully_drained = self._finish_final_fact_followup_task(
+                task_kind,
+                succeeded=completed_successfully,
+                followup_context=followup_context,
             )
-            if task_kind == "memory_user_claim_update":
+            if fully_drained and task_kind == "memory_user_claim_update":
                 claim_state_report = self.trigger_user_state_time_tick(force=True)
                 self._logger.info(
                     "final memory claim state evaluated queued=%s reason=%s "
@@ -1101,8 +1135,27 @@ class TaskScheduler:
                 )
         elif bool(followup_context.get("automatic")):
             self._finish_automatic_fact_followup_task(
-                task_kind, succeeded=bool(event.get("succeeded")),
+                task_kind, succeeded=completed_successfully,
             )
+
+    @staticmethod
+    def _fact_followup_progress_count(result: Any) -> int:
+        if not isinstance(result, dict):
+            return 0
+        try:
+            return max(0, int(result.get("signals_marked_processed") or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def _has_pending_fact_followup_signals(self, task_kind: str) -> bool:
+        if self._task_execution_db is None:
+            return False
+        target = {
+            "memory_user_claim_update": "explicit_user_claim",
+            "memory_user_intent_update": "user_intent_update",
+            "memory_user_observed_pattern_update": "user_action_signal_consolidation",
+        }.get(task_kind)
+        return bool(target and self._select_pending_signal_ids(target))
 
     def _record_store_completion(
         self, result: Dict[str, Any], *, completion_context: Any,
@@ -1170,9 +1223,12 @@ class TaskScheduler:
             state["task_pending"] = True
             target_generation = int(state["generation"])
             reference_timestamp = self._latest_input_time_end
-        report = self._submit_followup(
+        followup_payload: Dict[str, Any] = {
+            "reference_timestamp": reference_timestamp or None,
+        }
+        report = self.submit(
             kind,
-            reference_timestamp=reference_timestamp or None,
+            followup_payload,
             completion_context={
                 "fact_followup_scheduler": {
                     "task_kind": kind,
@@ -1181,6 +1237,7 @@ class TaskScheduler:
                     "reference_timestamp": reference_timestamp,
                 }
             },
+            report_payload=followup_payload,
         )
         if report.get("queued"):
             with self._fact_followup_lock:
@@ -1223,22 +1280,70 @@ class TaskScheduler:
         return candidate > current
 
     def _finish_automatic_fact_followup_task(self, kind: str, *, succeeded: bool) -> None:
+        has_pending = succeeded and self._has_pending_fact_followup_signals(kind)
         with self._fact_followup_lock:
             state = self._fact_followup_state[kind]
             state["task_pending"] = False
             if succeeded:
                 state["completed_generation"] = int(state["generation"])
-                state["unscheduled_signal_batches"] = 0
-                state["unscheduled_signal_facts"] = 0
-                state["unscheduled_contains_interaction"] = False
+                if has_pending:
+                    threshold = self._fact_followup_thresholds[kind]["default"]
+                    state["unscheduled_signal_batches"] = max(
+                        int(state["unscheduled_signal_batches"]),
+                        threshold["batches"],
+                    )
+                    state["unscheduled_signal_facts"] = max(
+                        int(state["unscheduled_signal_facts"]),
+                        threshold["facts"],
+                    )
+                else:
+                    state["unscheduled_signal_batches"] = 0
+                    state["unscheduled_signal_facts"] = 0
+                    state["unscheduled_contains_interaction"] = False
             else:
                 self._mark_fact_followup_needing_retry_locked(kind)
         if succeeded:
             self._schedule_fact_followup_if_eligible(kind)
 
     def _finish_final_fact_followup_task(
-        self, task_kind: str, *, succeeded: bool,
-    ) -> None:
+        self,
+        task_kind: str,
+        *,
+        succeeded: bool,
+        followup_context: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        followup_context = dict(followup_context or {})
+        if succeeded and self._has_pending_fact_followup_signals(task_kind):
+            reference_timestamp = str(
+                followup_context.get("reference_timestamp") or ""
+            )
+            payload = {"reference_timestamp": reference_timestamp or None}
+            continuation = self.submit(
+                task_kind,
+                payload,
+                completion_context={
+                    "fact_followup_scheduler": {
+                        "task_kind": task_kind,
+                        "final_flush": True,
+                        "reference_timestamp": reference_timestamp,
+                    }
+                },
+                report_payload=payload,
+            )
+            if continuation.get("queued"):
+                self._logger.info(
+                    "final memory follow-up continuing task_kind=%s remaining_signals=%s",
+                    task_kind,
+                    len(self._select_pending_signal_ids({
+                        "memory_user_claim_update": "explicit_user_claim",
+                        "memory_user_intent_update": "user_intent_update",
+                        "memory_user_observed_pattern_update": (
+                            "user_action_signal_consolidation"
+                        ),
+                    }[task_kind])),
+                )
+                return False
+            succeeded = False
         with self._fact_followup_lock:
             state = self._fact_followup_state[task_kind]
             if succeeded:
@@ -1260,6 +1365,7 @@ class TaskScheduler:
                 "memory final fact follow-up task failed kind=%s; retained pending evidence",
                 task_kind,
             )
+        return True
 
     def _mark_fact_followup_needing_retry_locked(self, kind: str) -> None:
         state = self._fact_followup_state[kind]

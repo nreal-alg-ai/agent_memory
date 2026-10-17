@@ -1407,7 +1407,7 @@ class SessionDB:
             "action_signal_ids": [int(row["signal_id"]) for row in action_rows],
         }
 
-    def get_user_signal_mappings_by_ids(
+    def get_user_signals_by_ids(
         self, signal_type: str, signal_ids: Sequence[int],
     ) -> List[Dict[str, Any]]:
         table = {
@@ -1429,7 +1429,7 @@ class SessionDB:
             ).fetchall())
         return rows
 
-    def get_user_signal_mappings_by_fact_ids(
+    def get_user_signals_by_fact_ids(
         self, signal_type: str, fact_ids: Sequence[int],
     ) -> List[Dict[str, Any]]:
         table = {
@@ -1505,6 +1505,25 @@ class SessionDB:
         ).fetchall()
         return [self._row_to_dict(row) for row in rows]
 
+    def get_user_action_signals_by_ids(
+        self, signal_ids: Sequence[int],
+    ) -> List[Dict[str, Any]]:
+        """Load the complete action signals selected for occurrence grouping."""
+        ids = sorted({int(value) for value in signal_ids if int(value) > 0})
+        signals: List[Dict[str, Any]] = []
+        for offset in range(0, len(ids), 500):
+            chunk = ids[offset:offset + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = self._conn.execute(
+                "SELECT * FROM memory_fact_user_action_signals "
+                f"WHERE signal_id IN ({placeholders})",
+                chunk,
+            ).fetchall()
+            signals.extend(self._row_to_dict(row) for row in rows)
+        return sorted(signals, key=lambda signal: (
+            int(signal["fact_id"]), int(signal["signal_id"])
+        ))
+
     def get_grouped_user_action_signals(
         self, *, subject_entity_id: int, action_kind: str, limit: int = 256,
     ) -> List[Dict[str, Any]]:
@@ -1557,7 +1576,7 @@ class SessionDB:
         )
         self._commit_if_needed()
 
-    def upsert_fact_user_claim_signal_mappings(
+    def upsert_fact_user_claim_signals(
         self,
         mappings: Sequence[Dict[str, Any]],
     ) -> int:
@@ -1624,7 +1643,7 @@ class SessionDB:
         self._commit_if_needed()
         return changed
 
-    def get_fact_user_claim_signal_mappings(
+    def get_fact_user_claim_signals(
         self,
         fact_id: int,
     ) -> Dict[str, Dict[str, Any]]:
@@ -1651,7 +1670,7 @@ class SessionDB:
             for mapping in [self._row_to_dict(row)]
         }
 
-    def upsert_fact_user_intent_signal_mappings(
+    def upsert_fact_user_intent_signals(
         self,
         mappings: Sequence[Dict[str, Any]],
     ) -> int:
@@ -1731,7 +1750,7 @@ class SessionDB:
         self._commit_if_needed()
         return changed
 
-    def get_fact_user_intent_signal_mappings(
+    def get_fact_user_intent_signals(
         self,
         fact_id: int,
     ) -> Dict[str, Dict[str, Any]]:
@@ -1758,6 +1777,35 @@ class SessionDB:
             mapping["subject_entity"] = str(mapping.get("subject") or "")
             mappings[str(mapping["signal_key"])] = mapping
         return mappings
+
+    def get_user_intent_signals_by_ids(
+        self,
+        signal_ids: Sequence[int],
+    ) -> List[Dict[str, Any]]:
+        """Load the complete intent signals selected for one update task."""
+        ids = sorted({int(value) for value in signal_ids if int(value) > 0})
+        signals: List[Dict[str, Any]] = []
+        for offset in range(0, len(ids), 500):
+            chunk = ids[offset:offset + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = self._conn.execute(
+                "SELECT signal.*, entity.name AS subject "
+                "FROM memory_fact_user_intent_signals AS signal "
+                "LEFT JOIN memory_entity_nodes AS entity "
+                "ON entity.id = signal.subject_entity_id "
+                f"WHERE signal.signal_id IN ({placeholders}) "
+                "AND signal.subject_entity_id IS NOT NULL "
+                "ORDER BY signal.signal_id",
+                chunk,
+            ).fetchall()
+            for row in rows:
+                signal = self._row_to_dict(row)
+                signal["candidate_object_types"] = _json_loads(
+                    signal.get("candidate_object_types"), []
+                )
+                signal["subject_entity"] = str(signal.get("subject") or "")
+                signals.append(signal)
+        return signals
 
     def upsert_user_claim(
         self,

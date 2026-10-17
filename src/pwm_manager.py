@@ -37,8 +37,8 @@ class PersonWorldModel:
                 memory_config=manager_config,
                 logger=self._logger.getChild("llm_client"),
             )
-            # The worker starts on the first submission, after both domains
-            # and their follow-up submission gates have been initialized.
+            # Both memory and user-state handlers are registered before the
+            # shared worker starts processing its FIFO.
             self._task_scheduler = TaskScheduler(
                 operation_reporter=self._operation_reporter,
                 maxsize=int(manager_config.get("task_queue_maxsize", 100) or 100),
@@ -47,6 +47,7 @@ class PersonWorldModel:
                 task_scheduling_config=(
                     (memory_runtime_config or {}).get("task_scheduling")
                 ),
+                memory_enabled=manager_config.get("memory_enabled", True),
             )
             self._memory_runtime = MemoryRuntime(
                 db_path=resolved_db_path,

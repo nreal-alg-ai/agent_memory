@@ -183,6 +183,10 @@ memory_runtime:
       max_tokens: 6000
       min_tokens_for_duration: 1000
   task_scheduling:
+    enable_memory_user_claim_update: true
+    enable_memory_user_observed_pattern_update: true
+    enable_memory_user_intent_update: true
+    enable_memory_user_state_update: true
     # Interaction batches remain more responsive than ambient input, but a
     # fact follow-up task still needs multiple committed batches and signal-bearing
     # facts. Signal counts themselves are diagnostic only: one fact may emit
@@ -211,10 +215,6 @@ memory_runtime:
 
 memory_manager:
   memory_enabled: true
-  enable_memory_user_claim_update: true
-  enable_memory_user_observed_pattern_update: true
-  enable_memory_user_intent_update: true
-  enable_memory_user_state_update: true
   llm:
     llm_provider: deepseek
     llm_name: deepseek-v4-flash
@@ -236,9 +236,10 @@ memory_manager:
 
   task_queue_maxsize: 100
 
-  user_claim_limit: 100
-  user_observed_pattern_limit: 100
-  user_intent_limit: 100
+  user_claim_signal_limit: 100
+  user_claim_signal_batch_size: 8
+  user_action_signal_limit: 100
+  user_intent_signal_limit: 100
   user_intent_signal_batch_size: 8
   user_state_update_limit: 80
   user_claim_explicit_min_confidence: 0.72

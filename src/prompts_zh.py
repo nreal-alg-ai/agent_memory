@@ -276,35 +276,38 @@ user_intent_signals 输出规则：
 {dialogue_batch}
 """
 
-INTENT_EXTRACTION_PROMPT_ZH = """你是个人世界模型的显式 user_intent 提炼模块。你负责从已落库、可追溯的 narrative facts 中提取用户本人的未来目标、明确安排和可闭环责任事项。本次输入是批量调度的独立 signal 条目，不是同一意图的证据组。
+INTENT_EXTRACTION_PROMPT_ZH = """你是个人世界模型的显式 user_intent 提炼模块。
 
-只允许输出三类对象。若 signal 的 `assertion_source=third_party_report`，它仅是可核查的第三方线索：不得据此生成用户本人已设定的 goal 或已承担的 work_item；只有 fact 明确描述已落实的未来安排时，才可谨慎输出低置信度 plan，并在 summary 中保留“据某人所述”的来源限定。
-- goal：主体明确、跨越多个动作的持续性期望结果；一次性愿望或单次动作不是 goal。
-- plan：明确的未来安排、行程、会议、活动或事件；必须有时间/时间窗口，或“已约定、已报名、已安排”等安排性证据；它不是待办。
-- work_item：责任人明确的有界事项；除具体动作外，必须有交付物、截止时间、明确承诺或经用户本人明确接受的分配中的至少一项完成锚点。它可以是 personal_action、commitment、assigned 或 external_commitment。
+一、目标
+逐条审查输入的 `user_intent_signal` 及其所属 fact，判断该 fact 是否直接支持一个关于用户本人的未来目标、明确安排或可闭环责任事项。成立时生成一个 `intent_candidate`；证据不足时返回 null。本模块不根据多个 signal 归纳意图，也不判断新旧对象是否相同。
 
-严格限制：
-- 只能使用输入 facts 的直接证据。assistant 的建议、推测、行为规律和 prediction 不得自动落库。
-- 对方提出“你去做”等要求不等于用户本人承担责任；只有 fact 明确保留用户本人随后接受、承诺或修正该要求的回应，才能据此创建或更新相应的目标、安排或责任事项。普通应声或“知道了”不足以构成承诺。
-- “也许”“如果”“要不要”“考虑一下”等弱假设默认不输出对象。
-- goal 或 plan 不得自动拆出 work_item；只有文本明确表达下一步、交付、承诺或分配时才输出 work_item。
-- 计划发生是 `occurred`，事项完成是 `completed`，二者不能混淆。
-- 每个 candidate 只能属于一种 `object_type`；同一 fact 不得自动拆成多类对象，除非 fact 明确提供每一类对象的独立证据。
-- `lifecycle_evidence` 只描述当前 fact 可直接观察到的生命周期证据，不是数据库操作；最终 create、update、complete 等操作由后续 reconciliation 结合已有对象决定。
-- 每个 candidate 必须输出一个 `primary_domain`，且只能为 `general|health|work|life|information|finance|family|learning|social|interest|travel`。它表示对象主要影响的用户生活领域，优先选择最具体领域；`general` 仅用于真正跨领域的对象，不能作为不确定时的兜底。
-- 每个 `signal_id` 必须单独判断，只能使用该条目的 fact 和 user_intent_signal；不得跨条目拼接证据。每条输出恰好一条结果，其 `intent_candidate` 是一个对象或 null；不得为一条 signal 生成多个对象。signal 仅用于路由，不保证存在合格对象。
-- `evidence_fact_ids` 必须且只能包含当前条目的 `fact.id`。`lifecycle_update` 可以提炼成关于现有对象变化的 candidate；当前 prompt 不负责判断数据库中是否存在该对象，后续 reconciliation 负责匹配，匹配失败时不能创建新对象。
+二、user_intent 的含义
+`user_intent` 是用户未来导向的目标、安排或责任，不是对 fact 的逐字复述。fact 保存发生过的陈述和情境，intent candidate 提取其中可追踪、可更新的未来对象。只允许三类：
+- `goal`：用户明确追求、跨越多个动作的持续性期望结果；一次性愿望或单次动作不是 goal。
+- `plan`：用户将参与的明确未来安排、行程、会议、活动或事件；必须有时间/时间窗口，或“已约定、已报名、已安排”等安排性证据；它不是待办。
+- `work_item`：用户本人负责的有界事项；除具体动作外，必须有交付物、截止时间、明确承诺或用户本人明确接受的分配中的至少一项完成锚点。它可以是 personal_action、commitment、assigned 或 external_commitment。
+goal 或 plan 不得自动拆出 work_item；只有 fact 明确提供下一步动作、交付、承诺或分配的独立证据时，才可由对应 signal 提炼 work_item。
 
-world owner：{world_owner_name}
+三、输入 user_intent_signal 的含义
+每个条目包含独立的 `signal_id`、一条 `user_intent_signal` 及其所属 fact。同一 fact 可能因多个 signal 重复出现，但仍是同一份证据。signal 是 fact 提炼阶段给出的待核验线索，不是已经成立的 user_intent，也不是 fact 之外的新证据：`evidence_kind` 提示 goal、plan、responsibility 或 lifecycle_update，`candidate_object_types` 限定可输出的类型，`subject_entity` 与 `user_role` 提示用户在其中的身份，`user_intent_anchor` 帮助定位对象，`assertion_source`、`explicitness` 与 `evidence_basis` 帮助审查证据来源；signal 的 `confidence` 只是前一阶段的估计。必须用当前条目的 fact `summary` 核验 signal，不得照搬 signal 的结论、借用其他条目的事实，或把重复 fact 当作多次独立证据。当前时间只用于理解 fact 中已有的相对时间，不是安排或截止日期的独立证据。
+
+四、输出规则
+1. 每个输入 `signal_id` 恰好返回一条结果，其 `intent_candidate` 只能是一个对象或 null；当前 signal 与 fact 不符、事实不足或没有合格未来对象时返回 null，不得省略该 signal。candidate 的 `object_type` 必须属于该 signal 的 `candidate_object_types`。
+2. 只能使用当前 fact 直接支持的内容。助手建议、推测、行为规律、prediction 和“也许”“如果”“要不要”“考虑一下”等未确定假设不能生成对象。对方提出要求也不等于用户承担责任；只有 fact 明确保留用户本人的接受、承诺或修正回应才可生成相应责任，普通应声或“知道了”不足以构成承诺。
+3. `assertion_source=third_party_report` 只是可核查的第三方线索，不能据此认定用户已设定 goal 或承担 work_item。仅当 fact 明确描述已落实的未来安排时，才可谨慎输出低置信度 plan，并在 summary 保留“据某人所述”等来源限定。
+4. `summary` 应自包含地说明对象、用户角色及必要的时间或条件。`evidence_fact_ids` 必须恰好为当前条目 fact 的 `[fact.id]`；`confidence` 要按 fact 对最终 candidate 的支持程度重新判断，不得直接照搬 signal 的 confidence。
+5. `lifecycle_evidence` 只描述当前 fact 直接观察到的状态证据，不是数据库操作；plan 已发生是 `occurred`，work_item 已完成是 `completed`，不能混淆。`lifecycle_update` 可以生成关于已有对象变化的 candidate，但后续 reconciliation 匹配不到已有对象时不得创建新对象。
+6. `primary_domain` 只能为 `general|health|work|life|information|finance|family|learning|social|interest|travel`；优先选择最具体的用户生活领域，`general` 只用于真正跨领域的对象，不能作为不确定时的兜底。没有证据的时间和专属细节留空，不得编造。只返回 JSON。
+
 当前时间：{reference_timestamp}
-输入的独立 signal 条目（每条含 `signal_id`、`fact` 和唯一的 `user_intent_signal`）：
+输入的独立 signal 条目（每条含整数 `signal_id`、`fact` 和唯一的 `user_intent_signal`）：
 {signal_items}
 
 输出 JSON：
 {
   "results": [
     {
-      "signal_id": "原样复制输入条目的 signal_id",
+      "signal_id": 1,
       "intent_candidate": {
         "object_type": "goal|plan|work_item",
         "summary": "完整、可展示的对象描述",
@@ -383,49 +386,57 @@ existing objects：
 
 EXPLICIT_USER_CLAIM_EXTRACTION_PROMPT_ZH = """你是个人世界模型的显式 user_claim 提炼模块。
 
-输入是已经落库、可追溯的 narrative facts。每条 fact 都可能带有零到多个 `user_claim_signals`，包含该 fact 的候选主张类型、聚合标签和证据定位。你必须查看全部 signals，但它们只是候选提示，不是额外事实或最终结论；最终 claim 必须由对应 fact 的 `summary` 直接支持，并通过 `evidence_fact_ids` 指向事实依据。单次行为只能作为观察线索，不能单独推出偏好、习惯或人格规律。用户本人直接陈述，或明确确认/纠正他人的具体说法，都可构成显式主张；仅有他人陈述、模糊应声、单次行为、建议或助手推测则不行。回应型 fact 必须完整保留他人的说法与用户本人的最终立场。
+一、目标
+逐条审查输入的 `user_claim_signal` 及其对应 fact，判断该 fact 是否直接支持关于用户本人的显式主张；成立时生成 `user_claim`，不成立时返回空 `claims`。本模块不归纳观察到的行为规律，不生成未来目标或待办，也不判断新旧 claim 的关系。
 
-本流程生成的 claim_origin 由系统标记为 `explicit`，不需要在输出中提供该字段。
+二、user_claim 的含义
+`user_claim` 是用户本人明确陈述或明确确认的、语义完整且可追溯到 fact 的主张，用于表达用户的身份、所属关系、人与事物的关系、偏好、约束或本人自述的持续行为。它不是 fact 的同义复述：fact 保存原始事件和对话情境，claim 抽取其中可复用、可与以后证据比较的用户主张。一条 claim 只表达一个核心判断，须写清主体、属性或关系、具体内容及必要的对象、时间和条件；“可复用”不等于永远有效，不能把有条件或阶段性的说法泛化成永久属性。
+允许的 `claim_type` 为：
+- `identity_profile`：用户明确说明的身份、背景或角色；
+- `affiliation`：用户与组织、团队、项目或地点的所属关系；
+- `relationship`：用户与人、组织或项目的其他明确关系；
+- `preference`：用户明确表达的喜欢、厌恶或优先选择；
+- `constraint`：用户明确表达的限制、禁止、能力边界或持续条件；
+- `behavior_pattern`：用户明确自述或确认的持续行为或惯例，例如“我每周三都跑步”。
+单次事件或行为不是持续行为主张；从多次行为观察归纳出的规律属于 `user_observed_pattern`。未来行程、计划、承诺和待办属于 fact / user_intent。助手的猜测、建议和未经用户确认的第三方说法都不是显式 user_claim。
 
-`user_claim` 是关于用户本人的、可回溯到 facts 的持久主张，不是对单次事件的复述，也不替代原始事实证据。所有 claim 的 `subject_entity` 必须是当前输入中明确标出的 `world_owner_entity`（用户本人）；不得为其他人、组织、产品用户或环境 speaker 创建 user_claim。关系另一端可以是 facts 中出现的其他实体，并写入 `object_entity`。若输入 facts 没有明确的 `world_owner_entity`，输出空数组。允许的显式 claim_type 只有：
-- identity_profile：身份、背景、角色、稳定画像；
-- affiliation：所属组织、团队、项目、地点；
-- relationship：人与人/组织/项目的明确关系；
-- preference：明确喜欢、厌恶、优先选择；
-- constraint：明确限制、禁止、能力边界、持续条件；
-- behavior_pattern：用户本人明确自述或确认的持续行为、习惯或惯例，例如“我每周三都跑步”。不得根据观察到的行为自行归纳规律；这种跨事件模式单独保存为 `user_observed_pattern`。
+三、输入 user_claim_signal 的含义
+每个输入条目有独立的 `signal_id`、一条 `user_claim_signal` 及其所属 fact。同一个 fact 可能因多个 signal 重复出现，但它仍是同一份事实证据。signal 是 fact 提炼阶段给出的候选线索，不是最终 claim，也不是 fact 之外的新证据：`claim_type_hint` 提示可能的类别，`claim_anchor` 标出待核验的主题，`evidence_basis` 帮助定位证据，signal 的 `confidence` 只表示前一阶段的估计。必须以当前条目的 fact `summary` 核验该 signal，不得照搬 signal 的判断、借用其他条目的事实，或把重复出现的 fact 当作多次独立证据。
 
-规则：
-1. 每条 claim 的 subject_entity 必须等于其证据 fact 中非空的 `world_owner_entity`；不能把第三方设为 subject。object_entity（如有）必须来自输入 facts 的 entities；不能凭空造实体。
-2. evidence_fact_ids 必须只引用输入 fact_id。每条 claim 至少引用一个直接支持它的 fact。
-3. predicate 使用简短、稳定的小写英文键，例如 has_role、works_with、member_of、located_in、prefers、dislikes、requires、cannot、has_constraint、usually_does、has_routine。
-4. 关系型主张使用 object_entity；非关系主张的属性、值和限定条件必须完整写入 claim_text。
-5. claim_text 是给人阅读的完整、自包含陈述，必须明确主语、关系/属性和值，例如“用户明确偏好安静、节奏较慢的旅行方式”。
-6. 否定语义必须写入 predicate 与 claim_text，例如 dislikes、cannot、is_not_member_of；不要输出独立的正负字段。没有直接明示时不要输出。
-7. 不要输出一次行程、临时任务、单次建议、待办、开放问题；它们属于 fact / intent 层，而不是 claim。
-8. `primary_domain` 必须为 `general|health|work|life|information|finance|family|learning|social|interest|travel` 之一，表示该主张主要涉及的用户生活领域；优先选择最具体领域，`general` 只用于真正跨领域的主张。
-9. 输出空数组是正确结果。只返回 JSON。
+四、输出规则
+1. 对每个输入 `signal_id` 恰好返回一个结果；一条 signal 可以产生零条或多条不同的 claim。证据不足、signal 与 fact 不符，或当前 fact 不包含合格显式主张时，返回空 `claims`，不得省略该 signal。
+2. 显式主张须来自用户本人直接陈述，或用户对他人具体说法的明确确认、否认、纠正；回应型 fact 必须同时保留对方说法和用户最终立场。仅有第三方报告、模糊应声、单次行为或助手推测时，不能生成 claim。
+3. 每条 claim 的 `subject_entity` 必须等于当前 fact 中非空的 `world_owner_entity`（用户本人），不得以其他人、产品用户或环境 speaker 为主体。`object_entity` 若非空，必须来自同一 fact 的 `entities`；没有明确用户主体时返回空 `claims`。
+4. 每条 claim 必须由当前 fact 的 `summary` 直接支持，`evidence_fact_ids` 必须恰好为当前条目 fact 的 `[fact_id]`。不得引用其他 fact，即使它们内容相似。
+5. `claim_text` 必须是自包含的完整陈述，写明会影响语义的对象、范围、时间及条件；不要拼接无关主张。`predicate` 使用简短稳定的小写英文键，如 `has_role`、`member_of`、`prefers`、`dislikes`、`requires`、`cannot`、`has_routine`。否定语义同时体现在 predicate 和 claim_text 中，不输出独立正负字段。
+6. `primary_domain` 只能是 `general|health|work|life|information|finance|family|learning|social|interest|travel`，优先选最具体领域。仅当 fact 明确给出有效时间时填写 `valid_from`/`valid_to`，不得猜测。claim 的 `confidence` 应根据当前 fact 对最终主张的支持程度独立判断，不照搬 signal 的 confidence。
+7. 同一 fact 在多个条目中出现时仍逐条审查；相同主张可以由不同 signal 输出，系统后续去重。只返回 JSON，不要 markdown。
 
 输出：
 {
-  "claims": [
+  "results": [
     {
-      "subject_entity": "",
-      "claim_type": "identity_profile|affiliation|relationship|preference|constraint|behavior_pattern",
-      "primary_domain": "general|health|work|life|information|finance|family|learning|social|interest|travel",
-      "predicate": "",
-      "object_entity": "",
-      "claim_text": "包含主体和完整语义的陈述",
-      "valid_from": "",
-      "valid_to": "",
-      "evidence_fact_ids": [1],
-      "confidence": 0.85
+      "signal_id": 1,
+      "claims": [
+        {
+          "subject_entity": "",
+          "claim_type": "identity_profile|affiliation|relationship|preference|constraint|behavior_pattern",
+          "primary_domain": "general|health|work|life|information|finance|family|learning|social|interest|travel",
+          "predicate": "",
+          "object_entity": "",
+          "claim_text": "包含主体和完整语义的陈述",
+          "valid_from": "",
+          "valid_to": "",
+          "evidence_fact_ids": [1],
+          "confidence": 0.85
+        }
+      ]
     }
   ]
 }
 
-facts：
-{facts}
+signal_items：
+{signal_items}
 """
 
 

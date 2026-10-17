@@ -269,31 +269,38 @@ Dialogue/transcript evidence batch:
 {dialogue_batch}
 """
 
-INTENT_EXTRACTION_PROMPT_EN = """Extract Intent & Execution objects from stored, traceable narrative facts for a personal world model. The input is a scheduling batch of independent signal items, not an evidence group for one intent.
+INTENT_EXTRACTION_PROMPT_EN = """You extract explicit user_intents for a personal world model.
 
-If a signal has `assertion_source=third_party_report`, treat it as a verifiable third-party lead, not a wearer commitment. Do not create a goal or work item solely from it. A plan may be emitted only when the fact clearly describes an established future arrangement; keep confidence low and preserve the source qualification in the summary.
+1. Objective
+Review each input `user_intent_signal` together with its own fact. Determine whether the fact directly supports one future-facing goal, established arrangement, or bounded responsibility of user self. Return one `intent_candidate` when supported, or null when it is not. Do not infer an intent by combining multiple signals or decide whether a new candidate matches an existing object.
 
-Only output:
-- goal: an explicit, durable desired outcome that spans more than one action;
-- plan: an explicit future arrangement, event, activity, trip, meeting, or appointment with a time/window or explicit arranged, agreed, or registered evidence;
-- work_item: a bounded responsibility with a clear responsible party, action, and at least one completion anchor: a deliverable, deadline, explicit commitment, or an assignment explicitly accepted by the wearer.
+2. Meaning of user_intent
+A `user_intent` is a trackable, updateable future object, not a verbatim restatement of the fact. The fact preserves the statement and its context. Only these object types are allowed:
+- `goal`: an explicit, enduring desired outcome spanning multiple actions; a one-off wish or single action is not a goal.
+- `plan`: an established future arrangement, trip, meeting, activity, or event involving user self, supported by a time/window or explicit arranged, agreed, or registered evidence; it is not a to-do.
+- `work_item`: a bounded action for which user self is responsible, with at least one completion anchor beyond the action: a deliverable, deadline, explicit commitment, or assignment explicitly accepted by user self. It may be personal_action, commitment, assigned, or external_commitment.
+Never derive a work item automatically from a goal or plan. A corresponding signal may yield a work item only when the fact independently supports a next action, deliverable, commitment, or assignment.
 
-Use only direct fact evidence. Do not store assistant suggestions, speculation, behavior patterns, or predictions. Do not create an object for weak hypotheticals such as maybe, if, should we, or consider. A goal or plan never automatically creates a work item. Use `occurred` only for a plan whose event happened, and `completed` only for a completed work item. Each candidate has exactly one `object_type`; do not fan out one fact into multiple object types without independent evidence. `lifecycle_evidence` describes only an observed fact-level change, never a database operation; reconciliation decides create, update, or completion against existing objects. Every candidate must output one `primary_domain` from `general|health|work|life|information|finance|family|learning|social|interest|travel`. It is the primary user-life domain affected by the object: prefer the most specific domain, and use `general` only for genuinely cross-domain objects, never as an uncertainty fallback.
+3. Meaning of the input user_intent_signal
+Each item has its own `signal_id`, one `user_intent_signal`, and its associated fact. The same fact may appear under multiple signals, but remains one piece of evidence. The signal is a lead from fact extraction, neither an established user_intent nor new evidence beyond the fact: `evidence_kind` hints at goal, plan, responsibility, or lifecycle_update; `candidate_object_types` limits permitted output types; `subject_entity` and `user_role` hint at user self's role; `user_intent_anchor` locates the object; `assertion_source`, `explicitness`, and `evidence_basis` help inspect provenance. Its `confidence` is only a prior estimate. Verify the signal against the current fact's `summary`; do not copy its conclusion, use another item's evidence, or treat a repeated fact as independent evidence. Reference time only helps interpret relative times already present in the fact; it is not evidence of an arrangement or deadline.
 
-Another person's request or assignment does not by itself make it the wearer's responsibility. For a response-based intent, the fact must preserve the wearer's subsequent clear acceptance, commitment, or correction. A mere acknowledgment or "got it" is insufficient.
+4. Output rules
+1. Return exactly one result for every input `signal_id`, with one candidate object or null. Return null when the signal and fact disagree, the fact is insufficient, or no qualifying future object exists. The candidate's `object_type` must be in that signal's `candidate_object_types`.
+2. Use only direct evidence from the current fact. Assistant suggestions, speculation, behavior patterns, predictions, and unresolved hypotheticals such as maybe, if, should we, or consider cannot create an object. Another person's request does not assign responsibility to user self; the fact must preserve user self's clear acceptance, commitment, or correction. A mere acknowledgment or "got it" is insufficient.
+3. `assertion_source=third_party_report` is a verifiable lead, not proof that user self set a goal or accepted a work item. A low-confidence plan is possible only when the fact clearly describes an established future arrangement; qualify its summary with the third-party source.
+4. Make `summary` self-contained, including the object, user role, and material time or conditions. `evidence_fact_ids` must be exactly `[fact.id]` for the current item. Judge final confidence from the fact; do not copy the signal's confidence.
+5. `lifecycle_evidence` describes only a change directly observed in the fact, not a database operation. A plan that happened is `occurred`; a finished work item is `completed`. A `lifecycle_update` may describe a change to an existing object, but later reconciliation must not create a new object if no matching existing object is found.
+6. `primary_domain` must be one of `general|health|work|life|information|finance|family|learning|social|interest|travel`. Prefer the most specific user-life domain; reserve `general` for genuinely cross-domain objects, not uncertainty. Leave unsupported times and details empty. Return JSON only.
 
-Judge each `signal_id` independently using only its own fact and user_intent_signal; never combine evidence across items. Return exactly one result per signal, with either one `intent_candidate` object or null. A signal is only a routing hint, not a guaranteed object. `evidence_fact_ids` must contain exactly that item's `fact.id`. A lifecycle update may yield a candidate describing a change to an existing object; this prompt does not know whether that object exists in the database. Later reconciliation performs the match and must not create a new object when no match exists.
-
-World owner: {world_owner_name}
 Reference time: {reference_timestamp}
-Independent signal items (each has `signal_id`, `fact`, and one `user_intent_signal`):
+Independent signal items (each has an integer `signal_id`, `fact`, and one `user_intent_signal`):
 {signal_items}
 
 Return JSON only:
 {
   "results": [
     {
-      "signal_id": "copy the input signal_id exactly",
+      "signal_id": 1,
       "intent_candidate": {
         "object_type": "goal|plan|work_item",
         "summary": "complete, user-facing object description",
@@ -346,40 +353,53 @@ existing objects:
 
 EXPLICIT_USER_CLAIM_EXTRACTION_PROMPT_EN = """You extract explicit user_claims for a personal world model.
 
-The input contains stored, traceable narrative facts. Each fact may include zero or more `user_claim_signals` with candidate claim types, grouping labels, and evidence pointers. Inspect all signals, but treat them only as candidate hints, never as additional facts or final conclusions. Every emitted claim must be directly supported by the corresponding fact summary and cite its factual basis in `evidence_fact_ids`. A one-off action is only an observational hint and cannot by itself establish a preference, habit, or behavioral rule. A proposition directly stated by the wearer, or clearly confirmed or corrected by the wearer in response to another person's specific statement, can support an explicit claim. Another person's statement alone, a vague acknowledgment, a one-off action, a recommendation, or assistant speculation cannot. A response-based fact must preserve both the earlier statement and the wearer's final position.
+1. Objective
+Review each input `user_claim_signal` together with its corresponding fact. Determine whether that fact directly supports an explicit proposition about user self. Generate a `user_claim` when it does; otherwise return empty `claims`. Do not infer patterns from observed behavior, generate future goals or to-dos, or decide how new claims relate to existing claims.
 
-The system assigns `claim_origin=explicit` to claims from this process; do not include that field in the output.
+2. Meaning of user_claim
+A `user_claim` is a complete proposition about user self, explicitly stated or clearly confirmed by the user and traceable to a fact. It may describe the user's identity, affiliation, other relationships, preferences, constraints, or a continuing behavior the user has described. It is not a paraphrase of the fact: the fact preserves the original event and conversational context, while the claim extracts a reusable proposition that can be compared with later evidence. Each claim must express one central assertion, including its subject, attribute or relationship, concrete content, and any necessary object, time, or condition. Reusable does not mean permanently true; do not turn a conditional or temporary statement into an unconditional permanent attribute.
+Allowed `claim_type` values are:
+- `identity_profile`: an identity, background, or role explicitly described by the user;
+- `affiliation`: the user's membership or affiliation with an organization, team, project, or place;
+- `relationship`: another explicit relationship between the user and a person, organization, or project;
+- `preference`: a clearly expressed liking, dislike, or priority;
+- `constraint`: a clearly expressed restriction, prohibition, capability boundary, or continuing condition;
+- `behavior_pattern`: a continuing behavior or routine explicitly stated or confirmed by the user, such as "I run every Wednesday".
+A single event or action is not a continuing-behavior claim. Patterns inferred from repeated observed actions belong to `user_observed_pattern`. Future trips, plans, commitments, and to-dos belong to facts or user_intents. Assistant guesses, suggestions, and unconfirmed third-party statements are not explicit user_claims.
 
-`user_claim` is a durable proposition about user self that remains traceable to facts; it is not a retelling of a one-time event and does not replace the underlying evidence. Every claim's `subject_entity` must be the non-empty `world_owner_entity` explicitly marked in its evidence fact (user self). Never create a user_claim whose subject is another person, organization, product user, or ambient speaker. Other entities may be the `object_entity` of a relation involving user self. If no evidence fact explicitly identifies `world_owner_entity`, return no claim. Allowed explicit claim_type values are identity_profile, affiliation, relationship, preference, constraint, and behavior_pattern. Use behavior_pattern only for a continuing behavior, habit, or routine explicitly stated or confirmed by the wearer, such as "I run every Wednesday". Do not infer a pattern from observed actions; cross-event patterns are stored separately as `user_observed_pattern`.
+3. Meaning of the input user_claim_signal
+Each input item has its own `signal_id`, one `user_claim_signal`, and its source fact. The same fact may appear in several items, but it remains one piece of factual evidence. The signal is a candidate hint produced during fact extraction, not a final claim or new evidence beyond the fact: `claim_type_hint` suggests a possible type, `claim_anchor` points to the topic to verify, `evidence_basis` helps locate the evidence, and the signal's `confidence` is only the earlier stage's estimate. Verify the signal against the current item's fact `summary`. Do not copy the signal's judgment, borrow facts from another item, or count a repeated fact as multiple independent observations.
 
-Rules:
-1. subject_entity must exactly equal `world_owner_entity` on every cited evidence fact; never use a third party as subject. Any object_entity must occur in input fact entities.
-2. evidence_fact_ids must cite only input fact IDs and each claim needs direct evidence.
-3. Use concise stable lowercase predicates, such as has_role, works_with, member_of, located_in, prefers, dislikes, requires, cannot, has_constraint, usually_does, and has_routine.
-4. Use object_entity for relational claims. For non-relational claims, express the attribute, value, and relevant qualification completely in claim_text.
-5. claim_text is a complete, self-contained, reader-facing proposition with its subject, predicate, and value.
-6. Encode negation in predicate and claim_text, such as dislikes, cannot, or is_not_member_of; do not output a standalone positive/negative field. Return no claim without direct evidence.
-7. Do not output a one-time trip, task, plan, recommendation, or open question. An empty list is correct. Return JSON only.
-8. `primary_domain` must be one of `general|health|work|life|information|finance|family|learning|social|interest|travel`; choose the most specific user-life domain, and use `general` only for genuinely cross-domain claims.
+4. Output rules
+1. Return exactly one result for every input `signal_id`; a signal may yield zero or several distinct claims. Return empty `claims`, rather than omitting the result, when evidence is insufficient, the signal conflicts with its fact, or the fact contains no qualifying explicit proposition.
+2. An explicit proposition must come from the user's own direct statement or their clear confirmation, denial, or correction of another person's specific statement. A response-based fact must preserve both the earlier statement and the user's final position. A third-party report alone, vague acknowledgment, one-off action, or assistant speculation cannot establish a claim.
+3. Each claim's `subject_entity` must equal the non-empty `world_owner_entity` (user self) in the current fact. Never use another person, product user, or ambient speaker as the subject. A non-empty `object_entity` must occur in the same fact's `entities`. Return empty `claims` if the user's identity is not explicit in the fact.
+4. Every claim must be directly supported by the current fact's `summary`, and its `evidence_fact_ids` must be exactly `[fact_id]` from that item. Do not cite another fact, even if its content is similar.
+5. `claim_text` must be a complete, self-contained statement that preserves any object, scope, time, or condition that changes the meaning; do not combine unrelated propositions. Use short, stable lowercase English predicates such as `has_role`, `member_of`, `prefers`, `dislikes`, `requires`, `cannot`, or `has_routine`. Express negation in both predicate and claim_text; do not add a separate polarity field.
+6. `primary_domain` must be one of `general|health|work|life|information|finance|family|learning|social|interest|travel`; choose the most specific domain. Fill `valid_from`/`valid_to` only when the fact explicitly establishes the validity period; do not guess. Judge the claim's `confidence` independently from how well the current fact supports the final proposition; do not copy the signal's confidence.
+7. Review each item independently even when several items share a fact. Different signals may output the same proposition; the system will deduplicate it later. Return JSON only, without markdown.
 
 Output:
 {
-  "claims": [{
-    "subject_entity": "",
-    "claim_type": "identity_profile|affiliation|relationship|preference|constraint|behavior_pattern",
-    "primary_domain": "general|health|work|life|information|finance|family|learning|social|interest|travel",
-    "predicate": "",
-    "object_entity": "",
-    "claim_text": "complete proposition with subject and meaning",
-    "valid_from": "",
-    "valid_to": "",
-    "evidence_fact_ids": [1],
-    "confidence": 0.85
+  "results": [{
+    "signal_id": 1,
+    "claims": [{
+      "subject_entity": "",
+      "claim_type": "identity_profile|affiliation|relationship|preference|constraint|behavior_pattern",
+      "primary_domain": "general|health|work|life|information|finance|family|learning|social|interest|travel",
+      "predicate": "",
+      "object_entity": "",
+      "claim_text": "complete proposition with subject and meaning",
+      "valid_from": "",
+      "valid_to": "",
+      "evidence_fact_ids": [1],
+      "confidence": 0.85
+    }]
   }]
 }
 
-facts:
-{facts}
+signal_items:
+{signal_items}
 """
 
 
