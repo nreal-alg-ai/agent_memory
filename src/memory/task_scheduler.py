@@ -435,9 +435,12 @@ class TaskScheduler:
             "user_action_signal_consolidation": "action",
         }.get(target, "claim")
         pending_ids = self._task_execution_db.pending_signal_ids(target)
-        pending_signals = self._claim_state_database.get_user_signals_by_ids(
-            signal_type, pending_ids,
-        )
+        if not pending_ids:
+            return []
+        with self._claim_state_database.reader_transaction() as reader_db:
+            pending_signals = reader_db.get_user_signals_by_ids(
+                signal_type, pending_ids,
+            )
         valid_ids = {int(row["signal_id"]) for row in pending_signals}
         missing = set(pending_ids) - valid_ids
         if missing:
@@ -554,7 +557,10 @@ class TaskScheduler:
         report_payload: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Enqueue and report a task, or return a recorded rejection."""
-        with self._execution_lock, self._worker_lock:
+        # Enqueueing must not wait for the worker's long-running LLM handler.
+        # The worker still holds _execution_lock for its shared writer connection;
+        # signal validation above uses its own read-only connection.
+        with self._worker_lock:
             task_id = self._operation_reporter.next_task_id(task_kind)
             if self._shutdown_event.is_set():
                 reason = "worker_shutdown"
@@ -576,9 +582,7 @@ class TaskScheduler:
                 "started_at": time.monotonic(),
                 "completion_context": dict(completion_context or {}),
             }
-            try:
-                self._queue.put_nowait(task)
-            except queue.Full:
+            if self._queue.full():
                 return self._reject_locked(task_kind, task_id, "worker_queue_full")
             try:
                 self._operation_reporter.on_task_submitted(
@@ -597,10 +601,6 @@ class TaskScheduler:
                     self._record_input_time_end_locked(
                         task["completion_context"].get("input_time_end")
                     )
-            self._logger.info(
-                "scheduled task queued task_kind=%s task_id=%s queue_depth=%s",
-                task_kind, task_id, self._queue.qsize(),
-            )
             if self._task_execution_db is not None:
                 try:
                     self._task_execution_db.record_submission(task_id, task_kind)
@@ -609,6 +609,13 @@ class TaskScheduler:
                         "Failed to persist task submission kind=%s id=%s",
                         task_kind, task_id,
                     )
+            # Publish only after the reporter and task DB know the task. The
+            # worker may take it immediately after put_nowait returns.
+            self._queue.put_nowait(task)
+            self._logger.info(
+                "scheduled task queued task_kind=%s task_id=%s queue_depth=%s",
+                task_kind, task_id, self._queue.qsize(),
+            )
             self._ensure_worker_locked()
         return {
             "queued": True,

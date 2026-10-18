@@ -405,18 +405,18 @@ signal_items:
 
 USER_OBSERVED_PATTERN_EXTRACTION_PROMPT_EN = """You conservatively extract user_observed_patterns about the user for a personal world model.
 
-Input is a set of user actions already grouped by real-world occurrence. Each occurrence has one representative signal; several facts about one occurrence do not count as repeated behavior. Infer whether independent occurrences support a behavioral pattern, including its demonstrated conditions.
+Input is a set of semantically similar user_action_signals, including new and historical signals. Each signal includes its fact, event time, and evidence source. Retrieval only established action similarity; it did not prove that each signal describes a separate event. Decide whether the evidence supports a behavioral pattern and its demonstrated conditions.
 
-A user_observed_pattern describes a behavioral pattern observed across independent actions. It is not an explicit claim by the user and does not imply that the user endorses the pattern. A habit explicitly stated by the user belongs in explicit user_claims.
+A user_observed_pattern describes a behavioral pattern inferred from concrete action evidence. It is not an explicit claim by the user and does not imply endorsement. A habit explicitly stated by the user belongs in explicit user_claims.
 
 Hard rules:
-1. A pattern requires at least three distinct support_occurrence_group_ids, each directly supporting it, including at least one new_occurrence_group_id.
-2. A single statement, event, plan, task, or assistant recommendation is not a pattern.
-3. Do not infer preferences from isolated behavior or use transcript time as event time.
+1. A pattern requires at least three distinct support_signal_ids, each directly supporting it, including at least one new_signal_id.
+2. Repeated mentions of one event in different facts do not count as repeated behavior. A single event, plan, task, or assistant suggestion is insufficient. If repeated behavior is not established, return an empty array.
+3. Do not infer preferences from isolated behavior or substitute conversation or recording time for event time.
 4. subject_entity must equal the given user-self subject and `world_owner_entity`.
 5. pattern_text is a complete reader-facing behavioral pattern description with its subject.
 6. `primary_domain` must be one of `general|health|work|life|information|finance|family|learning|social|interest|travel`; choose the most specific user-life domain, and use `general` only for genuinely cross-domain patterns.
-7. Day-of-week, time-of-day, place, and other conditions require support from several independent occurrences. Evidence IDs must be input IDs. An empty list is correct. Return JSON only.
+7. Day-of-week, time-of-day, place, and other conditions require support from multiple relevant signals. Do not invent a periodic schedule when event times are insufficient. Evidence IDs must be input IDs. An empty list is correct. Return JSON only.
 
 Output:
 {
@@ -425,16 +425,76 @@ Output:
     "primary_domain": "general|health|work|life|information|finance|family|learning|social|interest|travel",
     "pattern_text": "complete behavioral pattern description with its subject",
     "condition_text": "",
-    "support_occurrence_group_ids": [1, 2, 3],
+    "support_signal_ids": [1, 2, 3],
     "confidence": 0.8
   }]
 }
 
-Pattern extraction target and new occurrences:
+Pattern extraction target and new signals:
 {pattern_target}
 
-Independent action occurrences:
-{action_occurrences}
+Similar action signals and their facts:
+{action_signals}
+"""
+
+
+USER_OBSERVED_PATTERN_RECONCILIATION_PROMPT_EN = """You classify the semantic relationship between a new user_observed_pattern and existing patterns.
+
+Compare the complete pattern_text, condition_text, and supporting evidence. Pay close attention to weekday, time of day, location, conditions, and scope. Similar actions are not necessarily the same pattern.
+
+semantic_relation must be:
+- duplicate: the same behavioral pattern under the same conditions despite different wording;
+- supports: new evidence supports the existing pattern without changing its conditions;
+- refines: the new pattern adds a supported condition or narrows the existing scope;
+- contradicts: the patterns cannot both hold under the same conditions;
+- unrelated: different patterns or insufficient evidence to determine a relation.
+
+The candidate may relate to more than one existing pattern. A shared action or signal is not enough for duplicate. Return an empty relations list when no clear relation exists. Return JSON only.
+
+Output:
+{
+  "relations": [{
+    "existing_pattern_id": 1,
+    "semantic_relation": "duplicate|supports|refines|contradicts|unrelated",
+    "confidence": 0.8,
+    "reason": "brief explanation"
+  }]
+}
+
+New pattern:
+{candidate_pattern}
+
+Existing patterns:
+{existing_patterns}
+"""
+
+
+USER_OBSERVED_PATTERN_SIGNAL_RELATION_PROMPT_EN = """Determine how each new user_action_signal relates to each retrieved user_observed_pattern. Similarity retrieval provides candidates, not proof. Each pattern includes representative historical action evidence and event times.
+
+Classify a signal-pattern pair as:
+- supports: a new behavior instance under the pattern's actual conditions. Similar action words alone, or a retelling of the same event, are not new support.
+- refines: evidence suggests the pattern's scope or conditions may need narrowing. A single exception rarely overturns a general pattern.
+- contradicts: evidence clearly conflicts under the same conditions. Different times, places, or circumstances need not conflict; one isolated action usually does not refute a habit.
+- unrelated: different behavior, insufficient evidence, or a duplicate account of one event.
+
+Use only the supplied evidence. Never infer event time from conversation time. One signal may support multiple distinct patterns. Include only pairs with a meaningful relation; an empty list is valid. Return JSON only.
+
+Output:
+{
+  "decisions": [{
+    "signal_id": 1,
+    "existing_pattern_id": 2,
+    "semantic_relation": "supports|refines|contradicts|unrelated",
+    "confidence": 0.8,
+    "reason": "brief explanation"
+  }]
+}
+
+New action signals and their facts:
+{new_signals}
+
+Existing patterns and representative evidence:
+{existing_patterns}
 """
 
 

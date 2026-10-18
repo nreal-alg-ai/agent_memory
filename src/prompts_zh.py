@@ -299,6 +299,7 @@ goal 或 plan 不得自动拆出 work_item；只有 fact 明确提供下一步�
 5. `lifecycle_evidence` 只描述当前 fact 直接观察到的状态证据，不是数据库操作；plan 已发生是 `occurred`，work_item 已完成是 `completed`，不能混淆。`lifecycle_update` 可以生成关于已有对象变化的 candidate，但后续 reconciliation 匹配不到已有对象时不得创建新对象。
 6. `primary_domain` 只能为 `general|health|work|life|information|finance|family|learning|social|interest|travel`；优先选择最具体的用户生活领域，`general` 只用于真正跨领域的对象，不能作为不确定时的兜底。没有证据的时间和专属细节留空，不得编造。只返回 JSON。
 
+world owner：{world_owner_name}
 当前时间：{reference_timestamp}
 输入的独立 signal 条目（每条含整数 `signal_id`、`fact` 和唯一的 `user_intent_signal`）：
 {signal_items}
@@ -442,18 +443,18 @@ signal_items：
 
 USER_OBSERVED_PATTERN_EXTRACTION_PROMPT_ZH = """你是个人世界模型的 user_observed_pattern 提炼模块。
 
-输入是用户本人跨时间的行为信号，已按现实中的同一次行为归并为 occurrence。每个 occurrence 只有一条代表信号；相同 occurrence_group_id 的多条 fact 不算多次行为。你需要判断这些独立行为是否支持用户本人的行为规律，并关注“在什么前提或情境下做了这个动作”。
+输入是一组语义相近的 user_action_signal，包含本批新增信号与历史信号；每条信号都附有对应 fact、事件时间和证据来源。检索只说明动作相似，不证明它们是不同次事件。你需要判断这些证据是否足以支持用户本人的行为规律，以及规律成立的前提或情境。
 
 user_observed_pattern 表达从多次独立行为事件中观察到的用户行为模式。它不是用户明确表达的主张，也不代表用户一定认同该模式。用户直接自述的习惯应留在 explicit user_claim 中。
 
 硬规则：
-1. 一条 pattern 至少需要 3 个不同的 support_occurrence_group_ids，且每个 ID 都必须直接支持当前模式；必须包含至少一个 new_occurrence_group_ids。
-2. 单次表达、一次事件、计划、任务、助手建议不能归纳为规律。
+1. 一条 pattern 至少需要 3 个不同的 support_signal_ids，且每个信号都必须直接支持当前模式；其中至少一个必须属于 new_signal_ids。
+2. 不同 fact 对同一事件的重复提及不能算作多次行为。单次表达、一次事件、计划、任务、助手建议不能归纳为规律；无法确认重复行为时返回空数组。
 3. 不要把偶然行为升级为偏好；只能从可计数的独立事件归纳行为规律。不要把语料记录时间当成事件发生时间。
 4. subject_entity 必须等于输入中的用户本人（world_owner_entity），不得输出关于其他主体的模式。
 5. pattern_text 必须是带主体且语义完整的行为模式描述；condition_text 为空或简短条件。
 6. `primary_domain` 必须为 `general|health|work|life|information|finance|family|learning|social|interest|travel` 之一，表示该规律主要涉及的用户生活领域；优先选择最具体领域，`general` 只用于真正跨领域的规律。
-7. 规律涉及星期、时段、地点或前提时，必须得到多个独立 occurrence 的支持；不能凭一个样例泛化条件。evidence IDs 必须来自输入。输出空数组是正确结果。只返回 JSON。
+7. 规律涉及星期、时段、地点或前提时，必须得到多个相关信号的支持；事件时间不足时不能编造周期。证据 ID 必须来自输入。输出空数组是正确结果。只返回 JSON。
 
 输出：
 {
@@ -463,17 +464,77 @@ user_observed_pattern 表达从多次独立行为事件中观察到的用户行�
       "primary_domain": "general|health|work|life|information|finance|family|learning|social|interest|travel",
       "pattern_text": "包含主体和完整行为模式语义的陈述",
       "condition_text": "",
-      "support_occurrence_group_ids": [1, 2, 3],
+      "support_signal_ids": [1, 2, 3],
       "confidence": 0.8
     }
   ]
 }
 
-模式提炼目标与本批新增事件：
+模式提炼目标与本批新增信号：
 {pattern_target}
 
-独立行为事件：
-{action_occurrences}
+相似行为信号与对应 fact：
+{action_signals}
+"""
+
+
+USER_OBSERVED_PATTERN_RECONCILIATION_PROMPT_ZH = """你负责判断新生成的 user_observed_pattern 与已有行为规律之间的语义关系。
+
+比较完整的 pattern_text、condition_text 和支持证据，尤其注意星期、时段、地点、适用条件和范围。动作相似不意味着属于同一规律。
+
+semantic_relation 只能是：
+- duplicate：措辞不同，但行为及其成立条件表达同一规律；
+- supports：新证据支持旧规律，且不改变旧规律的条件；
+- refines：新规律有证据支持地增加条件，或缩小旧规律的适用范围；
+- contradicts：两条规律在相同条件下不能同时成立；
+- unrelated：规律不同，或证据不足以判断两者存在明确关系。
+
+一个 candidate 可以与多个已有规律相关。仅共享动作或 signal 不足以判为 duplicate；没有明确关系时返回空 relations。只返回 JSON。
+
+输出：
+{
+  "relations": [{
+    "existing_pattern_id": 1,
+    "semantic_relation": "duplicate|supports|refines|contradicts|unrelated",
+    "confidence": 0.8,
+    "reason": "简短说明"
+  }]
+}
+
+新规律：
+{candidate_pattern}
+
+已有规律：
+{existing_patterns}
+"""
+
+
+USER_OBSERVED_PATTERN_SIGNAL_RELATION_PROMPT_ZH = """判断每条新的 user_action_signal 与检索到的每条 user_observed_pattern 的关系。相似性检索只提供候选，不构成支持证据；每条已有规律附有代表性的历史行为证据和事件时间。
+
+signal 与 pattern 的关系只能是：
+- supports：在该规律实际适用条件下发生了一次新的行为。仅动作词相似，或对同一事件的重复叙述，不能成为新的支持证据；
+- refines：证据表明规律的范围或条件可能需要收窄；单个例外通常不足以推翻一般规律；
+- contradicts：证据在相同条件下与规律明确冲突。时间、地点或情境不同不必然冲突，一次孤立行为通常不能否定习惯；
+- unrelated：行为不同、证据不足，或只是同一事件的重复记录。
+
+只能使用输入证据，不得把对话时间当成事件发生时间。一条 signal 可以支持多个不同规律。仅输出有明确关系的 signal-pattern 配对；没有时返回空 decisions。只返回 JSON。
+
+输出：
+{
+  "decisions": [{
+    "signal_id": 1,
+    "existing_pattern_id": 2,
+    "semantic_relation": "supports|refines|contradicts|unrelated",
+    "confidence": 0.8,
+    "reason": "简短说明"
+  }]
+}
+
+新行为信号及对应 fact：
+{new_signals}
+
+已有规律及代表性证据：
+{existing_patterns}
 """
 
 

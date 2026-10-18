@@ -38,6 +38,8 @@ from .memory_types import MemoryUnit
 from .task_scheduler import TaskScheduler
 from prompts_en import (
     DERIVED_USER_CLAIM_EXTRACTION_PROMPT_EN,
+    USER_OBSERVED_PATTERN_RECONCILIATION_PROMPT_EN,
+    USER_OBSERVED_PATTERN_SIGNAL_RELATION_PROMPT_EN,
     USER_CLAIM_RECONCILIATION_PROMPT_EN,
     EXPLICIT_USER_CLAIM_EXTRACTION_PROMPT_EN,
     USER_OBSERVED_PATTERN_EXTRACTION_PROMPT_EN,
@@ -51,6 +53,8 @@ from prompts_en import (
 )
 from prompts_zh import (
     DERIVED_USER_CLAIM_EXTRACTION_PROMPT_ZH,
+    USER_OBSERVED_PATTERN_RECONCILIATION_PROMPT_ZH,
+    USER_OBSERVED_PATTERN_SIGNAL_RELATION_PROMPT_ZH,
     USER_CLAIM_RECONCILIATION_PROMPT_ZH,
     EXPLICIT_USER_CLAIM_EXTRACTION_PROMPT_ZH,
     USER_OBSERVED_PATTERN_EXTRACTION_PROMPT_ZH,
@@ -63,14 +67,7 @@ from prompts_zh import (
     UNIFIED_MEMORY_EXTRACTION_PROMPT_ZH,
 )
 from .utils import _cal_embedding_cosine_similarity
-from .user_action_occurrences import (
-    describes_aggregate_action,
-    has_vague_occurrence_time,
-    occurrence_profile,
-    potential_same_occurrence,
-    same_action,
-    same_occurrence,
-)
+from .user_action_similarity import action_lexical_similarity
 from user_state import UserStateResolver
 
 RecallTimeBounds = Optional[Tuple[Optional[str], Optional[str]]]
@@ -228,21 +225,17 @@ class MemoryNodeManager:
             1.0,
             0.75,
         )
-        self._user_observed_pattern_min_occurrences = max(
+        self._user_observed_pattern_min_support_signals = max(
             3,
             int(
                 self._memory_cfg.get(
-                    "user_observed_pattern_min_occurrences", 3,
+                    "user_observed_pattern_min_support_signals", 3,
                 ) or 3
             ),
         )
-        self._user_observed_pattern_min_time_windows = max(
-            2,
-            int(self._memory_cfg.get("user_observed_pattern_min_time_windows", 2) or 2),
-        )
-        self._user_observed_pattern_occurrence_limit = max(
-            self._user_observed_pattern_min_occurrences,
-            int(self._memory_cfg.get("user_observed_pattern_occurrence_limit", 16) or 16),
+        self._user_observed_pattern_signal_limit = max(
+            self._user_observed_pattern_min_support_signals,
+            int(self._memory_cfg.get("user_observed_pattern_signal_limit", 32) or 32),
         )
         self._initialize_recall_config()
         self._embedding_client: Optional[EmbeddingClient] = None
@@ -2321,99 +2314,13 @@ class MemoryNodeManager:
             "user_intent_signal_count": len(user_intent_signal_mapping_updates),
         }
 
-    def _group_user_action_signals_by_occurrence(
-        self, signal_ids: Sequence[int],
-    ) -> Dict[str, int]:
-        """Group pending signals when the observed-pattern task consumes them."""
-        if not signal_ids:
-            return {"created_count": 0, "merged_count": 0}
-        action_signals = self._db.get_user_action_signals_by_ids(signal_ids)
-        facts_by_id = {
-            int(fact["id"]): fact
-            for fact in self._db.get_memory_facts_by_ids(
-                [int(item["fact_id"]) for item in action_signals]
-            )
-        }
-        created_count = merged_count = 0
-        for signal in action_signals:
-            if signal.get("occurrence_group_id") is not None:
-                continue
-            fact_id = int(signal["fact_id"])
-            fact = facts_by_id.get(fact_id) or {}
-            metadata = fact.get("metadata") or {}
-            profile = occurrence_profile(
-                signal.get("event_time_key"),
-                metadata.get("time_confidence"),
-            )
-            if (
-                describes_aggregate_action(signal.get("action_text"))
-                or has_vague_occurrence_time(signal.get("action_text"))
-            ):
-                profile["independence_status"] = "unresolved"
-            candidate = {
-                **signal, **profile,
-                "location": signal.get("location") or "",
-            }
-            grouped_signals = self._db.get_user_action_occurrence_candidates(
-                subject_entity_id=int(signal["subject_entity_id"]),
-                occurrence_key=profile["occurrence_key"],
-                action_kind=str(signal["action_kind"]),
-                time_precision=profile["time_precision"],
-                independence_status=profile["independence_status"],
-                fact_id=(
-                    fact_id if profile["independence_status"] != "countable"
-                    else None
-                ),
-            )
-            match = next(
-                (grouped for grouped in grouped_signals
-                 if same_occurrence(candidate, grouped)), None,
-            )
-            if match is None and profile["independence_status"] == "countable":
-                # Only compare paraphrases inside the same known occurrence
-                # window. A loose embedding match alone never groups signals.
-                for grouped in grouped_signals:
-                    if not potential_same_occurrence(candidate, grouped):
-                        continue
-                    try:
-                        left = self._generate_embedding_vector(
-                            str(candidate["action_text"])
-                        )
-                        right = self._generate_embedding_vector(
-                            str(grouped["action_text"])
-                        )
-                        similarity = (
-                            _cal_embedding_cosine_similarity(left, right)
-                            if left is not None and right is not None else 0.0
-                        )
-                    except Exception as exc:
-                        self._logger.warning(
-                            "user action occurrence match unavailable: %s", exc,
-                        )
-                        break
-                    if similarity >= 0.91:
-                        match = grouped
-                        break
-            if match is None:
-                occurrence_group_id = int(signal["signal_id"])
-                created_count += 1
-            else:
-                occurrence_group_id = int(match["occurrence_group_id"])
-                merged_count += 1
-            self._db.assign_user_action_occurrence_group(
-                signal_id=int(signal["signal_id"]),
-                occurrence_group_id=occurrence_group_id,
-                **profile,
-            )
-        return {"created_count": created_count, "merged_count": merged_count}
-
     def _process_memory_user_observed_pattern_update_task(
         self, *, signal_ids: Optional[Sequence[int]] = None,
         limit: Optional[int] = None,
         reference_timestamp: Optional[Any] = None,
         **_: Any,
     ) -> Dict[str, Any]:
-        """Consolidate pending actions, then infer repeatable user patterns."""
+        """Find similar past actions and reconcile resulting pattern candidates."""
         limit = max(
             1,
             int(limit or self._memory_cfg.get("user_action_signal_limit") or 100),
@@ -2425,17 +2332,18 @@ class MemoryNodeManager:
             return {"status": "empty", "signal_count": 0,
                     "user_observed_pattern_ids": [], "_completed_signal_ids": []}
         started_at = time.monotonic()
-        with self._db.transaction():
-            grouping = self._group_user_action_signals_by_occurrence(selected_ids)
-            update = self._update_user_observed_patterns_from_action_signals(
-                selected_ids,
-            )
+        update = self._update_user_observed_patterns_from_action_signals(
+            selected_ids,
+        )
         completed = bool(update.get("completed"))
         report = {
             "status": "ok" if completed else "failed",
             "signal_count": len(selected_ids),
-            "occurrence_groups_created": grouping["created_count"],
-            "signals_merged": grouping["merged_count"],
+            "similar_action_batches": int(update.get("similar_action_batches") or 0),
+            "pattern_relations_recorded": int(update.get("relations_recorded") or 0),
+            "direct_support_signal_count": int(
+                update.get("direct_support_signal_count") or 0
+            ),
             "user_observed_patterns_created": int(update.get("created") or 0),
             "user_observed_patterns_updated": int(update.get("updated") or 0),
             "user_observed_pattern_ids": update.get("pattern_ids") or [],
@@ -4647,97 +4555,354 @@ class MemoryNodeManager:
     def _update_user_observed_patterns_from_action_signals(
         self, signal_ids: Sequence[int],
     ) -> Dict[str, Any]:
-        """Infer patterns from independent, time-grounded action occurrences."""
-        selected = {int(value) for value in signal_ids}
-        signals = self._db.get_user_signals_by_ids("action", signal_ids)
-        seed_signals = [
-            signal
-            for fact_id in {int(item["fact_id"]) for item in signals}
-            for signal in self._db.get_fact_user_action_signals(fact_id)
-            if int(signal["signal_id"]) in selected
-            and signal.get("independence_status") == "countable"
-        ]
+        """Update nearby patterns first, then discover patterns from action history."""
+        seed_signals = self._db.get_user_action_signals_by_ids(signal_ids)
         report: Dict[str, Any] = {
             "candidate_count": 0, "updated": 0, "created": 0,
             "pattern_ids": [], "completed": True,
+            "similar_action_batches": 0, "relations_recorded": 0,
+            "direct_support_signal_count": 0,
         }
-        seeds_by_kind: Dict[Tuple[int, str], List[Dict[str, Any]]] = {}
-        for signal in seed_signals:
-            seeds_by_kind.setdefault(
-                (int(signal["subject_entity_id"]), str(signal["action_kind"])),
-                [],
-            ).append(signal)
-        for (subject_id, action_kind), seeds in seeds_by_kind.items():
-            history = self._db.get_grouped_user_action_signals(
-                subject_entity_id=subject_id, action_kind=action_kind,
-                limit=max(128, self._user_observed_pattern_occurrence_limit * 8),
+        if not seed_signals:
+            return report
+        subject_id = int(seed_signals[0]["subject_entity_id"])
+        history = self._db.get_user_action_signals()
+        pool = {int(row["signal_id"]): row for row in history}
+        pool.update({int(row["signal_id"]): row for row in seed_signals})
+        vectors = self._user_action_vectors_for_signals(list(pool.values()))
+        existing_patterns = self._db.get_user_observed_patterns(
+            subject_entity_id=subject_id, limit=None,
+        )
+        facts_by_id = {
+            int(fact["id"]): fact
+            for fact in self._db.get_memory_facts_by_ids(
+                [int(signal["fact_id"]) for signal in seed_signals]
             )
-            # One row per real occurrence, with new evidence always retained.
-            by_group = {
-                int(signal["occurrence_group_id"]): signal
-                for signal in history if signal.get("occurrence_group_id")
-            }
-            by_group.update({
-                int(signal["occurrence_group_id"]): signal
-                for signal in seeds if signal.get("occurrence_group_id")
-            })
-            seed_groups = {
-                int(signal["occurrence_group_id"])
-                for signal in seeds if signal.get("occurrence_group_id")
-            }
-            ordered = sorted(
-                by_group.values(),
-                key=lambda signal: (
-                    int(signal["occurrence_group_id"]) not in seed_groups,
-                    not any(same_action(signal["action_text"], seed["action_text"])
-                            for seed in seeds),
-                    -int(signal["signal_id"]),
-                ),
-            )[:self._user_observed_pattern_occurrence_limit]
-            windows = {
-                str(signal.get("occurrence_key") or "")[:10]
-                for signal in ordered if signal.get("occurrence_key")
-            }
-            if (len(ordered) < self._user_observed_pattern_min_occurrences
-                    or len(windows) < self._user_observed_pattern_min_time_windows):
-                continue
-            report["candidate_count"] += 1
+        }
+        # A pattern is retrieved directly from its own text and supporting
+        # actions. Discovery's historical-signal cap must not hide it.
+        related_by_seed: Dict[Tuple[int, ...], List[Dict[str, Any]]] = {}
+        patterns_by_id = {int(pattern["id"]): pattern for pattern in existing_patterns}
+        for signal in seed_signals:
+            related = self._retrieve_similar_user_observed_patterns(
+                signal=signal, patterns=existing_patterns, signals_by_id=pool,
+                vectors=vectors,
+            )
+            if related:
+                key = tuple(int(pattern["id"]) for pattern in related)
+                related_by_seed.setdefault(key, []).append(signal)
+        supported_signal_ids: set[int] = set()
+        for pattern_ids, related_signals in related_by_seed.items():
+            for offset in range(0, len(related_signals), 8):
+                direct_update = self._update_observed_patterns_from_new_action_signals(
+                    new_signals=related_signals[offset:offset + 8],
+                    existing_patterns=[patterns_by_id[value] for value in pattern_ids],
+                    facts_by_id=facts_by_id,
+                )
+                if direct_update is None:
+                    report.update(completed=False, error="invalid_action_pattern_relation_response")
+                    return report
+                supported_signal_ids.update(direct_update["supported_signal_ids"])
+                report["updated"] += len(direct_update["updated_pattern_ids"])
+                report["relations_recorded"] += direct_update["relations_recorded"]
+                report["pattern_ids"].extend(direct_update["updated_pattern_ids"])
+        report["direct_support_signal_count"] = len(supported_signal_ids)
+
+        unresolved = [
+            signal for signal in seed_signals
+            if int(signal["signal_id"]) not in supported_signal_ids
+        ]
+        seed_ids = {int(signal["signal_id"]) for signal in seed_signals}
+        neighborhoods = self._retrieve_similar_user_action_signal_batches(
+            seeds=unresolved,
+            history=[row for signal_id, row in pool.items() if signal_id not in seed_ids],
+            vectors=vectors,
+        )
+        report["similar_action_batches"] = len(neighborhoods)
+        for ordered, new_signal_ids in neighborhoods:
             facts_by_id = {
                 int(fact["id"]): fact
                 for fact in self._db.get_memory_facts_by_ids(
                     [int(signal["fact_id"]) for signal in ordered]
                 )
             }
+            if len(ordered) < self._user_observed_pattern_min_support_signals:
+                continue
+            report["candidate_count"] += 1
             patterns = self._extract_user_observed_patterns(
-                subject_entity_id=subject_id, action_kind=action_kind,
-                seed_group_ids=seed_groups, signals=ordered, facts_by_id=facts_by_id,
+                subject_entity_id=subject_id,
+                new_signal_ids=new_signal_ids,
+                signals=ordered,
+                facts_by_id=facts_by_id,
             )
             if patterns is None:
                 report.update(completed=False, error="invalid_observed_pattern_response")
                 return report
             for pattern in patterns:
-                pattern_id, created = self._db.upsert_user_observed_pattern(
-                    subject_entity_id=subject_id,
-                    pattern_key=":".join((
-                        pattern["primary_domain"],
-                        self._generate_topic_name_key(pattern["condition_text"]),
-                        self._generate_topic_name_key(pattern["pattern_text"]),
-                    )),
-                    pattern_text=pattern["pattern_text"],
-                    condition_text=pattern["condition_text"],
-                    primary_domain=pattern["primary_domain"],
-                    confidence=pattern["confidence"],
-                    metadata={"action_kind": action_kind},
+                applied = self._reconcile_user_observed_pattern(
+                    pattern, subject_entity_id=subject_id,
                 )
-                self._db.upsert_user_observed_pattern_occurrences(
-                    pattern_id=pattern_id,
-                    occurrence_group_ids=pattern["support_occurrence_group_ids"],
-                )
-                report["created"] += int(created)
-                report["updated"] += int(not created)
-                report["pattern_ids"].append(pattern_id)
+                if applied is None:
+                    report.update(completed=False, error="invalid_pattern_reconciliation")
+                    return report
+                report["created"] += int(applied["created"])
+                report["updated"] += int(not applied["created"])
+                report["relations_recorded"] += int(applied["relations_recorded"])
+                report["pattern_ids"].append(int(applied["pattern_id"]))
         report["pattern_ids"] = sorted(set(report["pattern_ids"]))
         return report
+
+    def _update_observed_patterns_from_new_action_signals(
+        self, *, new_signals: Sequence[Dict[str, Any]],
+        existing_patterns: Sequence[Dict[str, Any]],
+        facts_by_id: Dict[int, Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        """Classify new behavior against existing patterns before discovery."""
+        result: Dict[str, Any] = {
+            "supported_signal_ids": set(), "updated_pattern_ids": set(),
+            "relations_recorded": 0,
+        }
+        if not new_signals or not existing_patterns:
+            return result
+        def representative_ids(pattern: Dict[str, Any]) -> List[int]:
+            ids = pattern.get("support_signal_ids") or []
+            return ids if len(ids) <= 4 else [ids[0], *ids[-3:]]
+
+        evidence_ids = [
+            signal_id
+            for pattern in existing_patterns
+            for signal_id in representative_ids(pattern)
+        ]
+        evidence_signals = self._db.get_user_action_signals_by_ids(evidence_ids)
+        evidence_facts = {
+            int(fact["id"]): fact
+            for fact in self._db.get_memory_facts_by_ids([
+                int(signal["fact_id"]) for signal in evidence_signals
+            ])
+        }
+        evidence_by_id = {
+            int(signal["signal_id"]): signal for signal in evidence_signals
+        }
+
+        def signal_view(signal: Dict[str, Any], fact: Dict[str, Any]) -> Dict[str, Any]:
+            return {
+                "signal_id": int(signal["signal_id"]),
+                "action_text": signal.get("action_text") or "",
+                "action_kind": signal.get("action_kind") or "",
+                "event_time": signal.get("event_time_key") or "",
+                "location": signal.get("location") or "",
+                "fact_id": int(signal["fact_id"]),
+                "fact_summary": fact.get("summary") or "",
+                "dialogue_time": fact.get("dialogue_time_key") or "",
+            }
+
+        new_by_id = {int(signal["signal_id"]): signal for signal in new_signals}
+        pattern_by_id = {int(pattern["id"]): pattern for pattern in existing_patterns}
+        language = self._resolve_prompt_language_from_text(
+            "\n".join(str(signal.get("action_text") or "") for signal in new_signals)
+        )
+        template = (
+            USER_OBSERVED_PATTERN_SIGNAL_RELATION_PROMPT_EN
+            if language == "en" else USER_OBSERVED_PATTERN_SIGNAL_RELATION_PROMPT_ZH
+        )
+        raw = self._llm_client.call_llm(
+            template.replace("{new_signals}", json.dumps([
+                signal_view(signal, facts_by_id.get(int(signal["fact_id"])) or {})
+                for signal in new_signals
+            ], ensure_ascii=False, indent=2)).replace("{existing_patterns}", json.dumps([
+                {
+                    "id": int(pattern["id"]),
+                    "pattern_text": pattern.get("pattern_text") or "",
+                    "condition_text": pattern.get("condition_text") or "",
+                    "confidence": pattern.get("confidence"),
+                    "supporting_actions": [
+                        signal_view(evidence_by_id[signal_id], evidence_facts.get(
+                            int(evidence_by_id[signal_id]["fact_id"])
+                        ) or {})
+                        for signal_id in representative_ids(pattern)
+                        if signal_id in evidence_by_id
+                    ],
+                }
+                for pattern in existing_patterns
+            ], ensure_ascii=False, indent=2))
+        )
+        parsed = self._llm_client.parse_json_object_from_llm_text(raw or "")
+        if not parsed or not isinstance(parsed.get("decisions"), list):
+            return None
+        decisions: Dict[Tuple[int, int], Dict[str, Any]] = {}
+        for item in parsed["decisions"]:
+            if not isinstance(item, dict):
+                continue
+            try:
+                signal_id = int(item.get("signal_id"))
+                pattern_id = int(item.get("existing_pattern_id"))
+            except (TypeError, ValueError):
+                continue
+            relation = str(item.get("semantic_relation") or "").strip().lower()
+            if (
+                signal_id not in new_by_id or pattern_id not in pattern_by_id
+                or relation not in {"supports", "refines", "contradicts", "unrelated"}
+            ):
+                continue
+            confidence = self._clamp_float(item.get("confidence"), 0.0, 1.0, 0.0)
+            if confidence < 0.7 or relation == "unrelated":
+                continue
+            key = (signal_id, pattern_id)
+            if key not in decisions or confidence > decisions[key]["confidence"]:
+                decisions[key] = {
+                    "semantic_relation": relation,
+                    "confidence": confidence,
+                    "reason": _compact_whitespace(item.get("reason") or "")[:240],
+                }
+        with self._db.transaction():
+            for (signal_id, pattern_id), decision in decisions.items():
+                signal = new_by_id[signal_id]
+                snapshot = signal_view(
+                    signal, facts_by_id.get(int(signal["fact_id"])) or {},
+                )
+                if decision["semantic_relation"] == "supports":
+                    added = self._db.add_user_observed_pattern_signals(
+                        pattern_id=pattern_id, signal_ids=[signal_id],
+                    )
+                    if added:
+                        self._db.refresh_user_observed_pattern(
+                            pattern_id=pattern_id,
+                            confidence=float(pattern_by_id[pattern_id]["confidence"]),
+                        )
+                        result["updated_pattern_ids"].add(pattern_id)
+                    result["supported_signal_ids"].add(signal_id)
+                result["relations_recorded"] += int(
+                    self._db.record_user_observed_pattern_relation(
+                        target_pattern_id=pattern_id, trigger_pattern_id=None,
+                        semantic_relation=decision["semantic_relation"],
+                        support_signal_ids=[signal_id],
+                        candidate_snapshot=snapshot,
+                        semantic_confidence=decision["confidence"],
+                        semantic_reason=decision["reason"],
+                    )
+                )
+        return result
+
+    def _user_action_vectors_for_signals(
+        self, signals: Sequence[Dict[str, Any]],
+    ) -> Dict[int, np.ndarray]:
+        """Read cached action vectors and embed only missing action texts."""
+        self._ensure_embedding_client()
+        assert self._embedding_client is not None
+        dimension = self._embedding_client.dimension
+        vectors: Dict[int, np.ndarray] = {}
+        missing: List[Dict[str, Any]] = []
+        for signal in signals:
+            signal_id = int(signal["signal_id"])
+            blob = signal.get("action_text_embedding")
+            vector = np.frombuffer(blob, dtype=np.float32) if blob else None
+            if vector is not None and vector.size == dimension and np.all(np.isfinite(vector)):
+                vectors[signal_id] = vector
+            else:
+                missing.append(signal)
+        if missing:
+            embedded = self._embedding_client.embed_batch(
+                str(signal.get("action_text") or "") for signal in missing
+            )
+            updates: List[Tuple[int, np.ndarray]] = []
+            for signal, vector in zip(missing, embedded):
+                if vector is None:
+                    continue
+                array = np.asarray(vector, dtype=np.float32)
+                if array.size != dimension or not np.all(np.isfinite(array)):
+                    continue
+                signal_id = int(signal["signal_id"])
+                vectors[signal_id] = array
+                updates.append((signal_id, array))
+            if updates:
+                self._db.set_user_action_signal_embeddings(updates)
+        return vectors
+
+    @staticmethod
+    def _user_action_signal_similarity(
+        left: Dict[str, Any], right: Dict[str, Any],
+        vectors: Dict[int, np.ndarray],
+    ) -> float:
+        lexical = action_lexical_similarity(
+            left.get("action_text"), right.get("action_text"),
+        )
+        left_vector = vectors.get(int(left["signal_id"]))
+        right_vector = vectors.get(int(right["signal_id"]))
+        semantic = (
+            max(0.0, _cal_embedding_cosine_similarity(left_vector, right_vector))
+            if left_vector is not None and right_vector is not None else 0.0
+        )
+        return max(lexical, semantic * 0.82)
+
+    def _retrieve_similar_user_observed_patterns(
+        self, *, signal: Dict[str, Any],
+        patterns: Sequence[Dict[str, Any]],
+        signals_by_id: Dict[int, Dict[str, Any]],
+        vectors: Dict[int, np.ndarray],
+    ) -> List[Dict[str, Any]]:
+        """Retrieve existing patterns independently of discovery neighborhoods."""
+        ranked: List[Tuple[float, Dict[str, Any]]] = []
+        for pattern in patterns:
+            score = action_lexical_similarity(
+                signal.get("action_text"), pattern.get("pattern_text"),
+            )
+            for support_id in pattern.get("support_signal_ids") or []:
+                support = signals_by_id.get(int(support_id))
+                if support is not None:
+                    score = max(score, self._user_action_signal_similarity(
+                        signal, support, vectors,
+                    ))
+            if score >= 0.60:
+                ranked.append((score, pattern))
+        ranked.sort(key=lambda item: (-item[0], int(item[1]["id"])))
+        return [pattern for _, pattern in ranked[:8]]
+
+    def _retrieve_similar_user_action_signal_batches(
+        self, *, seeds: Sequence[Dict[str, Any]],
+        history: Sequence[Dict[str, Any]], vectors: Dict[int, np.ndarray],
+    ) -> List[Tuple[List[Dict[str, Any]], set[int]]]:
+        """Build novel-pattern batches from similar actions, without pattern quotas."""
+        if not seeds:
+            return []
+        capacity = max(1, self._user_observed_pattern_signal_limit)
+        seed_ids = {int(row["signal_id"]) for row in seeds}
+        historical = [
+            row for row in history if int(row["signal_id"]) not in seed_ids
+        ]
+        batches: List[Tuple[List[Dict[str, Any]], set[int]]] = []
+        remaining = list(seeds)
+        while remaining:
+            anchor = remaining.pop(0)
+            grouped = [anchor]
+            still_unmatched = []
+            for candidate in remaining:
+                if (
+                    len(grouped) < capacity
+                    and self._user_action_signal_similarity(anchor, candidate, vectors) >= 0.60
+                ):
+                    grouped.append(candidate)
+                else:
+                    still_unmatched.append(candidate)
+            remaining = still_unmatched
+            ranked_history = sorted(
+                (
+                    (
+                        max(self._user_action_signal_similarity(seed, row, vectors)
+                            for seed in grouped),
+                        row,
+                    )
+                    for row in historical
+                ),
+                key=lambda item: (-item[0], -int(item[1]["signal_id"])),
+            )
+            neighbors = [
+                row for score, row in ranked_history if score >= 0.60
+            ][:max(0, capacity - len(grouped))]
+            batches.append((
+                [*grouped, *neighbors],
+                {int(row["signal_id"]) for row in grouped},
+            ))
+        return batches
 
     def _fact_user_claim_signal_mapping_updates(
         self,
@@ -4912,8 +5077,7 @@ class MemoryNodeManager:
         self,
         *,
         subject_entity_id: int,
-        action_kind: str,
-        seed_group_ids: set[int],
+        new_signal_ids: set[int],
         signals: Sequence[Dict[str, Any]],
         facts_by_id: Dict[int, Dict[str, Any]],
     ) -> Optional[List[Dict[str, Any]]]:
@@ -4929,18 +5093,24 @@ class MemoryNodeManager:
                 "subject_entity": self._world_owner_entity_name,
                 "subject_entity_id": subject_entity_id,
                 "world_owner_entity": self._world_owner_entity_name,
-                "action_kind": action_kind,
-                "new_occurrence_group_ids": sorted(seed_group_ids),
-            }, ensure_ascii=False, indent=2)).replace("{action_occurrences}", json.dumps([
+                "new_signal_ids": sorted(new_signal_ids),
+            }, ensure_ascii=False, indent=2)).replace("{action_signals}", json.dumps([
                 {
-                    "occurrence_group_id": int(signal["occurrence_group_id"]),
-                    "event_time": signal.get("occurrence_key") or "",
+                    "signal_id": int(signal["signal_id"]),
+                    "action_kind": signal.get("action_kind") or "",
+                    "event_time": signal.get("event_time_key") or "",
                     "action_text": signal.get("action_text") or "",
                     "location": signal.get("location") or "",
+                    "owner_evidence_type": signal.get("owner_evidence_type") or "",
+                    "owner_evidence_text": signal.get("owner_evidence_text") or "",
+                    "other_evidence_text": signal.get("other_evidence_text") or "",
                     "fact_id": int(signal["fact_id"]),
                     "fact_summary": (
                         facts_by_id.get(int(signal["fact_id"])) or {}
                     ).get("summary") or "",
+                    "dialogue_time": (
+                        facts_by_id.get(int(signal["fact_id"])) or {}
+                    ).get("dialogue_time_key") or "",
                 }
                 for signal in signals
             ], ensure_ascii=False, indent=2))
@@ -4948,16 +5118,14 @@ class MemoryNodeManager:
         parsed = self._llm_client.parse_json_object_from_llm_text(raw or "")
         if parsed is None or not isinstance(parsed.get("patterns"), list):
             return None
-        signals_by_group = {
-            int(signal["occurrence_group_id"]): signal for signal in signals
-        }
+        available_signal_ids = {int(signal["signal_id"]) for signal in signals}
         result: List[Dict[str, Any]] = []
         for raw_pattern in parsed["patterns"][:4]:
             pattern = self._normalize_user_observed_pattern(
                 raw_pattern,
                 subject_entity_id=subject_entity_id,
-                seed_group_ids=seed_group_ids,
-                signals_by_group=signals_by_group,
+                new_signal_ids=new_signal_ids,
+                available_signal_ids=available_signal_ids,
             )
             if pattern:
                 result.append(pattern)
@@ -4968,8 +5136,8 @@ class MemoryNodeManager:
         raw: Any,
         *,
         subject_entity_id: int,
-        seed_group_ids: set[int],
-        signals_by_group: Dict[int, Dict[str, Any]],
+        new_signal_ids: set[int],
+        available_signal_ids: set[int],
     ) -> Optional[Dict[str, Any]]:
         if not isinstance(raw, dict):
             return None
@@ -4981,18 +5149,13 @@ class MemoryNodeManager:
             != self._world_owner_entity_name
         ):
             return None
-        group_ids = list(dict.fromkeys(
-            int(value) for value in (raw.get("support_occurrence_group_ids") or [])
-            if str(value).strip().isdigit() and int(value) in signals_by_group
+        signal_ids = list(dict.fromkeys(
+            int(value) for value in (raw.get("support_signal_ids") or [])
+            if str(value).strip().isdigit() and int(value) in available_signal_ids
         ))[:24]
-        windows = {
-            str(signals_by_group[group_id].get("occurrence_key") or "")[:10]
-            for group_id in group_ids
-        } - {""}
         if (
-            len(group_ids) < self._user_observed_pattern_min_occurrences
-            or len(windows) < self._user_observed_pattern_min_time_windows
-            or not seed_group_ids.intersection(group_ids)
+            len(signal_ids) < self._user_observed_pattern_min_support_signals
+            or not new_signal_ids.intersection(signal_ids)
         ):
             return None
         pattern_text = _compact_whitespace(raw.get("pattern_text") or "")[:480]
@@ -5004,8 +5167,184 @@ class MemoryNodeManager:
             "condition_text": _compact_whitespace(raw.get("condition_text") or "")[:240],
             "primary_domain": primary_domain,
             "confidence": confidence,
-            "support_occurrence_group_ids": group_ids,
+            "support_signal_ids": signal_ids,
         }
+
+    def _reconcile_user_observed_pattern(
+        self, pattern: Dict[str, Any], *, subject_entity_id: int,
+    ) -> Optional[Dict[str, Any]]:
+        """Reuse an equivalent pattern or create a new one with relation events."""
+        existing = self._db.get_user_observed_patterns(
+            subject_entity_id=subject_entity_id, limit=200,
+        )
+        # Domain is a preference for the shortlist, not an exclusion: a pattern
+        # can be assigned to a different domain in a later extraction.
+        ranked = sorted(existing, key=lambda row: (
+            int(row.get("primary_domain") == pattern["primary_domain"]),
+            action_lexical_similarity(
+                pattern["pattern_text"], row.get("pattern_text"),
+            ),
+        ), reverse=True)
+        related = ranked[:16]
+        relations = self._classify_user_observed_pattern_relations(pattern, related)
+        if relations is None:
+            return None
+        existing_by_id = {int(row["id"]): row for row in related}
+        merge_relations = [
+            item for item in relations
+            if item["semantic_relation"] in {"duplicate", "supports"}
+        ]
+        if merge_relations:
+            selected = max(merge_relations, key=lambda item: (
+                item["confidence"],
+                float(existing_by_id[item["existing_pattern_id"]].get("confidence") or 0.0),
+            ))
+            pattern_id = selected["existing_pattern_id"]
+            with self._db.transaction():
+                self._db.add_user_observed_pattern_signals(
+                    pattern_id=pattern_id, signal_ids=pattern["support_signal_ids"],
+                )
+                self._db.refresh_user_observed_pattern(
+                    pattern_id=pattern_id, confidence=pattern["confidence"],
+                )
+                recorded_count = 0
+                for relation in relations:
+                    if relation["semantic_relation"] == "unrelated":
+                        continue
+                    target_id = relation["existing_pattern_id"]
+                    recorded_count += int(self._db.record_user_observed_pattern_relation(
+                        target_pattern_id=target_id,
+                        trigger_pattern_id=(pattern_id if target_id != pattern_id else None),
+                        semantic_relation=relation["semantic_relation"],
+                        support_signal_ids=pattern["support_signal_ids"],
+                        candidate_snapshot=pattern,
+                        semantic_confidence=relation["confidence"],
+                        semantic_reason=relation["reason"],
+                    ))
+            return {"pattern_id": pattern_id, "created": False,
+                    "relations_recorded": recorded_count}
+
+        pattern_key = hashlib.sha256(json.dumps({
+            "pattern_text": pattern["pattern_text"].casefold(),
+            "condition_text": pattern["condition_text"].casefold(),
+            "primary_domain": pattern["primary_domain"],
+        }, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+        with self._db.transaction():
+            pattern_id, created = self._db.upsert_user_observed_pattern(
+                subject_entity_id=subject_entity_id, pattern_key=pattern_key,
+                pattern_text=pattern["pattern_text"],
+                condition_text=pattern["condition_text"],
+                primary_domain=pattern["primary_domain"],
+                confidence=pattern["confidence"],
+            )
+            self._db.add_user_observed_pattern_signals(
+                pattern_id=pattern_id, signal_ids=pattern["support_signal_ids"],
+            )
+            recorded_count = 0
+            for relation in relations:
+                if relation["semantic_relation"] not in {"refines", "contradicts"}:
+                    continue
+                if relation["existing_pattern_id"] == pattern_id:
+                    continue
+                recorded_count += int(self._db.record_user_observed_pattern_relation(
+                    target_pattern_id=relation["existing_pattern_id"],
+                    trigger_pattern_id=pattern_id,
+                    semantic_relation=relation["semantic_relation"],
+                    support_signal_ids=pattern["support_signal_ids"],
+                    candidate_snapshot=pattern,
+                    semantic_confidence=relation["confidence"],
+                    semantic_reason=relation["reason"],
+                ))
+        return {"pattern_id": pattern_id, "created": created,
+                "relations_recorded": recorded_count}
+
+    def _classify_user_observed_pattern_relations(
+        self, candidate: Dict[str, Any], existing: Sequence[Dict[str, Any]],
+    ) -> Optional[List[Dict[str, Any]]]:
+        if not existing:
+            return []
+        evidence_ids = list(candidate["support_signal_ids"][-8:])
+        evidence_ids.extend(
+            signal_id
+            for row in existing
+            for signal_id in (row.get("support_signal_ids") or [])[-4:]
+        )
+        signals_by_id = {
+            int(row["signal_id"]): row
+            for row in self._db.get_user_action_signals_by_ids(evidence_ids)
+        }
+        facts_by_id = {
+            int(row["id"]): row
+            for row in self._db.get_memory_facts_by_ids([
+                int(signal["fact_id"]) for signal in signals_by_id.values()
+            ])
+        }
+
+        def evidence_view(signal_ids: Sequence[int], limit: int) -> List[Dict[str, Any]]:
+            result: List[Dict[str, Any]] = []
+            for signal_id in signal_ids[-limit:]:
+                signal = signals_by_id.get(int(signal_id))
+                if signal is None:
+                    continue
+                result.append({
+                    "signal_id": int(signal_id),
+                    "action_text": signal.get("action_text") or "",
+                    "event_time": signal.get("event_time_key") or "",
+                    "location": signal.get("location") or "",
+                    "fact_summary": (
+                        facts_by_id.get(int(signal["fact_id"])) or {}
+                    ).get("summary") or "",
+                })
+            return result
+
+        language = self._resolve_prompt_language_from_text(
+            candidate["pattern_text"],
+        )
+        template = (
+            USER_OBSERVED_PATTERN_RECONCILIATION_PROMPT_EN
+            if language == "en" else USER_OBSERVED_PATTERN_RECONCILIATION_PROMPT_ZH
+        )
+        raw = self._llm_client.call_llm(
+            template.replace("{candidate_pattern}", json.dumps(
+                {**candidate, "supporting_actions": evidence_view(
+                    candidate["support_signal_ids"], 8,
+                )}, ensure_ascii=False, indent=2,
+            )).replace("{existing_patterns}", json.dumps([
+                {
+                    "id": row["id"], "pattern_text": row["pattern_text"],
+                    "condition_text": row.get("condition_text") or "",
+                    "primary_domain": row.get("primary_domain") or "",
+                    "support_signal_ids": row.get("support_signal_ids") or [],
+                    "supporting_actions": evidence_view(
+                        row.get("support_signal_ids") or [], 4,
+                    ),
+                }
+                for row in existing
+            ], ensure_ascii=False, indent=2))
+        )
+        parsed = self._llm_client.parse_json_object_from_llm_text(raw or "")
+        if not parsed or not isinstance(parsed.get("relations"), list):
+            return None
+        allowed_ids = {int(row["id"]) for row in existing}
+        allowed_relations = {"duplicate", "supports", "refines", "contradicts", "unrelated"}
+        result: List[Dict[str, Any]] = []
+        for item in parsed["relations"]:
+            if not isinstance(item, dict):
+                continue
+            try:
+                target_id = int(item.get("existing_pattern_id"))
+            except (TypeError, ValueError):
+                continue
+            relation = str(item.get("semantic_relation") or "").strip().lower()
+            if target_id not in allowed_ids or relation not in allowed_relations:
+                continue
+            result.append({
+                "existing_pattern_id": target_id,
+                "semantic_relation": relation,
+                "confidence": self._clamp_float(item.get("confidence"), 0.0, 1.0, 0.7),
+                "reason": _compact_whitespace(item.get("reason") or "")[:240],
+            })
+        return result
 
     @staticmethod
     def _normalize_user_claim_text(

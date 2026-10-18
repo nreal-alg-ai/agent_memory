@@ -245,9 +245,8 @@ memory_manager:
   user_claim_explicit_min_confidence: 0.72
   user_claim_derived_min_confidence: 0.75
   user_claim_signal_max_per_fact: 3
-  user_observed_pattern_min_occurrences: 3
-  user_observed_pattern_min_time_windows: 2
-  user_observed_pattern_occurrence_limit: 16
+  user_observed_pattern_min_support_signals: 3
+  user_observed_pattern_signal_limit: 32
   
   recall:  
     recall_top_k: 8
