@@ -243,6 +243,7 @@ class TaskOperationReporter:
             "memory_user_observed_pattern_update",
             "memory_user_intent_update",
             "memory_user_state_update",
+            "user_prediction_near_term_preparation",
         }:
             if not isinstance(result, dict):
                 return False
@@ -337,7 +338,16 @@ class TaskScheduler:
             "memory_user_state_update": self._config_bool(
                 settings.get("enable_memory_user_state_update"), True,
             ),
+            "user_prediction_near_term_preparation": self._config_bool(
+                settings.get("enable_user_prediction"), True,
+            ),
         }
+        self._user_prediction_horizon_hours = max(
+            0.1, float(settings.get("user_prediction_horizon_hours", 6) or 6),
+        )
+        self._prediction_candidate_provider: Optional[Callable[..., List[Dict[str, Any]]]] = None
+        self._prediction_lock = threading.RLock()
+        self._prediction_inflight: set[tuple[str, int, str]] = set()
         self._claim_state_database = claim_state_database
         self._task_execution_db: Optional[TaskExecutionDB] = None
         if claim_state_database is not None and hasattr(claim_state_database, "db_path"):
@@ -524,6 +534,12 @@ class TaskScheduler:
             if task_kind in self._handlers:
                 raise ValueError(f"Task handler already registered: {task_kind}")
             self._handlers[task_kind] = handler
+
+    def register_prediction_candidate_provider(
+        self, provider: Callable[..., List[Dict[str, Any]]],
+    ) -> None:
+        """Supply the scheduler with the predictor's time-aware intent selection."""
+        self._prediction_candidate_provider = provider
 
     @staticmethod
     def _config_bool(value: Any, default: bool = False) -> bool:
@@ -913,6 +929,58 @@ class TaskScheduler:
             "oldest_change_age_seconds": round(age_seconds, 1),
         }
 
+    def trigger_user_prediction_time_tick(
+        self, *, now: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
+        """Find existing intents newly inside the rolling prediction window."""
+        return self._schedule_due_user_predictions(
+            now=now, trigger_source="time_tick",
+        )
+
+    def _schedule_due_user_predictions(
+        self, *, now: Optional[datetime], trigger_source: str,
+        intent_refs: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        if self._prediction_candidate_provider is None:
+            return {"queued": False, "reason": "prediction_provider_unavailable"}
+        effective_now = now or datetime.now().astimezone()
+        if effective_now.tzinfo is None:
+            effective_now = effective_now.replace(tzinfo=datetime.now().astimezone().tzinfo)
+        with self._prediction_lock:
+            # A read-only snapshot is enough here; the handler rechecks intent validity.
+            with self._execution_lock:
+                candidates = self._prediction_candidate_provider(
+                    as_of=effective_now,
+                    horizon_hours=self._user_prediction_horizon_hours,
+                    intent_refs=intent_refs,
+                )
+            completed = (
+                self._task_execution_db.completed_prediction_intents(candidates)
+                if self._task_execution_db is not None else set()
+            )
+            selected = [item for item in candidates if (
+                str(item["object_type"]), int(item["id"]), str(item["fingerprint"])
+            ) not in completed | self._prediction_inflight]
+            if not selected:
+                return {"queued": False, "reason": "no_unpredicted_due_intents",
+                        "due_intent_count": len(candidates)}
+            refs = [{"object_type": item["object_type"], "object_id": item["id"],
+                     "fingerprint": item["fingerprint"]} for item in selected]
+            report = self.submit(
+                "user_prediction_near_term_preparation",
+                {"as_of": effective_now, "horizon_hours": self._user_prediction_horizon_hours,
+                 "intent_refs": refs},
+                completion_context={"prediction_intents": refs},
+                report_payload={"trigger_source": trigger_source,
+                                "due_intent_count": len(refs),
+                                "as_of": effective_now.isoformat()},
+            )
+            if report.get("queued"):
+                self._prediction_inflight.update((item["object_type"],
+                    item["object_id"], item["fingerprint"]) for item in refs)
+            return {**report, "due_intent_count": len(candidates),
+                    "selected_intent_count": len(refs)}
+
     def submit_final_memory_tasks(
         self,
         *,
@@ -1007,8 +1075,54 @@ class TaskScheduler:
             self._process_user_activity_task_follow_up_steps(event)
         elif task_kind == "memory_user_state_update":
             self._process_user_state_update_follow_up_steps(event)
+        elif task_kind == "user_prediction_near_term_preparation":
+            self._process_user_prediction_follow_up_steps(event)
+        elif task_kind == "memory_user_intent_update":
+            self._process_fact_followup_task_completion(event)
+            self._process_user_intent_update_follow_up_steps(event)
         elif task_kind in self._FACT_FOLLOWUP_TASK_KINDS:
             self._process_fact_followup_task_completion(event)
+
+    def _process_user_intent_update_follow_up_steps(
+        self, event: Dict[str, Any],
+    ) -> None:
+        """Check newly created or affected intents for near-term prediction."""
+        result = event.get("result")
+        if (not event.get("succeeded") or not isinstance(result, dict)
+                or not result.get("affected_objects")):
+            return
+        reference_text = str(result.get("reference_timestamp") or "").strip()
+        try:
+            prediction_as_of = datetime.fromisoformat(
+                reference_text.replace("Z", "+00:00"),
+            )
+        except ValueError:
+            prediction_as_of = datetime.now().astimezone()
+        self._schedule_due_user_predictions(
+            now=prediction_as_of,
+            trigger_source="new_intent",
+            intent_refs=[{
+                "object_type": item.get("object_type"),
+                "object_id": item.get("object_id"),
+            } for item in result["affected_objects"]],
+        )
+
+    def _process_user_prediction_follow_up_steps(self, event: Dict[str, Any]) -> None:
+        context = event.get("completion_context") or {}
+        refs = context.get("prediction_intents") or []
+        result = event.get("result") or {}
+        with self._prediction_lock:
+            for ref in refs:
+                self._prediction_inflight.discard((
+                    str(ref["object_type"]), int(ref["object_id"]),
+                    str(ref["fingerprint"]),
+                ))
+            if (event.get("succeeded") and isinstance(result, dict)
+                    and result.get("status") in {"ok", "empty"}
+                    and self._task_execution_db is not None):
+                self._task_execution_db.complete_prediction_intents(
+                    result.get("processed_intents") or [],
+                )
 
     def _process_fact_extraction_follow_up_steps(self, event: Dict[str, Any]) -> None:
         try:

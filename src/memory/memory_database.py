@@ -566,57 +566,6 @@ class SessionDB:
                 FOREIGN KEY(trigger_pattern_id) REFERENCES memory_user_observed_patterns(id) ON DELETE SET NULL
             );
 
-            CREATE TABLE IF NOT EXISTS memory_user_states (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_entity_id INTEGER NOT NULL,
-                state_domain TEXT NOT NULL,
-                state_type TEXT NOT NULL,
-                state_kind TEXT NOT NULL,
-                state_topic TEXT NOT NULL,
-                state_text TEXT NOT NULL DEFAULT '',
-                status TEXT NOT NULL DEFAULT 'active',
-                confidence REAL NOT NULL DEFAULT 0.0,
-                conditions TEXT NOT NULL DEFAULT '{}',
-                valid_from TEXT NOT NULL DEFAULT '',
-                valid_to TEXT NOT NULL DEFAULT '',
-                last_observed_at TEXT NOT NULL DEFAULT '',
-                metadata TEXT NOT NULL DEFAULT '{}',
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                UNIQUE(user_entity_id, state_domain, state_type, state_kind, state_topic),
-                FOREIGN KEY(user_entity_id) REFERENCES memory_entity_nodes(id) ON DELETE CASCADE
-            );
-
-            CREATE TABLE IF NOT EXISTS memory_user_state_evidence (
-                state_id INTEGER NOT NULL,
-                evidence_type TEXT NOT NULL,
-                evidence_id INTEGER NOT NULL,
-                role TEXT NOT NULL DEFAULT 'support',
-                weight REAL NOT NULL DEFAULT 1.0,
-                observed_at TEXT NOT NULL DEFAULT '',
-                details TEXT NOT NULL DEFAULT '{}',
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                PRIMARY KEY(state_id, evidence_type, evidence_id, role),
-                FOREIGN KEY(state_id) REFERENCES memory_user_states(id) ON DELETE CASCADE
-            );
-
-            CREATE TABLE IF NOT EXISTS memory_user_state_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                state_id INTEGER NOT NULL,
-                operation TEXT NOT NULL,
-                previous_payload TEXT NOT NULL DEFAULT '{}',
-                new_payload TEXT NOT NULL DEFAULT '{}',
-                trigger_claim_ids TEXT NOT NULL DEFAULT '[]',
-                trigger_intent_objects TEXT NOT NULL DEFAULT '[]',
-                effective_at TEXT NOT NULL DEFAULT '',
-                decision_source TEXT NOT NULL DEFAULT '',
-                confidence REAL NOT NULL DEFAULT 0.0,
-                reason TEXT NOT NULL DEFAULT '',
-                created_at TEXT NOT NULL,
-                FOREIGN KEY(state_id) REFERENCES memory_user_states(id) ON DELETE CASCADE
-            );
-
             CREATE TABLE IF NOT EXISTS memory_user_intent_items (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 object_type TEXT NOT NULL CHECK(object_type IN ('goal', 'plan', 'work_item')),
@@ -709,12 +658,6 @@ class SessionDB:
             ON memory_user_claim_events(target_claim_id, effective_at DESC, id DESC);
             CREATE INDEX IF NOT EXISTS idx_memory_user_claim_events_trigger
             ON memory_user_claim_events(trigger_claim_id, id DESC);
-            CREATE INDEX IF NOT EXISTS idx_memory_user_states_user_status
-            ON memory_user_states(user_entity_id, state_domain, state_type, status, updated_at DESC);
-            CREATE INDEX IF NOT EXISTS idx_memory_user_state_evidence_state
-            ON memory_user_state_evidence(state_id, role, evidence_type);
-            CREATE INDEX IF NOT EXISTS idx_memory_user_state_events_state
-            ON memory_user_state_events(state_id, effective_at DESC, id DESC);
             CREATE INDEX IF NOT EXISTS idx_memory_user_intent_items_owner_type_status
             ON memory_user_intent_items(world_owner_entity_id, object_type, status, updated_at DESC);
             CREATE INDEX IF NOT EXISTS idx_memory_user_intent_items_primary_time
@@ -2371,6 +2314,45 @@ class SessionDB:
         ).fetchone()
         return self._intent_row_to_api(row) if row else None
 
+    def get_time_bearing_user_intents(
+        self, *, world_owner_entity_id: int,
+    ) -> List[Dict[str, Any]]:
+        """Read all potentially actionable intents, including older rows nearing due time."""
+        rows = self._conn.execute(
+            """SELECT * FROM memory_user_intent_items
+               WHERE world_owner_entity_id = ? AND primary_entity_id = ?
+                 AND ((object_type = 'goal' AND status = 'active')
+                   OR (object_type = 'plan' AND status IN ('planned', 'rescheduled'))
+                   OR (object_type = 'work_item'
+                       AND status IN ('open', 'in_progress', 'blocked')))
+                 AND ((object_type = 'plan' AND time_start != '')
+                   OR (object_type != 'plan' AND time_end != ''))
+               ORDER BY id""",
+            (int(world_owner_entity_id), int(world_owner_entity_id)),
+        ).fetchall()
+        return [self._intent_row_to_api(row) for row in rows]
+
+    def get_plan_ids_with_unresolved_relations(self, plan_ids: Sequence[int]) -> set[int]:
+        """Conservatively exclude plans whose status has not absorbed relation events."""
+        ids = sorted({int(value) for value in plan_ids if int(value) > 0})
+        if not ids:
+            return set()
+        placeholders = ",".join("?" for _ in ids)
+        rows = self._conn.execute(
+            f"""SELECT DISTINCT object_id FROM memory_user_intent_events
+                WHERE object_type = 'plan' AND event_type = 'relation_observed'
+                AND object_id IN ({placeholders})""",
+            ids,
+        ).fetchall()
+        return {int(row["object_id"]) for row in rows}
+
+    def get_entity_id_by_name(self, name: str) -> Optional[int]:
+        row = self._conn.execute(
+            "SELECT id FROM memory_entity_nodes WHERE name = ?", (str(name),)
+        ).fetchone()
+        return int(row["id"]) if row else None
+
+
     def upsert_intent_evidence(self, evidence: Sequence[Dict[str, Any]]) -> int:
         now = local_now_text()
         changed = 0
@@ -2616,338 +2598,6 @@ class SessionDB:
         by_id = {int(row["id"]): self._row_to_dict(row) for row in rows}
         return [by_id[claim_id] for claim_id in ids if claim_id in by_id]
 
-    def get_user_states(
-        self,
-        *,
-        user_entity_id: int,
-        state_domains: Optional[Sequence[str]] = None,
-        state_types: Optional[Sequence[str]] = None,
-        statuses: Optional[Sequence[str]] = None,
-        limit: int = 160,
-    ) -> List[Dict[str, Any]]:
-        """Return current durable user states, not historical read snapshots."""
-        clauses = ["user_entity_id = ?"]
-        params: List[Any] = [int(user_entity_id)]
-        if state_domains:
-            placeholders = ",".join("?" for _ in state_domains)
-            clauses.append(f"state_domain IN ({placeholders})")
-            params.extend(str(value) for value in state_domains)
-        if state_types:
-            placeholders = ",".join("?" for _ in state_types)
-            clauses.append(f"state_type IN ({placeholders})")
-            params.extend(str(value) for value in state_types)
-        if statuses:
-            placeholders = ",".join("?" for _ in statuses)
-            clauses.append(f"status IN ({placeholders})")
-            params.extend(str(value) for value in statuses)
-        rows = self._conn.execute(
-            f"""
-            SELECT * FROM memory_user_states
-            WHERE {' AND '.join(clauses)}
-            ORDER BY updated_at DESC, id DESC
-            LIMIT ?
-            """,
-            (*params, max(1, int(limit or 160))),
-        ).fetchall()
-        result: List[Dict[str, Any]] = []
-        for row in rows:
-            item = self._row_to_dict(row)
-            item["conditions"] = _json_loads(item.get("conditions"), {})
-            item["metadata"] = _json_loads(item.get("metadata"), {})
-            result.append(item)
-        return result
-
-    def get_user_states_by_ids(self, state_ids: Sequence[int]) -> List[Dict[str, Any]]:
-        ids = list(dict.fromkeys(
-            int(value) for value in state_ids or []
-            if str(value).strip().isdigit() and int(value) > 0
-        ))
-        if not ids:
-            return []
-        placeholders = ",".join("?" for _ in ids)
-        rows = self._conn.execute(
-            f"SELECT * FROM memory_user_states WHERE id IN ({placeholders})",
-            ids,
-        ).fetchall()
-        by_id = {int(row["id"]): self._row_to_dict(row) for row in rows}
-        result: List[Dict[str, Any]] = []
-        for state_id in ids:
-            row = by_id.get(state_id)
-            if not row:
-                continue
-            row["conditions"] = _json_loads(row.get("conditions"), {})
-            row["metadata"] = _json_loads(row.get("metadata"), {})
-            result.append(row)
-        return result
-
-    def user_state_identity_exists(
-        self, *, user_entity_id: int, state_domain: str,
-        state_type: str, state_kind: str, state_topic: str,
-    ) -> bool:
-        row = self._conn.execute(
-            """
-            SELECT 1 FROM memory_user_states
-            WHERE user_entity_id = ? AND state_domain = ?
-              AND state_type = ? AND state_kind = ?
-              AND state_topic = ? LIMIT 1
-            """,
-            (
-                int(user_entity_id), str(state_domain), str(state_type),
-                str(state_kind), str(state_topic),
-            ),
-        ).fetchone()
-        return row is not None
-
-    def get_user_state_ids_for_claim_ids(
-        self, claim_ids: Sequence[int], *, limit: int = 160,
-    ) -> List[int]:
-        ids = list(dict.fromkeys(
-            int(value) for value in claim_ids or []
-            if str(value).strip().isdigit() and int(value) > 0
-        ))
-        if not ids:
-            return []
-        placeholders = ",".join("?" for _ in ids)
-        rows = self._conn.execute(
-            f"""
-            SELECT DISTINCT evidence.state_id
-            FROM memory_user_state_evidence AS evidence
-            JOIN memory_user_states AS state ON state.id = evidence.state_id
-            WHERE evidence.evidence_type = 'user_claim'
-              AND evidence.evidence_id IN ({placeholders})
-              AND state.status IN ('active', 'weakened')
-            LIMIT ?
-            """,
-            (*ids, max(1, int(limit))),
-        ).fetchall()
-        return [int(row["state_id"]) for row in rows]
-
-    def get_user_state_claim_evidence(
-        self, state_ids: Sequence[int], *, limit: int = 480,
-    ) -> List[Dict[str, Any]]:
-        ids = list(dict.fromkeys(
-            int(value) for value in state_ids or []
-            if str(value).strip().isdigit() and int(value) > 0
-        ))
-        if not ids:
-            return []
-        placeholders = ",".join("?" for _ in ids)
-        rows = self._conn.execute(
-            f"""
-            SELECT * FROM memory_user_state_evidence
-            WHERE evidence_type = 'user_claim' AND state_id IN ({placeholders})
-            ORDER BY state_id, evidence_id LIMIT ?
-            """,
-            (*ids, max(1, int(limit))),
-        ).fetchall()
-        return [self._row_to_dict(row) for row in rows]
-
-    def get_user_state_evidence(
-        self, state_ids: Sequence[int], *, limit: int = 480,
-    ) -> List[Dict[str, Any]]:
-        ids = sorted({int(value) for value in state_ids if int(value) > 0})
-        if not ids:
-            return []
-        placeholders = ",".join("?" for _ in ids)
-        rows = self._conn.execute(
-            "SELECT * FROM memory_user_state_evidence "
-            f"WHERE state_id IN ({placeholders}) "
-            "ORDER BY state_id, evidence_type, evidence_id LIMIT ?",
-            (*ids, max(1, int(limit))),
-        ).fetchall()
-        return [self._row_to_dict(row) for row in rows]
-
-    def replace_user_state_claim_evidence(
-        self, *, state_id: int, evidence: Sequence[Dict[str, Any]],
-    ) -> None:
-        """Replace claim evidence after a full claim-only state resolution."""
-        self._conn.execute(
-            "DELETE FROM memory_user_state_evidence WHERE state_id = ? AND evidence_type = 'user_claim'",
-            (int(state_id),),
-        )
-        self.upsert_user_state_evidence([
-            {**item, "state_id": int(state_id)} for item in evidence
-        ])
-        self._commit_if_needed()
-
-    def upsert_user_state(
-        self,
-        *,
-        user_entity_id: int,
-        state_domain: str,
-        state_type: str,
-        state_kind: str,
-        state_topic: str,
-        state_text: str,
-        status: str,
-        confidence: float,
-        conditions: Optional[Dict[str, Any]] = None,
-        valid_from: str = "",
-        valid_to: str = "",
-        last_observed_at: str = "",
-        metadata: Optional[Dict[str, Any]] = None,
-        target_state_id: Optional[int] = None,
-    ) -> tuple[int, bool, Optional[Dict[str, Any]]]:
-        """Create or incrementally update one state and return its old value."""
-        now = local_now_text()
-        owner_id = int(user_entity_id)
-        target_id = int(target_state_id or 0)
-        topic = str(state_topic or "").strip()
-        if not topic:
-            raise ValueError("state_topic is required")
-        existing = None
-        if target_id > 0:
-            existing = self._conn.execute(
-                "SELECT * FROM memory_user_states WHERE id = ? AND user_entity_id = ?",
-                (target_id, owner_id),
-            ).fetchone()
-            if existing is None:
-                raise ValueError(f"Unknown target user state: {target_id}")
-        if existing is None:
-            existing = self._conn.execute(
-                """
-                SELECT * FROM memory_user_states
-                WHERE user_entity_id = ? AND state_domain = ?
-                  AND state_type = ? AND state_kind = ?
-                  AND state_topic = ?
-                """,
-                (
-                    owner_id, str(state_domain), str(state_type),
-                    str(state_kind), topic,
-                ),
-            ).fetchone()
-        old = self._row_to_dict(existing) if existing else None
-        if old:
-            if (
-                old["state_domain"] != state_domain
-                or old["state_type"] != state_type
-                or old["state_kind"] != state_kind
-                or old["state_topic"] != topic
-            ):
-                raise ValueError("Target user state identity cannot be changed")
-            state_id = int(old["id"])
-            self._conn.execute(
-                """
-                UPDATE memory_user_states
-                SET state_text = ?, status = ?, confidence = ?, conditions = ?,
-                    valid_from = ?, valid_to = ?, last_observed_at = ?,
-                    metadata = ?, updated_at = ?
-                WHERE id = ?
-                """,
-                (
-                    str(state_text or old.get("state_text") or ""),
-                    str(status or old.get("status") or "active"),
-                    float(confidence),
-                    _json_dumps(conditions if isinstance(conditions, dict) else {}),
-                    str(valid_from or old.get("valid_from") or ""),
-                    str(valid_to or old.get("valid_to") or ""),
-                    str(last_observed_at or old.get("last_observed_at") or ""),
-                    _json_dumps(metadata if isinstance(metadata, dict) else {}),
-                    now,
-                    state_id,
-                ),
-            )
-            self._commit_if_needed()
-            return state_id, False, old
-        cur = self._conn.execute(
-            """
-            INSERT INTO memory_user_states (
-                user_entity_id, state_domain, state_type, state_kind,
-                state_topic, state_text, status,
-                confidence, conditions, valid_from, valid_to, last_observed_at,
-                metadata, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                owner_id, str(state_domain), str(state_type), str(state_kind),
-                topic, str(state_text),
-                str(status or "active"), float(confidence),
-                _json_dumps(conditions if isinstance(conditions, dict) else {}),
-                str(valid_from or ""), str(valid_to or ""),
-                str(last_observed_at or ""),
-                _json_dumps(metadata if isinstance(metadata, dict) else {}), now, now,
-            ),
-        )
-        self._commit_if_needed()
-        return int(cur.lastrowid), True, None
-
-    def upsert_user_state_evidence(self, evidence: Sequence[Dict[str, Any]]) -> int:
-        now = local_now_text()
-        changed = 0
-        for item in evidence or []:
-            try:
-                state_id = int(item.get("state_id") or 0)
-                evidence_id = int(item.get("evidence_id") or 0)
-            except (TypeError, ValueError):
-                continue
-            evidence_type = str(item.get("evidence_type") or "").strip()
-            role = str(item.get("role") or "support").strip()
-            if state_id <= 0 or evidence_id <= 0 or not evidence_type:
-                continue
-            self._conn.execute(
-                """
-                INSERT INTO memory_user_state_evidence (
-                    state_id, evidence_type, evidence_id, role, weight,
-                    observed_at, details, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(state_id, evidence_type, evidence_id, role)
-                DO UPDATE SET weight = excluded.weight,
-                              observed_at = excluded.observed_at,
-                              details = excluded.details,
-                              updated_at = excluded.updated_at
-                """,
-                (
-                    state_id, evidence_type, evidence_id, role,
-                    float(item.get("weight") or 0.0),
-                    str(item.get("observed_at") or ""),
-                    _json_dumps(item.get("details") or {}), now, now,
-                ),
-            )
-            changed += 1
-        self._commit_if_needed()
-        return changed
-
-    def record_user_state_event(
-        self,
-        *,
-        state_id: int,
-        operation: str,
-        previous_payload: Optional[Dict[str, Any]],
-        new_payload: Optional[Dict[str, Any]],
-        trigger_claim_ids: Sequence[int],
-        trigger_intent_objects: Sequence[Dict[str, Any]],
-        effective_at: str,
-        decision_source: str,
-        confidence: float,
-        reason: str,
-    ) -> int:
-        normalized_claim_ids: List[int] = []
-        for value in trigger_claim_ids or []:
-            try:
-                claim_id = int(value)
-            except (TypeError, ValueError):
-                continue
-            if claim_id > 0:
-                normalized_claim_ids.append(claim_id)
-        cur = self._conn.execute(
-            """
-            INSERT INTO memory_user_state_events (
-                state_id, operation, previous_payload, new_payload,
-                trigger_claim_ids, trigger_intent_objects, effective_at,
-                decision_source, confidence, reason, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                int(state_id), str(operation), _json_dumps(previous_payload or {}),
-                _json_dumps(new_payload or {}),
-                _json_dumps(sorted(set(normalized_claim_ids))),
-                _json_dumps(list(trigger_intent_objects or [])), str(effective_at or ""),
-                str(decision_source or ""), float(confidence), str(reason or ""),
-                local_now_text(),
-            ),
-        )
-        self._commit_if_needed()
-        return int(cur.lastrowid)
 
     def get_entity_names_by_ids(
         self,

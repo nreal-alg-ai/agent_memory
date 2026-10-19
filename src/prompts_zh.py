@@ -757,6 +757,20 @@ supporting_claims：{supporting_claims}
 """
 
 
+USER_PREDICTION_NEAR_TERM_PREPARATION_PROMPT_ZH = """你是个人世界模型的预测模块。依据指定预测窗口内即将到达时间锚点的用户目标、安排或待办，预测用户在此之前可能进行的准备行为。周期性状态仅是可选的辅助证据。
+
+预测是假设，不是已发生事实。每项必须引用一个输入 intent 的 object_type 和 id；只在确实相关时引用 recurring_state id，没有相关 state 时 state_ids 可以为空。不要将 intent 原文复述为预测，不要凭空添加具体物品、地点或时刻，也不要预测助手自己的行为。目标/截止时间本身并不保证用户一定准备；证据不足时返回空列表。预测窗口必须晚于参考时间、早于或等于所引用 intent 的 anchor_at。最多输出 5 项。
+
+只返回 JSON：
+{{"predictions":[{{"intent_type":"plan|work_item|goal","intent_id":1,"state_ids":[],"behavior_text":"用户可能提前确认出行安排","window_start":"ISO 时间","window_end":"ISO 时间","conditions":["若该安排未变"],"likelihood_band":"low|medium|high","uncertainties":["安排可能变化"],"rationale":"该意图及可选周期状态如何支持预测"}}]}}
+
+参考时间：{as_of}
+预测窗口：{horizon_start} 至 {horizon_end}
+临近意图：{intents}
+有效周期状态：{states}
+"""
+
+
 RECALL_QUERY_ANALYSIS_PROMPT_ZH = """你是 AI 眼镜长期记忆系统中的 recall query 分析器。
 
 请先理解当前记忆结构，再分析用户查询的检索方式。

@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     from memory.memory_database import SessionDB
     from llm_client import LLMClient
     from memory.task_scheduler import TaskScheduler
+    from .user_model_database import UserModelDB
 
 
 class UserStateResolver:
@@ -88,6 +89,7 @@ class UserStateResolver:
         self,
         *,
         db: "SessionDB",
+        model_db: "UserModelDB",
         task_scheduler: TaskScheduler,
         llm_client: "LLMClient",
         memory_config: Optional[Mapping[str, Any]] = None,
@@ -95,6 +97,7 @@ class UserStateResolver:
         logger: Optional[logging.Logger] = None,
     ) -> None:
         self._db = db
+        self._model_db = model_db
         self._llm_client = llm_client
         self._world_owner_entity_name = str(world_owner_entity_name or "用户本人").strip()
         self._logger = logger or logging.getLogger(__name__)
@@ -231,7 +234,7 @@ class UserStateResolver:
                 ]
                 related_intents.append(view)
 
-        existing_states = self._db.get_user_states(
+        existing_states = self._model_db.get_user_states(
             user_entity_id=owner_id,
             state_types=["situational_state"],
             statuses=["active", "weakened"],
@@ -336,7 +339,7 @@ class UserStateResolver:
             )
             if normalized is None:
                 continue
-            if normalized["operation"] == "create" and self._db.user_state_identity_exists(
+            if normalized["operation"] == "create" and self._model_db.user_state_identity_exists(
                 user_entity_id=owner_id,
                 state_domain=normalized["state_domain"],
                 state_type=normalized["state_type"],
@@ -363,7 +366,7 @@ class UserStateResolver:
         if not operations:
             report["status"] = "ok"
             return report
-        with self._db.transaction():
+        with self._model_db.transaction():
             applied = self.apply_operations(
                 user_entity_id=owner_id,
                 operations=operations,
@@ -481,7 +484,7 @@ class UserStateResolver:
                 and any(signal_id in (item.get("support_signal_ids") or [])
                         for item in domain_patterns.values())
             })
-            existing_states = self._db.get_user_states(
+            existing_states = self._model_db.get_user_states(
                 user_entity_id=owner_id, state_domains=[domain],
                 state_types=["recurring_state"], statuses=["active", "weakened"],
                 limit=self._update_limit + 1,
@@ -492,7 +495,7 @@ class UserStateResolver:
                     "status": "error", "error": "observed_pattern_state_input_limit_exceeded",
                 }
                 continue
-            state_evidence = self._db.get_user_state_evidence(
+            state_evidence = self._model_db.get_user_state_evidence(
                 [int(item["id"]) for item in existing_states],
                 limit=max(480, self._update_limit * 12),
             )
@@ -656,7 +659,7 @@ class UserStateResolver:
                     )
                 ):
                     continue
-                if action == "create" and self._db.user_state_identity_exists(
+                if action == "create" and self._model_db.user_state_identity_exists(
                     user_entity_id=owner_id, state_domain=domain,
                     state_type="recurring_state",
                     state_kind=normalized["state_kind"],
@@ -673,7 +676,7 @@ class UserStateResolver:
                 seen_targets.add(target)
                 operations.append(normalized)
             if operations:
-                with self._db.transaction():
+                with self._model_db.transaction():
                     applied = self.apply_operations(
                         user_entity_id=owner_id, operations=operations,
                         reference_time=update_input["reference_time"],
@@ -775,16 +778,16 @@ class UserStateResolver:
                 for event in relations
                 for key in ("target_claim_id", "trigger_claim_id")
             } - changed_ids
-            linked_state_ids = self._db.get_user_state_ids_for_claim_ids(
+            linked_state_ids = self._model_db.get_user_state_ids_for_claim_ids(
                 sorted(changed_ids | related_ids), limit=self._update_limit + 1,
             )
             linked_states = [
-                state for state in self._db.get_user_states_by_ids(linked_state_ids)
+                state for state in self._model_db.get_user_states_by_ids(linked_state_ids)
                 if int(state.get("user_entity_id") or 0) == user_entity_id
                 and state.get("state_domain") == domain
                 and state.get("status") in {"active", "weakened"}
             ]
-            domain_states = self._db.get_user_states(
+            domain_states = self._model_db.get_user_states(
                 user_entity_id=user_entity_id, state_domains=[domain],
                 statuses=["active", "weakened"], limit=self._update_limit + 1,
             )
@@ -794,12 +797,12 @@ class UserStateResolver:
             }
             states = list(states_by_id.values())[:self._update_limit]
             state_evidence_limit = max(480, self._update_limit * 12)
-            state_evidence = self._db.get_user_state_claim_evidence(
+            state_evidence = self._model_db.get_user_state_claim_evidence(
                 [int(state["id"]) for state in states],
                 limit=state_evidence_limit + 1,
             )
             pattern_evidence = [
-                item for item in self._db.get_user_state_evidence(
+                item for item in self._model_db.get_user_state_evidence(
                     [int(state["id"]) for state in states],
                     limit=state_evidence_limit + 1,
                 )
@@ -1004,7 +1007,7 @@ class UserStateResolver:
                 for state in existing_states.values()
             ):
                 return None
-            if operation["operation"] == "create" and self._db.user_state_identity_exists(
+            if operation["operation"] == "create" and self._model_db.user_state_identity_exists(
                 user_entity_id=int(update_input["user_entity_id"]),
                 state_domain=str(update_input["state_domain"]),
                 state_type=operation["state_type"],
@@ -1066,6 +1069,18 @@ class UserStateResolver:
                 }
                 continue
             claim_updates, operations = normalized
+            # State is the projection; write it first. If this fails, source
+            # claims remain unchanged and the scheduler can retry the batch.
+            with self._model_db.transaction():
+                applied = self.apply_operations(
+                    user_entity_id=owner_id, operations=operations,
+                    reference_time=update_input["reference_time"],
+                    replace_claim_evidence=True,
+                    decision_source=self.CLAIM_RESOLVER_VERSION,
+                )
+            # Memory and model databases cannot share an SQLite transaction.
+            # Claim transitions are idempotent, so an interrupted second write
+            # remains retryable through the scheduler's unacknowledged batch.
             with self._db.transaction():
                 changed_status_count = sum(
                     self._db.apply_user_claim_status_decision(
@@ -1076,12 +1091,6 @@ class UserStateResolver:
                         reason=item["reason"], decision_source=self.CLAIM_RESOLVER_VERSION,
                     )
                     for item in claim_updates
-                )
-                applied = self.apply_operations(
-                    user_entity_id=owner_id, operations=operations,
-                    reference_time=update_input["reference_time"],
-                    replace_claim_evidence=True,
-                    decision_source=self.CLAIM_RESOLVER_VERSION,
                 )
             report["claim_status_update_count"] += changed_status_count
             for key in ("operation_count", "created", "reinforced", "revised", "weakened", "expired"):
@@ -1127,10 +1136,10 @@ class UserStateResolver:
             action = str(operation.get("operation") or "")
             target_id = int(operation.get("target_state_id") or 0)
             previous_claim_evidence = (
-                self._db.get_user_state_claim_evidence([target_id])
+                self._model_db.get_user_state_claim_evidence([target_id])
                 if replace_claim_evidence and target_id else []
             )
-            state_id, created, previous = self._db.upsert_user_state(
+            state_id, created, previous = self._model_db.upsert_user_state(
                 user_entity_id=owner_id,
                 target_state_id=target_id or None,
                 state_domain=str(operation["state_domain"]),
@@ -1150,18 +1159,18 @@ class UserStateResolver:
                     "state_domain": str(operation["state_domain"]),
                 },
             )
-            current = self._db.get_user_states_by_ids([state_id])[0]
+            current = self._model_db.get_user_states_by_ids([state_id])[0]
             evidence = [
                 {**item, "state_id": state_id, "observed_at": effective_at}
                 for item in operation.get("evidence") or []
             ]
             if replace_claim_evidence:
-                self._db.replace_user_state_claim_evidence(
+                self._model_db.replace_user_state_claim_evidence(
                     state_id=state_id, evidence=evidence,
                 )
             else:
-                self._db.upsert_user_state_evidence(evidence)
-            self._db.record_user_state_event(
+                self._model_db.upsert_user_state_evidence(evidence)
+            self._model_db.record_user_state_event(
                 state_id=state_id,
                 operation=action,
                 previous_payload={
@@ -1209,7 +1218,7 @@ class UserStateResolver:
         state_types: Optional[Sequence[str]] = None,
         statuses: Optional[Sequence[str]] = None,
     ) -> List[Dict[str, Any]]:
-        return self._db.get_user_states(
+        return self._model_db.get_user_states(
             user_entity_id=int(user_entity_id),
             state_domains=state_domains,
             state_types=state_types,

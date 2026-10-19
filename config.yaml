@@ -183,6 +183,8 @@ memory_runtime:
       max_tokens: 6000
       min_tokens_for_duration: 1000
   task_scheduling:
+    enable_user_prediction: true
+    user_prediction_horizon_hours: 6
     enable_memory_user_claim_update: true
     enable_memory_user_observed_pattern_update: true
     enable_memory_user_intent_update: true

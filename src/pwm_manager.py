@@ -12,7 +12,7 @@ from memory.memory_database import SessionDB
 from memory.memory_manager import MemoryNodeManager
 from memory.memory_runtime import MemoryRuntime
 from memory.task_scheduler import TaskOperationReporter, TaskScheduler
-from user_state import UserStateResolver
+from user_model import UserModelDB, UserPrediction, UserStateResolver
 
 
 class PersonWorldModel:
@@ -33,6 +33,10 @@ class PersonWorldModel:
         self._operation_reporter = operation_reporter or TaskOperationReporter()
         self._database = SessionDB(resolved_db_path)
         try:
+            model_db_path = resolved_db_path.with_name("user_model.db")
+            if model_db_path == resolved_db_path:
+                raise ValueError("Memory database and user_model.db must be distinct")
+            self._user_model_database = UserModelDB(model_db_path)
             self._llm_client = LLMClient(
                 memory_config=manager_config,
                 logger=self._logger.getChild("llm_client"),
@@ -60,6 +64,7 @@ class PersonWorldModel:
             )
             self._user_state_resolver = UserStateResolver(
                 db=self._database,
+                model_db=self._user_model_database,
                 task_scheduler=self._task_scheduler,
                 llm_client=self._llm_client,
                 memory_config=manager_config,
@@ -68,10 +73,22 @@ class PersonWorldModel:
                 ),
                 logger=self._logger.getChild("user_state_resolver"),
             )
+            self._user_prediction = UserPrediction(
+                db=self._database,
+                model_db=self._user_model_database,
+                task_scheduler=self._task_scheduler,
+                llm_client=self._llm_client,
+                world_owner_entity_name=(
+                    self._memory_runtime.manager.world_owner_entity_name
+                ),
+                logger=self._logger.getChild("user_prediction"),
+            )
             self._task_scheduler.start()
         except Exception:
             if hasattr(self, "_task_scheduler"):
                 self._task_scheduler.shutdown(wait=True, timeout=0)
+            if hasattr(self, "_user_model_database"):
+                self._user_model_database.close()
             self._database.close()
             raise
         self._closed = False
@@ -90,6 +107,10 @@ class PersonWorldModel:
         return self._user_state_resolver
 
     @property
+    def user_prediction(self) -> UserPrediction:
+        return self._user_prediction
+
+    @property
     def task_scheduler(self) -> TaskScheduler:
         return self._task_scheduler
 
@@ -100,6 +121,10 @@ class PersonWorldModel:
     @property
     def database(self) -> SessionDB:
         return self._database
+
+    @property
+    def user_model_database(self) -> UserModelDB:
+        return self._user_model_database
 
     @property
     def operation_reporter(self) -> TaskOperationReporter:
@@ -200,6 +225,12 @@ class PersonWorldModel:
         """Evaluate the thirty-minute claim-to-state update window now."""
         return self._task_scheduler.trigger_user_state_time_tick(now=now)
 
+    def trigger_user_prediction_time_tick(
+        self, *, now: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
+        """Scan active intents that have entered the configured forecast window."""
+        return self._task_scheduler.trigger_user_prediction_time_tick(now=now)
+
     def get_user_states(
         self,
         *,
@@ -216,6 +247,30 @@ class PersonWorldModel:
                 state_domains=state_domains,
                 state_types=state_types,
                 statuses=statuses,
+            )
+
+    def predict_near_term_preparation(
+        self, *, as_of: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
+        """Evaluate current near-term intents and enqueue only unseen versions."""
+        return self._task_scheduler.trigger_user_prediction_time_tick(now=as_of)
+
+    def get_active_predictions(
+        self, *, as_of: Optional[datetime] = None,
+    ) -> List[Dict[str, Any]]:
+        with self._task_scheduler.execution_lock:
+            return self._user_prediction.get_active_predictions(as_of=as_of)
+
+    def record_prediction_outcome(
+        self, *, prediction_id: int, status: str,
+        observed_at: Optional[datetime] = None,
+        evidence_refs: Optional[Sequence[Dict[str, Any]]] = None,
+        note: str = "",
+    ) -> bool:
+        with self._task_scheduler.execution_lock:
+            return self._user_prediction.record_prediction_outcome(
+                prediction_id=prediction_id, status=status,
+                observed_at=observed_at, evidence_refs=evidence_refs, note=note,
             )
 
     def close(self, timeout: Optional[float] = 30.0) -> None:
@@ -242,5 +297,6 @@ class PersonWorldModel:
                 safe_to_close_database = True
             finally:
                 if safe_to_close_database:
+                    self._user_model_database.close()
                     self._database.close()
                     self._closed = True

@@ -35,7 +35,7 @@ from .memory_context_manager import (
     convert_interaction_turn_to_online_unit,
 )
 from .memory_types import MemoryUnit
-from user_state import UserStateResolver
+from user_model import UserModelDB, UserStateResolver
 
 
 _MEMORY_INPUT_TOKEN_RE = re.compile(
@@ -97,6 +97,7 @@ class MemoryRuntime:
         )
 
         database = database or SessionDB(Path(db_path).expanduser().resolve())
+        self._user_model_database: Optional[UserModelDB] = None
         try:
             manager_logger = self._logger.getChild("memory_manager")
             self._llm_client = llm_client or LLMClient(
@@ -123,8 +124,13 @@ class MemoryRuntime:
             )
             self._user_state_resolver: Optional[UserStateResolver] = None
             if self._owns_shared_resources:
+                model_db_path = database.db_path.with_name("user_model.db")
+                if model_db_path == database.db_path:
+                    raise ValueError("Memory database and user_model.db must be distinct")
+                self._user_model_database = UserModelDB(model_db_path)
                 self._user_state_resolver = UserStateResolver(
                     db=database,
+                    model_db=self._user_model_database,
                     task_scheduler=self._task_scheduler,
                     llm_client=self._llm_client,
                     memory_config=manager_config,
@@ -135,6 +141,8 @@ class MemoryRuntime:
             if self._owns_shared_resources:
                 if hasattr(self, "_task_scheduler"):
                     self._task_scheduler.shutdown(wait=True, timeout=0)
+                if self._user_model_database is not None:
+                    self._user_model_database.close()
                 database.close()
             raise
         self._memory_database = database
@@ -208,6 +216,8 @@ class MemoryRuntime:
                 safe_to_close_database = True
             finally:
                 if safe_to_close_database and self._memory_database is not None:
+                    if self._user_model_database is not None:
+                        self._user_model_database.close()
                     self._memory_database.close()
 
     @property

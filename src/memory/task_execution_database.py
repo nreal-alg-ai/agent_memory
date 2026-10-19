@@ -93,6 +93,13 @@ class TaskExecutionDB:
                 result_json TEXT NOT NULL DEFAULT '{}',
                 PRIMARY KEY(run_id, task_id)
             );
+            CREATE TABLE IF NOT EXISTS user_prediction_intent_progress (
+                object_type TEXT NOT NULL,
+                object_id INTEGER NOT NULL,
+                fingerprint TEXT NOT NULL,
+                completed_at TEXT NOT NULL,
+                PRIMARY KEY(object_type, object_id)
+            );
             CREATE TABLE IF NOT EXISTS user_claim_signal_consolidation_task_info (
                 batch_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 source_task_id TEXT NOT NULL UNIQUE,
@@ -177,6 +184,40 @@ class TaskExecutionDB:
                SET status = ?, completed_at = ?, result_json = ?
                WHERE run_id = ? AND task_id = ?""",
             (status, _now(), result_json, self._run_id, task_id),
+        )
+        self._conn.commit()
+
+    @_locked
+    def completed_prediction_intents(
+        self, intents: Sequence[Dict[str, Any]],
+    ) -> set[Tuple[str, int, str]]:
+        completed: set[Tuple[str, int, str]] = set()
+        for intent in intents:
+            object_type = str(intent["object_type"])
+            object_id = int(intent["id"])
+            row = self._conn.execute(
+                """SELECT fingerprint FROM user_prediction_intent_progress
+                   WHERE object_type = ? AND object_id = ?""",
+                (object_type, object_id),
+            ).fetchone()
+            fingerprint = str(intent["fingerprint"])
+            if row and row["fingerprint"] == fingerprint:
+                completed.add((object_type, object_id, fingerprint))
+        return completed
+
+    @_locked
+    def complete_prediction_intents(
+        self, intents: Sequence[Dict[str, Any]],
+    ) -> None:
+        self._conn.executemany(
+            """INSERT INTO user_prediction_intent_progress
+               (object_type, object_id, fingerprint, completed_at)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(object_type, object_id) DO UPDATE SET
+                 fingerprint = excluded.fingerprint,
+                 completed_at = excluded.completed_at""",
+            [(str(item["object_type"]), int(item["id"]),
+              str(item["fingerprint"]), _now()) for item in intents],
         )
         self._conn.commit()
 

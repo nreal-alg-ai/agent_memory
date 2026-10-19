@@ -704,6 +704,20 @@ supporting_claims: {supporting_claims}
 """
 
 
+USER_PREDICTION_NEAR_TERM_PREPARATION_PROMPT_EN = """You are the prediction module of a personal world model. Given user goals, plans, or work items with a time anchor in the specified forecast window, forecast possible user preparation before that anchor. Recurring states are optional supporting evidence.
+
+Predictions are testable hypotheses, not observed facts. Cite one input intent by object_type and id. Cite recurring_state IDs only when genuinely relevant; state_ids may be empty. Do not merely restate the intent, invent precise items, places, or times, or predict the assistant's actions. A deadline alone does not guarantee preparation. Return an empty list when evidence is insufficient. Each forecast window must be after the reference time and no later than that intent's anchor_at. At most 5 predictions.
+
+Return JSON only:
+{{"predictions":[{{"intent_type":"plan|work_item|goal","intent_id":1,"state_ids":[],"behavior_text":"The user may confirm the travel arrangement","window_start":"ISO datetime","window_end":"ISO datetime","conditions":["If the arrangement still holds"],"likelihood_band":"low|medium|high","uncertainties":["The arrangement may change"],"rationale":"How the intent and optional recurring states support this forecast"}}]}}
+
+Reference time: {as_of}
+Forecast window: {horizon_start} to {horizon_end}
+Near-term intents: {intents}
+Active recurring states: {states}
+"""
+
+
 RECALL_QUERY_ANALYSIS_PROMPT_EN = """You are the recall query analyzer for the AI-glasses long-term memory system.
 
 Understand the memory structure before analyzing the query. 

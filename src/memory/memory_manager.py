@@ -68,7 +68,7 @@ from prompts_zh import (
 )
 from .utils import _cal_embedding_cosine_similarity
 from .user_action_similarity import action_lexical_similarity
-from user_state import UserStateResolver
+from user_model import UserStateResolver
 
 RecallTimeBounds = Optional[Tuple[Optional[str], Optional[str]]]
 
@@ -2445,6 +2445,7 @@ class MemoryNodeManager:
         )
         report: Dict[str, Any] = {
             "status": "empty",
+            "reference_timestamp": str(reference_timestamp),
             "seed_fact_count": len(facts),
             "user_intent_signal_count": 0,
             "signal_batch_count": 0,
