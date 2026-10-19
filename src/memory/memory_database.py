@@ -570,8 +570,9 @@ class SessionDB:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_entity_id INTEGER NOT NULL,
                 state_domain TEXT NOT NULL,
-                state_class TEXT NOT NULL,
-                state_key TEXT NOT NULL,
+                state_type TEXT NOT NULL,
+                state_kind TEXT NOT NULL,
+                state_topic TEXT NOT NULL,
                 state_text TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL DEFAULT 'active',
                 confidence REAL NOT NULL DEFAULT 0.0,
@@ -582,7 +583,7 @@ class SessionDB:
                 metadata TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
-                UNIQUE(user_entity_id, state_domain, state_class, state_key),
+                UNIQUE(user_entity_id, state_domain, state_type, state_kind, state_topic),
                 FOREIGN KEY(user_entity_id) REFERENCES memory_entity_nodes(id) ON DELETE CASCADE
             );
 
@@ -709,7 +710,7 @@ class SessionDB:
             CREATE INDEX IF NOT EXISTS idx_memory_user_claim_events_trigger
             ON memory_user_claim_events(trigger_claim_id, id DESC);
             CREATE INDEX IF NOT EXISTS idx_memory_user_states_user_status
-            ON memory_user_states(user_entity_id, state_domain, state_class, status, updated_at DESC);
+            ON memory_user_states(user_entity_id, state_domain, state_type, status, updated_at DESC);
             CREATE INDEX IF NOT EXISTS idx_memory_user_state_evidence_state
             ON memory_user_state_evidence(state_id, role, evidence_type);
             CREATE INDEX IF NOT EXISTS idx_memory_user_state_events_state
@@ -1995,6 +1996,58 @@ class SessionDB:
             ]
         return patterns
 
+    def get_user_observed_patterns_by_ids(
+        self, pattern_ids: Sequence[int],
+    ) -> List[Dict[str, Any]]:
+        ids = sorted({int(value) for value in pattern_ids if int(value) > 0})
+        if not ids:
+            return []
+        placeholders = ",".join("?" for _ in ids)
+        rows = self._conn.execute(
+            f"SELECT * FROM memory_user_observed_patterns WHERE id IN ({placeholders})",
+            ids,
+        ).fetchall()
+        patterns = [self._row_to_dict(row) for row in rows]
+        for pattern in patterns:
+            evidence = self._conn.execute(
+                "SELECT signal_id FROM memory_user_observed_pattern_signals "
+                "WHERE pattern_id = ? ORDER BY signal_id",
+                (int(pattern["id"]),),
+            ).fetchall()
+            pattern["support_signal_ids"] = [int(row["signal_id"]) for row in evidence]
+        return patterns
+
+    def get_user_observed_pattern_events_for_signal_ids(
+        self, signal_ids: Sequence[int],
+    ) -> List[Dict[str, Any]]:
+        """Read relation events created from a task's action-signal snapshot."""
+        selected = {int(value) for value in signal_ids if int(value) > 0}
+        if not selected:
+            return []
+        rows_by_id: Dict[int, sqlite3.Row] = {}
+        ids = sorted(selected)
+        for offset in range(0, len(ids), 500):
+            chunk = ids[offset:offset + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = self._conn.execute(
+                "SELECT DISTINCT event.* FROM memory_user_observed_pattern_events AS event "
+                "JOIN json_each(event.support_signal_ids) AS signal "
+                f"WHERE CAST(signal.value AS INTEGER) IN ({placeholders})",
+                chunk,
+            ).fetchall()
+            rows_by_id.update({int(row["id"]): row for row in rows})
+        events = []
+        for row in sorted(rows_by_id.values(), key=lambda item: int(item["id"]), reverse=True):
+            event = self._row_to_dict(row)
+            event["support_signal_ids"] = _json_loads(
+                event.get("support_signal_ids"), [],
+            )
+            event["candidate_snapshot"] = _json_loads(
+                event.get("candidate_snapshot"), {},
+            )
+            events.append(event)
+        return events
+
     def record_user_claim_relation(
         self,
         *,
@@ -2568,7 +2621,7 @@ class SessionDB:
         *,
         user_entity_id: int,
         state_domains: Optional[Sequence[str]] = None,
-        state_classes: Optional[Sequence[str]] = None,
+        state_types: Optional[Sequence[str]] = None,
         statuses: Optional[Sequence[str]] = None,
         limit: int = 160,
     ) -> List[Dict[str, Any]]:
@@ -2579,10 +2632,10 @@ class SessionDB:
             placeholders = ",".join("?" for _ in state_domains)
             clauses.append(f"state_domain IN ({placeholders})")
             params.extend(str(value) for value in state_domains)
-        if state_classes:
-            placeholders = ",".join("?" for _ in state_classes)
-            clauses.append(f"state_class IN ({placeholders})")
-            params.extend(str(value) for value in state_classes)
+        if state_types:
+            placeholders = ",".join("?" for _ in state_types)
+            clauses.append(f"state_type IN ({placeholders})")
+            params.extend(str(value) for value in state_types)
         if statuses:
             placeholders = ",".join("?" for _ in statuses)
             clauses.append(f"status IN ({placeholders})")
@@ -2629,15 +2682,19 @@ class SessionDB:
 
     def user_state_identity_exists(
         self, *, user_entity_id: int, state_domain: str,
-        state_class: str, state_key: str,
+        state_type: str, state_kind: str, state_topic: str,
     ) -> bool:
         row = self._conn.execute(
             """
             SELECT 1 FROM memory_user_states
             WHERE user_entity_id = ? AND state_domain = ?
-              AND state_class = ? AND state_key = ? LIMIT 1
+              AND state_type = ? AND state_kind = ?
+              AND state_topic = ? LIMIT 1
             """,
-            (int(user_entity_id), str(state_domain), str(state_class), str(state_key)),
+            (
+                int(user_entity_id), str(state_domain), str(state_type),
+                str(state_kind), str(state_topic),
+            ),
         ).fetchone()
         return row is not None
 
@@ -2685,6 +2742,21 @@ class SessionDB:
         ).fetchall()
         return [self._row_to_dict(row) for row in rows]
 
+    def get_user_state_evidence(
+        self, state_ids: Sequence[int], *, limit: int = 480,
+    ) -> List[Dict[str, Any]]:
+        ids = sorted({int(value) for value in state_ids if int(value) > 0})
+        if not ids:
+            return []
+        placeholders = ",".join("?" for _ in ids)
+        rows = self._conn.execute(
+            "SELECT * FROM memory_user_state_evidence "
+            f"WHERE state_id IN ({placeholders}) "
+            "ORDER BY state_id, evidence_type, evidence_id LIMIT ?",
+            (*ids, max(1, int(limit))),
+        ).fetchall()
+        return [self._row_to_dict(row) for row in rows]
+
     def replace_user_state_claim_evidence(
         self, *, state_id: int, evidence: Sequence[Dict[str, Any]],
     ) -> None:
@@ -2703,8 +2775,9 @@ class SessionDB:
         *,
         user_entity_id: int,
         state_domain: str,
-        state_class: str,
-        state_key: str,
+        state_type: str,
+        state_kind: str,
+        state_topic: str,
         state_text: str,
         status: str,
         confidence: float,
@@ -2719,23 +2792,39 @@ class SessionDB:
         now = local_now_text()
         owner_id = int(user_entity_id)
         target_id = int(target_state_id or 0)
+        topic = str(state_topic or "").strip()
+        if not topic:
+            raise ValueError("state_topic is required")
         existing = None
         if target_id > 0:
             existing = self._conn.execute(
                 "SELECT * FROM memory_user_states WHERE id = ? AND user_entity_id = ?",
                 (target_id, owner_id),
             ).fetchone()
+            if existing is None:
+                raise ValueError(f"Unknown target user state: {target_id}")
         if existing is None:
             existing = self._conn.execute(
                 """
                 SELECT * FROM memory_user_states
                 WHERE user_entity_id = ? AND state_domain = ?
-                  AND state_class = ? AND state_key = ?
+                  AND state_type = ? AND state_kind = ?
+                  AND state_topic = ?
                 """,
-                (owner_id, str(state_domain), str(state_class), str(state_key)),
+                (
+                    owner_id, str(state_domain), str(state_type),
+                    str(state_kind), topic,
+                ),
             ).fetchone()
         old = self._row_to_dict(existing) if existing else None
         if old:
+            if (
+                old["state_domain"] != state_domain
+                or old["state_type"] != state_type
+                or old["state_kind"] != state_kind
+                or old["state_topic"] != topic
+            ):
+                raise ValueError("Target user state identity cannot be changed")
             state_id = int(old["id"])
             self._conn.execute(
                 """
@@ -2763,13 +2852,15 @@ class SessionDB:
         cur = self._conn.execute(
             """
             INSERT INTO memory_user_states (
-                user_entity_id, state_domain, state_class, state_key, state_text, status,
+                user_entity_id, state_domain, state_type, state_kind,
+                state_topic, state_text, status,
                 confidence, conditions, valid_from, valid_to, last_observed_at,
                 metadata, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                owner_id, str(state_domain), str(state_class), str(state_key), str(state_text),
+                owner_id, str(state_domain), str(state_type), str(state_kind),
+                topic, str(state_text),
                 str(status or "active"), float(confidence),
                 _json_dumps(conditions if isinstance(conditions, dict) else {}),
                 str(valid_from or ""), str(valid_to or ""),

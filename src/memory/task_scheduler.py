@@ -1109,6 +1109,29 @@ class TaskScheduler:
                 reference_timestamp=result.get("reference_timestamp"),
                 source_task_id=str(event.get("task_id") or ""),
             )
+        if (task_kind == "memory_user_observed_pattern_update"
+                and event.get("succeeded") and isinstance(result, dict)):
+            changed_ids = list(result.get("user_observed_pattern_ids") or [])
+            affected_ids = list(result.get("affected_user_observed_pattern_ids") or [])
+            if changed_ids or affected_ids:
+                payload = {
+                    "changed_claim_ids": [],
+                    "changed_user_activity_ids": [],
+                    "changed_observed_pattern_ids": changed_ids,
+                    "affected_observed_pattern_ids": affected_ids,
+                    "trigger_user_action_signal_ids": list(
+                        result.get("trigger_user_action_signal_ids") or []
+                    ),
+                    "reference_timestamp": result.get("reference_timestamp"),
+                    "runtime_context": {},
+                }
+                self.submit(
+                    "memory_user_state_update", payload,
+                    report_payload={
+                        "changed_observed_pattern_ids": changed_ids,
+                        "affected_observed_pattern_ids": affected_ids,
+                    },
+                )
         context = event.get("completion_context")
         if not isinstance(context, dict):
             return

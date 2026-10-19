@@ -580,11 +580,11 @@ Inputs: changed_claims are direct evidence for this update; related_claims are e
 Reason in this order, then return one joint result:
 1. Independently assess new states. Read every changed claim and combine evidence concerning the same state dimension. Ask whether it supports a durable preference, stable constraint, or behavioral pattern useful for future prediction or service decisions. Do this even when existing_states=[] and relation_events=[]; emit create when evidence suffices rather than returning empty operations automatically. One direct, unambiguous explicit claim with durable meaning may establish an enduring_state, such as "I have always preferred morning meetings" establishing a time preference; multiple claims are not mandatory. Related concrete preferences may be aggregated, but do not mix unrelated subjects merely to create an aggregate. State text should express a reusable judgment, not paste or closely paraphrase claims.
 2. Distinguish durable tendencies from repetition. enduring_state covers preferences, styles, values, or constraints that broadly persist across time or situations. An explicit stable preference is not a one-off event merely because it was said once. recurring_state requires an explicitly stated habit/rule or multiple observations supporting periodic, frequent, repeated, or conditional behavior. Liking an activity, planning it once, or remembering an experience does not prove repetition. A one-time goal, plan, trip, recent emotion, or concern about ability does not automatically become a durable state. Create only enduring_state or recurring_state from claims, not situational_state.
-3. Align with existing states. If an existing state in the same domain, class, and key already expresses the conclusion, reinforce or revise it rather than creating a duplicate. If new evidence challenges a state, examine all state_claim_evidence and supporting_claims before weakening, expiring, or partially revising it. Losing one support claim does not necessarily invalidate the state. Do not abandon a justified create decision merely because no old state is affected.
+3. Align with existing states. If an existing state with the same state_domain, state_type, state_kind, and state_topic already expresses the conclusion, reinforce or revise it rather than creating a duplicate. If new evidence challenges a state, examine state_claim_evidence, state_pattern_evidence, supporting_claims, and supporting_patterns before weakening, expiring, or partially revising it. Losing one support claim does not necessarily invalidate the state. Do not weaken or expire a recurring_state solely because a claim changed while an observed pattern still supports it. Do not abandon a justified create decision merely because no old state is affected.
 4. Decide old-claim status. Only a contradicts or supersedes event with an old target claim and a changed trigger claim may justify an old-claim update. The relation alone is not a status decision: consider text, origin (explicit is usually more direct than derived), time, and conditions. Contradicts may at most weaken; only an unambiguous supersedes may supersede. Claims valid under different conditions or times may coexist. Do not alter changed claims or invalidate an old claim merely because an aggregate state fails. If there is no eligible relation, claim_updates=[]; this does not prevent state operations.
 5. Check joint consistency. A claim proposed as superseded cannot remain effective support for a state. Omit individual state candidates lacking evidence, but do not discard other supported states in the same update.
 
-State operations are create|reinforce|revise|weaken|expire. Existing-state updates must use its id; create uses target_state_id=0. Controlled enduring_state keys: communication_style|decision_style|value_priority|risk_preference|privacy_preference|time_preference|work_style|lifestyle_preference|long_term_constraint. Controlled recurring_state keys: daily_routine|weekly_routine|work_routine|health_routine|social_routine|conditional_behavior. Preserve an existing state's class and key; stay within state_domain.
+State operations are create|reinforce|revise|weaken|expire. Existing-state updates must use its id; create uses target_state_id=0. Controlled enduring_state kinds: communication_style|decision_style|value_priority|risk_preference|privacy_preference|time_preference|work_style|lifestyle_preference|long_term_constraint. Controlled recurring_state kinds: daily_routine|weekly_routine|work_routine|health_routine|social_routine|conditional_behavior. state_kind is a category, not a unique state identity; distinct states in one category may coexist. On create, also output a short, stable state_topic for the specific subject, such as weekday_gym or evening_walk. If new evidence or a paraphrase concerns an existing state, update its target_state_id instead of creating another topic. Preserve an existing state's state_type, state_kind, and state_topic; stay within state_domain.
 
 Each state operation cites input claims only, with evidence_type=user_claim, evidence_id, role=change_trigger|support|counterexample|context, and weight. Cite at least one changed claim as the trigger. A claim proposed as superseded cannot remain support in this update. Counterexamples must not be mislabeled as support. Include concise reasons and confidence in [0,1]. Return an empty operations array only after assessing every changed claim and finding no justified operation. Return JSON only:
 {
@@ -592,8 +592,9 @@ Each state operation cites input claims only, with evidence_type=user_claim, evi
   "operations": [{
     "operation": "create|reinforce|revise|weaken|expire",
     "target_state_id": 0,
-    "state_class": "enduring_state|recurring_state",
-    "state_key": "controlled option",
+    "state_type": "enduring_state|recurring_state",
+    "state_kind": "controlled option",
+    "state_topic": "stable topic for this specific state",
     "state_text": "complete aggregate user-state statement",
     "conditions": {}, "valid_from": "", "valid_to": "", "confidence": 0.8,
     "evidence": [{"evidence_type": "user_claim", "evidence_id": 1, "role": "change_trigger|support|counterexample|context", "weight": 1.0}],
@@ -609,6 +610,8 @@ supporting_claims: {supporting_claims}
 relation_events: {relation_events}
 existing_states: {existing_states}
 state_claim_evidence: {state_claim_evidence}
+state_pattern_evidence: {state_pattern_evidence}
+supporting_patterns: {supporting_patterns}
 """
 
 
@@ -620,7 +623,7 @@ Create or update only `situational_state`; do not create enduring_state or recur
 
 Every operation must cite at least one `user_activity` item from this input. Facts may only be cited from `linked_facts`; goals/plans/work items may only be cited from `related_active_intents`. Related intents were prefiltered by the system because they share fact evidence with the activity; still decide whether they describe the same ongoing situation. Never cite an ID not supplied here. Activity is the trigger and situation anchor; do not infer that a completed activity is still current.
 
-Choose `state_domain` only from `allowed_domains`. When updating an existing state, use the ID of an existing state with the same domain, class, and key. `state_key` must be one of: `current_focus`, `current_constraint`, `current_availability`, `current_energy`, `current_stress`, `current_social_engagement`, `current_preparation`. `state_text` must be a self-contained description of the current state, not a historical summary. Provide a plausible `valid_to` or ending condition when evidence supports it; do not invent a deadline. Allowed operations are create, reinforce, revise, weaken, expire; `target_state_id` is 0 for create.
+Choose `state_domain` only from `allowed_domains`. When updating an existing state, use its ID and preserve its state_domain, state_type, state_kind, and state_topic. `state_kind` must be one of: `current_focus`, `current_constraint`, `current_availability`, `current_energy`, `current_stress`, `current_social_engagement`, `current_preparation`. It is a category; different ongoing situations in one category may coexist. On create, output a short, stable `state_topic` for the specific situation. New evidence for an existing situation must update its target_state_id rather than create a duplicate. `state_text` must be a self-contained description of the current state, not a historical summary. Provide a plausible `valid_to` or ending condition when evidence supports it; do not invent a deadline. Allowed operations are create, reinforce, revise, weaken, expire; `target_state_id` is 0 for create.
 
 Return JSON only:
 {
@@ -629,8 +632,9 @@ Return JSON only:
       "operation": "create|reinforce|revise|weaken|expire",
       "target_state_id": 0,
       "state_domain": "one allowed_domains value",
-      "state_class": "situational_state",
-      "state_key": "one controlled option",
+      "state_type": "situational_state",
+      "state_kind": "one controlled option",
+      "state_topic": "stable topic for this specific situation",
       "state_text": "complete and explicit current-state statement",
       "conditions": {},
       "valid_from": "",
@@ -664,6 +668,39 @@ related_active_intents:
 
 existing_situational_states:
 {existing_states}
+"""
+
+
+USER_OBSERVED_PATTERN_STATE_UPDATE_PROMPT_EN = """Incrementally update recurring_state from the user's newly created or newly supported observed patterns.
+
+A user_observed_pattern is inferred from independent observed actions, not self-report. supporting_actions are representative raw evidence. changed_patterns were created or gained support in this task; affected_patterns are older patterns touched by relation events. The relation events classify support, refinement, or contradiction. An existing state may already express the same routine based on an explicit user_claim: update that state instead of creating another state for a different evidence source.
+
+Only update recurring_state in the given state_domain. Do not invent a weekday, frequency, time, or condition that the evidence does not establish. state_text should express a reusable behavioral tendency, not copy a pattern. Use target_state_id for an equivalent existing state; otherwise create a stable, specific state_topic. state_kind must be one of daily_routine|weekly_routine|work_routine|health_routine|social_routine|conditional_behavior.
+
+New patterns or new support may create, reinforce, or revise a state. Weaken only when a relation event and concrete counterevidence justify it; a single exception rarely negates a repeated behavior. Do not expire states in this first version. Return an empty operations list when no reliable change is supported. Every operation must cite at least one changed_pattern or trigger_signal. Durable support should cite a user_observed_pattern ID; a raw counterexample may cite a user_action_signal ID. Counterexamples must not be labeled support. Cite only supplied IDs.
+
+Return JSON only:
+{
+  "operations": [{
+    "operation": "create|reinforce|revise|weaken", "target_state_id": 0,
+    "state_type": "recurring_state", "state_kind": "health_routine",
+    "state_topic": "stable identifier for the specific pattern",
+    "state_text": "complete behavioral state", "conditions": {},
+    "valid_from": "", "valid_to": "", "confidence": 0.8,
+    "evidence": [{"evidence_type": "user_observed_pattern|user_action_signal", "evidence_id": 1, "role": "change_trigger|support|counterexample|context", "weight": 1.0}],
+    "reason": "why this evidence changes the state"
+  }]
+}
+
+reference_time: {reference_time}
+state_domain: {state_domain}
+changed_patterns: {changed_patterns}
+affected_patterns: {affected_patterns}
+relation_events: {relation_events}
+trigger_signals: {trigger_signals}
+existing_states: {existing_states}
+state_evidence: {state_evidence}
+supporting_claims: {supporting_claims}
 """
 
 

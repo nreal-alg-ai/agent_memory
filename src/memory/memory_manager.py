@@ -2330,7 +2330,9 @@ class MemoryNodeManager:
         ))[:limit]
         if not selected_ids:
             return {"status": "empty", "signal_count": 0,
-                    "user_observed_pattern_ids": [], "_completed_signal_ids": []}
+                    "user_observed_pattern_ids": [],
+                    "affected_user_observed_pattern_ids": [],
+                    "_completed_signal_ids": []}
         started_at = time.monotonic()
         update = self._update_user_observed_patterns_from_action_signals(
             selected_ids,
@@ -2347,6 +2349,8 @@ class MemoryNodeManager:
             "user_observed_patterns_created": int(update.get("created") or 0),
             "user_observed_patterns_updated": int(update.get("updated") or 0),
             "user_observed_pattern_ids": update.get("pattern_ids") or [],
+            "affected_user_observed_pattern_ids": update.get("affected_pattern_ids") or [],
+            "trigger_user_action_signal_ids": selected_ids,
             "reference_timestamp": reference_timestamp,
             "total_elapsed_ms": round((time.monotonic() - started_at) * 1000, 2),
             "_completed_signal_ids": selected_ids if completed else [],
@@ -4559,7 +4563,7 @@ class MemoryNodeManager:
         seed_signals = self._db.get_user_action_signals_by_ids(signal_ids)
         report: Dict[str, Any] = {
             "candidate_count": 0, "updated": 0, "created": 0,
-            "pattern_ids": [], "completed": True,
+            "pattern_ids": [], "affected_pattern_ids": [], "completed": True,
             "similar_action_batches": 0, "relations_recorded": 0,
             "direct_support_signal_count": 0,
         }
@@ -4606,6 +4610,7 @@ class MemoryNodeManager:
                 report["updated"] += len(direct_update["updated_pattern_ids"])
                 report["relations_recorded"] += direct_update["relations_recorded"]
                 report["pattern_ids"].extend(direct_update["updated_pattern_ids"])
+                report["affected_pattern_ids"].extend(direct_update["affected_pattern_ids"])
         report["direct_support_signal_count"] = len(supported_signal_ids)
 
         unresolved = [
@@ -4649,7 +4654,9 @@ class MemoryNodeManager:
                 report["updated"] += int(not applied["created"])
                 report["relations_recorded"] += int(applied["relations_recorded"])
                 report["pattern_ids"].append(int(applied["pattern_id"]))
+                report["affected_pattern_ids"].extend(applied["affected_pattern_ids"])
         report["pattern_ids"] = sorted(set(report["pattern_ids"]))
+        report["affected_pattern_ids"] = sorted(set(report["affected_pattern_ids"]))
         return report
 
     def _update_observed_patterns_from_new_action_signals(
@@ -4660,7 +4667,7 @@ class MemoryNodeManager:
         """Classify new behavior against existing patterns before discovery."""
         result: Dict[str, Any] = {
             "supported_signal_ids": set(), "updated_pattern_ids": set(),
-            "relations_recorded": 0,
+            "affected_pattern_ids": set(), "relations_recorded": 0,
         }
         if not new_signals or not existing_patterns:
             return result
@@ -4771,6 +4778,8 @@ class MemoryNodeManager:
                         )
                         result["updated_pattern_ids"].add(pattern_id)
                     result["supported_signal_ids"].add(signal_id)
+                elif decision["semantic_relation"] in {"refines", "contradicts"}:
+                    result["affected_pattern_ids"].add(pattern_id)
                 result["relations_recorded"] += int(
                     self._db.record_user_observed_pattern_relation(
                         target_pattern_id=pattern_id, trigger_pattern_id=None,
@@ -5222,7 +5231,10 @@ class MemoryNodeManager:
                         semantic_reason=relation["reason"],
                     ))
             return {"pattern_id": pattern_id, "created": False,
-                    "relations_recorded": recorded_count}
+                    "affected_pattern_ids": [
+                        item["existing_pattern_id"] for item in relations
+                        if item["semantic_relation"] in {"refines", "contradicts"}
+                    ], "relations_recorded": recorded_count}
 
         pattern_key = hashlib.sha256(json.dumps({
             "pattern_text": pattern["pattern_text"].casefold(),
@@ -5256,7 +5268,10 @@ class MemoryNodeManager:
                     semantic_reason=relation["reason"],
                 ))
         return {"pattern_id": pattern_id, "created": created,
-                "relations_recorded": recorded_count}
+                "affected_pattern_ids": [
+                    item["existing_pattern_id"] for item in relations
+                    if item["semantic_relation"] in {"refines", "contradicts"}
+                ], "relations_recorded": recorded_count}
 
     def _classify_user_observed_pattern_relations(
         self, candidate: Dict[str, Any], existing: Sequence[Dict[str, Any]],

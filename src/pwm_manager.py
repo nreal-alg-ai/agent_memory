@@ -204,7 +204,7 @@ class PersonWorldModel:
         self,
         *,
         state_domains: Optional[Sequence[str]] = None,
-        state_classes: Optional[Sequence[str]] = None,
+        state_types: Optional[Sequence[str]] = None,
         statuses: Optional[Sequence[str]] = None,
     ) -> List[Dict[str, Any]]:
         """Read the current user model through the resolver."""
@@ -214,7 +214,7 @@ class PersonWorldModel:
             return self._user_state_resolver.get_current_states(
                 user_entity_id=owner_id,
                 state_domains=state_domains,
-                state_classes=state_classes,
+                state_types=state_types,
                 statuses=statuses,
             )
 
