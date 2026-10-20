@@ -2316,18 +2316,13 @@ class MemoryNodeManager:
 
     def _process_memory_user_observed_pattern_update_task(
         self, *, signal_ids: Optional[Sequence[int]] = None,
-        limit: Optional[int] = None,
         reference_timestamp: Optional[Any] = None,
         **_: Any,
     ) -> Dict[str, Any]:
         """Find similar past actions and reconcile resulting pattern candidates."""
-        limit = max(
-            1,
-            int(limit or self._memory_cfg.get("user_action_signal_limit") or 100),
-        )
         selected_ids = list(dict.fromkeys(
             int(value) for value in signal_ids or [] if int(value) > 0
-        ))[:limit]
+        ))
         if not selected_ids:
             return {"status": "empty", "signal_count": 0,
                     "user_observed_pattern_ids": [],
@@ -2362,24 +2357,18 @@ class MemoryNodeManager:
 
     def _process_memory_user_claim_update_task(
         self,
-        limit: Optional[int] = None,
         reference_timestamp: Optional[Any] = None,
         signal_ids: Optional[Sequence[int]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         """Project new facts into user claims."""
         update_started_at = time.monotonic()
-        limit = max(
-            1,
-            int(limit or self._memory_cfg.get("user_claim_signal_limit") or 100),
-        )
         selected_signal_ids = list(dict.fromkeys(
             int(value) for value in signal_ids or [] if int(value) > 0
-        ))[:limit]
+        ))
         if reference_timestamp is None:
             reference_timestamp = kwargs.get("timestamp") or _now_text()
         self._log_info("memory_user_claim", "start", {
-            "limit": limit,
             "timestamp": reference_timestamp,
             "user_claim_signal_count": len(selected_signal_ids),
         })
@@ -2424,19 +2413,14 @@ class MemoryNodeManager:
     def _process_memory_user_intent_update_task(
         self,
         *,
-        limit: Optional[int] = None,
         reference_timestamp: Optional[Any] = None,
         signal_ids: Optional[Sequence[int]] = None,
     ) -> Dict[str, Any]:
         """Extract independent intent signals in bounded LLM batches."""
-        limit = max(
-            1,
-            int(limit or self._memory_cfg.get("user_intent_signal_limit") or 100),
-        )
         reference_timestamp = reference_timestamp or _now_text()
         selected_signal_ids = list(dict.fromkeys(
             int(value) for value in signal_ids or [] if int(value) > 0
-        ))[:limit]
+        ))
         pending_signals = self._db.get_user_intent_signals_by_ids(
             selected_signal_ids,
         )
@@ -2459,7 +2443,7 @@ class MemoryNodeManager:
             "affected_objects": [],
         }
         self._log_user_intent_facts_loaded(
-            "memory_user_intent_update", facts, limit, reference_timestamp,
+            "memory_user_intent_update", facts, reference_timestamp,
         )
         if not facts:
             self._log_info("memory_user_intent_update", "finish", report)
@@ -5381,7 +5365,6 @@ class MemoryNodeManager:
         self,
         processing_target: str,
         facts: List[Dict[str, Any]],
-        limit: int,
         reference_timestamp: Any,
     ) -> None:
         """Log the independent fact batch consumed by future-commitment update."""
@@ -5389,7 +5372,6 @@ class MemoryNodeManager:
             "processing_target": processing_target,
             "fact_count": len(facts),
             "fact_ids": [fact.get("id") for fact in facts],
-            "limit": limit,
             "reference_timestamp": reference_timestamp,
             "time_start": facts[0].get("dialogue_time_key") if facts else "",
             "time_end": facts[-1].get("dialogue_time_key") if facts else "",

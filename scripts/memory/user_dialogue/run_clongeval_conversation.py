@@ -324,7 +324,7 @@ def db_counts(db: Any) -> Dict[str, int]:
 
 def replay_context_into_memory(
     *,
-    runtime: PersonWorldModel,
+    pwm: PersonWorldModel,
     db: Any,
     days: Sequence[Dict[str, Any]],
     group_id: str,
@@ -342,7 +342,7 @@ def replay_context_into_memory(
                 day["date"] + timedelta(seconds=pair_index),
                 seen_timestamps,
             )
-            store_report = runtime.accept_memory_input(
+            store_report = pwm.accept_memory_input(
                 interaction_turn={
                     "user_message": user,
                     "assistant_response": assistant,
@@ -368,13 +368,13 @@ def replay_context_into_memory(
     # releases all remaining delayed input through the same append path.
     finalization: Dict[str, Any] = {}
     if last_turn_timestamp is not None:
-        watermark_report = runtime.update_ambient_asr_watermark(
+        watermark_report = pwm.update_ambient_asr_watermark(
             last_turn_timestamp,
         )
         ambient_watermark_updates += 1
         if watermark_report.get("queued"):
             store_batches += 1
-        finalization = runtime.finalize_memory_session(
+        finalization = pwm.finalize_memory_session(
             reason="clongeval_context_complete",
             tags=[
                 "clongeval_conversation",
@@ -656,7 +656,7 @@ def process_context_group(
     context_log_handler = add_context_log_handler(context_log_path)
     memory_logger: Optional[logging.Logger] = None
     memory_log_handler: Optional[logging.Handler] = None
-    runtime: Optional[PersonWorldModel] = None
+    pwm: Optional[PersonWorldModel] = None
     results: List[Dict[str, Any]] = []
     try:
         memory_logger, memory_log_handler = configure_memory_logger(
@@ -674,7 +674,7 @@ def process_context_group(
             db_path,
         )
         operation_reporter = TaskOperationReporter()
-        runtime = PersonWorldModel(
+        pwm = PersonWorldModel(
             memory_runtime_config=memory_runtime_config,
             memory_manager_config=memory_manager_config,
             user_state_config=user_state_config,
@@ -684,8 +684,8 @@ def process_context_group(
             operation_reporter=operation_reporter,
             logger=memory_logger,
         )
-        db = runtime.database
-        manager = runtime.memory_manager
+        db = pwm.database
+        manager = pwm.memory_manager
         if not args.skip_embedding_validation:
             validate_embedding_runtime(manager, db, embedding_config)
         log_memory_index_state(db, f"before_context:{group_id}")
@@ -699,12 +699,12 @@ def process_context_group(
             }
         else:
             replay_stats = replay_context_into_memory(
-                runtime=runtime,
+                pwm=pwm,
                 db=db,
                 days=days,
                 group_id=group_id,
             )
-            if not runtime.wait_for_memory_tasks():
+            if not pwm.wait_for_memory_tasks():
                 raise RuntimeError(
                     "Timed out while draining queued memory store and follow-up tasks"
                 )
@@ -723,7 +723,7 @@ def process_context_group(
         replay_stats["store_flushes"] = int(store_operation_report.get("submitted") or 0)
 
         for record_index, record in enumerate(group_records, 1):
-            recall_report = runtime.trigger_memory_recall(
+            recall_report = pwm.trigger_memory_recall(
                 str(record["query"]),
             )
             recall_context = str(recall_report.get("memory_context") or "")
@@ -731,7 +731,7 @@ def process_context_group(
             hypothesis = ""
             if args.run_reader:
                 hypothesis = run_reader(
-                    runtime.llm_client,
+                    pwm.llm_client,
                     str(record["query"]),
                     recall_context,
                     args.reader_max_context_chars,
@@ -811,9 +811,9 @@ def process_context_group(
             "results": results,
         }
     finally:
-        if runtime is not None:
-            log_memory_index_state(runtime.database, f"finished_context:{group_id}")
-            runtime.close()
+        if pwm is not None:
+            log_memory_index_state(pwm.database, f"finished_context:{group_id}")
+            pwm.close()
         remove_memory_logger_handler(memory_logger, memory_log_handler)
         remove_context_log_handler(context_log_handler)
 

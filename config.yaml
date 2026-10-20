@@ -239,10 +239,7 @@ personal_world_model:
     memory_enabled: true
     memory_prompt_language_mode: zh
     user_memory_database_path: 
-    user_claim_signal_limit: 100
     user_claim_signal_batch_size: 8
-    user_action_signal_limit: 100
-    user_intent_signal_limit: 100
     user_intent_signal_batch_size: 8
     user_claim_explicit_min_confidence: 0.72
     user_claim_derived_min_confidence: 0.75

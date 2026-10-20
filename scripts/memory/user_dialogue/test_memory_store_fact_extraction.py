@@ -579,7 +579,7 @@ def main() -> int:
         args.manager_log_level,
     )
     operation_reporter = TaskOperationReporter()
-    runtime = PersonWorldModel(
+    pwm = PersonWorldModel(
         memory_runtime_config=memory_runtime_config,
         memory_manager_config=memory_manager_config,
         user_state_config=user_state_config,
@@ -589,13 +589,13 @@ def main() -> int:
         operation_reporter=operation_reporter,
         logger=memory_logger,
     )
-    db = runtime.database
-    manager = runtime.memory_manager
+    db = pwm.database
+    manager = pwm.memory_manager
     try:
         validate_embedding_runtime(manager, db, embedding_config)
         log_memory_index_state(db, "initialized")
     except Exception:
-        runtime.close()
+        pwm.close()
         close_memory_logger(memory_logger, memory_log_handler)
         raise
 
@@ -612,7 +612,7 @@ def main() -> int:
                 # does not collide on "#00" across turns in the same sample.
                 turn_timestamp = base_turn_timestamp + timedelta(hours=hour_offset, seconds=turn_index)
                 before_id = db._conn.execute("SELECT COALESCE(MAX(id), 0) AS max_id FROM memory_facts").fetchone()["max_id"]
-                ok = runtime.accept_memory_input(
+                ok = pwm.accept_memory_input(
                     interaction_turn={
                         "user_message": user,
                         "assistant_response": assistant,
@@ -622,12 +622,12 @@ def main() -> int:
                 )
                 has_unfinalized_turns = True
                 if is_last_turn:
-                    runtime.finalize_memory_session(
+                    pwm.finalize_memory_session(
                         reason="store_fact_sample_complete",
                         tags=["store_fact_test", f"sample:{sample_id}"],
                     )
                     has_unfinalized_turns = False
-                if not runtime.wait_for_memory_tasks():
+                if not pwm.wait_for_memory_tasks():
                     raise RuntimeError("Timed out while draining queued memory tasks")
                 nodes = list(iter_stored_nodes(db, before_id))
                 store_operation_report = operation_reporter.latest_report("memory_fact_extraction")
@@ -664,12 +664,12 @@ def main() -> int:
                     len(nodes),
                 )
         if has_unfinalized_turns:
-            runtime.finalize_memory_session(reason="store_fact_test_complete")
-            if not runtime.wait_for_memory_tasks():
+            pwm.finalize_memory_session(reason="store_fact_test_complete")
+            if not pwm.wait_for_memory_tasks():
                 raise RuntimeError("Timed out while draining final memory tasks")
     finally:
         log_memory_index_state(db, "finished")
-        runtime.close()
+        pwm.close()
         close_memory_logger(memory_logger, memory_log_handler)
 
     memory_operation_report = operation_reporter.snapshot()

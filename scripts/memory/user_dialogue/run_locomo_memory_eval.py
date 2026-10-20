@@ -99,9 +99,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--memory-prompt-language", choices=("source", "en", "zh"), default=None
     )
-    parser.add_argument(
-        "--memory-output-language", choices=("source", "en", "zh"), default=None
-    )
     parser.add_argument("--reader-model")
     parser.add_argument("--reader-base-url")
     parser.add_argument("--reader-api-key")
@@ -109,10 +106,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reader-max-tokens", type=int, default=8192)
     parser.add_argument("--reader-temperature", type=float, default=0.0)
     parser.add_argument("--reader-max-context-chars", type=int, default=16000)
-    parser.add_argument("--recall-top-k", type=int, default=8)
+    parser.add_argument("--recall-top-k", type=int, default=None)
     parser.add_argument("--recall-budget", choices=("low", "mid", "high"), default=None)
     parser.add_argument(
-        "--recall-mode", choices=("stage1", "stage2", "normal"), default="normal"
+        "--recall-mode", choices=("stage1", "stage2", "normal"), default=None
     )
     parser.add_argument(
         "--recall-gate-mode", choices=("auto", "force"), default=None
@@ -226,12 +223,16 @@ def resolve_runtime_args(args: argparse.Namespace) -> None:
         manager_config.get("memory_prompt_language_mode")
         or "source"
     )
-    args.memory_output_language = args.memory_output_language or str(
-        runtime_config.get("memory_output_language_mode")
-        or manager_config.get("memory_output_language_mode")
-        or "source"
+    recall_config = manager_config.get("recall")
+    if not isinstance(recall_config, dict):
+        recall_config = {}
+    args.recall_budget = args.recall_budget or str(recall_config.get("recall_budget") or "mid")
+    args.recall_top_k = args.recall_top_k or int(
+        recall_config.get("recall_top_k") or 8
     )
-    args.recall_budget = args.recall_budget or str(manager_config.get("recall_budget") or "mid")
+    args.recall_mode = args.recall_mode or str(
+        recall_config.get("recall_mode") or "normal"
+    )
     args.reader_model = args.reader_model or str(chat_config.get("llm_name") or args.llm_model)
     args.reader_base_url = args.reader_base_url or str(chat_config.get("llm_base_url") or args.llm_base_url)
     if args.reader_base_url.rstrip("/") == "https://api.deepseek.com":
@@ -245,6 +246,16 @@ def prepare_runtime_configs(
 ) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
     config = load_project_config(args.config)
     llm_config, embedding_config, memory_runtime_config, task_scheduling_config, memory_manager_config, user_state_config = split_memory_config(config)
+    recall_config = memory_manager_config.setdefault("recall", {})
+    recall_config["recall_top_k"] = int(
+        args.recall_top_k or recall_config.get("recall_top_k") or 8
+    )
+    recall_config["recall_budget"] = str(
+        args.recall_budget or recall_config.get("recall_budget") or "mid"
+    )
+    recall_config["recall_mode"] = str(
+        args.recall_mode or recall_config.get("recall_mode") or "normal"
+    )
     memory_input_config = memory_runtime_config.setdefault(
         "memory_context_manager",
         {},
@@ -268,8 +279,6 @@ def prepare_runtime_configs(
     llm_config["llm_thinking"] = str(args.llm_thinking)
     llm_config["llm_json_mode"] = bool(args.llm_json_mode)
     memory_manager_config["memory_prompt_language_mode"] = str(args.memory_prompt_language)
-    memory_manager_config["memory_output_language_mode"] = str(args.memory_output_language)
-    memory_runtime_config["memory_output_language_mode"] = str(args.memory_output_language)
     return (
         memory_runtime_config,
         memory_manager_config,
@@ -410,7 +419,7 @@ def validate_runtime(manager: Any) -> None:
 
 
 def replay_sample_into_memory(
-    runtime: PersonWorldModel,
+    pwm: PersonWorldModel,
     sample: Dict[str, Any],
     sessions: Sequence[Tuple[int, datetime, str, List[Dict[str, Any]]]],
 ) -> LocomoReplayStats:
@@ -424,7 +433,7 @@ def replay_sample_into_memory(
         orphan_turns += orphaned
         for pair_index, (user_message, assistant_response, dia_ids) in enumerate(pairs):
             turn_pairs += 1
-            runtime.accept_memory_input(
+            pwm.accept_memory_input(
                 interaction_turn={
                     "user_message": user_message,
                     "assistant_response": assistant_response,
@@ -434,11 +443,11 @@ def replay_sample_into_memory(
                 },
                 tags=["locomo", f"sample_id:{sample_id}", f"session_id:S{session_id}", *[f"dia_id:{dia_id}" for dia_id in dia_ids]],
             )
-    runtime.finalize_memory_session(
+    pwm.finalize_memory_session(
         reason="locomo_history_complete",
         tags=["locomo", f"sample_id:{sample_id}"],
     )
-    if not runtime.wait_for_memory_tasks():
+    if not pwm.wait_for_memory_tasks():
         raise RuntimeError("Timed out while draining queued memory tasks")
     return LocomoReplayStats(dialog_turns, turn_pairs, 0, orphan_turns)
 
@@ -472,10 +481,10 @@ def build_sample_memory_context(
         sample_state_dir,
         args.manager_log_level,
     ) as (memory_log_path, memory_logger):
-        runtime: Optional[PersonWorldModel] = None
+        pwm: Optional[PersonWorldModel] = None
         try:
             operation_reporter = TaskOperationReporter()
-            runtime = PersonWorldModel(
+            pwm = PersonWorldModel(
                 memory_runtime_config=memory_runtime_config,
                 memory_manager_config=memory_manager_config,
                 user_state_config=user_state_config,
@@ -485,11 +494,11 @@ def build_sample_memory_context(
                 operation_reporter=operation_reporter,
                 logger=memory_logger,
             )
-            db = runtime.database
-            manager = runtime.memory_manager
+            db = pwm.database
+            manager = pwm.memory_manager
             validate_runtime(manager)
             sessions = sorted_locomo_sessions(sample, int(args.max_sessions))
-            replay_stats = replay_sample_into_memory(runtime, sample, sessions)
+            replay_stats = replay_sample_into_memory(pwm, sample, sessions)
             memory_operation_report = operation_reporter.snapshot()
             operation_counts = memory_operation_report.get("counts") or {}
             store_operation_report = operation_counts.get("memory_fact_extraction") or {}
@@ -519,7 +528,7 @@ def build_sample_memory_context(
             detail_rows: List[Dict[str, Any]] = []
             for qa_index, qa in selected_qas(sample, args):
                 question = str(qa.get("question") or "").strip()
-                recall_report = runtime.trigger_memory_recall(
+                recall_report = pwm.trigger_memory_recall(
                     question,
                     tags=["locomo", f"sample_id:{sample_id}"],
                     time_end=recall_time_end,
@@ -581,8 +590,8 @@ def build_sample_memory_context(
             }
             return output, detail_rows
         finally:
-            if runtime is not None:
-                runtime.close()
+            if pwm is not None:
+                pwm.close()
 
 
 def sample_worker(

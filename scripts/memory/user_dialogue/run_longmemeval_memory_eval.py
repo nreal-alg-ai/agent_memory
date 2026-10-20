@@ -156,7 +156,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--recall-top-k",
         type=int,
-        default=8,
+        default=None,
         help="Top-k passed to the memory runtime recall.",
     )
     parser.add_argument(
@@ -167,7 +167,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--recall-mode",
-        default="normal",
+        default=None,
         choices=["stage1", "stage2", "normal"],
         help="Recall path passed to the memory runtime.",
     )
@@ -363,9 +363,18 @@ def resolve_llm_args(args: argparse.Namespace) -> None:
             or "source"
         )
     )
+    recall_config = manager_config.get("recall")
+    if not isinstance(recall_config, dict):
+        recall_config = {}
     args.recall_budget = (
         args.recall_budget
-        or str(manager_config.get("recall_budget") or "mid")
+        or str(recall_config.get("recall_budget") or "mid")
+    )
+    args.recall_top_k = args.recall_top_k or int(
+        recall_config.get("recall_top_k") or 8
+    )
+    args.recall_mode = args.recall_mode or str(
+        recall_config.get("recall_mode") or "normal"
     )
 
     args.reader_model = (
@@ -615,6 +624,16 @@ def prepare_runtime_configs(
 ) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
     config = load_project_config(args.config)
     llm_config, embedding_config, memory_runtime_config, task_scheduling_config, memory_manager_config, user_state_config = split_memory_config(config)
+    recall_config = memory_manager_config.setdefault("recall", {})
+    recall_config["recall_top_k"] = int(
+        args.recall_top_k or recall_config.get("recall_top_k") or 8
+    )
+    recall_config["recall_budget"] = str(
+        args.recall_budget or recall_config.get("recall_budget") or "mid"
+    )
+    recall_config["recall_mode"] = str(
+        args.recall_mode or recall_config.get("recall_mode") or "normal"
+    )
     memory_input_config = memory_runtime_config.setdefault(
         "memory_context_manager",
         {},
@@ -1023,7 +1042,7 @@ def answer_question_with_reader(
 
 def replay_sessions_into_memory(
     *,
-    runtime: PersonWorldModel,
+    pwm: PersonWorldModel,
     item: Dict[str, Any],
     sessions: Sequence[Tuple[str, datetime, List[Dict[str, Any]], int]],
 ) -> SessionReplayStats:
@@ -1043,7 +1062,7 @@ def replay_sessions_into_memory(
                 session_dt + timedelta(seconds=pair_index),
                 seen_keys=seen_timestamps,
             )
-            runtime.accept_memory_input(
+            pwm.accept_memory_input(
                 interaction_turn={
                     "user_message": user_message,
                     "assistant_response": assistant_response,
@@ -1057,11 +1076,11 @@ def replay_sessions_into_memory(
                     f"session_index:{session_position}",
                 ],
             )
-    runtime.finalize_memory_session(
+    pwm.finalize_memory_session(
         reason="longmemeval_history_complete",
         tags=["longmemeval", f"question_id:{item.get('question_id')}"],
     )
-    if not runtime.wait_for_memory_tasks():
+    if not pwm.wait_for_memory_tasks():
         raise RuntimeError("Timed out while draining queued memory tasks")
 
     return SessionReplayStats(
@@ -1115,10 +1134,10 @@ def build_instance_memory_context(
             question_id,
             db_path,
         )
-        runtime: Optional[PersonWorldModel] = None
+        pwm: Optional[PersonWorldModel] = None
         try:
             operation_reporter = TaskOperationReporter()
-            runtime = PersonWorldModel(
+            pwm = PersonWorldModel(
                 memory_runtime_config=memory_runtime_config,
                 memory_manager_config=memory_manager_config,
                 user_state_config=user_state_config,
@@ -1128,8 +1147,8 @@ def build_instance_memory_context(
                 operation_reporter=operation_reporter,
                 logger=memory_logger,
             )
-            db = runtime.database
-            manager = runtime.memory_manager
+            db = pwm.database
+            manager = pwm.memory_manager
             validate_runtime(manager)
 
             sessions = sorted_history_sessions(item, max_sessions=int(args.max_sessions))
@@ -1141,18 +1160,18 @@ def build_instance_memory_context(
                 )
             else:
                 replay_stats = replay_sessions_into_memory(
-                    runtime=runtime,
+                    pwm=pwm,
                     item=item,
                     sessions=sessions,
                 )
-            if not runtime.wait_for_memory_tasks():
+            if not pwm.wait_for_memory_tasks():
                 raise RuntimeError(
                     "Timed out while draining queued memory tasks"
                 )
             effective_question_dt = effective_question_datetime(question_dt, sessions)
             effective_question_date_text = format_memory_time(effective_question_dt)
             counts = db_counts(db)
-            recall_report = runtime.trigger_memory_recall(
+            recall_report = pwm.trigger_memory_recall(
                 question,
                 time_end=effective_question_date_text,
             )
@@ -1229,8 +1248,8 @@ def build_instance_memory_context(
                 ),
             }
         finally:
-            if runtime is not None:
-                runtime.close()
+            if pwm is not None:
+                pwm.close()
 
 
 def answer_instance_from_memory_context(

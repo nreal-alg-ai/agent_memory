@@ -205,25 +205,23 @@ def main() -> None:
     )
     final_input_flush = dict(finalization.get("input_flush") or {})
     user_activity_result = dict(finalization.get("user_activity") or {})
-    user_claim_submit = dict(
-        (finalization.get("fact_followup_tasks") or {}).get("memory_user_claim_update") or {}
-    )
-    user_intent_submit = dict(
-        (finalization.get("fact_followup_tasks") or {}).get("memory_user_intent_update") or {}
-    )
     queued_memory_store_count += int(bool(final_input_flush.get("queued")))
 
     if not pwm.wait_for_memory_tasks():
         raise RuntimeError("Timed out while draining queued memory tasks")
 
+    followup_dispatch_result = (
+        operation_reporter.latest_report("memory_final_fact_followups") or {}
+    )
+    followup_tasks = followup_dispatch_result.get("fact_followup_tasks") or {}
     store_operation_report = operation_reporter.operation_report("memory_fact_extraction")
     user_claim_result = (
         operation_reporter.latest_report("memory_user_claim_update")
-        or user_claim_submit
+        or followup_tasks.get("memory_user_claim_update") or {}
     )
     user_intent_result = (
         operation_reporter.latest_report("memory_user_intent_update")
-        or user_intent_submit
+        or followup_tasks.get("memory_user_intent_update") or {}
     )
     user_state_result = operation_reporter.latest_report(
         "memory_user_state_update"

@@ -225,15 +225,15 @@ def build_service(config_source: Any = None) -> tuple[MemoryMCPService, logging.
         asr_result_dir,
     )
     try:
-        memory_runtime_logger = logger.getChild("memory_runtime")
-        memory_runtime = PersonWorldModel(
+        person_world_model_logger = logger.getChild("person_world_model")
+        person_world_model = PersonWorldModel(
             memory_runtime_config=memory_runtime_config,
             memory_manager_config=memory_manager_config,
             user_state_config=user_state_config,
             llm_model_config=llm_model_config,
             embedding_model_config=embedding_model_config,
             task_scheduling_config=task_scheduling_config,
-            logger=memory_runtime_logger,
+            logger=person_world_model_logger,
         )
         voice_logger = logger.getChild("voice_runtime")
 
@@ -248,15 +248,15 @@ def build_service(config_source: Any = None) -> tuple[MemoryMCPService, logging.
             return runtime
 
         return MemoryMCPService(
-            memory_runtime,
+            person_world_model,
             voice_runtime_factory=build_voice_runtime,
             queue_timeout=queue_timeout,
             asr_result_dir=asr_result_dir,
             logger=logger,
         ), logger
     except Exception:
-        if "memory_runtime" in locals():
-            memory_runtime.close()
+        if "person_world_model" in locals():
+            person_world_model.close()
         raise
 
 

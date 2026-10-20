@@ -152,6 +152,18 @@ class TaskExecutionDB:
             CREATE INDEX IF NOT EXISTS idx_claim_batches_pending
             ON user_claim_consolidation_task_info(processed_user_state, batch_id);
         """)
+        # Queued tasks are process-local. Restore unfinished reservations after
+        # a restart; rows with no pending IDs remain processed.
+        with self._conn:
+            for signal_type, table in self._SIGNAL_BATCHES.items():
+                _, pending_column, processed_column = next(
+                    columns for columns in self._PENDING_COLUMNS.values()
+                    if columns[0] == signal_type
+                )
+                self._conn.execute(
+                    f"UPDATE {table} SET {processed_column}=0 "
+                    f"WHERE {processed_column}=1 AND {pending_column} != '[]'"
+                )
         self._registered_signal_ids = {
             signal_type: self._load_registered_signal_ids(table)
             for signal_type, table in self._SIGNAL_BATCHES.items()
@@ -340,6 +352,68 @@ class TaskExecutionDB:
         ):
             pending.extend(_ids(row[pending_column]))
         return list(dict.fromkeys(pending))
+
+    @_locked
+    def reserve_signal_ids(self, target: str, signal_ids: Sequence[int]) -> List[int]:
+        """Hide submitted signals from later task snapshots until completion."""
+        try:
+            signal_type, pending_column, processed_column = self._PENDING_COLUMNS[target]
+        except KeyError as exc:
+            raise ValueError(f"Invalid signal processing target: {target}") from exc
+        selected = set(_ids(signal_ids))
+        if not selected:
+            return []
+        table = self._SIGNAL_BATCHES[signal_type]
+        reserved: set[int] = set()
+        with self._conn:
+            for row in self._conn.execute(
+                f"SELECT batch_id, {pending_column} FROM {table} "
+                f"WHERE {processed_column}=0 ORDER BY batch_id"
+            ).fetchall():
+                matched = set(_ids(row[pending_column])) & selected
+                if not matched:
+                    continue
+                reserved.update(matched)
+                self._conn.execute(
+                    f"UPDATE {table} SET {processed_column}=1, updated_at=? "
+                    "WHERE batch_id=?",
+                    (_now(), row["batch_id"]),
+                )
+            if reserved != selected:
+                raise ValueError("Signal IDs are no longer pending")
+        return sorted(reserved)
+
+    @_locked
+    def finish_signal_task(
+        self, target: str, selected_ids: Sequence[int], completed_ids: Sequence[int],
+    ) -> List[int]:
+        """Acknowledge completed IDs and release uncompleted IDs for retry."""
+        try:
+            signal_type, pending_column, processed_column = self._PENDING_COLUMNS[target]
+        except KeyError as exc:
+            raise ValueError(f"Invalid signal processing target: {target}") from exc
+        selected = set(_ids(selected_ids))
+        completed = set(_ids(completed_ids)) & selected
+        if not selected:
+            return []
+        table = self._SIGNAL_BATCHES[signal_type]
+        changed: set[int] = set()
+        with self._conn:
+            for row in self._conn.execute(
+                f"SELECT batch_id, {pending_column} FROM {table} "
+                f"WHERE {processed_column}=1 ORDER BY batch_id"
+            ).fetchall():
+                pending = _ids(row[pending_column])
+                if not set(pending) & selected:
+                    continue
+                changed.update(set(pending) & completed)
+                remaining = [signal_id for signal_id in pending if signal_id not in completed]
+                self._conn.execute(
+                    f"UPDATE {table} SET {pending_column}=?, {processed_column}=?, "
+                    "updated_at=? WHERE batch_id=?",
+                    (json.dumps(remaining), int(not remaining), _now(), row["batch_id"]),
+                )
+        return sorted(changed)
 
     @_locked
     def mark_signal_ids_completed(

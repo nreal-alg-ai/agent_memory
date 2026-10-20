@@ -80,7 +80,6 @@ class MemoryRuntime:
         )
         self._memory_database = database
         self._memory_manager = manager
-        self._user_state_resolver = None
         self._embedding_client = EmbeddingClient(
             dict(resolved_embedding_config or getattr(manager, "_embedding_cfg", {}) or {}),
         )
@@ -99,21 +98,10 @@ class MemoryRuntime:
         )
         self._user_activity_tags: List[str] = []
 
-    def close(self, timeout: Optional[float] = 30.0) -> None:
-        """Submit any buffered input; resource shutdown belongs to the PWM."""
-        self.flush_pending_memory_inputs(reason="runtime_close")
-
     @property
     def manager(self) -> MemoryNodeManager:
         """Return the manager owned by this runtime for diagnostics/adapters."""
         return self._memory_manager
-
-    @property
-    def user_state_resolver(self) -> Any:
-        """State resolution is composed by :class:`PersonWorldModel`."""
-        if self._user_state_resolver is None:
-            raise RuntimeError("UserStateResolver is owned by PersonWorldModel")
-        return self._user_state_resolver
 
     @property
     def database(self) -> SessionDB:
@@ -538,20 +526,16 @@ class MemoryRuntime:
                 "reason": str(drain_report.get("reason") or "queue_rejected"),
             }
         self._memory_context_manager.seal_pending_units(boundary_reason=reason)
-        final_tasks = self._task_scheduler.submit_final_memory_tasks(
-            submit_fact_task=self._trigger_memory_store_task_for_sealed_memory_input,
-            submit_user_activity_task=lambda: self._trigger_memory_user_activity(
-                reason=reason,
-                tags=tags,
-            ),
+        store_report = self._trigger_memory_store_task_for_sealed_memory_input()
+        user_activity_report = self._trigger_memory_user_activity(
+            reason=reason,
+            tags=tags,
         )
-        store_report = final_tasks["fact"]
-        user_activity_report = final_tasks["user_activity"]
-        fact_followup_reports = final_tasks["fact_followup_tasks"]
+        fact_followup_dispatch = self._task_scheduler.submit_flush_fact_followup_tasks()
         submission_reports = [
             store_report,
             user_activity_report,
-            *fact_followup_reports.values(),
+            fact_followup_dispatch,
         ]
         rejected_reasons = {
             "queue_rejected",
@@ -571,14 +555,11 @@ class MemoryRuntime:
                 bool(store_report.get("queued"))
                 or queued
                 or bool(user_activity_report.get("queued"))
-                or any(
-                    bool((report or {}).get("queued"))
-                    for report in fact_followup_reports.values()
-                )
+                or bool(fact_followup_dispatch.get("queued"))
             ),
             "reason": str(store_report.get("reason") or ""),
             "user_activity": user_activity_report,
-            "fact_followup_tasks": fact_followup_reports,
+            "fact_followup_dispatch": fact_followup_dispatch,
         }
 
     def _trigger_memory_store_task_for_sealed_memory_input(
@@ -730,18 +711,14 @@ class MemoryRuntime:
             "accepted": bool(input_flush_report.get("accepted", True)),
             "input_flush": input_flush_report,
             "user_activity": dict(input_flush_report.get("user_activity") or {}),
-            "fact_followup_tasks": dict(
-                input_flush_report.get("fact_followup_tasks") or {}
+            "fact_followup_dispatch": dict(
+                input_flush_report.get("fact_followup_dispatch") or {}
             ),
         }
 
     def wait_for_memory_tasks(self, timeout: Optional[float] = None) -> bool:
         """Wait until all tasks already submitted to the memory manager complete."""
         return self._task_scheduler.flush(timeout=timeout)
-
-    def fact_followup_scheduler_snapshot(self) -> Dict[str, Any]:
-        """Return shared scheduler's fact follow-up scheduling diagnostics."""
-        return self._task_scheduler.fact_followup_task_snapshot()
 
     @staticmethod
     def _transcript_segment_text(segment: Dict[str, Any]) -> str:
