@@ -37,9 +37,9 @@ for import_root in (SRC_ROOT, REPO_ROOT):
         sys.path.insert(0, str(import_root))
 
 from llm_client import DEFAULT_LLM_BASE_URL, DEFAULT_LLM_MODEL
-from memory.task_scheduler import TaskOperationReporter
+from task_scheduler import TaskOperationReporter
 from pwm_manager import PersonWorldModel
-from memory.config import split_memory_config
+from config import split_memory_config
 from memory.utils import _as_embedding_vector
 import memory.memory_database as memory_database_module
 
@@ -312,8 +312,7 @@ def _expand_env_refs(value: Any) -> Any:
 def resolve_llm_args(args: argparse.Namespace) -> None:
     config = load_project_config(args.config)
     model_config = config.get("model", {}) if isinstance(config.get("model"), dict) else {}
-    runtime_config, manager_config = split_memory_config(config)
-    llm_config = manager_config["llm"]
+    llm_config, _embedding_config, runtime_config, _scheduling_config, manager_config, _user_state_config = split_memory_config(config)
     chat_config = config.get("chat", {}) if isinstance(config.get("chat"), dict) else {}
 
     args.llm_model = (
@@ -613,11 +612,9 @@ def session_turn_pairs(session: Sequence[Dict[str, Any]]) -> Tuple[List[Tuple[st
 
 def prepare_runtime_configs(
     args: argparse.Namespace,
-) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
     config = load_project_config(args.config)
-    memory_runtime_config, memory_manager_config = split_memory_config(config)
-    llm_config = memory_manager_config["llm"]
-    embedding_config = memory_manager_config["embedding"]
+    llm_config, embedding_config, memory_runtime_config, task_scheduling_config, memory_manager_config, user_state_config = split_memory_config(config)
     memory_input_config = memory_runtime_config.setdefault(
         "memory_context_manager",
         {},
@@ -660,7 +657,14 @@ def prepare_runtime_configs(
     memory_manager_config["enable_interpretation_feedback"] = bool(
         args.enable_feedback_analysis
     )
-    return memory_runtime_config, memory_manager_config, llm_config, embedding_config
+    return (
+        memory_runtime_config,
+        memory_manager_config,
+        llm_config,
+        embedding_config,
+        task_scheduling_config,
+        user_state_config,
+    )
 
 
 def validate_runtime(manager: Any) -> None:
@@ -1075,6 +1079,8 @@ def build_instance_memory_context(
     memory_manager_config: Dict[str, Any],
     llm_config: Dict[str, Any],
     embedding_config: Dict[str, Any],
+    task_scheduling_config: Dict[str, Any],
+    user_state_config: Dict[str, Any],
 ) -> Dict[str, Any]:
     question_id = str(item.get("question_id") or "unknown_question")
     question = str(item.get("question") or "").strip()
@@ -1095,6 +1101,10 @@ def build_instance_memory_context(
             "Existing memory DB not found for question "
             f"{question_id}: {db_path}"
         )
+    memory_manager_config["user_memory_database_path"] = str(db_path)
+    user_state_config["user_model_database_path"] = str(
+        db_path.with_name("user_model.db")
+    )
 
     with question_memory_logging(
         question_state_dir,
@@ -1109,9 +1119,12 @@ def build_instance_memory_context(
         try:
             operation_reporter = TaskOperationReporter()
             runtime = PersonWorldModel(
-                db_path=db_path,
                 memory_runtime_config=memory_runtime_config,
                 memory_manager_config=memory_manager_config,
+                user_state_config=user_state_config,
+                llm_model_config=llm_config,
+                embedding_model_config=embedding_config,
+                task_scheduling_config=task_scheduling_config,
                 operation_reporter=operation_reporter,
                 logger=memory_logger,
             )
@@ -1244,6 +1257,8 @@ def run_instance(
     memory_manager_config: Dict[str, Any],
     llm_config: Dict[str, Any],
     embedding_config: Dict[str, Any],
+    task_scheduling_config: Dict[str, Any],
+    user_state_config: Dict[str, Any],
 ) -> Dict[str, Any]:
     memory_result = build_instance_memory_context(
         args=args,
@@ -1252,6 +1267,8 @@ def run_instance(
         memory_manager_config=memory_manager_config,
         llm_config=llm_config,
         embedding_config=embedding_config,
+        task_scheduling_config=task_scheduling_config,
+        user_state_config=user_state_config,
     )
     return answer_instance_from_memory_context(args=args, result=memory_result)
 
@@ -1262,6 +1279,8 @@ def run_instance_memory_context_worker(
         int,
         Dict[str, Any],
         argparse.Namespace,
+        Dict[str, Any],
+        Dict[str, Any],
         Dict[str, Any],
         Dict[str, Any],
         Dict[str, Any],
@@ -1277,6 +1296,8 @@ def run_instance_memory_context_worker(
         memory_manager_config,
         llm_config,
         embedding_config,
+        task_scheduling_config,
+        user_state_config,
     ) = payload
     question_id = str(item.get("question_id") or f"item_{index}")
     question_state_dir = args.state_dir / question_id
@@ -1301,6 +1322,8 @@ def run_instance_memory_context_worker(
         memory_manager_config=memory_manager_config,
         llm_config=llm_config,
         embedding_config=embedding_config,
+        task_scheduling_config=task_scheduling_config,
+        user_state_config=user_state_config,
     )
     logging.info(
         "[%s/%s] Finished %s: sessions=%s user_activities=%s facts=%s states=%s actionable_items=%srecall_chars=%s",
@@ -1371,6 +1394,8 @@ def main() -> int:
         memory_manager_config,
         llm_config,
         embedding_config,
+        task_scheduling_config,
+        user_state_config,
     ) = prepare_runtime_configs(args)
     success_count = 0
     failure_count = 0
@@ -1394,6 +1419,8 @@ def main() -> int:
                 memory_manager_config,
                 llm_config,
                 embedding_config,
+                task_scheduling_config,
+                user_state_config,
             )
             for index, item in enumerate(selected, 1)
         ]
@@ -1446,6 +1473,8 @@ def main() -> int:
                     memory_manager_config=memory_manager_config,
                     llm_config=llm_config,
                     embedding_config=embedding_config,
+                    task_scheduling_config=task_scheduling_config,
+                    user_state_config=user_state_config,
                 )
                 result = memory_results_by_index[index]
                 logging.info(

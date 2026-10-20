@@ -34,9 +34,9 @@ for import_root in (SRC_ROOT, REPO_ROOT):
         sys.path.insert(0, str(import_root))
 
 from llm_client import DEFAULT_LLM_BASE_URL, DEFAULT_LLM_MODEL
-from memory.task_scheduler import TaskOperationReporter
+from task_scheduler import TaskOperationReporter
 from pwm_manager import PersonWorldModel
-from memory.config import split_memory_config
+from config import split_memory_config
 from memory.utils import _as_embedding_vector
 import memory.memory_database as memory_database_module
 
@@ -213,8 +213,7 @@ def load_project_config(config_path: Path) -> Dict[str, Any]:
 def resolve_runtime_args(args: argparse.Namespace) -> None:
     config = load_project_config(args.config)
     model_config = config.get("model") if isinstance(config.get("model"), dict) else {}
-    runtime_config, manager_config = split_memory_config(config)
-    llm_config = manager_config["llm"]
+    llm_config, _embedding_config, runtime_config, _scheduling_config, manager_config, _user_state_config = split_memory_config(config)
     chat_config = config.get("chat") if isinstance(config.get("chat"), dict) else {}
     args.llm_model = args.llm_model or str(llm_config.get("llm_name") or model_config.get("default") or DEFAULT_LLM_MODEL)
     args.llm_base_url = args.llm_base_url or str(llm_config.get("llm_base_url") or model_config.get("base_url") or DEFAULT_LLM_BASE_URL)
@@ -243,11 +242,9 @@ def resolve_runtime_args(args: argparse.Namespace) -> None:
 
 def prepare_runtime_configs(
     args: argparse.Namespace,
-) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
     config = load_project_config(args.config)
-    memory_runtime_config, memory_manager_config = split_memory_config(config)
-    llm_config = memory_manager_config["llm"]
-    embedding_config = memory_manager_config["embedding"]
+    llm_config, embedding_config, memory_runtime_config, task_scheduling_config, memory_manager_config, user_state_config = split_memory_config(config)
     memory_input_config = memory_runtime_config.setdefault(
         "memory_context_manager",
         {},
@@ -273,7 +270,14 @@ def prepare_runtime_configs(
     memory_manager_config["memory_prompt_language_mode"] = str(args.memory_prompt_language)
     memory_manager_config["memory_output_language_mode"] = str(args.memory_output_language)
     memory_runtime_config["memory_output_language_mode"] = str(args.memory_output_language)
-    return memory_runtime_config, memory_manager_config, llm_config, embedding_config
+    return (
+        memory_runtime_config,
+        memory_manager_config,
+        llm_config,
+        embedding_config,
+        task_scheduling_config,
+        user_state_config,
+    )
 
 
 def resolve_output_paths(args: argparse.Namespace) -> Tuple[Path, Path]:
@@ -454,10 +458,16 @@ def build_sample_memory_context(
     memory_manager_config: Dict[str, Any],
     llm_config: Dict[str, Any],
     embedding_config: Dict[str, Any],
+    task_scheduling_config: Dict[str, Any],
+    user_state_config: Dict[str, Any],
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     sample_id = str(sample.get("sample_id") or "unknown_sample")
     sample_state_dir = args.state_dir / sample_id
     db_path = sample_state_dir / "memory.db"
+    memory_manager_config["user_memory_database_path"] = str(db_path)
+    user_state_config["user_model_database_path"] = str(
+        db_path.with_name("user_model.db")
+    )
     with sample_memory_logging(
         sample_state_dir,
         args.manager_log_level,
@@ -466,9 +476,12 @@ def build_sample_memory_context(
         try:
             operation_reporter = TaskOperationReporter()
             runtime = PersonWorldModel(
-                db_path=db_path,
                 memory_runtime_config=memory_runtime_config,
                 memory_manager_config=memory_manager_config,
+                user_state_config=user_state_config,
+                llm_model_config=llm_config,
+                embedding_model_config=embedding_config,
+                task_scheduling_config=task_scheduling_config,
                 operation_reporter=operation_reporter,
                 logger=memory_logger,
             )
@@ -582,6 +595,8 @@ def sample_worker(
         Dict[str, Any],
         Dict[str, Any],
         Dict[str, Any],
+        Dict[str, Any],
+        Dict[str, Any],
     ],
 ) -> Tuple[int, Dict[str, Any], List[Dict[str, Any]]]:
     (
@@ -593,6 +608,8 @@ def sample_worker(
         memory_manager_config,
         llm_config,
         embedding_config,
+        task_scheduling_config,
+        user_state_config,
     ) = payload
     sample_id = str(sample.get("sample_id") or f"sample_{index}")
     configure_logging(args.state_dir / sample_id / "run_locomo_memory_eval.log", args.log_level, args.manager_log_level, stream=False)
@@ -604,6 +621,8 @@ def sample_worker(
         memory_manager_config,
         llm_config,
         embedding_config,
+        task_scheduling_config,
+        user_state_config,
     )
     logging.info("[%s/%s] Finished LoCoMo sample %s: facts=%s states=%s qa_rows=%s", index, total, sample_id, output["_memory_eval"]["db_counts"]["facts"], output["_memory_eval"]["db_counts"]["states"], len(detail_rows))
     return index, output, detail_rows
@@ -736,6 +755,7 @@ def main() -> int:
         memory_manager_config,
         llm_config,
         embedding_config,
+        task_scheduling_config,
     ) = prepare_runtime_configs(args)
     outputs_by_index: Dict[int, Dict[str, Any]] = {}
     details_by_index: Dict[int, List[Dict[str, Any]]] = {}
@@ -751,6 +771,8 @@ def main() -> int:
             memory_manager_config,
             llm_config,
             embedding_config,
+            task_scheduling_config,
+            user_state_config,
         )
         for index, sample in enumerate(samples, 1)
     ]
@@ -778,6 +800,8 @@ def main() -> int:
                     memory_manager_config,
                     llm_config,
                     embedding_config,
+                    task_scheduling_config,
+                    user_state_config,
                 )
                 outputs_by_index[index], details_by_index[index] = output, details
                 logging.info(

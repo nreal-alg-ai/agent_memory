@@ -38,9 +38,9 @@ def _load_project_config() -> Dict[str, Any]:
 
         config_path = Path(__file__).resolve().parents[2] / "config.yaml"
         loaded = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
-        manager_config = loaded.get("memory_manager")
-        if isinstance(manager_config, dict) and isinstance(manager_config.get("embedding"), dict):
-            return dict(manager_config["embedding"])
+        pwm_config = loaded.get("personal_world_model")
+        if isinstance(pwm_config, dict) and isinstance(pwm_config.get("embedding_model"), dict):
+            return dict(pwm_config["embedding_model"])
     except Exception:
         pass
     return {}

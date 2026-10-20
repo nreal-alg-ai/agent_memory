@@ -19,7 +19,7 @@ SRC_ROOT = REPO_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from memory.memory_runtime import MemoryRuntime
+from pwm_manager import PersonWorldModel
 from voice.voice_runtime import VoiceRuntime
 
 
@@ -90,7 +90,7 @@ class MemoryMCPService:
 
     def __init__(
         self,
-        memory_runtime: MemoryRuntime,
+        memory_runtime: PersonWorldModel,
         voice_runtime: Optional["VoiceRuntime"] = None,
         *,
         voice_runtime_factory: Optional[Callable[[], "VoiceRuntime"]] = None,
@@ -160,13 +160,15 @@ class MemoryMCPService:
                 )
             )
 
-        queue_flushed = self.memory_runtime.flush_pending_memory_inputs(
-            timeout=self.queue_timeout,
+        flush_report = self.memory_runtime.finalize_memory_session(
+            reason=f"mcp_audio_file_complete:{source}",
+            tags=tags,
         )
+        queue_flushed = bool(flush_report.get("accepted"))
 
         queued_count = sum(bool(report.get("queued")) for report in store_reports)
         report = {
-            "status": "ok" if queue_flushed else "queue_flush_timeout",
+            "status": "ok" if queue_flushed else "queue_flush_rejected",
             "source_type": source,
             "session_start": resolved_session_start,
             "audio": {
@@ -180,6 +182,7 @@ class MemoryMCPService:
             "store_queue_event_count": queued_count,
             "store_reports": store_reports,
             "store_queue_flushed": queue_flushed,
+            "input_flush_report": flush_report,
         }
         return _json_compatible(report)
 

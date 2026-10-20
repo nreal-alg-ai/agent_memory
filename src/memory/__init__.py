@@ -7,7 +7,7 @@ source units -> facts and user-activity observations -> indexed memory.
 
 from .memory_database import SessionDB
 from .memory_manager import MemoryNodeManager
-from .task_scheduler import TaskOperationReporter
+from task_scheduler import TaskOperationReporter
 from .memory_runtime import MemoryRuntime
 
 __all__ = [

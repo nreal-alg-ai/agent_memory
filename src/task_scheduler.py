@@ -9,7 +9,7 @@ import time
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
-from .task_execution_database import TaskExecutionDB
+from task_execution_database import TaskExecutionDB
 
 if TYPE_CHECKING:
     from .memory_database import SessionDB
@@ -244,6 +244,7 @@ class TaskOperationReporter:
             "memory_user_intent_update",
             "memory_user_state_update",
             "user_prediction_near_term_preparation",
+            "user_proactive_policy_evaluation",
         }:
             if not isinstance(result, dict):
                 return False
@@ -340,6 +341,9 @@ class TaskScheduler:
             ),
             "user_prediction_near_term_preparation": self._config_bool(
                 settings.get("enable_user_prediction"), True,
+            ),
+            "user_proactive_policy_evaluation": self._config_bool(
+                settings.get("enable_user_proactive_policy_evaluation"), True,
             ),
         }
         self._user_prediction_horizon_hours = max(
@@ -1123,6 +1127,35 @@ class TaskScheduler:
                 self._task_execution_db.complete_prediction_intents(
                     result.get("processed_intents") or [],
                 )
+        if not event.get("succeeded") or not isinstance(result, dict):
+            return
+        new_prediction_ids = sorted({
+            int(item["id"])
+            for item in result.get("predictions") or []
+            if isinstance(item, dict)
+            and item.get("save_action") == "created"
+            and str(item.get("id") or "").isdigit()
+            and int(item["id"]) > 0
+        })
+        if not new_prediction_ids:
+            return
+        report = self.submit(
+            "user_proactive_policy_evaluation",
+            {
+                "prediction_ids": new_prediction_ids,
+                "source_prediction_task_id": str(event.get("task_id") or ""),
+                "runtime_context": {},
+            },
+            report_payload={
+                "prediction_ids": new_prediction_ids,
+                "source_prediction_task_id": str(event.get("task_id") or ""),
+            },
+        )
+        if not report.get("queued"):
+            self._logger.warning(
+                "proactive policy evaluation was not queued prediction_ids=%s reason=%s",
+                new_prediction_ids, report.get("reason") or "unknown",
+            )
 
     def _process_fact_extraction_follow_up_steps(self, event: Dict[str, Any]) -> None:
         try:

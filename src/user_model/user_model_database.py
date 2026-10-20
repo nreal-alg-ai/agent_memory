@@ -139,6 +139,23 @@ class UserModelDB:
                 created_at TEXT NOT NULL,
                 FOREIGN KEY(run_id) REFERENCES user_prediction_runs(id) ON DELETE CASCADE
             );
+            CREATE TABLE IF NOT EXISTS user_proactive_decisions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                prediction_id INTEGER NOT NULL,
+                user_entity_id INTEGER NOT NULL,
+                policy_version TEXT NOT NULL,
+                decision TEXT NOT NULL CHECK(decision IN (
+                    'recommend_service', 'defer', 'suppress'
+                )),
+                reason_code TEXT NOT NULL DEFAULT '',
+                rationale TEXT NOT NULL DEFAULT '',
+                runtime_context TEXT NOT NULL DEFAULT '{}',
+                prediction_snapshot TEXT NOT NULL DEFAULT '{}',
+                source_prediction_task_id TEXT NOT NULL DEFAULT '',
+                evaluated_at TEXT NOT NULL,
+                UNIQUE(prediction_id, policy_version),
+                FOREIGN KEY(prediction_id) REFERENCES user_predictions(id) ON DELETE CASCADE
+            );
             CREATE INDEX IF NOT EXISTS idx_user_states_user_status
             ON user_states(user_entity_id, state_domain, state_type, status, updated_at DESC);
             CREATE INDEX IF NOT EXISTS idx_user_state_evidence_state
@@ -149,6 +166,8 @@ class UserModelDB:
             ON user_prediction_runs(user_entity_id, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_user_predictions_active
             ON user_predictions(user_entity_id, status, window_end);
+            CREATE INDEX IF NOT EXISTS idx_user_proactive_decisions_user_time
+            ON user_proactive_decisions(user_entity_id, evaluated_at DESC, id DESC);
             CREATE UNIQUE INDEX IF NOT EXISTS idx_user_predictions_pending_key
             ON user_predictions(user_entity_id, prediction_key)
             WHERE status = 'pending';
@@ -230,6 +249,71 @@ class UserModelDB:
             (int(user_entity_id), str(as_of), max(1, int(limit))),
         ).fetchall()
         return [self._prediction_row_to_api(row) for row in rows]
+
+    def get_user_predictions_by_ids(
+        self, prediction_ids: Sequence[int],
+    ) -> List[Dict[str, Any]]:
+        ids = sorted({int(value) for value in prediction_ids
+                      if str(value).isdigit() and int(value) > 0})
+        if not ids:
+            return []
+        placeholders = ",".join("?" for _ in ids)
+        rows = self._conn.execute(
+            f"SELECT * FROM user_predictions WHERE id IN ({placeholders}) ORDER BY id",
+            ids,
+        ).fetchall()
+        return [self._prediction_row_to_api(row) for row in rows]
+
+    def save_user_proactive_decision(
+        self, payload: Dict[str, Any],
+    ) -> Tuple[int, bool]:
+        cursor = self._conn.execute(
+            """INSERT OR IGNORE INTO user_proactive_decisions (
+                prediction_id, user_entity_id, policy_version, decision,
+                reason_code, rationale, runtime_context, prediction_snapshot,
+                source_prediction_task_id, evaluated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                int(payload["prediction_id"]), int(payload["user_entity_id"]),
+                str(payload["policy_version"]), str(payload["decision"]),
+                str(payload.get("reason_code") or ""),
+                str(payload.get("rationale") or ""),
+                _json_dumps(payload.get("runtime_context") or {}),
+                _json_dumps(payload.get("prediction_snapshot") or {}),
+                str(payload.get("source_prediction_task_id") or ""),
+                str(payload["evaluated_at"]),
+            ),
+        )
+        self._commit_if_needed()
+        created = cursor.rowcount == 1
+        row = self._conn.execute(
+            """SELECT id FROM user_proactive_decisions
+               WHERE prediction_id = ? AND policy_version = ?""",
+            (int(payload["prediction_id"]), str(payload["policy_version"])),
+        ).fetchone()
+        return int(row["id"]), created
+
+    def get_user_proactive_decisions(
+        self, *, user_entity_id: Optional[int] = None, limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        clauses = []
+        params: List[Any] = []
+        if user_entity_id is not None:
+            clauses.append("user_entity_id = ?")
+            params.append(int(user_entity_id))
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self._conn.execute(
+            f"""SELECT * FROM user_proactive_decisions {where}
+                ORDER BY evaluated_at DESC, id DESC LIMIT ?""",
+            (*params, max(1, int(limit))),
+        ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["runtime_context"] = _json_loads(item.get("runtime_context"), {})
+            item["prediction_snapshot"] = _json_loads(item.get("prediction_snapshot"), {})
+            result.append(item)
+        return result
 
     def record_user_prediction_outcome(
         self, *, prediction_id: int, outcome_status: str,

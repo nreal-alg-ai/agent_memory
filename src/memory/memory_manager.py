@@ -31,11 +31,11 @@ try:
 except ImportError:  # pragma: no cover - exercised only in minimal installs
     jieba = None
 
-from .embedding_client import EmbeddingClient
+from embedding_client import EmbeddingClient
 from llm_client import LLMClient
 from .memory_database import SessionDB
 from .memory_types import MemoryUnit
-from .task_scheduler import TaskScheduler
+from task_scheduler import TaskScheduler
 from prompts_en import (
     DERIVED_USER_CLAIM_EXTRACTION_PROMPT_EN,
     USER_OBSERVED_PATTERN_RECONCILIATION_PROMPT_EN,

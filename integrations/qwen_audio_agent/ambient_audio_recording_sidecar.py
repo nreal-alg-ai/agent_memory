@@ -33,7 +33,7 @@ SRC_ROOT = REPO_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from memory.config import split_memory_config
+from config import load_voice_runtime_config
 from voice.voice_runtime import VoiceRuntime
 
 
@@ -555,10 +555,7 @@ def main() -> int:
     state_dir = args.state_dir.expanduser().resolve()
     state_dir.mkdir(parents=True, exist_ok=True)
     config = _load_config(args.config.expanduser().resolve())
-    _runtime_config, _manager_config, voice_config = split_memory_config(
-        config,
-        include_voice_runtime=True,
-    )
+    voice_config = load_voice_runtime_config(config)
     speaker_config = voice_config.get("speaker_identification")
     if not isinstance(speaker_config, dict):
         speaker_config = {}

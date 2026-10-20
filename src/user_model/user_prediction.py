@@ -15,7 +15,7 @@ from prompts_zh import USER_PREDICTION_NEAR_TERM_PREPARATION_PROMPT_ZH
 if TYPE_CHECKING:
     from llm_client import LLMClient
     from memory.memory_database import SessionDB
-    from memory.task_scheduler import TaskScheduler
+    from task_scheduler import TaskScheduler
     from .user_model_database import UserModelDB
 
 

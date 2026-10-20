@@ -6,7 +6,7 @@ from typing import Any, Deque, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from .embedding_client import EmbeddingClient
+from embedding_client import EmbeddingClient
 from .memory_types import MemoryUnit
 from .utils import _as_embedding_vector, _cal_embedding_cosine_similarity, _sigmoid, _centroid, _cohesion
 from .memory_manager import (

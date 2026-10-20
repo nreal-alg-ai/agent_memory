@@ -11,8 +11,10 @@ from llm_client import LLMClient
 from memory.memory_database import SessionDB
 from memory.memory_manager import MemoryNodeManager
 from memory.memory_runtime import MemoryRuntime
-from memory.task_scheduler import TaskOperationReporter, TaskScheduler
-from user_model import UserModelDB, UserPrediction, UserStateResolver
+from task_scheduler import TaskOperationReporter, TaskScheduler
+from user_model import (
+    UserModelDB, UserPrediction, UserProactiveService, UserStateResolver,
+)
 
 
 class PersonWorldModel:
@@ -21,60 +23,76 @@ class PersonWorldModel:
     def __init__(
         self,
         *,
-        db_path: Path | str,
-        memory_runtime_config: Optional[Dict[str, Any]] = None,
-        memory_manager_config: Optional[Dict[str, Any]] = None,
+        memory_runtime_config: Dict[str, Any],
+        memory_manager_config: Dict[str, Any],
+        user_state_config: Dict[str, Any],
+        llm_model_config: Dict[str, Any],
+        embedding_model_config: Dict[str, Any],
+        task_scheduling_config: Dict[str, Any],
         operation_reporter: Optional[TaskOperationReporter] = None,
         logger: Optional[logging.Logger] = None,
     ) -> None:
         self._logger = logger or logging.getLogger(__name__)
-        manager_config = dict(memory_manager_config or {})
-        resolved_db_path = Path(db_path).expanduser().resolve()
+        runtime_config = dict(memory_runtime_config)
+        manager_config = dict(memory_manager_config)
+        llm_config = dict(llm_model_config)
+        embedding_config = dict(embedding_model_config)
+        scheduler_config = dict(task_scheduling_config)
+        memory_db_value = manager_config.get("user_memory_database_path")
+        user_model_db_value = user_state_config.get("user_model_database_path")
+        if not memory_db_value:
+            raise ValueError(
+                "memory_manager_config.user_memory_database_path is required"
+            )
+        if not user_model_db_value:
+            raise ValueError(
+                "user_state_config.user_model_database_path is required"
+            )
+        memory_db_path = Path(memory_db_value).expanduser().resolve()
+        model_db_path = Path(user_model_db_value).expanduser().resolve()
+        if model_db_path == memory_db_path:
+            raise ValueError("User memory and user model database paths must be distinct")
         self._operation_reporter = operation_reporter or TaskOperationReporter()
-        self._database = SessionDB(resolved_db_path)
+        self._user_memory_database = SessionDB(memory_db_path)
         try:
-            model_db_path = resolved_db_path.with_name("user_model.db")
-            if model_db_path == resolved_db_path:
-                raise ValueError("Memory database and user_model.db must be distinct")
             self._user_model_database = UserModelDB(model_db_path)
             self._llm_client = LLMClient(
-                memory_config=manager_config,
+                memory_config={"llm": llm_config},
                 logger=self._logger.getChild("llm_client"),
             )
             # Both memory and user-state handlers are registered before the
             # shared worker starts processing its FIFO.
             self._task_scheduler = TaskScheduler(
                 operation_reporter=self._operation_reporter,
-                maxsize=int(manager_config.get("task_queue_maxsize", 100) or 100),
+                maxsize=int(scheduler_config.get("task_queue_maxsize", 100) or 100),
                 logger=self._logger.getChild("task_scheduler"),
-                claim_state_database=self._database,
-                task_scheduling_config=(
-                    (memory_runtime_config or {}).get("task_scheduling")
-                ),
+                claim_state_database=self._user_memory_database,
+                task_scheduling_config=scheduler_config,
                 memory_enabled=manager_config.get("memory_enabled", True),
             )
             self._memory_runtime = MemoryRuntime(
-                db_path=resolved_db_path,
-                database=self._database,
+                db_path=memory_db_path,
+                database=self._user_memory_database,
                 task_scheduler=self._task_scheduler,
                 llm_client=self._llm_client,
-                memory_runtime_config=memory_runtime_config,
+                memory_runtime_config=runtime_config,
                 memory_manager_config=manager_config,
+                embedding_config=embedding_config,
                 logger=self._logger.getChild("memory_runtime"),
             )
             self._user_state_resolver = UserStateResolver(
-                db=self._database,
+                db=self._user_memory_database,
                 model_db=self._user_model_database,
                 task_scheduler=self._task_scheduler,
                 llm_client=self._llm_client,
-                memory_config=manager_config,
+                user_state_config=user_state_config,
                 world_owner_entity_name=(
                     self._memory_runtime.manager.world_owner_entity_name
                 ),
                 logger=self._logger.getChild("user_state_resolver"),
             )
             self._user_prediction = UserPrediction(
-                db=self._database,
+                db=self._user_memory_database,
                 model_db=self._user_model_database,
                 task_scheduler=self._task_scheduler,
                 llm_client=self._llm_client,
@@ -83,13 +101,19 @@ class PersonWorldModel:
                 ),
                 logger=self._logger.getChild("user_prediction"),
             )
+            self._user_proactive_service = UserProactiveService(
+                model_db=self._user_model_database,
+                task_scheduler=self._task_scheduler,
+                llm_client=self._llm_client,
+                logger=self._logger.getChild("user_proactive_service"),
+            )
             self._task_scheduler.start()
         except Exception:
             if hasattr(self, "_task_scheduler"):
                 self._task_scheduler.shutdown(wait=True, timeout=0)
             if hasattr(self, "_user_model_database"):
                 self._user_model_database.close()
-            self._database.close()
+            self._user_memory_database.close()
             raise
         self._closed = False
         self._memory_inputs_need_flush = False
@@ -111,6 +135,10 @@ class PersonWorldModel:
         return self._user_prediction
 
     @property
+    def user_proactive_service(self) -> UserProactiveService:
+        return self._user_proactive_service
+
+    @property
     def task_scheduler(self) -> TaskScheduler:
         return self._task_scheduler
 
@@ -120,7 +148,7 @@ class PersonWorldModel:
 
     @property
     def database(self) -> SessionDB:
-        return self._database
+        return self._user_memory_database
 
     @property
     def user_model_database(self) -> UserModelDB:
@@ -168,7 +196,7 @@ class PersonWorldModel:
         reason: str = "explicit_finalize",
         tags: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
-        report = self._memory_runtime.finalize_memory_session(
+        report = self._memory_runtime.flush_pending_memory_inputs(
             reason=reason,
             tags=tags,
         )
@@ -178,7 +206,7 @@ class PersonWorldModel:
             input_flush.get("user_activity") or {},
             *((input_flush.get("fact_followup_tasks") or {}).values()),
         ]
-        if not any(
+        if bool(report.get("accepted", False)) and not any(
             item.get("reason") in {
                 "queue_rejected", "worker_queue_full", "worker_shutdown",
                 "task_handler_not_registered",
@@ -201,20 +229,6 @@ class PersonWorldModel:
             tags=tags,
             time_end=time_end,
         )
-
-    def flush_pending_memory_inputs(
-        self,
-        timeout: Optional[float] = None,
-        *,
-        tags: Optional[List[str]] = None,
-    ) -> bool:
-        flushed = self._memory_runtime.flush_pending_memory_inputs(
-            timeout=timeout,
-            tags=tags,
-        )
-        if flushed:
-            self._memory_inputs_need_flush = False
-        return flushed
 
     def wait_for_memory_tasks(self, timeout: Optional[float] = None) -> bool:
         return self._task_scheduler.flush(timeout=timeout)
@@ -241,7 +255,7 @@ class PersonWorldModel:
         """Read the current user model through the resolver."""
         with self._task_scheduler.execution_lock:
             owner_name = self.memory_manager.world_owner_entity_name
-            owner_id = self._database.add_entity_names([owner_name])[owner_name]
+            owner_id = self._user_memory_database.add_entity_names([owner_name])[owner_name]
             return self._user_state_resolver.get_current_states(
                 user_entity_id=owner_id,
                 state_domains=state_domains,
@@ -273,30 +287,42 @@ class PersonWorldModel:
                 observed_at=observed_at, evidence_refs=evidence_refs, note=note,
             )
 
+    def get_recent_proactive_decisions(
+        self, *, limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        with self._task_scheduler.execution_lock:
+            owner_name = self.memory_manager.world_owner_entity_name
+            owner_id = self._user_memory_database.get_entity_id_by_name(owner_name)
+            if owner_id is None:
+                return []
+            return self._user_proactive_service.get_recent_decisions(
+                user_entity_id=owner_id, limit=limit,
+            )
+
     def close(self, timeout: Optional[float] = 30.0) -> None:
         if self._closed:
             return
+        if self._memory_inputs_need_flush:
+            self.finalize_memory_session(reason="pwm_close")
+            if self._memory_inputs_need_flush:
+                raise RuntimeError("Pending memory inputs could not be submitted")
         safe_to_close_database = False
         try:
-            if self._memory_inputs_need_flush and not self.flush_pending_memory_inputs(timeout=timeout):
-                raise RuntimeError("Pending memory inputs could not be submitted")
+            if not self._task_scheduler.flush(timeout=timeout):
+                self._logger.warning(
+                    "PWM tasks did not drain within timeout=%s; continuing to drain",
+                    timeout,
+                )
+                if not self._task_scheduler.flush(timeout=None):
+                    raise RuntimeError("PWM task worker stopped with pending tasks")
+            stopped = self._task_scheduler.shutdown(wait=True, timeout=timeout)
+            if not stopped:
+                stopped = self._task_scheduler.shutdown(wait=True, timeout=None)
+            if not stopped:
+                raise RuntimeError("PWM task worker did not stop cleanly")
+            safe_to_close_database = True
         finally:
-            try:
-                if not self._task_scheduler.flush(timeout=timeout):
-                    self._logger.warning(
-                        "PWM tasks did not drain within timeout=%s; continuing to drain",
-                        timeout,
-                    )
-                    if not self._task_scheduler.flush(timeout=None):
-                        raise RuntimeError("PWM task worker stopped with pending tasks")
-                stopped = self._task_scheduler.shutdown(wait=True, timeout=timeout)
-                if not stopped:
-                    stopped = self._task_scheduler.shutdown(wait=True, timeout=None)
-                if not stopped:
-                    raise RuntimeError("PWM task worker did not stop cleanly")
-                safe_to_close_database = True
-            finally:
-                if safe_to_close_database:
-                    self._user_model_database.close()
-                    self._database.close()
-                    self._closed = True
+            if safe_to_close_database:
+                self._user_model_database.close()
+                self._user_memory_database.close()
+                self._closed = True

@@ -21,8 +21,8 @@ SRC_ROOT = ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from memory.config import split_memory_config  # noqa: E402
-from memory.embedding_client import EmbeddingClient  # noqa: E402
+from config import split_memory_config  # noqa: E402
+from embedding_client import EmbeddingClient  # noqa: E402
 
 
 DEFAULT_TEXTS = [
@@ -160,10 +160,7 @@ def main() -> int:
     args = parse_args()
     config_path = args.config.expanduser().resolve()
     config = load_config(config_path)
-    _, memory_manager_config = split_memory_config(config)
-    embedding_config = memory_manager_config.get("embedding") or {}
-    if not isinstance(embedding_config, dict):
-        raise ValueError("memory_manager.embedding must be a mapping")
+    _llm, embedding_config, _runtime, _scheduling, _manager, _user_state = split_memory_config(config)
 
     texts = load_texts(args)
     client = EmbeddingClient(dict(embedding_config))

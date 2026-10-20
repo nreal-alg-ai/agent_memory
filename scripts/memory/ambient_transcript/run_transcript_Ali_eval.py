@@ -21,8 +21,8 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from llm_client import DEFAULT_LLM_BASE_URL, DEFAULT_LLM_MODEL
-from memory.task_scheduler import TaskOperationReporter
-from memory.config import split_memory_config
+from task_scheduler import TaskOperationReporter
+from config import split_memory_config
 from pwm_manager import PersonWorldModel
 
 
@@ -58,7 +58,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--textgrid", type=Path, default=DEFAULT_TEXTGRID)
     parser.add_argument("--output-root-dir", type=Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--output-dir", type=Path)
-    parser.add_argument("--db-name", default="memory.db")
+    parser.add_argument("--db-name", default="user_memory.db")
     parser.add_argument(
         "--segment-limit",
         type=int,
@@ -83,11 +83,13 @@ def main() -> None:
     args = parse_args()
     config = load_project_config(args.config)
     (
+        llm_config,
+        embedding_config,
         memory_runtime_config,
+        task_scheduling_config,
         memory_manager_config,
+        user_state_config,
     ) = split_memory_config(config)
-    llm_config = memory_manager_config["llm"]
-    embedding_config = memory_manager_config["embedding"]
     if args.disable_llm:
         llm_config["llm_api_key"] = ""
     memory_input_config = memory_runtime_config.setdefault(
@@ -154,6 +156,10 @@ def main() -> None:
         args.log_level,
     )
     db_path = output_dir / args.db_name
+    memory_manager_config["user_memory_database_path"] = str(db_path)
+    user_state_config["user_model_database_path"] = str(
+        db_path.with_name("user_model.db")
+    )
     transcript_path = output_dir / "transcript.txt"
     report_path = output_dir / "report.json"
 
@@ -170,15 +176,18 @@ def main() -> None:
     llm_config["llm_api_key"] = expand_env_refs(llm_config["llm_api_key"])
 
     operation_reporter = TaskOperationReporter()
-    runtime = PersonWorldModel(
-        db_path=db_path,
+    pwm = PersonWorldModel(
         memory_runtime_config=memory_runtime_config,
         memory_manager_config=memory_manager_config,
+        user_state_config=user_state_config,
+        llm_model_config=llm_config,
+        embedding_model_config=embedding_config,
+        task_scheduling_config=task_scheduling_config,
         operation_reporter=operation_reporter,
         logger=memory_logger,
     )
 
-    input_report = runtime.accept_memory_input(
+    input_report = pwm.accept_memory_input(
         transcript_segments=memory_segments,
         tags=["Eval_Ali", textgrid_path.stem],
         ambient_recording_enabled=True,
@@ -190,7 +199,7 @@ def main() -> None:
             len(memory_segments),
         )
 
-    finalization = runtime.finalize_memory_session(
+    finalization = pwm.finalize_memory_session(
         reason="ali_eval_complete",
         tags=["Eval_Ali", textgrid_path.stem],
     )
@@ -204,7 +213,7 @@ def main() -> None:
     )
     queued_memory_store_count += int(bool(final_input_flush.get("queued")))
 
-    if not runtime.wait_for_memory_tasks():
+    if not pwm.wait_for_memory_tasks():
         raise RuntimeError("Timed out while draining queued memory tasks")
 
     store_operation_report = operation_reporter.operation_report("memory_fact_extraction")
@@ -248,7 +257,7 @@ def main() -> None:
     }
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     logging.info("Wrote report: %s", report_path)
-    runtime.close()
+    pwm.close()
     memory_logger.removeHandler(memory_log_handler)
     memory_log_handler.close()
     print(json.dumps(report, ensure_ascii=False, indent=2))

@@ -27,7 +27,7 @@ from prompts_zh import (
 if TYPE_CHECKING:
     from memory.memory_database import SessionDB
     from llm_client import LLMClient
-    from memory.task_scheduler import TaskScheduler
+    from task_scheduler import TaskScheduler
     from .user_model_database import UserModelDB
 
 
@@ -92,7 +92,7 @@ class UserStateResolver:
         model_db: "UserModelDB",
         task_scheduler: TaskScheduler,
         llm_client: "LLMClient",
-        memory_config: Optional[Mapping[str, Any]] = None,
+        user_state_config: Optional[Mapping[str, Any]] = None,
         world_owner_entity_name: str = "用户本人",
         logger: Optional[logging.Logger] = None,
     ) -> None:
@@ -101,14 +101,13 @@ class UserStateResolver:
         self._llm_client = llm_client
         self._world_owner_entity_name = str(world_owner_entity_name or "用户本人").strip()
         self._logger = logger or logging.getLogger(__name__)
-        config = dict(memory_config or {})
+        config = dict(user_state_config or {})
         self._update_limit = max(
             1,
             int(config.get("user_state_update_limit", 80) or 80),
         )
         self._prompt_language_mode = str(
-            config.get("memory_prompt_language_mode")
-            or config.get("prompt_language_mode")
+            config.get("prompt_language_mode")
             or "source"
         ).strip().lower()
         task_scheduler.register_handler(self.TASK_KIND, self.process_update_task)

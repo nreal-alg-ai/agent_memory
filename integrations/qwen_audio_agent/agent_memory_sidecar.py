@@ -32,8 +32,8 @@ SRC_ROOT = REPO_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from memory.config import split_memory_config
-from memory.memory_runtime import MemoryRuntime
+from config import split_memory_config
+from pwm_manager import PersonWorldModel
 
 
 _ENV_REF_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
@@ -100,7 +100,7 @@ def _message_key(owner_id: str, session_id: str, message: Dict[str, Any]) -> str
 
 @dataclass
 class OwnerRuntime:
-    runtime: MemoryRuntime
+    runtime: PersonWorldModel
     seen_path: Path
     seen_order: List[str] = field(default_factory=list)
     seen: set[str] = field(default_factory=set)
@@ -129,6 +129,10 @@ class AgentMemoryRuntime:
         state_dir: Path,
         memory_runtime_config: Dict[str, Any],
         memory_manager_config: Dict[str, Any],
+        user_state_config: Dict[str, Any],
+        llm_model_config: Dict[str, Any],
+        embedding_model_config: Dict[str, Any],
+        task_scheduling_config: Dict[str, Any],
         logger: logging.Logger,
     ) -> None:
         self._state_dir = state_dir.resolve()
@@ -136,6 +140,10 @@ class AgentMemoryRuntime:
         self._owner_dir.mkdir(parents=True, exist_ok=True)
         self._runtime_config = dict(memory_runtime_config)
         self._manager_config = dict(memory_manager_config)
+        self._user_state_config = dict(user_state_config)
+        self._llm_config = dict(llm_model_config)
+        self._embedding_config = dict(embedding_model_config)
+        self._task_scheduling_config = dict(task_scheduling_config)
         self._logger = logger
         self._owners: Dict[str, OwnerRuntime] = {}
         self._operation_lock = threading.RLock()
@@ -177,10 +185,20 @@ class AgentMemoryRuntime:
                     seen_order = [str(item) for item in parsed[-_MAX_SEEN_IDS:]]
             except (OSError, ValueError, TypeError):
                 self._logger.warning("Ignoring invalid observed-message index owner=%s", key)
-        runtime = MemoryRuntime(
-            db_path=owner_dir / "memory.db",
+        manager_config = dict(self._manager_config)
+        user_state_config = dict(self._user_state_config)
+        memory_db_path = owner_dir / "memory.db"
+        manager_config["user_memory_database_path"] = str(memory_db_path)
+        user_state_config["user_model_database_path"] = str(
+            owner_dir / "user_model.db"
+        )
+        runtime = PersonWorldModel(
             memory_runtime_config=self._runtime_config,
-            memory_manager_config=self._manager_config,
+            memory_manager_config=manager_config,
+            user_state_config=user_state_config,
+            llm_model_config=self._llm_config,
+            embedding_model_config=self._embedding_config,
+            task_scheduling_config=self._task_scheduling_config,
             logger=self._logger.getChild(f"owner.{key[:12]}"),
         )
         created = OwnerRuntime(
@@ -476,8 +494,10 @@ class AgentMemoryRuntime:
                 followup_tasks.get("memory_user_intent_update") or {}
             )
         else:
-            input_flushed = holder.runtime.flush_pending_memory_inputs()
-            input_flush = {"queued": bool(input_flushed)}
+            flush_report = holder.runtime.finalize_memory_session(
+                reason="qwen_audio_agent_transport_checkpoint",
+            )
+            input_flush = dict(flush_report.get("input_flush") or {})
             user_activity = None
             user_claim = None
             user_intent = None
@@ -695,11 +715,22 @@ def main() -> int:
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
     config = _load_config(args.config.expanduser().resolve())
-    runtime_config, manager_config = split_memory_config(config)
+    (
+        llm_config,
+        embedding_config,
+        runtime_config,
+        task_scheduling_config,
+        manager_config,
+        user_state_config,
+    ) = split_memory_config(config)
     runtime = AgentMemoryRuntime(
         state_dir=state_dir,
         memory_runtime_config=runtime_config,
         memory_manager_config=manager_config,
+        user_state_config=user_state_config,
+        llm_model_config=llm_config,
+        embedding_model_config=embedding_config,
+        task_scheduling_config=task_scheduling_config,
         logger=logger,
     )
     ipc_server = _LocalTranscriptIpcServer(

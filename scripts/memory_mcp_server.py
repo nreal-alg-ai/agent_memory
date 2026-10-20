@@ -32,9 +32,9 @@ SRC_ROOT = REPO_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from memory.config import split_memory_config
-from memory.memory_runtime import MemoryRuntime
+from config import load_voice_runtime_config, split_memory_config
 from mcp.mcp_server import MemoryMCPService, StdioMCPServer
+from pwm_manager import PersonWorldModel
 from voice.voice_runtime import VoiceRuntime
 
 
@@ -193,10 +193,19 @@ def build_service(config_source: Any = None) -> tuple[MemoryMCPService, logging.
         if _explicit_override(config_source, "queue_timeout") is not None
         else server_config.get("queue_timeout", 30.0)
     )
-    memory_runtime_config, memory_manager_config, voice_runtime_config = split_memory_config(
-        config,
-        include_voice_runtime=True,
+    (
+        llm_model_config,
+        embedding_model_config,
+        memory_runtime_config,
+        task_scheduling_config,
+        memory_manager_config,
+        user_state_config,
+    ) = split_memory_config(config)
+    memory_manager_config["user_memory_database_path"] = str(db_path)
+    user_state_config["user_model_database_path"] = str(
+        db_path.with_name("user_model.db")
     )
+    voice_runtime_config = load_voice_runtime_config(config)
     voice_runtime_config = resolve_voice_runtime_paths(
         voice_runtime_config,
         config_path,
@@ -217,10 +226,13 @@ def build_service(config_source: Any = None) -> tuple[MemoryMCPService, logging.
     )
     try:
         memory_runtime_logger = logger.getChild("memory_runtime")
-        memory_runtime = MemoryRuntime(
-            db_path=db_path,
+        memory_runtime = PersonWorldModel(
             memory_runtime_config=memory_runtime_config,
             memory_manager_config=memory_manager_config,
+            user_state_config=user_state_config,
+            llm_model_config=llm_model_config,
+            embedding_model_config=embedding_model_config,
+            task_scheduling_config=task_scheduling_config,
             logger=memory_runtime_logger,
         )
         voice_logger = logger.getChild("voice_runtime")
