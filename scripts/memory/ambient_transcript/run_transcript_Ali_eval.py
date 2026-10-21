@@ -211,7 +211,7 @@ def main() -> None:
         raise RuntimeError("Timed out while draining queued memory tasks")
 
     followup_dispatch_result = (
-        operation_reporter.latest_report("memory_final_fact_followups") or {}
+        operation_reporter.latest_report("memory_flush_fact_followups") or {}
     )
     followup_tasks = followup_dispatch_result.get("fact_followup_tasks") or {}
     store_operation_report = operation_reporter.operation_report("memory_fact_extraction")
@@ -223,9 +223,14 @@ def main() -> None:
         operation_reporter.latest_report("memory_user_intent_update")
         or followup_tasks.get("memory_user_intent_update") or {}
     )
-    user_state_result = operation_reporter.latest_report(
-        "memory_user_state_update"
-    )
+    user_state_results = {
+        task_kind: operation_reporter.latest_report(task_kind)
+        for task_kind in (
+            "memory_user_claim_state_update",
+            "memory_user_activity_state_update",
+            "memory_user_observed_pattern_state_update",
+        )
+    }
     logging.info(
         "Transcript input complete segments=%s queued_memory_stores=%s "
         "stored_memory_stores=%s",
@@ -251,7 +256,7 @@ def main() -> None:
         "user_activity_result": user_activity_result,
         "user_claim_result": user_claim_result,
         "user_intent_result": user_intent_result,
-        "user_state_result": user_state_result,
+        "user_state_results": user_state_results,
     }
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     logging.info("Wrote report: %s", report_path)

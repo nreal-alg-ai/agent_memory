@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from embedding_client import EmbeddingClient
-from .memory_database import SessionDB
+from .memory_database import UserMemoryDB
 
 from .memory_manager import (
     MemoryNodeManager,
@@ -51,7 +51,7 @@ class MemoryRuntime:
         self,
         *,
         db_path: Path | str,
-        database: SessionDB,
+        database: UserMemoryDB,
         task_scheduler: TaskScheduler,
         llm_client: LLMClient,
         memory_runtime_config: Optional[Dict[str, Any]] = None,
@@ -104,7 +104,7 @@ class MemoryRuntime:
         return self._memory_manager
 
     @property
-    def database(self) -> SessionDB:
+    def database(self) -> UserMemoryDB:
         """Return the shared database injected by the composition root."""
         return self._memory_database
 

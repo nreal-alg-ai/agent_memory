@@ -159,7 +159,7 @@ def _blob_to_embedding(value: Any) -> Optional[np.ndarray]:
     return vector.reshape(1, -1).astype(np.float32)
 
 
-class SessionDB:
+class UserMemoryDB:
     """SQLite facade for the current memory schema and its derived indexes."""
 
     def __init__(self, db_path: Path | str) -> None:
@@ -180,9 +180,9 @@ class SessionDB:
     def close(self) -> None:
         self._conn.close()
 
-    def open_reader(self) -> "SessionDB":
+    def open_reader(self) -> "UserMemoryDB":
         """Open a query-only connection without running schema initialization."""
-        reader = object.__new__(SessionDB)
+        reader = object.__new__(UserMemoryDB)
         reader.db_path = self.db_path
         reader._conn = sqlite3.connect(
             str(self.db_path),
@@ -2002,15 +2002,15 @@ class SessionDB:
         semantic_confidence: Optional[float] = None,
         semantic_reason: str = "",
         details: Optional[Dict[str, Any]] = None,
-    ) -> bool:
-        """Record a semantic relation without changing either claim's status."""
+    ) -> Optional[int]:
+        """Return the persisted relation event ID without changing claim status."""
         target_id = int(target_claim_id)
         trigger_id = int(trigger_claim_id)
         if target_id <= 0 or trigger_id <= 0 or target_id == trigger_id:
-            return False
+            return None
         relation = str(semantic_relation or "").strip().lower()
         if not relation or relation == "unrelated":
-            return False
+            return None
         occurred_at = str(effective_at or "")
         existing = self._conn.execute(
             """
@@ -2023,15 +2023,15 @@ class SessionDB:
             (target_id, trigger_id, relation, occurred_at),
         ).fetchone()
         if existing:
-            return False
+            return int(existing["id"])
         row = self._conn.execute(
             "SELECT status FROM memory_user_claims WHERE id = ?",
             (target_id,),
         ).fetchone()
         if not row:
-            return False
+            return None
         status = str(row["status"] or "")
-        self._conn.execute(
+        cur = self._conn.execute(
             """
             INSERT INTO memory_user_claim_events (
                 target_claim_id, trigger_claim_id, event_type,
@@ -2055,7 +2055,7 @@ class SessionDB:
             ),
         )
         self._commit_if_needed()
-        return True
+        return int(cur.lastrowid)
 
     @staticmethod
     def _intent_object_spec(object_type: str) -> tuple[str, tuple[str, ...]]:
@@ -2476,28 +2476,29 @@ class SessionDB:
             result.setdefault(int(event["target_claim_id"]), []).append(event)
         return result
 
-    def get_user_claim_relations_for_claim_ids(
-        self, claim_ids: Sequence[int], *, limit: int = 400,
+    def get_user_claim_relation_events_by_ids(
+        self, event_ids: Sequence[int],
     ) -> List[Dict[str, Any]]:
-        """Find direct semantic relations in either direction from changed claims."""
+        """Load the exact relation events referenced by a state-update batch."""
         ids = list(dict.fromkeys(
-            int(value) for value in claim_ids or []
+            int(value) for value in event_ids or []
             if str(value).strip().isdigit() and int(value) > 0
         ))
         if not ids:
             return []
-        placeholders = ",".join("?" for _ in ids)
-        rows = self._conn.execute(
-            f"""
-            SELECT * FROM memory_user_claim_events
-            WHERE event_type = 'relation_observed'
-              AND (target_claim_id IN ({placeholders})
-                   OR trigger_claim_id IN ({placeholders}))
-            ORDER BY id DESC LIMIT ?
-            """,
-            (*ids, *ids, max(1, int(limit))),
-        ).fetchall()
-        return [self._row_to_dict(row) for row in rows]
+        rows_by_id: Dict[int, Dict[str, Any]] = {}
+        for start in range(0, len(ids), 400):
+            chunk = ids[start:start + 400]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = self._conn.execute(
+                f"SELECT * FROM memory_user_claim_events "
+                f"WHERE event_type = 'relation_observed' AND id IN ({placeholders})",
+                chunk,
+            ).fetchall()
+            rows_by_id.update(
+                (int(row["id"]), self._row_to_dict(row)) for row in rows
+            )
+        return [rows_by_id[event_id] for event_id in ids if event_id in rows_by_id]
 
     def apply_user_claim_status_decision(
         self, *, claim_id: int, new_status: str, trigger_claim_id: int,
@@ -2547,6 +2548,7 @@ class SessionDB:
         *,
         entity_id: Optional[int] = None,
         subject_entity_id: Optional[int] = None,
+        primary_domain: Optional[str] = None,
         claim_type: Optional[str] = None,
         claim_origin: Optional[str] = None,
         predicate: Optional[str] = None,
@@ -2560,6 +2562,7 @@ class SessionDB:
             params.extend((int(entity_id), int(entity_id)))
         for column, value in (
             ("subject_entity_id", subject_entity_id),
+            ("primary_domain", primary_domain),
             ("claim_type", claim_type),
             ("claim_origin", claim_origin),
             ("predicate", predicate),

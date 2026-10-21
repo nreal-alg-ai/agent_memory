@@ -8,12 +8,12 @@ import sqlite3
 import threading
 import time
 from datetime import datetime
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence
 
 from task_execution_database import TaskExecutionDB
 
 if TYPE_CHECKING:
-    from .memory_database import SessionDB
+    from .memory_database import UserMemoryDB
 
 
 TaskHandler = Callable[..., Any]
@@ -244,7 +244,9 @@ class TaskOperationReporter:
             "memory_user_claim_update",
             "memory_user_observed_pattern_update",
             "memory_user_intent_update",
-            "memory_user_state_update",
+            "memory_user_claim_state_update",
+            "memory_user_activity_state_update",
+            "memory_user_observed_pattern_state_update",
             "user_prediction_near_term_preparation",
             "user_proactive_policy_evaluation",
         }:
@@ -312,7 +314,7 @@ class TaskScheduler:
         logger: Optional[logging.Logger] = None,
         worker_name: str = "memory-task-worker",
         task_scheduling_config: Optional[Dict[str, Any]] = None,
-        claim_state_database: Optional[SessionDB] = None,
+        claim_state_database: Optional[UserMemoryDB] = None,
         memory_enabled: Any = True,
     ) -> None:
         self._operation_reporter = operation_reporter
@@ -332,6 +334,9 @@ class TaskScheduler:
             else {}
         )
         self._memory_enabled = self._config_bool(memory_enabled, True)
+        user_state_updates_enabled = self._config_bool(
+            settings.get("enable_memory_user_state_update"), True,
+        )
         self._task_enabled = {
             "memory_user_claim_update": self._config_bool(
                 settings.get("enable_memory_user_claim_update"), True,
@@ -342,9 +347,9 @@ class TaskScheduler:
             "memory_user_intent_update": self._config_bool(
                 settings.get("enable_memory_user_intent_update"), True,
             ),
-            "memory_user_state_update": self._config_bool(
-                settings.get("enable_memory_user_state_update"), True,
-            ),
+            "memory_user_claim_state_update": user_state_updates_enabled,
+            "memory_user_activity_state_update": user_state_updates_enabled,
+            "memory_user_observed_pattern_state_update": user_state_updates_enabled,
             "user_prediction_near_term_preparation": self._config_bool(
                 settings.get("enable_user_prediction"), True,
             ),
@@ -508,13 +513,16 @@ class TaskScheduler:
             result["signals_marked_processed"] = len(completed)
 
     def record_pending_user_state_claims(
-        self, claim_ids: List[int], *, reference_timestamp: Any = None,
+        self, claim_ids: List[int], *,
+        claim_relations: Sequence[Dict[str, Any]] = (),
+        reference_timestamp: Any = None,
         source_task_id: str = "",
     ) -> int:
         if self._task_execution_db is None:
             return 0
         return self._task_execution_db.record_pending_user_state_claims(
             claim_ids,
+            claim_relations=claim_relations,
             reference_timestamp=reference_timestamp,
             source_task_id=source_task_id,
         )
@@ -626,7 +634,9 @@ class TaskScheduler:
                 )
             if self._task_execution_db is not None:
                 try:
-                    self._task_execution_db.record_submission(task_id, task_kind)
+                    self._task_execution_db.record_task_submission_info(
+                        task_id, task_kind,
+                    )
                 except Exception:
                     self._logger.exception(
                         "Failed to persist task submission kind=%s id=%s",
@@ -839,7 +849,7 @@ class TaskScheduler:
         )
         if self._task_execution_db is not None:
             try:
-                self._task_execution_db.record_completion(
+                self._task_execution_db.record_task_completion_info(
                     task_id,
                     status=(result_status or "ok") if succeeded else "failed",
                     result=result if error is None else {
@@ -921,20 +931,20 @@ class TaskScheduler:
                 )
                 self._claim_state_task_pending = True
         state_payload = {
-            "changed_claim_ids": [claim_id for claim_id, _ in versions],
-            "changed_user_activity_ids": [],
+            "new_claim_ids": [claim_id for claim_id, _ in versions],
+            "claim_relations": pending["claim_relations"],
             "reference_timestamp": reference_timestamp,
-            "runtime_context": {},
         }
         report = self.submit(
-            "memory_user_state_update",
+            "memory_user_claim_state_update",
             state_payload,
             completion_context={
                 "claim_state_window_versions": versions,
                 "claim_state_final_flush": force,
             },
             report_payload={
-                "changed_claim_ids": state_payload["changed_claim_ids"],
+                "new_claim_ids": state_payload["new_claim_ids"],
+                "relation_event_count": len(state_payload["claim_relations"]),
                 "reference_timestamp": reference_timestamp,
             },
         )
@@ -1054,7 +1064,9 @@ class TaskScheduler:
             "memory_user_claim_update": self._postprocess_user_claim_update_task,
             "memory_user_observed_pattern_update": self._postprocess_fact_followup_task,
             "memory_user_intent_update": self._postprocess_fact_followup_task,
-            "memory_user_state_update": self._postprocess_user_state_update_task,
+            "memory_user_claim_state_update": (
+                self._postprocess_user_claim_state_update_task
+            ),
             "user_prediction_near_term_preparation": self._postprocess_user_prediction_task,
         }
         completion: Dict[str, Any] = {"postprocessed": False}
@@ -1075,7 +1087,9 @@ class TaskScheduler:
                 self._schedule_after_user_observed_pattern_update_task
             ),
             "memory_user_intent_update": self._schedule_after_user_intent_update_task,
-            "memory_user_state_update": self._schedule_after_user_state_update_task,
+            "memory_user_claim_state_update": (
+                self._schedule_after_user_claim_state_update_task
+            ),
             "user_prediction_near_term_preparation": self._schedule_after_user_prediction_task,
         }
         schedule = schedulers.get(task_kind)
@@ -1120,7 +1134,6 @@ class TaskScheduler:
         if not activity_ids:
             return
         payload = {
-            "changed_claim_ids": [],
             "changed_user_activity_ids": sorted({
                 int(value) for value in activity_ids
                 if str(value).strip().isdigit() and int(value) > 0
@@ -1129,7 +1142,7 @@ class TaskScheduler:
             "runtime_context": {},
         }
         self.submit(
-            "memory_user_state_update",
+            "memory_user_activity_state_update",
             payload,
             report_payload={
                 "changed_user_activity_ids": payload["changed_user_activity_ids"],
@@ -1189,7 +1202,7 @@ class TaskScheduler:
                 new_prediction_ids, report.get("reason") or "unknown",
             )
 
-    def _postprocess_user_state_update_task(
+    def _postprocess_user_claim_state_update_task(
         self, event: Dict[str, Any],
     ) -> Dict[str, Any]:
         context = event.get("completion_context") or {}
@@ -1228,7 +1241,7 @@ class TaskScheduler:
             "force_requested": force_requested,
         }
 
-    def _schedule_after_user_state_update_task(
+    def _schedule_after_user_claim_state_update_task(
         self, event: Dict[str, Any], completion: Dict[str, Any],
     ) -> None:
         context = event.get("completion_context") or {}
@@ -1254,7 +1267,8 @@ class TaskScheduler:
         try:
             if event.get("succeeded") and isinstance(result, dict):
                 self.record_pending_user_state_claims(
-                    list(result.get("affected_claim_ids") or []),
+                    list(result.get("new_claim_ids") or []),
+                    claim_relations=result.get("claim_relations") or [],
                     reference_timestamp=result.get("reference_timestamp"),
                     source_task_id=str(event.get("task_id") or ""),
                 )
@@ -1274,18 +1288,15 @@ class TaskScheduler:
             affected_ids = list(result.get("affected_user_observed_pattern_ids") or [])
             if changed_ids or affected_ids:
                 payload = {
-                    "changed_claim_ids": [],
-                    "changed_user_activity_ids": [],
                     "changed_observed_pattern_ids": changed_ids,
                     "affected_observed_pattern_ids": affected_ids,
                     "trigger_user_action_signal_ids": list(
                         result.get("trigger_user_action_signal_ids") or []
                     ),
                     "reference_timestamp": result.get("reference_timestamp"),
-                    "runtime_context": {},
                 }
                 self.submit(
-                    "memory_user_state_update", payload,
+                    "memory_user_observed_pattern_state_update", payload,
                     report_payload={
                         "changed_observed_pattern_ids": changed_ids,
                         "affected_observed_pattern_ids": affected_ids,

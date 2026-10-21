@@ -61,7 +61,6 @@ class UserModelDB:
         self._conn.executescript("""
             CREATE TABLE IF NOT EXISTS user_states (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_entity_id INTEGER NOT NULL,
                 state_domain TEXT NOT NULL,
                 state_type TEXT NOT NULL,
                 state_kind TEXT NOT NULL,
@@ -76,7 +75,7 @@ class UserModelDB:
                 metadata TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
-                UNIQUE(user_entity_id, state_domain, state_type, state_kind, state_topic)
+                UNIQUE(state_domain, state_type, state_kind, state_topic)
             );
             CREATE TABLE IF NOT EXISTS user_state_evidence (
                 state_id INTEGER NOT NULL,
@@ -156,8 +155,8 @@ class UserModelDB:
                 UNIQUE(prediction_id, policy_version),
                 FOREIGN KEY(prediction_id) REFERENCES user_predictions(id) ON DELETE CASCADE
             );
-            CREATE INDEX IF NOT EXISTS idx_user_states_user_status
-            ON user_states(user_entity_id, state_domain, state_type, status, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_user_states_domain_type_status
+            ON user_states(state_domain, state_type, status, updated_at DESC);
             CREATE INDEX IF NOT EXISTS idx_user_state_evidence_state
             ON user_state_evidence(state_id, role, evidence_type);
             CREATE INDEX IF NOT EXISTS idx_user_state_events_state
@@ -333,15 +332,14 @@ class UserModelDB:
     def get_user_states(
         self,
         *,
-        user_entity_id: int,
         state_domains: Optional[Sequence[str]] = None,
         state_types: Optional[Sequence[str]] = None,
         statuses: Optional[Sequence[str]] = None,
         limit: int = 160,
     ) -> List[Dict[str, Any]]:
         """Return current durable user states, not historical read snapshots."""
-        clauses = ["user_entity_id = ?"]
-        params: List[Any] = [int(user_entity_id)]
+        clauses: List[str] = []
+        params: List[Any] = []
         if state_domains:
             placeholders = ",".join("?" for _ in state_domains)
             clauses.append(f"state_domain IN ({placeholders})")
@@ -354,10 +352,11 @@ class UserModelDB:
             placeholders = ",".join("?" for _ in statuses)
             clauses.append(f"status IN ({placeholders})")
             params.extend(str(value) for value in statuses)
+        where_clause = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         rows = self._conn.execute(
             f"""
             SELECT * FROM user_states
-            WHERE {' AND '.join(clauses)}
+            {where_clause}
             ORDER BY updated_at DESC, id DESC
             LIMIT ?
             """,
@@ -395,18 +394,17 @@ class UserModelDB:
         return result
 
     def user_state_identity_exists(
-        self, *, user_entity_id: int, state_domain: str,
+        self, *, state_domain: str,
         state_type: str, state_kind: str, state_topic: str,
     ) -> bool:
         row = self._conn.execute(
             """
             SELECT 1 FROM user_states
-            WHERE user_entity_id = ? AND state_domain = ?
-              AND state_type = ? AND state_kind = ?
+            WHERE state_domain = ? AND state_type = ? AND state_kind = ?
               AND state_topic = ? LIMIT 1
             """,
             (
-                int(user_entity_id), str(state_domain), str(state_type),
+                str(state_domain), str(state_type),
                 str(state_kind), str(state_topic),
             ),
         ).fetchone()
@@ -487,7 +485,6 @@ class UserModelDB:
     def upsert_user_state(
         self,
         *,
-        user_entity_id: int,
         state_domain: str,
         state_type: str,
         state_kind: str,
@@ -504,7 +501,6 @@ class UserModelDB:
     ) -> tuple[int, bool, Optional[Dict[str, Any]]]:
         """Create or incrementally update one state and return its old value."""
         now = local_now_text()
-        owner_id = int(user_entity_id)
         target_id = int(target_state_id or 0)
         topic = str(state_topic or "").strip()
         if not topic:
@@ -512,8 +508,8 @@ class UserModelDB:
         existing = None
         if target_id > 0:
             existing = self._conn.execute(
-                "SELECT * FROM user_states WHERE id = ? AND user_entity_id = ?",
-                (target_id, owner_id),
+                "SELECT * FROM user_states WHERE id = ?",
+                (target_id,),
             ).fetchone()
             if existing is None:
                 raise ValueError(f"Unknown target user state: {target_id}")
@@ -521,12 +517,11 @@ class UserModelDB:
             existing = self._conn.execute(
                 """
                 SELECT * FROM user_states
-                WHERE user_entity_id = ? AND state_domain = ?
-                  AND state_type = ? AND state_kind = ?
+                WHERE state_domain = ? AND state_type = ? AND state_kind = ?
                   AND state_topic = ?
                 """,
                 (
-                    owner_id, str(state_domain), str(state_type),
+                    str(state_domain), str(state_type),
                     str(state_kind), topic,
                 ),
             ).fetchone()
@@ -566,14 +561,14 @@ class UserModelDB:
         cur = self._conn.execute(
             """
             INSERT INTO user_states (
-                user_entity_id, state_domain, state_type, state_kind,
+                state_domain, state_type, state_kind,
                 state_topic, state_text, status,
                 confidence, conditions, valid_from, valid_to, last_observed_at,
                 metadata, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                owner_id, str(state_domain), str(state_type), str(state_kind),
+                str(state_domain), str(state_type), str(state_kind),
                 topic, str(state_text),
                 str(status or "active"), float(confidence),
                 _json_dumps(conditions if isinstance(conditions, dict) else {}),

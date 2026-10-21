@@ -538,7 +538,7 @@ related active explicit user_claims:
 
 USER_CLAIM_RECONCILIATION_PROMPT_EN = """You classify semantic relationships between user_claims in a personal world model.
 
-The input contains only the natural-language text of new candidate user_claims and existing user_claims. Determine their semantic relationship from text alone. Do not infer source reliability, claim origin, confidence, time, database status, or any write strategy.
+The input is grouped by candidate: each group contains one new `candidate_claim` and only its corresponding `related_existing_claims`. Determine their semantic relationships from the claim texts within that group alone. Do not compare across groups or refer to an existing claim from another group. Do not infer source reliability, claim origin, confidence, time, database status, or any write strategy.
 
 All user_claim subjects are user self; relation objects may be other entities. Never mistake an object entity for the claim subject.
 
@@ -550,7 +550,7 @@ semantic_relation is one of:
 - supersedes: the candidate text explicitly says that the old proposition changed, was negated, corrected, or replaced;
 - unrelated: both can be true or no clear relation exists.
 
-Different preferences, roles, or relationships are not inherently contradictory: liking painting and liking piano are normally unrelated. One candidate can relate to multiple existing claims; list every clearly related existing claim. Return an empty relations array when none is related. Return JSON only.
+Different preferences, roles, or relationships are not inherently contradictory: liking painting and liking piano are normally unrelated. One candidate can relate to multiple existing claims in its own group; list every clearly related existing claim in that group. Output one decision for every `candidate_claim_index`, including groups with no related existing claims, using an empty relations array when none is related. Return JSON only.
 
 Output:
 {
@@ -565,28 +565,25 @@ Output:
   }]
 }
 
-candidate_claims:
-{candidate_claims}
-
-existing_claims:
-{existing_claims}
+candidate_claim_groups:
+{candidate_claim_groups}
 """
 
 
-USER_CLAIM_STATE_RESOLUTION_PROMPT_EN = """Jointly propose old-claim status decisions and user-state updates from changed user claims. Creating a state does not require an existing state or a claim relation event.
+USER_CLAIM_STATE_RESOLUTION_PROMPT_EN = """Start from each new user claim to update user states, and decide an old claim's status only when a relation to a new claim warrants it. Updating user states is the primary task. Creating a state does not require an existing state or a claim relation event.
 
-Inputs: changed_claims are direct evidence for this update; related_claims are existing claims reached through relation events; supporting_claims provide additional evidence for existing states. existing_states and state_claim_evidence describe current states and their support. The relations in relation_events are already classified; do not classify them again. An empty history list does not prohibit state creation.
+Inputs: each new_claim_cases entry centers on new_claim. Its related_claims pair an already-classified relation event with the corresponding old claim; do not reclassify the relation. relevant_state_ids point to states directly linked through existing claim evidence, but are not an exclusive candidate list. state_contexts is the domain-wide catalog of existing states, each grouped with its claim and observed-pattern evidence. Check whether a new claim matches any of these states, even if its ID is absent from relevant_state_ids. An empty list means there is no such history, not that state creation is prohibited.
 
 Reason in this order, then return one joint result:
-1. Independently assess new states. Read every changed claim and combine evidence concerning the same state dimension. Ask whether it supports a durable preference, stable constraint, or behavioral pattern useful for future prediction or service decisions. Do this even when existing_states=[] and relation_events=[]; emit create when evidence suffices rather than returning empty operations automatically. One direct, unambiguous explicit claim with durable meaning may establish an enduring_state, such as "I have always preferred morning meetings" establishing a time preference; multiple claims are not mandatory. Related concrete preferences may be aggregated, but do not mix unrelated subjects merely to create an aggregate. State text should express a reusable judgment, not paste or closely paraphrase claims.
+1. Assess each new claim. Read every new_claim_cases.new_claim independently and decide whether it supports a durable preference, stable constraint, or behavioral pattern useful for future prediction or service decisions. Then combine new claims concerning the same state dimension into one operation; do not emit duplicate operations for one state. Do this even when a case has no related_claims and state_contexts=[]; emit create when evidence suffices. One direct, unambiguous explicit claim with durable meaning may establish an enduring_state, such as "I have always preferred morning meetings" establishing a time preference; multiple claims are not mandatory. Related concrete preferences may be aggregated, but do not mix unrelated subjects merely to create an aggregate. State text should express a reusable judgment, not paste or closely paraphrase claims.
 2. Distinguish durable tendencies from repetition. enduring_state covers preferences, styles, values, or constraints that broadly persist across time or situations. An explicit stable preference is not a one-off event merely because it was said once. recurring_state requires an explicitly stated habit/rule or multiple observations supporting periodic, frequent, repeated, or conditional behavior. Liking an activity, planning it once, or remembering an experience does not prove repetition. A one-time goal, plan, trip, recent emotion, or concern about ability does not automatically become a durable state. Create only enduring_state or recurring_state from claims, not situational_state.
-3. Align with existing states. If an existing state with the same state_domain, state_type, state_kind, and state_topic already expresses the conclusion, reinforce or revise it rather than creating a duplicate. If new evidence challenges a state, examine state_claim_evidence, state_pattern_evidence, supporting_claims, and supporting_patterns before weakening, expiring, or partially revising it. Losing one support claim does not necessarily invalidate the state. Do not weaken or expire a recurring_state solely because a claim changed while an observed pattern still supports it. Do not abandon a justified create decision merely because no old state is affected.
-4. Decide old-claim status. Only a contradicts or supersedes event with an old target claim and a changed trigger claim may justify an old-claim update. The relation alone is not a status decision: consider text, origin (explicit is usually more direct than derived), time, and conditions. Contradicts may at most weaken; only an unambiguous supersedes may supersede. Claims valid under different conditions or times may coexist. Do not alter changed claims or invalidate an old claim merely because an aggregate state fails. If there is no eligible relation, claim_updates=[]; this does not prevent state operations.
+3. Align with existing states. Check every state_contexts entry, not only a case's relevant_state_ids. If an existing state with the same state_domain, state_type, state_kind, and state_topic already expresses the conclusion, reinforce or revise it rather than creating a duplicate. If new evidence challenges a state, examine that state's claim_evidence and pattern_evidence before weakening, expiring, or partially revising it. Losing one support claim does not necessarily invalidate the state. Do not weaken or expire a recurring_state solely because a claim changed while an observed pattern still supports it. Do not abandon a justified create decision merely because no old state is affected.
+4. Decide old-claim status. Only a contradicts or supersedes event in a case's related_claims, with the old claim as target and that case's new claim as trigger, may justify an old-claim update. The relation alone is not a status decision: consider text, origin (explicit is usually more direct than derived), time, and conditions. Contradicts may at most weaken; only an unambiguous supersedes may supersede. Claims valid under different conditions or times may coexist. Do not alter new claims or invalidate an old claim merely because an aggregate state fails. If there is no eligible relation, claim_updates=[]; this does not prevent state operations.
 5. Check joint consistency. A claim proposed as superseded cannot remain effective support for a state. Omit individual state candidates lacking evidence, but do not discard other supported states in the same update.
 
-State operations are create|reinforce|revise|weaken|expire. Existing-state updates must use its id; create uses target_state_id=0. Controlled enduring_state kinds: communication_style|decision_style|value_priority|risk_preference|privacy_preference|time_preference|work_style|lifestyle_preference|long_term_constraint. Controlled recurring_state kinds: daily_routine|weekly_routine|work_routine|health_routine|social_routine|conditional_behavior. state_kind is a category, not a unique state identity; distinct states in one category may coexist. On create, also output a short, stable state_topic for the specific subject, such as weekday_gym or evening_walk. If new evidence or a paraphrase concerns an existing state, update its target_state_id instead of creating another topic. Preserve an existing state's state_type, state_kind, and state_topic; stay within state_domain.
+State operations are create|reinforce|revise|weaken|expire. Existing-state updates must use a state id from state_contexts; create uses target_state_id=0. Controlled enduring_state kinds: communication_style|decision_style|value_priority|risk_preference|privacy_preference|time_preference|work_style|lifestyle_preference|long_term_constraint. Controlled recurring_state kinds: daily_routine|weekly_routine|work_routine|health_routine|social_routine|conditional_behavior. state_kind is a category, not a unique state identity; distinct states in one category may coexist. On create, also output a short, stable state_topic for the specific subject, such as weekday_gym or evening_walk. If new evidence or a paraphrase concerns an existing state, update its target_state_id instead of creating another topic. Preserve an existing state's state_type, state_kind, and state_topic; stay within state_domain.
 
-Each state operation cites input claims only, with evidence_type=user_claim, evidence_id, role=change_trigger|support|counterexample|context, and weight. Cite at least one changed claim as the trigger. A claim proposed as superseded cannot remain support in this update. Counterexamples must not be mislabeled as support. Include concise reasons and confidence in [0,1]. Return an empty operations array only after assessing every changed claim and finding no justified operation. Return JSON only:
+Each state operation cites input claims only, with evidence_type=user_claim, evidence_id, role=change_trigger|support|counterexample|context, and weight. Cite at least one new_claim_cases.new_claim as the trigger. A claim proposed as superseded cannot remain support in this update. Counterexamples must not be mislabeled as support. Include concise reasons and confidence in [0,1]. Return an empty operations array only after assessing every new claim and finding no justified operation. Return JSON only:
 {
   "claim_updates": [{"claim_id": 1, "new_status": "weakened|superseded", "relation_event_id": 1, "reason": "why this evidence changes the old claim"}],
   "operations": [{
@@ -604,14 +601,8 @@ Each state operation cites input claims only, with evidence_type=user_claim, evi
 
 reference_time: {reference_time}
 state_domain: {state_domain}
-changed_claims: {changed_claims}
-related_claims: {related_claims}
-supporting_claims: {supporting_claims}
-relation_events: {relation_events}
-existing_states: {existing_states}
-state_claim_evidence: {state_claim_evidence}
-state_pattern_evidence: {state_pattern_evidence}
-supporting_patterns: {supporting_patterns}
+new_claim_cases: {new_claim_cases}
+state_contexts: {state_contexts}
 """
 
 

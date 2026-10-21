@@ -1184,7 +1184,9 @@ def build_instance_memory_context(
                 for kind in (
                     "memory_user_claim_update",
                     "memory_user_intent_update",
-                    "memory_user_state_update",
+                    "memory_user_claim_state_update",
+                    "memory_user_activity_state_update",
+                    "memory_user_observed_pattern_state_update",
                 )
             ]
             recall_operation_report = operation_counts.get("recall") or {}

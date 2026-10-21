@@ -33,7 +33,7 @@ except ImportError:  # pragma: no cover - exercised only in minimal installs
 
 from embedding_client import EmbeddingClient
 from llm_client import LLMClient
-from .memory_database import SessionDB
+from .memory_database import UserMemoryDB
 from .memory_types import MemoryUnit
 from task_scheduler import TaskScheduler
 from prompts_en import (
@@ -176,7 +176,7 @@ class MemoryNodeManager:
 
     def __init__(
         self,
-        db: SessionDB,
+        db: UserMemoryDB,
         *,
         embedding_config: Optional[Dict[str, Any]] = None,
         memory_manager_config: Optional[Dict[str, Any]] = None,
@@ -197,7 +197,6 @@ class MemoryNodeManager:
         )
         self._memory_prompt_language = str(
             self._memory_cfg.get("memory_prompt_language_mode")
-            or self._memory_cfg.get("prompt_language_mode")
             or "source"
         )
         self._memory_enabled = bool(self._memory_cfg.get("memory_enabled", True))
@@ -2377,7 +2376,8 @@ class MemoryNodeManager:
                 signal_ids=selected_signal_ids,
                 reference_timestamp=reference_timestamp,
             )
-            affected_claim_ids = list(claim_report.get("affected_claim_ids") or [])
+            new_claim_ids = list(claim_report.get("new_claim_ids") or [])
+            claim_relations = list(claim_report.get("claim_relations") or [])
         self._log_info("memory_user_claim", "user_claim_update_finish", claim_report)
         explicit_failed_count = int(
             claim_report.get("explicit", {}).get("failed_signal_count") or 0
@@ -2402,7 +2402,8 @@ class MemoryNodeManager:
                 2,
             ),
         }
-        report["affected_claim_ids"] = affected_claim_ids
+        report["new_claim_ids"] = new_claim_ids
+        report["claim_relations"] = claim_relations
         report["reference_timestamp"] = reference_timestamp
         report["_completed_signal_ids"] = claim_report.get(
             "_completed_signal_ids", [],
@@ -3369,9 +3370,9 @@ class MemoryNodeManager:
             explicit_report["completed"] = False
         explicit_report.pop("completed", None)
         processed_signal_ids = explicit_report.pop("processed_signal_ids", [])
-        affected_claim_ids = list(explicit_report.get("affected_claim_ids") or [])
+        new_claim_ids = list(explicit_report.get("new_claim_ids") or [])
         derived_report = self._update_derived_user_claims_from_explicit_claims(
-            affected_claim_ids=affected_claim_ids,
+            new_explicit_claim_ids=new_claim_ids,
         )
         derived_completed = bool(derived_report.pop("completed", False))
         # Only acknowledge signals that received a validated result and whose
@@ -3380,19 +3381,23 @@ class MemoryNodeManager:
             processed_signal_ids if derived_completed else []
         )
 
-        source_reports: List[Dict[str, Any]] = []
-        if derived_completed:
-            source_reports.extend((explicit_report, derived_report))
-        all_affected_claim_ids = sorted({
-            int(value)
-            for source_report in source_reports
-            for value in source_report.get("affected_claim_ids") or []
-            if str(value).strip().isdigit() and int(value) > 0
-        })
+        all_new_claim_ids = (
+            sorted(set(new_claim_ids) | set(derived_report.get("new_claim_ids") or []))
+            if derived_completed else []
+        )
+        all_claim_relations = {
+            int(relation["relation_event_id"]): relation
+            for source_report in (explicit_report, derived_report)
+            for relation in source_report.get("claim_relations") or []
+            if int(relation.get("relation_event_id") or 0) > 0
+        } if derived_completed else {}
         return {
             "explicit": explicit_report,
             "derived": derived_report,
-            "affected_claim_ids": all_affected_claim_ids,
+            "new_claim_ids": all_new_claim_ids,
+            "claim_relations": [
+                all_claim_relations[event_id] for event_id in sorted(all_claim_relations)
+            ],
             "_completed_signal_ids": completed_signal_ids,
         }
 
@@ -3589,27 +3594,25 @@ class MemoryNodeManager:
             USER_CLAIM_RECONCILIATION_PROMPT_EN
             if language == "en" else USER_CLAIM_RECONCILIATION_PROMPT_ZH
         )
-        prompt_candidates = [
+        candidate_claim_groups = [
             {
                 "candidate_claim_index": index,
-                "claim_text": candidate.get("claim_text") or "",
+                "candidate_claim": {
+                    "claim_text": candidate.get("claim_text") or "",
+                },
+                "related_existing_claims": [
+                    {
+                        "id": claim.get("id"),
+                        "claim_text": claim.get("claim_text") or "",
+                    }
+                    for claim in related_by_index.get(index, [])
+                ],
             }
             for index, candidate in enumerate(candidates)
         ]
-        existing_by_id = {
-            int(claim["id"]): claim
-            for claims in related_by_index.values()
-            for claim in claims
-            if str(claim.get("id") or "").strip().isdigit()
-        }
         raw = self._llm_client.call_llm(
-            prompt_template.replace("{candidate_claims}", json.dumps(
-                prompt_candidates, ensure_ascii=False, indent=2,
-            )).replace("{existing_claims}", json.dumps(
-                [
-                    {"id": claim.get("id"), "claim_text": claim.get("claim_text") or ""}
-                    for claim in existing_by_id.values()
-                ],
+            prompt_template.replace("{candidate_claim_groups}", json.dumps(
+                candidate_claim_groups,
                 ensure_ascii=False, indent=2,
             ))
         )
@@ -3739,7 +3742,7 @@ class MemoryNodeManager:
         candidate: Dict[str, Any],
         decision: Dict[str, Any],
         effective_at: str,
-    ) -> bool:
+    ) -> Optional[int]:
         """Persist semantic claim history without resolving effective state."""
         details = {
             "trigger_claim_snapshot": {
@@ -3832,6 +3835,7 @@ class MemoryNodeManager:
                 facts_by_id=facts_by_id,
                 confidence=float(candidate.get("confidence") or 0.0),
             )
+            persisted_relations: List[Dict[str, Any]] = []
             for decision in candidate_decisions:
                 target = target_for(decision)
                 if not target:
@@ -3839,13 +3843,18 @@ class MemoryNodeManager:
                 target_evidence_role = str(
                     decision.get("target_evidence_role") or ""
                 )
-                self._record_user_claim_relation(
+                relation_event_id = self._record_user_claim_relation(
                     target=target,
                     trigger_claim_id=claim_id,
                     candidate=candidate,
                     decision=decision,
                     effective_at=effective_at,
                 )
+                if relation_event_id:
+                    persisted_relations.append({
+                        **decision,
+                        "relation_event_id": int(relation_event_id),
+                    })
                 if target_evidence_role:
                     self._write_user_claim_evidence(
                         claim_id=int(target["id"]),
@@ -3857,7 +3866,7 @@ class MemoryNodeManager:
             applied.append({
                 "claim": candidate, "claim_id": claim_id, "created": created,
                 "effective_origin": candidate_origin,
-                "relations": candidate_decisions,
+                "relations": persisted_relations,
                 "merged": False,
             })
         self._log_info("memory_user_claim", "user_claim_reconciled", {
@@ -3910,13 +3919,15 @@ class MemoryNodeManager:
             "updated": 0,
             "created": 0,
             "merged": 0,
-            "affected_claim_ids": [],
+            "new_claim_ids": [],
+            "claim_relations": [],
             "processed_signal_ids": [],
             "completed": True,
         }
         if not signal_items:
             return report
-        affected_claim_ids: set[int] = set()
+        new_claim_ids: set[int] = set()
+        claim_relations: Dict[Tuple[int, int, str], Dict[str, Any]] = {}
         batch_size = max(
             1, int(self._memory_cfg.get("user_claim_signal_batch_size") or 8),
         )
@@ -4031,19 +4042,27 @@ class MemoryNodeManager:
             report["updated"] += len(applied)
             report["created"] += sum(int(item["created"]) for item in applied)
             report["merged"] += sum(int(item["merged"]) for item in applied)
-            affected_claim_ids.update(
-                int(claim_id)
-                for applied_item in applied
-                for claim_id in (
-                    applied_item.get("claim_id"),
-                    *[
-                        decision.get("existing_claim_id")
-                        for decision in applied_item.get("relations") or []
-                    ],
-                )
-                if str(claim_id or "").strip().isdigit() and int(claim_id) > 0
-            )
-        report["affected_claim_ids"] = sorted(affected_claim_ids)
+            for applied_item in applied:
+                claim_id = int(applied_item["claim_id"])
+                new_claim_ids.add(claim_id)
+                for decision in applied_item.get("relations") or []:
+                    existing_claim_id = int(decision.get("existing_claim_id") or 0)
+                    if existing_claim_id <= 0 or existing_claim_id == claim_id:
+                        continue
+                    semantic_relation = str(decision.get("semantic_relation") or "")
+                    key = (claim_id, existing_claim_id, semantic_relation)
+                    claim_relations[key] = {
+                        "relation_event_id": int(decision["relation_event_id"]),
+                        "new_claim_id": claim_id,
+                        "existing_claim_id": existing_claim_id,
+                        "semantic_relation": semantic_relation,
+                        "confidence": float(decision.get("confidence") or 0.0),
+                        "reason": str(decision.get("reason") or ""),
+                    }
+        report["new_claim_ids"] = sorted(new_claim_ids)
+        report["claim_relations"] = [
+            claim_relations[key] for key in sorted(claim_relations)
+        ]
         report["completed"] = report["failed_signal_count"] == 0
         return report
 
@@ -4133,7 +4152,7 @@ class MemoryNodeManager:
     def _update_derived_user_claims_from_explicit_claims(
         self,
         *,
-        affected_claim_ids: Sequence[int],
+        new_explicit_claim_ids: Sequence[int],
     ) -> Dict[str, Any]:
         """Derive local conclusions from this batch's explicit-claim changes.
 
@@ -4141,27 +4160,28 @@ class MemoryNodeManager:
         premise membership, fact traceability, and writes remain deterministic
         program responsibilities.
         """
-        affected_ids = list(dict.fromkeys(
+        explicit_claim_ids = list(dict.fromkeys(
             int(value)
-            for value in affected_claim_ids or []
+            for value in new_explicit_claim_ids or []
             if str(value).strip().isdigit() and int(value) > 0
         ))
         report: Dict[str, Any] = {
             "enabled": 1,
-            "affected_claim_count": len(affected_ids),
+            "input_explicit_claim_count": len(explicit_claim_ids),
             "seed_claim_count": 0,
-            "entity_group_count": 0,
+            "processed_seed_claim_count": 0,
             "input_claim_count": 0,
             "candidate_count": 0,
             "updated": 0,
             "created": 0,
             "suppressed": 0,
-            "affected_claim_ids": [],
+            "new_claim_ids": [],
+            "claim_relations": [],
             "completed": True,
         }
-        if not affected_ids:
+        if not explicit_claim_ids:
             return report
-        changed_claims = self._db.get_user_claims_by_ids(affected_ids)
+        changed_claims = self._db.get_user_claims_by_ids(explicit_claim_ids)
         world_owner_entity_id = self._intent_world_owner_entity_id()
         seed_claims = [
             claim
@@ -4174,84 +4194,129 @@ class MemoryNodeManager:
         if not seed_claims:
             return report
 
-        changed_by_entity: Dict[int, List[Dict[str, Any]]] = {}
-        for claim in seed_claims:
-            endpoint_entity_ids = {
-                int(entity_id)
-                for entity_id in (
-                    claim.get("subject_entity_id"),
-                    claim.get("object_entity_id"),
-                )
-                if str(entity_id or "").strip().isdigit() and int(entity_id) > 0
-            }
-            for entity_id in endpoint_entity_ids:
-                changed_by_entity.setdefault(entity_id, []).append(claim)
-        report["entity_group_count"] = len(changed_by_entity)
-        for entity_id, changed_claims in changed_by_entity.items():
+        new_derived_claim_ids: set[int] = set()
+        claim_relations: Dict[Tuple[int, int, str], Dict[str, Any]] = {}
+        for seed_claim in seed_claims:
             related_claims = self._retrieve_related_derived_explicit_claims(
-                entity_id=entity_id,
+                seed_claim=seed_claim,
+                batch_seed_claims=seed_claims,
                 world_owner_entity_id=world_owner_entity_id,
-                changed_claims=changed_claims,
             )
-            report["input_claim_count"] += len(changed_claims) + len(related_claims)
+            report["processed_seed_claim_count"] += 1
+            report["input_claim_count"] += 1 + len(related_claims)
             outcome = self._extract_derived_user_claims(
-                changed_claims=changed_claims,
+                changed_claims=[seed_claim],
                 related_claims=related_claims,
             )
             if outcome is None:
                 report["completed"] = False
                 report["error"] = "invalid_llm_derived_claim_response"
-                report["failed_entity_id"] = entity_id
+                report["failed_claim_id"] = int(seed_claim["id"])
+                report["new_claim_ids"] = sorted(new_derived_claim_ids)
+                report["claim_relations"] = [
+                    claim_relations[key] for key in sorted(claim_relations)
+                ]
                 return report
             report["candidate_count"] += len(outcome)
             if not outcome:
                 continue
-            group_report = self._apply_derived_user_claim_candidates(
+            claim_report = self._apply_derived_user_claim_candidates(
                 raw_candidates=outcome,
-                changed_claims=changed_claims,
+                changed_claims=[seed_claim],
                 related_claims=related_claims,
             )
             for key in ("updated", "created", "suppressed"):
-                report[key] += int(group_report[key])
-            report["affected_claim_ids"].extend(
+                report[key] += int(claim_report[key])
+            new_derived_claim_ids.update(
                 int(value)
-                for value in group_report.get("claim_ids") or []
+                for value in claim_report.get("new_claim_ids") or []
                 if int(value) > 0
             )
-        report["affected_claim_ids"] = sorted(set(report["affected_claim_ids"]))
+            for relation in claim_report.get("claim_relations") or []:
+                key = (
+                    int(relation["new_claim_id"]),
+                    int(relation["existing_claim_id"]),
+                    str(relation["semantic_relation"]),
+                )
+                claim_relations[key] = relation
+        report["new_claim_ids"] = sorted(new_derived_claim_ids)
+        report["claim_relations"] = [
+            claim_relations[key] for key in sorted(claim_relations)
+        ]
         return report
 
     def _retrieve_related_derived_explicit_claims(
         self,
         *,
-        entity_id: int,
+        seed_claim: Dict[str, Any],
+        batch_seed_claims: Sequence[Dict[str, Any]],
         world_owner_entity_id: int,
-        changed_claims: Sequence[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
-        """Load user-self explicit claims touching the anchor entity."""
-        changed_claim_ids = {
-            int(claim["id"])
-            for claim in changed_claims
-            if str(claim.get("id") or "").strip().isdigit()
-        }
+        """Find premises for one new claim without grouping by its subject."""
+        seed_claim_id = int(seed_claim["id"])
+        object_entity_id = int(seed_claim.get("object_entity_id") or 0)
+        primary_domain = str(seed_claim.get("primary_domain") or "")
+        predicate = str(seed_claim.get("predicate") or "")
         claims_by_id: Dict[int, Dict[str, Any]] = {}
-        for claim in self._db.get_user_claims(
-            entity_id=entity_id,
-            claim_origin="explicit",
-            statuses=["active"],
-            limit=32,
-        ):
-            claim_id = int(claim["id"])
-            if (
-                claim_id not in changed_claim_ids
-                and int(claim.get("subject_entity_id") or 0)
-                == int(world_owner_entity_id)
-            ):
-                claims_by_id[claim_id] = claim
-        return sorted(
-            claims_by_id.values(),
-            key=lambda claim: -int(claim.get("id") or 0),
-        )[:32]
+        batch_claim_ids = {int(claim["id"]) for claim in batch_seed_claims}
+
+        def add_claims(claims: Sequence[Dict[str, Any]]) -> None:
+            for claim in claims:
+                claim_id = int(claim["id"])
+                if (
+                    claim_id != seed_claim_id
+                    and claim.get("claim_origin") == "explicit"
+                    and claim.get("status") == "active"
+                    and int(claim.get("subject_entity_id") or 0)
+                    == world_owner_entity_id
+                ):
+                    claims_by_id[claim_id] = claim
+
+        # Other claims created in the same batch may be necessary premises
+        # even when they refer to different objects.
+        add_claims(batch_seed_claims)
+        search_filters: List[Dict[str, Any]] = []
+        if object_entity_id and object_entity_id != world_owner_entity_id:
+            search_filters.append({"entity_id": object_entity_id})
+        if primary_domain and primary_domain != "general":
+            search_filters.append({"primary_domain": primary_domain})
+        if predicate:
+            search_filters.append({"predicate": predicate})
+        # Keep a small recent owner-wide pool for cross-object and
+        # cross-predicate deductions that the narrower filters cannot find.
+        search_filters.append({})
+        for filters in search_filters:
+            add_claims(self._db.get_user_claims(
+                subject_entity_id=world_owner_entity_id,
+                claim_origin="explicit",
+                statuses=["active"],
+                limit=64,
+                **filters,
+            ))
+
+        def relevance(claim: Dict[str, Any]) -> Tuple[bool, bool, bool, bool, bool, str, int]:
+            claim_object_id = int(claim.get("object_entity_id") or 0)
+            return (
+                bool(object_entity_id and claim_object_id == object_entity_id),
+                bool(predicate and claim.get("predicate") == predicate),
+                bool(primary_domain and claim.get("primary_domain") == primary_domain),
+                claim.get("claim_type") == seed_claim.get("claim_type"),
+                int(claim["id"]) in batch_claim_ids,
+                str(claim.get("updated_at") or ""),
+                int(claim["id"]),
+            )
+
+        batch_related = sorted(
+            (claim for claim in claims_by_id.values() if int(claim["id"]) in batch_claim_ids),
+            key=relevance,
+            reverse=True,
+        )[:8]
+        historical_related = sorted(
+            (claim for claim in claims_by_id.values() if int(claim["id"]) not in batch_claim_ids),
+            key=relevance,
+            reverse=True,
+        )[:32 - len(batch_related)]
+        return [*batch_related, *historical_related]
 
     def _apply_derived_user_claim_candidates(
         self,
@@ -4262,7 +4327,8 @@ class MemoryNodeManager:
     ) -> Dict[str, Any]:
         """Validate, reconcile, and record one subject's LLM conclusions."""
         report: Dict[str, Any] = {
-            "updated": 0, "created": 0, "suppressed": 0, "claim_ids": [],
+            "updated": 0, "created": 0, "suppressed": 0,
+            "new_claim_ids": [], "claim_relations": [],
         }
         input_claims = [*changed_claims, *related_claims]
         input_by_id = {int(claim["id"]): claim for claim in input_claims}
@@ -4334,14 +4400,26 @@ class MemoryNodeManager:
                 premise_claim_ids=premise_ids,
             )
             persisted_derived_ids.append(claim_id)
-            report["claim_ids"].append(claim_id)
+            report["new_claim_ids"].append(claim_id)
+            for decision in item.get("relations") or []:
+                existing_claim_id = int(decision.get("existing_claim_id") or 0)
+                if existing_claim_id <= 0 or existing_claim_id == claim_id:
+                    continue
+                report["claim_relations"].append({
+                    "relation_event_id": int(decision["relation_event_id"]),
+                    "new_claim_id": claim_id,
+                    "existing_claim_id": existing_claim_id,
+                    "semantic_relation": str(decision.get("semantic_relation") or ""),
+                    "confidence": float(decision.get("confidence") or 0.0),
+                    "reason": str(decision.get("reason") or ""),
+                })
             report["created"] += int(item.get("created") or 0)
             report["updated"] += 1
         if persisted_derived_ids:
             self._sync_user_claim_recall_documents(
                 sorted(set(persisted_derived_ids))
             )
-        report["claim_ids"] = sorted(set(report["claim_ids"]))
+        report["new_claim_ids"] = sorted(set(report["new_claim_ids"]))
         return report
 
     def _derived_claim_prompt_view(
@@ -6216,7 +6294,7 @@ class MemoryNodeManager:
         tags: Optional[List[str]] = None,
         time_end: Optional[str] = None,
         recall_mode: str = "normal",
-        database: Optional[SessionDB] = None,
+        database: Optional[UserMemoryDB] = None,
     ) -> Dict[str, Any]:
         requested_recall_mode = str(recall_mode or "normal").strip().lower()
         started_at = time.monotonic()
@@ -6364,7 +6442,7 @@ class MemoryNodeManager:
         temporal_bounds: RecallTimeBounds,
         temporal_mode: str,
         candidate_limits: Dict[str, int],
-        database: Optional[SessionDB] = None,
+        database: Optional[UserMemoryDB] = None,
     ) -> List[Dict[str, Any]]:
         """Retrieve Stage 1 direct seeds for permitted object types.
 
@@ -6395,7 +6473,7 @@ class MemoryNodeManager:
         candidate_limits: Dict[str, int],
         candidate_source: str,
         prospective_query_profile: Optional[Dict[str, Any]] = None,
-        database: Optional[SessionDB] = None,
+        database: Optional[UserMemoryDB] = None,
     ) -> List[Dict[str, Any]]:
         """Retrieve direct seeds from the shared document projection.
 
@@ -6731,7 +6809,7 @@ class MemoryNodeManager:
         reference_time: str,
         temporal_mode: str = "dialogue_time",
         prompt_language: str = "zh",
-        database: Optional[SessionDB] = None,
+        database: Optional[UserMemoryDB] = None,
     ) -> Dict[str, Any]:
         """Run a deterministic, no-LLM recall path for high-confidence hits.
 
@@ -7081,7 +7159,7 @@ class MemoryNodeManager:
         *,
         seed_candidates: Sequence[Dict[str, Any]],
         candidate_source_prefix: str = "stage1",
-        database: Optional[SessionDB] = None,
+        database: Optional[UserMemoryDB] = None,
     ) -> List[Dict[str, Any]]:
         """Retrieve all fact associations for accepted direct candidates.
 
@@ -7102,7 +7180,7 @@ class MemoryNodeManager:
         *,
         direct_candidates: Sequence[Dict[str, Any]],
         candidate_source_prefix: str,
-        database: SessionDB,
+        database: UserMemoryDB,
     ) -> List[Dict[str, Any]]:
         """Expand claim/prospective candidates to their mapped fact evidence."""
         claim_candidates = [
@@ -7907,7 +7985,7 @@ class MemoryNodeManager:
         self,
         *,
         query: str,
-        database: Optional[SessionDB] = None,
+        database: Optional[UserMemoryDB] = None,
     ) -> List[str]:
         """Resolve entity anchors explicitly present in the query."""
         db = database or self._db
@@ -8404,7 +8482,7 @@ class MemoryNodeManager:
         temporal_bounds: RecallTimeBounds,
         temporal_mode: str,
         seed_channel_limits: Dict[str, Dict[str, int]],
-        database: Optional[SessionDB] = None,
+        database: Optional[UserMemoryDB] = None,
     ) -> List[Dict[str, Any]]:
         """Retrieve and deduplicate all direct Stage 2 seed channels.
 
@@ -8462,7 +8540,7 @@ class MemoryNodeManager:
         temporal_mode: str,
         candidate_limits: Dict[str, int],
         candidate_source: str,
-        database: Optional[SessionDB] = None,
+        database: Optional[UserMemoryDB] = None,
     ) -> List[Dict[str, Any]]:
         """Retrieve full-corpus embedding seeds from recall documents.
 
@@ -8595,7 +8673,7 @@ class MemoryNodeManager:
         temporal_mode: str = "dialogue_time",
         stage1_report: Optional[Dict[str, Any]] = None,
         prompt_language: str = "zh",
-        database: Optional[SessionDB] = None,
+        database: Optional[UserMemoryDB] = None,
     ) -> str:
         """Run the existing LLM and semantic-search recall pipeline.
 
@@ -8809,7 +8887,7 @@ class MemoryNodeManager:
         temporal_bounds: RecallTimeBounds,
         temporal_mode: str,
         per_type_limit: int,
-        database: SessionDB,
+        database: UserMemoryDB,
     ) -> List[Dict[str, Any]]:
         """Build and normalize candidates from one recall-document result set."""
         rows = list(rows or [])
@@ -8839,7 +8917,7 @@ class MemoryNodeManager:
         temporal_bounds: RecallTimeBounds,
         temporal_mode: str = "dialogue_time",
         entity_names_by_id: Optional[Dict[int, str]] = None,
-        database: Optional[SessionDB] = None,
+        database: Optional[UserMemoryDB] = None,
     ) -> Optional[Dict[str, Any]]:
         """Convert a hydrated recall object into the shared candidate shape."""
         object_type = str(

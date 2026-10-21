@@ -48,10 +48,10 @@ class UserProactiveService:
 
     @classmethod
     def _active_user_states(
-        cls, *, user_entity_id: int, as_of: datetime, model_db: UserModelDB,
+        cls, *, as_of: datetime, model_db: UserModelDB,
     ) -> List[Dict[str, Any]]:
         states = model_db.get_user_states(
-            user_entity_id=user_entity_id, statuses=["active"], limit=500,
+            statuses=["active"], limit=500,
         )
         active = []
         for state in states:
@@ -119,7 +119,7 @@ class UserProactiveService:
         for prediction in predictions:
             user_id = int(prediction["user_entity_id"])
             current_states = self._active_user_states(
-                user_entity_id=user_id, as_of=now, model_db=self._model_db,
+                as_of=now, model_db=self._model_db,
             )
             context_snapshot = {
                 "evaluated_at": now.isoformat(),

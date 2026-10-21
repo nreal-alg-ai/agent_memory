@@ -68,7 +68,7 @@ class TaskExecutionDB:
             ("user_claim_signal_consolidation_task_info", "signal_ids"),
             ("user_intent_signal_consolidation_task_info", "signal_ids"),
             ("user_action_signal_consolidation_task_info", "signal_ids"),
-            ("user_claim_consolidation_task_info", "claim_ids"),
+            ("user_claim_consolidation_task_info", "relation_event_refs"),
         ):
             exists = self._conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
@@ -143,6 +143,7 @@ class TaskExecutionDB:
                 batch_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 source_task_id TEXT NOT NULL UNIQUE,
                 claim_ids TEXT NOT NULL DEFAULT '[]',
+                relation_event_refs TEXT NOT NULL DEFAULT '[]',
                 pending_user_state_claim_ids TEXT NOT NULL DEFAULT '[]',
                 processed_user_state INTEGER NOT NULL DEFAULT 0,
                 reference_timestamp TEXT NOT NULL DEFAULT '',
@@ -174,7 +175,7 @@ class TaskExecutionDB:
         self._conn.close()
 
     @_locked
-    def record_submission(self, task_id: str, task_kind: str) -> None:
+    def record_task_submission_info(self, task_id: str, task_kind: str) -> None:
         self._conn.execute(
             """INSERT INTO task_execution_records
                (run_id, task_id, task_kind, status, submitted_at)
@@ -184,7 +185,7 @@ class TaskExecutionDB:
         self._conn.commit()
 
     @_locked
-    def record_completion(
+    def record_task_completion_info(
         self, task_id: str, *, status: str, result: Any,
     ) -> None:
         try:
@@ -451,12 +452,24 @@ class TaskExecutionDB:
         self,
         claim_ids: Sequence[int],
         *,
+        claim_relations: Sequence[Dict[str, Any]] = (),
         reference_timestamp: Any = None,
         source_task_id: str = "",
     ) -> int:
         ids = sorted(_ids(claim_ids))
         if not ids:
             return 0
+        selected_ids = set(ids)
+        if any(
+            int(relation.get("new_claim_id") or 0) not in selected_ids
+            or int(relation.get("relation_event_id") or 0) <= 0
+            for relation in claim_relations
+        ):
+            raise ValueError("Claim relation references must belong to the selected claims")
+        relation_refs = sorted({
+            (int(relation["new_claim_id"]), int(relation["relation_event_id"]))
+            for relation in claim_relations
+        })
         source = self._source_reference(source_task_id or uuid.uuid4().hex)
         now = _now()
         with self._conn:
@@ -469,23 +482,28 @@ class TaskExecutionDB:
             values = json.dumps(ids)
             self._conn.execute(
                 """INSERT INTO user_claim_consolidation_task_info
-                   (source_task_id, claim_ids, pending_user_state_claim_ids,
+                   (source_task_id, claim_ids, relation_event_refs,
+                    pending_user_state_claim_ids,
                     reference_timestamp, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                (source, values, values, str(reference_timestamp or ""), now, now),
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (source, values, json.dumps(relation_refs), values,
+                 str(reference_timestamp or ""), now, now),
             )
         return len(ids)
 
     @_locked
     def get_pending_user_state_claims(self, *, limit: int = 80) -> Dict[str, Any]:
         by_claim: Dict[int, Dict[str, Any]] = {}
+        relation_refs: set[Tuple[int, int]] = set()
         for row in self._conn.execute(
-            """SELECT batch_id, pending_user_state_claim_ids, reference_timestamp,
+            """SELECT batch_id, pending_user_state_claim_ids, relation_event_refs,
+                      reference_timestamp,
                       created_at
                FROM user_claim_consolidation_task_info
                WHERE processed_user_state=0 ORDER BY batch_id"""
         ):
-            for claim_id in _ids(row["pending_user_state_claim_ids"]):
+            pending_ids = set(_ids(row["pending_user_state_claim_ids"]))
+            for claim_id in pending_ids:
                 item = by_claim.setdefault(claim_id, {
                     "claim_id": claim_id,
                     "generation": int(row["batch_id"]),
@@ -496,13 +514,25 @@ class TaskExecutionDB:
                 item["generation"] = int(row["batch_id"])
                 item["last_detected_at"] = str(row["created_at"])
                 item["reference_timestamp"] = str(row["reference_timestamp"] or "")
+            relation_refs.update(
+                (int(claim_id), int(event_id))
+                for claim_id, event_id in json.loads(row["relation_event_refs"] or "[]")
+                if int(claim_id) in pending_ids
+            )
         ordered = sorted(
             by_claim.values(), key=lambda item: (item["first_detected_at"], item["claim_id"]),
         )
+        selected = ordered[:max(1, int(limit or 80))]
+        selected_ids = {int(item["claim_id"]) for item in selected}
         return {
             "pending_count": len(ordered),
             "first_detected_at": ordered[0]["first_detected_at"] if ordered else "",
-            "items": ordered[:max(1, int(limit or 80))],
+            "items": selected,
+            "claim_relations": [
+                {"new_claim_id": claim_id, "relation_event_id": event_id}
+                for claim_id, event_id in sorted(relation_refs)
+                if claim_id in selected_ids
+            ],
         }
 
     @_locked

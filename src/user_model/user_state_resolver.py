@@ -25,7 +25,7 @@ from prompts_zh import (
 )
 
 if TYPE_CHECKING:
-    from memory.memory_database import SessionDB
+    from memory.memory_database import UserMemoryDB
     from llm_client import LLMClient
     from task_scheduler import TaskScheduler
     from .user_model_database import UserModelDB
@@ -83,12 +83,14 @@ class UserStateResolver:
     }
     EVIDENCE_ROLES = {"support", "change_trigger", "counterexample", "context"}
 
-    TASK_KIND = "memory_user_state_update"
+    CLAIM_STATE_TASK_KIND = "memory_user_claim_state_update"
+    ACTIVITY_STATE_TASK_KIND = "memory_user_activity_state_update"
+    OBSERVED_PATTERN_STATE_TASK_KIND = "memory_user_observed_pattern_state_update"
 
     def __init__(
         self,
         *,
-        db: "SessionDB",
+        memory_db: "UserMemoryDB",
         model_db: "UserModelDB",
         task_scheduler: TaskScheduler,
         llm_client: "LLMClient",
@@ -96,8 +98,8 @@ class UserStateResolver:
         world_owner_entity_name: str = "用户本人",
         logger: Optional[logging.Logger] = None,
     ) -> None:
-        self._db = db
-        self._model_db = model_db
+        self._user_memory_db = memory_db
+        self._user_model_db = model_db
         self._llm_client = llm_client
         self._world_owner_entity_name = str(world_owner_entity_name or "用户本人").strip()
         self._logger = logger or logging.getLogger(__name__)
@@ -110,68 +112,43 @@ class UserStateResolver:
             config.get("prompt_language_mode")
             or "source"
         ).strip().lower()
-        task_scheduler.register_handler(self.TASK_KIND, self.process_update_task)
+        task_scheduler.register_handler(
+            self.CLAIM_STATE_TASK_KIND,
+            self.process_user_claim_state_update_task,
+        )
+        task_scheduler.register_handler(
+            self.ACTIVITY_STATE_TASK_KIND,
+            self.process_user_activity_state_update_task,
+        )
+        task_scheduler.register_handler(
+            self.OBSERVED_PATTERN_STATE_TASK_KIND,
+            self.process_user_observed_pattern_state_update_task,
+        )
 
     def set_logger(self, logger: Optional[logging.Logger]) -> None:
         self._logger = logger or logging.getLogger(__name__)
 
-    def process_update_task(
+    def process_user_activity_state_update_task(
         self,
         *,
-        changed_claim_ids: Optional[Sequence[int]] = None,
         changed_user_activity_ids: Optional[Sequence[int]] = None,
-        changed_observed_pattern_ids: Optional[Sequence[int]] = None,
-        affected_observed_pattern_ids: Optional[Sequence[int]] = None,
-        trigger_user_action_signal_ids: Optional[Sequence[int]] = None,
         reference_timestamp: Optional[Any] = None,
         runtime_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Build, prompt for, validate, and persist incremental state updates."""
-        reports: List[Dict[str, Any]] = []
-        activity_ids = list(changed_user_activity_ids or [])
-        if changed_claim_ids:
-            reports.append(self._process_user_claim_state_updates(
-                changed_claim_ids=changed_claim_ids,
-                reference_time=reference_timestamp,
-            ))
-        if activity_ids:
-            reports.append(
-                self._process_user_activity_situational_state_updates(
-                    activity_ids,
-                    reference_time=reference_timestamp,
-                    runtime_context=runtime_context or {},
-                )
-            )
-        if changed_observed_pattern_ids or affected_observed_pattern_ids:
-            reports.append(self._process_observed_pattern_state_updates(
-                changed_pattern_ids=changed_observed_pattern_ids or [],
-                affected_pattern_ids=affected_observed_pattern_ids or [],
-                trigger_signal_ids=trigger_user_action_signal_ids or [],
-                reference_time=reference_timestamp,
-            ))
-        report: Optional[Dict[str, Any]] = None
-        for item in reports:
-            report = self._combine_update_reports(report, item)
-        result = report or {
-            "status": "empty", "operation_count": 0, "state_ids": [],
-        }
-        self._log_update(result)
-        return result
-
-    def _process_user_activity_situational_state_updates(
-        self,
-        activity_ids: Sequence[int],
-        *,
-        reference_time: Optional[Any],
-        runtime_context: Optional[Mapping[str, Any]] = None,
-    ) -> Dict[str, Any]:
         """Update situational states from a new activity window and linked evidence."""
-        owner_id = int(self._db.add_entity_names([self._world_owner_entity_name])[
+        activity_ids = list(changed_user_activity_ids or [])
+        reference_time = reference_timestamp
+        owner_id = int(self._user_memory_db.add_entity_names([self._world_owner_entity_name])[
             self._world_owner_entity_name
         ])
-        activities = self._db.get_user_activity_items_by_ids(activity_ids)
+        activities = self._user_memory_db.get_user_activity_items_by_ids(activity_ids)
         if not activities:
-            return {"status": "empty", "activity_count": 0, "operation_count": 0, "state_ids": []}
+            result = {
+                "status": "empty", "activity_count": 0,
+                "operation_count": 0, "state_ids": [],
+            }
+            self._log_update(result, task_kind=self.ACTIVITY_STATE_TASK_KIND)
+            return result
         activity_timestamps = [
             str(item.get("ended_at") or item.get("started_at") or "").strip()
             for item in activities
@@ -187,7 +164,7 @@ class UserStateResolver:
             for fact_id in activity.get("evidence_fact_ids") or []
             if self._positive_int(fact_id)
         })
-        facts = self._db.get_memory_facts_by_ids(fact_ids) if fact_ids else []
+        facts = self._user_memory_db.get_memory_facts_by_ids(fact_ids) if fact_ids else []
         facts_by_id = {int(item["id"]): item for item in facts}
         activity_fact_ids = {
             int(activity["id"]): [
@@ -207,7 +184,7 @@ class UserStateResolver:
             "work_item": "responsible_entity_id",
         }
         for object_type, active_statuses in self.ACTIVE_INTENT_STATUSES.items():
-            items = self._db.get_intent_objects(
+            items = self._user_memory_db.get_intent_objects(
                 object_type=object_type,
                 world_owner_entity_id=owner_id,
                 statuses=sorted(active_statuses),
@@ -217,7 +194,7 @@ class UserStateResolver:
                 item for item in items
                 if int(item.get(intent_owner_columns[object_type]) or 0) == owner_id
             ]
-            evidence_by_object = self._db.get_intent_evidence_fact_ids(
+            evidence_by_object = self._user_memory_db.get_intent_evidence_fact_ids(
                 [(object_type, int(item["id"])) for item in owned_items],
                 limit=max(120, self._update_limit * 4),
             )
@@ -233,8 +210,7 @@ class UserStateResolver:
                 ]
                 related_intents.append(view)
 
-        existing_states = self._model_db.get_user_states(
-            user_entity_id=owner_id,
+        existing_states = self._user_model_db.get_user_states(
             state_types=["situational_state"],
             statuses=["active", "weakened"],
             limit=max(40, self._update_limit * 2),
@@ -305,6 +281,7 @@ class UserStateResolver:
         }
         if not isinstance(parsed, Mapping) or not isinstance(parsed.get("operations"), list):
             report.update({"status": "error", "error": "invalid_llm_activity_state_response"})
+            self._log_update(report, task_kind=self.ACTIVITY_STATE_TASK_KIND)
             return report
 
         existing_by_id = {int(item["id"]): item for item in existing_states}
@@ -338,8 +315,7 @@ class UserStateResolver:
             )
             if normalized is None:
                 continue
-            if normalized["operation"] == "create" and self._model_db.user_state_identity_exists(
-                user_entity_id=owner_id,
+            if normalized["operation"] == "create" and self._user_model_db.user_state_identity_exists(
                 state_domain=normalized["state_domain"],
                 state_type=normalized["state_type"],
                 state_kind=normalized["state_kind"],
@@ -364,37 +340,45 @@ class UserStateResolver:
 
         if not operations:
             report["status"] = "ok"
+            self._log_update(report, task_kind=self.ACTIVITY_STATE_TASK_KIND)
             return report
-        with self._model_db.transaction():
+        with self._user_model_db.transaction():
             applied = self.apply_operations(
-                user_entity_id=owner_id,
                 operations=operations,
                 reference_time=update_input["reference_time"],
                 decision_source="user_activity_situational_state_v1",
             )
         report.update(applied)
         report["status"] = "ok"
+        self._log_update(report, task_kind=self.ACTIVITY_STATE_TASK_KIND)
         return report
 
-    def _process_observed_pattern_state_updates(
-        self, *, changed_pattern_ids: Sequence[int],
-        affected_pattern_ids: Sequence[int], trigger_signal_ids: Sequence[int],
-        reference_time: Optional[Any],
+    def process_user_observed_pattern_state_update_task(
+        self,
+        *,
+        changed_observed_pattern_ids: Optional[Sequence[int]] = None,
+        affected_observed_pattern_ids: Optional[Sequence[int]] = None,
+        trigger_user_action_signal_ids: Optional[Sequence[int]] = None,
+        reference_timestamp: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """Project changed observed behavior into recurring states by domain."""
-        owner_id = int(self._db.add_entity_names([self._world_owner_entity_name])[
+        changed_pattern_ids = list(changed_observed_pattern_ids or [])
+        affected_pattern_ids = list(affected_observed_pattern_ids or [])
+        trigger_signal_ids = list(trigger_user_action_signal_ids or [])
+        reference_time = reference_timestamp
+        owner_id = int(self._user_memory_db.add_entity_names([self._world_owner_entity_name])[
             self._world_owner_entity_name
         ])
         changed_ids = {int(value) for value in changed_pattern_ids if int(value) > 0}
         affected_ids = {int(value) for value in affected_pattern_ids if int(value) > 0}
         trigger_ids = {int(value) for value in trigger_signal_ids if int(value) > 0}
-        patterns = self._db.get_user_observed_patterns_by_ids(changed_ids | affected_ids)
+        patterns = self._user_memory_db.get_user_observed_patterns_by_ids(changed_ids | affected_ids)
         patterns = [
             item for item in patterns
             if int(item.get("subject_entity_id") or 0) == owner_id
             and self._normalize_state_domain(item.get("primary_domain"))
         ]
-        events = self._db.get_user_observed_pattern_events_for_signal_ids(trigger_ids)
+        events = self._user_memory_db.get_user_observed_pattern_events_for_signal_ids(trigger_ids)
         pattern_by_id = {int(item["id"]): item for item in patterns}
         events = [
             item for item in events
@@ -410,13 +394,13 @@ class UserStateResolver:
         }
         signal_by_id = {
             int(item["signal_id"]): item
-            for item in self._db.get_user_action_signals_by_ids(
+            for item in self._user_memory_db.get_user_action_signals_by_ids(
                 representative_ids | trigger_ids
             )
         }
         fact_by_id = {
             int(item["id"]): item
-            for item in self._db.get_memory_facts_by_ids([
+            for item in self._user_memory_db.get_memory_facts_by_ids([
                 int(item["fact_id"]) for item in signal_by_id.values()
             ])
         }
@@ -483,8 +467,8 @@ class UserStateResolver:
                 and any(signal_id in (item.get("support_signal_ids") or [])
                         for item in domain_patterns.values())
             })
-            existing_states = self._model_db.get_user_states(
-                user_entity_id=owner_id, state_domains=[domain],
+            existing_states = self._user_model_db.get_user_states(
+                state_domains=[domain],
                 state_types=["recurring_state"], statuses=["active", "weakened"],
                 limit=self._update_limit + 1,
             )
@@ -494,7 +478,7 @@ class UserStateResolver:
                     "status": "error", "error": "observed_pattern_state_input_limit_exceeded",
                 }
                 continue
-            state_evidence = self._model_db.get_user_state_evidence(
+            state_evidence = self._user_model_db.get_user_state_evidence(
                 [int(item["id"]) for item in existing_states],
                 limit=max(480, self._update_limit * 12),
             )
@@ -504,7 +488,7 @@ class UserStateResolver:
             }
             claim_by_id = {
                 int(item["id"]): item
-                for item in self._db.get_user_claims_by_ids(sorted(claim_ids))
+                for item in self._user_memory_db.get_user_claims_by_ids(sorted(claim_ids))
             }
             supporting_claims = [
                 self._claim_prompt_view(item, []) for item in claim_by_id.values()
@@ -658,8 +642,8 @@ class UserStateResolver:
                     )
                 ):
                     continue
-                if action == "create" and self._model_db.user_state_identity_exists(
-                    user_entity_id=owner_id, state_domain=domain,
+                if action == "create" and self._user_model_db.user_state_identity_exists(
+                    state_domain=domain,
                     state_type="recurring_state",
                     state_kind=normalized["state_kind"],
                     state_topic=normalized["state_topic"],
@@ -675,9 +659,9 @@ class UserStateResolver:
                 seen_targets.add(target)
                 operations.append(normalized)
             if operations:
-                with self._model_db.transaction():
+                with self._user_model_db.transaction():
                     applied = self.apply_operations(
-                        user_entity_id=owner_id, operations=operations,
+                        operations=operations,
                         reference_time=update_input["reference_time"],
                         decision_source="user_observed_pattern_state_v1",
                     )
@@ -694,48 +678,8 @@ class UserStateResolver:
             "error" if failed == len(domains) and domains
             else "partial" if failed else "ok" if domains else "empty"
         )
+        self._log_update(report, task_kind=self.OBSERVED_PATTERN_STATE_TASK_KIND)
         return report
-
-    @staticmethod
-    def _combine_update_reports(
-        primary: Optional[Dict[str, Any]],
-        secondary: Optional[Dict[str, Any]],
-    ) -> Optional[Dict[str, Any]]:
-        if primary is None:
-            return dict(secondary) if secondary is not None else None
-        if secondary is None:
-            return primary
-        combined = dict(primary)
-        count_keys = {
-            "domain_count", "changed_claim_count", "changed_intent_object_count",
-            "existing_state_count", "operation_count", "created", "reinforced",
-            "revised", "weakened", "expired", "activity_count", "linked_fact_count",
-            "related_intent_count", "claim_status_update_count",
-            "changed_pattern_count", "affected_pattern_count",
-        }
-        for key in count_keys:
-            if key in primary or key in secondary:
-                combined[key] = int(primary.get(key) or 0) + int(secondary.get(key) or 0)
-        combined["state_ids"] = sorted(set(
-            list(primary.get("state_ids") or []) + list(secondary.get("state_ids") or [])
-        ))
-        domain_reports = dict(primary.get("domain_reports") or {})
-        for key, value in (secondary.get("domain_reports") or {}).items():
-            domain_reports[f"activity:{key}"] = value
-        if domain_reports:
-            combined["domain_reports"] = domain_reports
-        statuses = {str(primary.get("status") or ""), str(secondary.get("status") or "")}
-        if "error" in statuses:
-            combined["status"] = "partial" if "ok" in statuses else "error"
-        elif "partial" in statuses:
-            combined["status"] = "partial"
-        elif "ok" in statuses:
-            combined["status"] = "ok"
-        else:
-            combined["status"] = "empty"
-        if secondary.get("error"):
-            combined["activity_error"] = secondary["error"]
-        return combined
 
     def _resolve_prompt_language(self, text: str) -> str:
         if self._prompt_language_mode in {"en", "english", "force_en"}:
@@ -746,22 +690,41 @@ class UserStateResolver:
             return "zh"
         return "zh"
 
-    def _log_update(self, payload: Dict[str, Any]) -> None:
-        record = {"scope": "memory_user_state", "event": "finish", "payload": payload}
+    def _log_update(self, payload: Dict[str, Any], *, task_kind: str) -> None:
+        record = {"scope": task_kind, "event": "finish", "payload": payload}
         self._logger.info(
             "\n%s",
             json.dumps(record, ensure_ascii=False, sort_keys=False, indent=2, default=str),
         )
 
     def _build_user_claim_update_inputs(
-        self, *, user_entity_id: int, changed_claim_ids: Sequence[int],
+        self, *, world_owner_entity_id: int, new_claim_ids: Sequence[int],
+        claim_relations: Sequence[Mapping[str, Any]],
         reference_time: Optional[Any],
     ) -> Dict[str, Dict[str, Any]]:
         changed = [
-            claim for claim in self._db.get_user_claims_by_ids(changed_claim_ids)
-            if int(claim.get("subject_entity_id") or 0) == user_entity_id
+            claim for claim in self._user_memory_db.get_user_claims_by_ids(new_claim_ids)
+            if int(claim.get("subject_entity_id") or 0) == world_owner_entity_id
             and self._normalize_state_domain(claim.get("primary_domain"))
         ]
+        relation_refs = {
+            (int(item["new_claim_id"]), int(item["relation_event_id"]))
+            for item in claim_relations
+        }
+        new_claim_id_set = {int(claim_id) for claim_id in new_claim_ids}
+        if any(claim_id not in new_claim_id_set or event_id <= 0
+               for claim_id, event_id in relation_refs):
+            raise ValueError("Claim relation reference does not belong to this update")
+        event_ids = sorted({event_id for _, event_id in relation_refs})
+        relation_events = self._user_memory_db.get_user_claim_relation_events_by_ids(
+            event_ids,
+        )
+        loaded_refs = {
+            (int(event["trigger_claim_id"]), int(event["id"]))
+            for event in relation_events
+        }
+        if loaded_refs != relation_refs:
+            raise ValueError("Claim relation event is missing or mismatched")
         by_domain: Dict[str, List[Dict[str, Any]]] = {}
         for claim in changed:
             by_domain.setdefault(str(claim["primary_domain"]), []).append(claim)
@@ -769,25 +732,25 @@ class UserStateResolver:
         for domain, domain_claims in by_domain.items():
             changed_ids = {int(claim["id"]) for claim in domain_claims}
             relation_limit = max(400, self._update_limit * 8)
-            relations = self._db.get_user_claim_relations_for_claim_ids(
-                sorted(changed_ids), limit=relation_limit + 1,
-            )
+            relations = [
+                event for event in relation_events
+                if int(event["trigger_claim_id"]) in changed_ids
+            ]
             related_ids = {
                 int(event[key])
                 for event in relations
                 for key in ("target_claim_id", "trigger_claim_id")
             } - changed_ids
-            linked_state_ids = self._model_db.get_user_state_ids_for_claim_ids(
+            linked_state_ids = self._user_model_db.get_user_state_ids_for_claim_ids(
                 sorted(changed_ids | related_ids), limit=self._update_limit + 1,
             )
             linked_states = [
-                state for state in self._model_db.get_user_states_by_ids(linked_state_ids)
-                if int(state.get("user_entity_id") or 0) == user_entity_id
-                and state.get("state_domain") == domain
+                state for state in self._user_model_db.get_user_states_by_ids(linked_state_ids)
+                if state.get("state_domain") == domain
                 and state.get("status") in {"active", "weakened"}
             ]
-            domain_states = self._model_db.get_user_states(
-                user_entity_id=user_entity_id, state_domains=[domain],
+            domain_states = self._user_model_db.get_user_states(
+                state_domains=[domain],
                 statuses=["active", "weakened"], limit=self._update_limit + 1,
             )
             states_by_id = {
@@ -796,18 +759,18 @@ class UserStateResolver:
             }
             states = list(states_by_id.values())[:self._update_limit]
             state_evidence_limit = max(480, self._update_limit * 12)
-            state_evidence = self._model_db.get_user_state_claim_evidence(
+            state_evidence = self._user_model_db.get_user_state_claim_evidence(
                 [int(state["id"]) for state in states],
                 limit=state_evidence_limit + 1,
             )
             pattern_evidence = [
-                item for item in self._model_db.get_user_state_evidence(
+                item for item in self._user_model_db.get_user_state_evidence(
                     [int(state["id"]) for state in states],
                     limit=state_evidence_limit + 1,
                 )
                 if item["evidence_type"] == "user_observed_pattern"
             ]
-            supporting_patterns = self._db.get_user_observed_patterns_by_ids(
+            supporting_patterns = self._user_memory_db.get_user_observed_patterns_by_ids(
                 [int(item["evidence_id"]) for item in pattern_evidence]
             )
             supporting_ids = {
@@ -816,18 +779,91 @@ class UserStateResolver:
             all_ids = changed_ids | related_ids | supporting_ids
             claims_by_id = {
                 int(claim["id"]): claim
-                for claim in self._db.get_user_claims_by_ids(sorted(all_ids))
-                if int(claim.get("subject_entity_id") or 0) == user_entity_id
+                for claim in self._user_memory_db.get_user_claims_by_ids(sorted(all_ids))
+                if int(claim.get("subject_entity_id") or 0) == world_owner_entity_id
             }
-            fact_evidence = self._db.get_user_claim_evidence_fact_ids(
+            fact_evidence = self._user_memory_db.get_user_claim_evidence_fact_ids(
                 sorted(claims_by_id), limit=max(480, self._update_limit * 12),
             )
-            def claim_view(claim_id: int) -> Dict[str, Any]:
-                return self._claim_prompt_view(
-                    claims_by_id[claim_id], fact_evidence.get(claim_id, []),
-                )
+            claim_views_by_id = {
+                claim_id: self._claim_prompt_view(claim, fact_evidence.get(claim_id, []))
+                for claim_id, claim in claims_by_id.items()
+            }
+            relations_by_trigger: Dict[int, List[Dict[str, Any]]] = {}
+            for event in relations:
+                trigger_id = int(event["trigger_claim_id"])
+                target_id = int(event["target_claim_id"])
+                if trigger_id not in claim_views_by_id or target_id not in claim_views_by_id:
+                    continue
+                relations_by_trigger.setdefault(trigger_id, []).append({
+                    "relation_event": {
+                        "id": int(event["id"]),
+                        "target_claim_id": target_id,
+                        "trigger_claim_id": trigger_id,
+                        "semantic_relation": str(event.get("semantic_relation") or ""),
+                        "semantic_confidence": event.get("semantic_confidence"),
+                        "effective_at": str(event.get("effective_at") or ""),
+                        "semantic_reason": str(event.get("semantic_reason") or ""),
+                    },
+                    "existing_claim": claim_views_by_id[target_id],
+                })
+            patterns_by_id = {
+                int(pattern["id"]): {
+                    "id": int(pattern["id"]),
+                    "pattern_text": str(pattern.get("pattern_text") or ""),
+                    "condition_text": str(pattern.get("condition_text") or ""),
+                    "confidence": float(pattern.get("confidence") or 0.0),
+                }
+                for pattern in supporting_patterns
+            }
+            state_claim_evidence_by_id: Dict[int, List[Dict[str, Any]]] = {}
+            for evidence in state_evidence:
+                claim = claim_views_by_id.get(int(evidence["evidence_id"]))
+                if claim is None:
+                    continue
+                state_claim_evidence_by_id.setdefault(int(evidence["state_id"]), []).append({
+                    "claim": claim,
+                    "role": str(evidence.get("role") or ""),
+                    "weight": float(evidence.get("weight") or 0.0),
+                })
+            state_pattern_evidence_by_id: Dict[int, List[Dict[str, Any]]] = {}
+            for evidence in pattern_evidence:
+                pattern_id = int(evidence["evidence_id"])
+                state_pattern_evidence_by_id.setdefault(int(evidence["state_id"]), []).append({
+                    "pattern_id": pattern_id,
+                    "pattern": patterns_by_id.get(pattern_id),
+                    "role": str(evidence.get("role") or ""),
+                })
+            state_contexts = [
+                {
+                    "state": self._state_prompt_view(state),
+                    "claim_evidence": state_claim_evidence_by_id.get(int(state["id"]), []),
+                    "pattern_evidence": state_pattern_evidence_by_id.get(int(state["id"]), []),
+                }
+                for state in states
+            ]
+            new_claim_cases = []
+            for claim_id in sorted(changed_ids):
+                new_claim = claim_views_by_id.get(claim_id)
+                if new_claim is None:
+                    continue
+                related = relations_by_trigger.get(claim_id, [])
+                case_claim_ids = {claim_id} | {
+                    int(item["existing_claim"]["id"]) for item in related
+                }
+                new_claim_cases.append({
+                    "new_claim": new_claim,
+                    "related_claims": related,
+                    "relevant_state_ids": [
+                        int(context["state"]["id"])
+                        for context in state_contexts
+                        if any(
+                            int(evidence["claim"]["id"]) in case_claim_ids
+                            for evidence in context["claim_evidence"]
+                        )
+                    ],
+                })
             result[domain] = {
-                "user_entity_id": user_entity_id,
                 "input_truncated": (
                     len(relations) > relation_limit
                     or len(linked_state_ids) > self._update_limit
@@ -836,56 +872,8 @@ class UserStateResolver:
                 ),
                 "state_domain": domain,
                 "reference_time": self._timestamp_text(reference_time),
-                "changed_claims": [
-                    claim_view(claim_id) for claim_id in sorted(changed_ids)
-                    if claim_id in claims_by_id
-                ],
-                "related_claims": [
-                    claim_view(claim_id) for claim_id in sorted(related_ids)
-                    if claim_id in claims_by_id
-                ],
-                "supporting_claims": [
-                    claim_view(claim_id) for claim_id in sorted(supporting_ids)
-                    if claim_id in claims_by_id
-                ],
-                "relation_events": [
-                    {
-                        "id": int(event["id"]),
-                        "target_claim_id": int(event["target_claim_id"]),
-                        "trigger_claim_id": int(event["trigger_claim_id"]),
-                        "semantic_relation": str(event.get("semantic_relation") or ""),
-                        "semantic_confidence": event.get("semantic_confidence"),
-                        "effective_at": str(event.get("effective_at") or ""),
-                        "semantic_reason": str(event.get("semantic_reason") or ""),
-                    }
-                    for event in relations
-                    if int(event["target_claim_id"]) in claims_by_id
-                    and int(event["trigger_claim_id"]) in claims_by_id
-                ],
-                "existing_states": [self._state_prompt_view(state) for state in states],
-                "state_claim_evidence": [
-                    {
-                        "state_id": int(item["state_id"]),
-                        "claim_id": int(item["evidence_id"]),
-                        "role": str(item.get("role") or ""),
-                        "weight": float(item.get("weight") or 0.0),
-                    }
-                    for item in state_evidence
-                    if int(item["evidence_id"]) in claims_by_id
-                ],
-                "state_pattern_evidence": [
-                    {"state_id": int(item["state_id"]),
-                     "pattern_id": int(item["evidence_id"]),
-                     "role": str(item.get("role") or "")}
-                    for item in pattern_evidence
-                ],
-                "supporting_patterns": [
-                    {"id": int(item["id"]),
-                     "pattern_text": str(item.get("pattern_text") or ""),
-                     "condition_text": str(item.get("condition_text") or ""),
-                     "confidence": float(item.get("confidence") or 0.0)}
-                    for item in supporting_patterns
-                ],
+                "new_claim_cases": new_claim_cases,
+                "state_contexts": state_contexts,
             }
         return result
 
@@ -898,13 +886,32 @@ class UserStateResolver:
             return None
         if len(raw_updates) > 24 or len(raw_operations) > 24:
             return None
-        changed_ids = {int(item["id"]) for item in update_input["changed_claims"]}
-        related_by_id = {
-            int(item["id"]): item for item in update_input["related_claims"]
-        }
-        events_by_id = {
-            int(item["id"]): item for item in update_input["relation_events"]
-        }
+        changed_ids: set[int] = set()
+        related_by_id: Dict[int, Dict[str, Any]] = {}
+        events_by_id: Dict[int, Dict[str, Any]] = {}
+        claims: Dict[int, Dict[str, Any]] = {}
+        for case in update_input["new_claim_cases"]:
+            new_claim = case["new_claim"]
+            claim_id = int(new_claim["id"])
+            changed_ids.add(claim_id)
+            claims[claim_id] = new_claim
+            for relation in case["related_claims"]:
+                old_claim = relation["existing_claim"]
+                event = relation["relation_event"]
+                old_claim_id = int(old_claim["id"])
+                related_by_id[old_claim_id] = old_claim
+                claims[old_claim_id] = old_claim
+                events_by_id[int(event["id"])] = event
+        existing_states = {}
+        state_contexts_by_id = {}
+        for context in update_input["state_contexts"]:
+            state = context["state"]
+            state_id = int(state["id"])
+            existing_states[state_id] = state
+            state_contexts_by_id[state_id] = context
+            for evidence in context["claim_evidence"]:
+                claim = evidence["claim"]
+                claims[int(claim["id"])] = claim
         claim_updates: List[Dict[str, Any]] = []
         seen_claims: set[int] = set()
         for raw in raw_updates:
@@ -935,19 +942,11 @@ class UserStateResolver:
                 "reason": self._compact(raw.get("reason"))[:300],
             })
 
-        claims = {
-            int(item["id"]): item
-            for field in ("changed_claims", "related_claims", "supporting_claims")
-            for item in update_input[field]
-        }
         projected_status = {claim_id: str(item.get("status") or "") for claim_id, item in claims.items()}
         projected_status.update({
             item["claim_id"]: item["new_status"] for item in claim_updates
         })
         allowed_evidence = {("user_claim", claim_id): item for claim_id, item in claims.items()}
-        existing_states = {
-            int(state["id"]): state for state in update_input["existing_states"]
-        }
         operations: List[Dict[str, Any]] = []
         seen_states: set[tuple[str, ...]] = set()
         for raw in raw_operations:
@@ -964,9 +963,10 @@ class UserStateResolver:
             if (operation["operation"] in {"weaken", "expire"}
                     and operation["state_type"] == "recurring_state"
                     and any(
-                        int(item["state_id"]) == operation["target_state_id"]
-                        and item["role"] in {"support", "change_trigger"}
-                        for item in update_input.get("state_pattern_evidence") or []
+                        item["role"] in {"support", "change_trigger"}
+                        for item in state_contexts_by_id.get(
+                            operation["target_state_id"], {}
+                        ).get("pattern_evidence", [])
                     )):
                 continue
             raw_evidence = raw.get("evidence") if isinstance(raw, Mapping) else None
@@ -1006,8 +1006,7 @@ class UserStateResolver:
                 for state in existing_states.values()
             ):
                 return None
-            if operation["operation"] == "create" and self._model_db.user_state_identity_exists(
-                user_entity_id=int(update_input["user_entity_id"]),
+            if operation["operation"] == "create" and self._user_model_db.user_state_identity_exists(
                 state_domain=str(update_input["state_domain"]),
                 state_type=operation["state_type"],
                 state_kind=operation["state_kind"],
@@ -1017,21 +1016,30 @@ class UserStateResolver:
             operations.append(operation)
         return claim_updates, operations
 
-    def _process_user_claim_state_updates(
-        self, *, changed_claim_ids: Sequence[int], reference_time: Optional[Any],
+    def process_user_claim_state_update_task(
+        self,
+        *,
+        new_claim_ids: Optional[Sequence[int]] = None,
+        claim_relations: Optional[Sequence[Mapping[str, Any]]] = None,
+        reference_timestamp: Optional[Any] = None,
     ) -> Dict[str, Any]:
-        owner_id = int(self._db.add_entity_names([self._world_owner_entity_name])[
+        """Update enduring and recurring states from changed user claims."""
+        new_claim_ids = list(new_claim_ids or [])
+        reference_time = reference_timestamp
+        world_owner_entity_id = int(self._user_memory_db.add_entity_names([self._world_owner_entity_name])[
             self._world_owner_entity_name
         ])
         update_inputs = self._build_user_claim_update_inputs(
-            user_entity_id=owner_id, changed_claim_ids=changed_claim_ids,
+            world_owner_entity_id=world_owner_entity_id,
+            new_claim_ids=new_claim_ids,
+            claim_relations=list(claim_relations or []),
             reference_time=reference_time,
         )
         report: Dict[str, Any] = {
             "status": "empty", "domain_count": len(update_inputs),
-            "changed_claim_count": sum(len(item["changed_claims"]) for item in update_inputs.values()),
+            "changed_claim_count": sum(len(item["new_claim_cases"]) for item in update_inputs.values()),
             "changed_intent_object_count": 0,
-            "existing_state_count": sum(len(item["existing_states"]) for item in update_inputs.values()),
+            "existing_state_count": sum(len(item["state_contexts"]) for item in update_inputs.values()),
             "claim_status_update_count": 0, "operation_count": 0,
             "created": 0, "reinforced": 0, "revised": 0, "weakened": 0,
             "expired": 0, "state_ids": [], "domain_reports": {},
@@ -1044,14 +1052,18 @@ class UserStateResolver:
                     "status": "error", "error": "user_claim_state_input_limit_exceeded",
                 }
                 continue
-            source = "\n".join(item["claim_text"] for item in update_input["changed_claims"])
+            source = "\n".join(
+                case["new_claim"]["claim_text"]
+                for case in update_input["new_claim_cases"]
+            )
             template = (
                 USER_CLAIM_STATE_RESOLUTION_PROMPT_EN
                 if self._resolve_prompt_language(source) == "en"
                 else USER_CLAIM_STATE_RESOLUTION_PROMPT_ZH
             )
             prompt = template
-            for key, value in update_input.items():
+            for key in ("reference_time", "state_domain", "new_claim_cases", "state_contexts"):
+                value = update_input[key]
                 prompt = prompt.replace("{" + key + "}", json.dumps(
                     value, ensure_ascii=False, indent=2,
                 ) if isinstance(value, (dict, list)) else str(value or ""))
@@ -1070,9 +1082,9 @@ class UserStateResolver:
             claim_updates, operations = normalized
             # State is the projection; write it first. If this fails, source
             # claims remain unchanged and the scheduler can retry the batch.
-            with self._model_db.transaction():
+            with self._user_model_db.transaction():
                 applied = self.apply_operations(
-                    user_entity_id=owner_id, operations=operations,
+                    operations=operations,
                     reference_time=update_input["reference_time"],
                     replace_claim_evidence=True,
                     decision_source=self.CLAIM_RESOLVER_VERSION,
@@ -1080,9 +1092,9 @@ class UserStateResolver:
             # Memory and model databases cannot share an SQLite transaction.
             # Claim transitions are idempotent, so an interrupted second write
             # remains retryable through the scheduler's unacknowledged batch.
-            with self._db.transaction():
+            with self._user_memory_db.transaction():
                 changed_status_count = sum(
-                    self._db.apply_user_claim_status_decision(
+                    self._user_memory_db.apply_user_claim_status_decision(
                         claim_id=item["claim_id"], new_status=item["new_status"],
                         trigger_claim_id=item["trigger_claim_id"],
                         relation_event_id=item["relation_event_id"],
@@ -1096,8 +1108,12 @@ class UserStateResolver:
                 report[key] += int(applied.get(key) or 0)
             report["state_ids"].extend(applied["state_ids"])
             report["domain_reports"][domain] = {
-                "status": "ok", "changed_claim_count": len(update_input["changed_claims"]),
-                "related_claim_count": len(update_input["related_claims"]),
+                "status": "ok", "changed_claim_count": len(update_input["new_claim_cases"]),
+                "related_claim_count": len({
+                    int(relation["existing_claim"]["id"])
+                    for case in update_input["new_claim_cases"]
+                    for relation in case["related_claims"]
+                }),
                 "claim_status_update_count": changed_status_count,
                 **applied,
             }
@@ -1108,19 +1124,18 @@ class UserStateResolver:
         )
         if failed_count:
             report["failed_domain_count"] = failed_count
+        self._log_update(report, task_kind=self.CLAIM_STATE_TASK_KIND)
         return report
 
     def apply_operations(
         self,
         *,
-        user_entity_id: int,
         operations: Sequence[Mapping[str, Any]],
         reference_time: Optional[Any] = None,
         replace_claim_evidence: bool = False,
         decision_source: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Persist validated operations and their evidence/event trail."""
-        owner_id = int(user_entity_id)
         effective_at = self._timestamp_text(reference_time)
         report = {
             "operation_count": 0,
@@ -1135,11 +1150,10 @@ class UserStateResolver:
             action = str(operation.get("operation") or "")
             target_id = int(operation.get("target_state_id") or 0)
             previous_claim_evidence = (
-                self._model_db.get_user_state_claim_evidence([target_id])
+                self._user_model_db.get_user_state_claim_evidence([target_id])
                 if replace_claim_evidence and target_id else []
             )
-            state_id, created, previous = self._model_db.upsert_user_state(
-                user_entity_id=owner_id,
+            state_id, created, previous = self._user_model_db.upsert_user_state(
                 target_state_id=target_id or None,
                 state_domain=str(operation["state_domain"]),
                 state_type=str(operation["state_type"]),
@@ -1158,18 +1172,18 @@ class UserStateResolver:
                     "state_domain": str(operation["state_domain"]),
                 },
             )
-            current = self._model_db.get_user_states_by_ids([state_id])[0]
+            current = self._user_model_db.get_user_states_by_ids([state_id])[0]
             evidence = [
                 {**item, "state_id": state_id, "observed_at": effective_at}
                 for item in operation.get("evidence") or []
             ]
             if replace_claim_evidence:
-                self._model_db.replace_user_state_claim_evidence(
+                self._user_model_db.replace_user_state_claim_evidence(
                     state_id=state_id, evidence=evidence,
                 )
             else:
-                self._model_db.upsert_user_state_evidence(evidence)
-            self._model_db.record_user_state_event(
+                self._user_model_db.upsert_user_state_evidence(evidence)
+            self._user_model_db.record_user_state_event(
                 state_id=state_id,
                 operation=action,
                 previous_payload={
@@ -1212,13 +1226,11 @@ class UserStateResolver:
     def get_current_states(
         self,
         *,
-        user_entity_id: int,
         state_domains: Optional[Sequence[str]] = None,
         state_types: Optional[Sequence[str]] = None,
         statuses: Optional[Sequence[str]] = None,
     ) -> List[Dict[str, Any]]:
-        return self._model_db.get_user_states(
-            user_entity_id=int(user_entity_id),
+        return self._user_model_db.get_user_states(
             state_domains=state_domains,
             state_types=state_types,
             statuses=statuses or ["active", "weakened"],

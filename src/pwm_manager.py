@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 from llm_client import LLMClient
-from memory.memory_database import SessionDB
+from memory.memory_database import UserMemoryDB
 from memory.memory_manager import MemoryNodeManager
 from memory.memory_runtime import MemoryRuntime
 from task_scheduler import TaskOperationReporter, TaskScheduler
@@ -53,7 +53,7 @@ class PersonWorldModel:
         if model_db_path == memory_db_path:
             raise ValueError("User memory and user model database paths must be distinct")
         self._operation_reporter = operation_reporter or TaskOperationReporter()
-        self._user_memory_database = SessionDB(memory_db_path)
+        self._user_memory_database = UserMemoryDB(memory_db_path)
         try:
             self._user_model_database = UserModelDB(model_db_path)
             self._llm_client = LLMClient(
@@ -81,7 +81,7 @@ class PersonWorldModel:
                 logger=self._logger.getChild("memory_runtime"),
             )
             self._user_state_resolver = UserStateResolver(
-                db=self._user_memory_database,
+                memory_db=self._user_memory_database,
                 model_db=self._user_model_database,
                 task_scheduler=self._task_scheduler,
                 llm_client=self._llm_client,
@@ -147,7 +147,7 @@ class PersonWorldModel:
         return self._llm_client
 
     @property
-    def database(self) -> SessionDB:
+    def database(self) -> UserMemoryDB:
         return self._user_memory_database
 
     @property
@@ -254,10 +254,7 @@ class PersonWorldModel:
     ) -> List[Dict[str, Any]]:
         """Read the current user model through the resolver."""
         with self._task_scheduler.execution_lock:
-            owner_name = self.memory_manager.world_owner_entity_name
-            owner_id = self._user_memory_database.add_entity_names([owner_name])[owner_name]
             return self._user_state_resolver.get_current_states(
-                user_entity_id=owner_id,
                 state_domains=state_domains,
                 state_types=state_types,
                 statuses=statuses,

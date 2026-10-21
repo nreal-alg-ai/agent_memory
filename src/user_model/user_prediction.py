@@ -14,7 +14,7 @@ from prompts_zh import USER_PREDICTION_NEAR_TERM_PREPARATION_PROMPT_ZH
 
 if TYPE_CHECKING:
     from llm_client import LLMClient
-    from memory.memory_database import SessionDB
+    from memory.memory_database import UserMemoryDB
     from task_scheduler import TaskScheduler
     from .user_model_database import UserModelDB
 
@@ -26,7 +26,7 @@ class UserPrediction:
     MODEL_VERSION = "near_term_preparation_v1"
 
     def __init__(
-        self, *, db: SessionDB, model_db: UserModelDB, llm_client: LLMClient,
+        self, *, db: UserMemoryDB, model_db: UserModelDB, llm_client: LLMClient,
         task_scheduler: TaskScheduler,
         world_owner_entity_name: str = "用户本人",
         logger: Optional[logging.Logger] = None,
@@ -155,7 +155,7 @@ class UserPrediction:
         )
 
         states = self._model_db.get_user_states(
-            user_entity_id=owner_id, state_types=["recurring_state"],
+            state_types=["recurring_state"],
             statuses=["active"], limit=500,
         )
         active_states = []
