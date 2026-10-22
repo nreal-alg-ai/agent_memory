@@ -391,190 +391,41 @@ class UserStateResolver:
         owner_id = int(self._user_memory_db.add_entity_names([self._world_owner_entity_name])[
             self._world_owner_entity_name
         ])
-        new_ids = {int(value) for value in new_pattern_ids or [] if int(value) > 0}
-        relation_event_ids = {
-            int(value) for value in pattern_relation_event_ids or []
-        }
-        if any(event_id <= 0 for event_id in relation_event_ids):
-            raise ValueError("Pattern relation event IDs must be positive")
-        events = self._user_memory_db.get_user_observed_pattern_relation_events_by_ids(
-            relation_event_ids
+        update_inputs = self._build_user_observed_pattern_update_inputs(
+            world_owner_entity_id=owner_id,
+            new_pattern_ids=new_pattern_ids or [],
+            pattern_relation_event_ids=pattern_relation_event_ids or [],
+            reference_time=reference_time,
         )
-        if {int(item["id"]) for item in events} != relation_event_ids:
-            raise ValueError("Pattern relation event is missing")
-        changed_ids = new_ids | {
-            int(item["target_pattern_id"]) for item in events
-            if item["semantic_relation"] in {"supports", "duplicate"}
-        }
-        affected_ids = {
-            int(item["target_pattern_id"]) for item in events
-            if item["semantic_relation"] in {"refines", "contradicts"}
-        }
-        trigger_ids = {
-            int(value) for item in events
-            for value in item["support_signal_ids"]
-        }
-        patterns = self._user_memory_db.get_user_observed_patterns_by_ids(changed_ids | affected_ids)
-        patterns = [
-            item for item in patterns
-            if int(item.get("subject_entity_id") or 0) == owner_id
-            and self._normalize_state_domain(item.get("primary_domain"))
-        ]
-        pattern_by_id = {int(item["id"]): item for item in patterns}
-        events = [
-            item for item in events
-            if int(item["target_pattern_id"]) in pattern_by_id
-        ]
-        representative_ids = {
-            int(signal_id)
-            for pattern in patterns
-            for signal_id in (
-                (pattern.get("support_signal_ids") or [])[:1]
-                + (pattern.get("support_signal_ids") or [])[-3:]
-            )
-        }
-        signal_by_id = {
-            int(item["signal_id"]): item
-            for item in self._user_memory_db.get_user_action_signals_by_ids(
-                representative_ids | trigger_ids
-            )
-        }
-        fact_by_id = {
-            int(item["id"]): item
-            for item in self._user_memory_db.get_memory_facts_by_ids([
-                int(item["fact_id"]) for item in signal_by_id.values()
-            ])
-        }
-
-        def signal_view(signal_id: int) -> Dict[str, Any]:
-            signal = signal_by_id[signal_id]
-            fact = fact_by_id.get(int(signal["fact_id"])) or {}
-            return {
-                "signal_id": signal_id,
-                "action_text": str(signal.get("action_text") or ""),
-                "action_kind": str(signal.get("action_kind") or ""),
-                "event_time": str(signal.get("event_time_key") or ""),
-                "location": str(signal.get("location") or ""),
-                "fact_id": int(signal["fact_id"]),
-                "fact_summary": str(fact.get("summary") or ""),
-            }
-
-        def pattern_view(pattern: Mapping[str, Any]) -> Dict[str, Any]:
-            signal_ids = pattern.get("support_signal_ids") or []
-            representative = list(dict.fromkeys(signal_ids[:1] + signal_ids[-3:]))
-            return {
-                "id": int(pattern["id"]),
-                "primary_domain": str(pattern.get("primary_domain") or ""),
-                "pattern_text": str(pattern.get("pattern_text") or ""),
-                "condition_text": str(pattern.get("condition_text") or ""),
-                "confidence": float(pattern.get("confidence") or 0.0),
-                "support_signal_count": len(signal_ids),
-                "supporting_actions": [
-                    signal_view(int(value)) for value in representative
-                    if int(value) in signal_by_id
-                ],
-            }
-
         report: Dict[str, Any] = {
-            "status": "empty", "changed_pattern_count": len(changed_ids),
-            "affected_pattern_count": len(affected_ids), "domain_count": 0,
+            "status": "empty", "changed_pattern_count": update_inputs["changed_pattern_count"],
+            "affected_pattern_count": update_inputs["affected_pattern_count"],
+            "domain_count": len(update_inputs["domains"]),
             "operation_count": 0, "created": 0, "reinforced": 0,
             "revised": 0, "weakened": 0, "expired": 0,
             "state_ids": [], "domain_reports": {},
         }
-        domains = sorted({str(item["primary_domain"]) for item in patterns})
-        report["domain_count"] = len(domains)
+        domains = update_inputs["domains"]
         failed = 0
-        for domain in domains:
-            domain_patterns = {
-                int(item["id"]): item for item in patterns
-                if item["primary_domain"] == domain
-            }
-            domain_changed = changed_ids & domain_patterns.keys()
-            domain_affected = affected_ids & domain_patterns.keys()
-            domain_events = [
-                item for item in events
-                if int(item["target_pattern_id"]) in domain_patterns
-            ]
-            domain_trigger_ids = {
-                int(signal_id)
-                for event in domain_events
-                for signal_id in event["support_signal_ids"]
-                if int(signal_id) in trigger_ids and int(signal_id) in signal_by_id
-            }
-            existing_states = self._user_model_db.get_user_states(
-                state_domains=[domain],
-                state_types=["recurring_state"], statuses=["active", "weakened"],
-                limit=self._update_limit + 1,
-            )
-            if len(existing_states) > self._update_limit:
+        for domain, domain_input in domains.items():
+            if domain_input["input_truncated"]:
                 failed += 1
                 report["domain_reports"][domain] = {
                     "status": "error", "error": "observed_pattern_state_input_limit_exceeded",
                 }
                 continue
-            state_evidence = self._user_model_db.get_user_state_evidence_items(
-                [int(item["id"]) for item in existing_states],
-                limit=max(480, self._update_limit * 12),
-            )
-            claim_ids = {
-                int(item["evidence_id"]) for item in state_evidence
-                if item["evidence_type"] == "user_claim"
-            }
-            claim_by_id = {
-                int(item["id"]): item
-                for item in self._user_memory_db.get_user_claims_by_ids(sorted(claim_ids))
-            }
-            supporting_claims = [
-                self._claim_prompt_view(item, []) for item in claim_by_id.values()
-            ]
-            explicitly_supported_state_ids = {
-                int(item["state_id"])
-                for item in state_evidence
-                if item["evidence_type"] == "user_claim"
-                and item["role"] in {"support", "change_trigger"}
-                and (claim := claim_by_id.get(int(item["evidence_id"])))
-                and claim.get("claim_origin") == "explicit"
-                and claim.get("status") == "active"
-            }
-            update_input = {
-                "reference_time": self._timestamp_text(reference_time),
-                "state_domain": domain,
-                "changed_patterns": [
-                    pattern_view(domain_patterns[value]) for value in sorted(domain_changed)
-                ],
-                "affected_patterns": [
-                    pattern_view(domain_patterns[value])
-                    for value in sorted(domain_affected - domain_changed)
-                ],
-                "relation_events": [
-                    {
-                        "target_pattern_id": int(item["target_pattern_id"]),
-                        "trigger_pattern_id": int(item.get("trigger_pattern_id") or 0),
-                        "semantic_relation": str(item["semantic_relation"]),
-                        "support_signal_ids": item["support_signal_ids"],
-                        "candidate_snapshot": item.get("candidate_snapshot") or {},
-                        "semantic_reason": str(item.get("semantic_reason") or ""),
-                    }
-                    for item in domain_events
-                ],
-                "trigger_signals": [
-                    signal_view(value) for value in sorted(domain_trigger_ids)
-                ],
-                "existing_states": [
-                    self._state_prompt_view(item) for item in existing_states
-                ],
-                "state_evidence": [
-                    {"state_id": int(item["state_id"]),
-                     "evidence_type": str(item["evidence_type"]),
-                     "evidence_id": int(item["evidence_id"]),
-                     "role": str(item["role"])}
-                    for item in state_evidence
-                ],
-                "supporting_claims": supporting_claims,
-            }
+            update_input = domain_input["update_input"]
+            domain_patterns = domain_input["domain_patterns"]
+            domain_changed = domain_input["domain_changed"]
+            domain_affected = domain_input["domain_affected"]
+            domain_events = domain_input["domain_events"]
+            domain_trigger_ids = domain_input["domain_trigger_ids"]
+            signal_by_id = domain_input["signal_by_id"]
+            existing_states = domain_input["existing_states"]
+            explicitly_supported_state_ids = domain_input["explicitly_supported_state_ids"]
+            pattern_cases = update_input["pattern_cases"]
             source = "\n".join(
-                item["pattern_text"] for item in update_input["changed_patterns"]
+                item["pattern"]["pattern_text"] for item in pattern_cases
             )
             template = (
                 USER_OBSERVED_PATTERN_STATE_UPDATE_PROMPT_EN
@@ -607,13 +458,13 @@ class UserStateResolver:
                 for signal_id in domain_trigger_ids
             })
             linked_patterns_by_state = {
-                int(item["state_id"]): set() for item in state_evidence
+                int(state["id"]): {
+                    int(item["evidence_id"])
+                    for item in state["evidence_items"]
+                    if item["evidence_type"] == "user_observed_pattern"
+                }
+                for state in existing_states
             }
-            for item in state_evidence:
-                if item["evidence_type"] == "user_observed_pattern":
-                    linked_patterns_by_state[int(item["state_id"])].add(
-                        int(item["evidence_id"])
-                    )
             contradicting_signals_by_target: Dict[int, set[int]] = {}
             for item in domain_events:
                 if item["semantic_relation"] == "contradicts":
@@ -732,6 +583,217 @@ class UserStateResolver:
             json.dumps(record, ensure_ascii=False, sort_keys=False, indent=2, default=str),
         )
 
+    def _build_user_observed_pattern_update_inputs(
+        self, *, world_owner_entity_id: int, new_pattern_ids: Sequence[int],
+        pattern_relation_event_ids: Sequence[int], reference_time: Optional[Any],
+    ) -> Dict[str, Any]:
+        new_ids = {int(value) for value in new_pattern_ids if int(value) > 0}
+        relation_event_ids = {int(value) for value in pattern_relation_event_ids}
+        if any(event_id <= 0 for event_id in relation_event_ids):
+            raise ValueError("Pattern relation event IDs must be positive")
+        events = self._user_memory_db.get_user_observed_pattern_relation_events_by_ids(
+            relation_event_ids
+        )
+        if {int(item["id"]) for item in events} != relation_event_ids:
+            raise ValueError("Pattern relation event is missing")
+        changed_ids = new_ids | {
+            int(item["target_pattern_id"]) for item in events
+            if item["semantic_relation"] in {"supports", "duplicate"}
+        }
+        affected_ids = {
+            int(item["target_pattern_id"]) for item in events
+            if item["semantic_relation"] in {"refines", "contradicts"}
+        }
+        trigger_ids = {
+            int(value) for item in events for value in item["support_signal_ids"]
+        }
+        patterns = self._user_memory_db.get_user_observed_patterns_by_ids(
+            changed_ids | affected_ids
+        )
+        patterns = [
+            item for item in patterns
+            if int(item.get("subject_entity_id") or 0) == world_owner_entity_id
+            and self._normalize_state_domain(item.get("primary_domain"))
+        ]
+        pattern_by_id = {int(item["id"]): item for item in patterns}
+        events = [
+            item for item in events
+            if int(item["target_pattern_id"]) in pattern_by_id
+        ]
+        representative_ids = {
+            int(signal_id)
+            for pattern in patterns
+            for signal_id in (
+                (pattern.get("support_signal_ids") or [])[:1]
+                + (pattern.get("support_signal_ids") or [])[-3:]
+            )
+        }
+        signal_by_id = {
+            int(item["signal_id"]): item
+            for item in self._user_memory_db.get_user_action_signals_by_ids(
+                representative_ids | trigger_ids
+            )
+        }
+        domains: Dict[str, Dict[str, Any]] = {}
+        for domain in sorted({str(item["primary_domain"]) for item in patterns}):
+            domain_patterns = {
+                int(item["id"]): item for item in patterns
+                if item["primary_domain"] == domain
+            }
+            domain_changed = changed_ids & domain_patterns.keys()
+            domain_affected = affected_ids & domain_patterns.keys()
+            domain_events = [
+                item for item in events
+                if int(item["target_pattern_id"]) in domain_patterns
+            ]
+            domain_trigger_ids = {
+                int(signal_id)
+                for event in domain_events
+                for signal_id in event["support_signal_ids"]
+                if int(signal_id) in trigger_ids and int(signal_id) in signal_by_id
+            }
+            events_by_pattern: Dict[int, List[Dict[str, Any]]] = {}
+            for event in domain_events:
+                trigger_id = int(event.get("trigger_pattern_id") or 0)
+                case_id = (
+                    trigger_id if trigger_id in domain_changed
+                    else int(event["target_pattern_id"])
+                )
+                events_by_pattern.setdefault(case_id, []).append(event)
+            pattern_cases = []
+            for pattern_id in sorted(domain_changed | events_by_pattern.keys()):
+                pattern_cases.append({
+                    "pattern": self._user_observed_pattern_prompt_view(
+                        domain_patterns[pattern_id], signal_by_id,
+                    ),
+                    "update_kind": (
+                        "new" if pattern_id in new_ids
+                        else "supported" if pattern_id in domain_changed
+                        else "relation_only"
+                    ),
+                    "related_patterns": [
+                        {
+                            "relation_event": {
+                                key: event.get(key) for key in (
+                                    "id", "target_pattern_id", "trigger_pattern_id",
+                                    "semantic_relation", "support_signal_ids",
+                                    "candidate_snapshot", "semantic_reason",
+                                )
+                            },
+                            "existing_pattern": self._user_observed_pattern_prompt_view(
+                                domain_patterns[int(event["target_pattern_id"])],
+                                signal_by_id,
+                            ),
+                            "trigger_signals": [
+                                self._user_action_signal_prompt_view(signal_by_id[int(value)])
+                                for value in event["support_signal_ids"]
+                                if int(value) in signal_by_id
+                            ],
+                            "linked_state_ids": [],
+                        }
+                        for event in events_by_pattern.get(pattern_id, [])
+                    ],
+                    "related_states": [],
+                })
+            existing_states = self._user_model_db.get_user_states(
+                state_domains=[domain],
+                state_types=["recurring_state"], statuses=["active", "weakened"],
+                limit=self._update_limit + 1,
+                include_evidence=True,
+            )
+            if len(existing_states) > self._update_limit:
+                domains[domain] = {"input_truncated": True}
+                continue
+            claim_ids = {
+                int(item["evidence_id"])
+                for state in existing_states
+                for item in state["evidence_items"]
+                if item["evidence_type"] == "user_claim"
+            }
+            claim_by_id = {
+                int(item["id"]): item
+                for item in self._user_memory_db.get_user_claims_by_ids(sorted(claim_ids))
+            }
+            explicitly_supported_state_ids = {
+                int(state["id"])
+                for state in existing_states
+                for item in state["evidence_items"]
+                if item["evidence_type"] == "user_claim"
+                and item["role"] in {"support", "change_trigger"}
+                and (claim := claim_by_id.get(int(item["evidence_id"])))
+                and claim.get("claim_origin") == "explicit"
+                and claim.get("status") == "active"
+            }
+            linked_state_ids_by_pattern: Dict[int, set[int]] = {}
+            for state in existing_states:
+                state_id = int(state["id"])
+                for item in state["evidence_items"]:
+                    if item["evidence_type"] == "user_observed_pattern":
+                        linked_state_ids_by_pattern.setdefault(
+                            int(item["evidence_id"]), set(),
+                        ).add(state_id)
+            detailed_state_ids = set()
+            for case in pattern_cases:
+                related_pattern_ids = {
+                    int(related["existing_pattern"]["id"])
+                    for related in case["related_patterns"]
+                } | {int(case["pattern"]["id"])}
+                related_state_ids = {
+                    state_id for related_id in related_pattern_ids
+                    for state_id in linked_state_ids_by_pattern.get(related_id, set())
+                }
+                detailed_state_ids.update(related_state_ids)
+            state_contexts = {
+                int(state["id"]): self._build_state_context(
+                    state, detailed=int(state["id"]) in detailed_state_ids,
+                    world_owner_entity_id=world_owner_entity_id,
+                )
+                for state in existing_states
+            }
+            for case in pattern_cases:
+                related_pattern_ids = {
+                    int(related["existing_pattern"]["id"])
+                    for related in case["related_patterns"]
+                } | {int(case["pattern"]["id"])}
+                related_state_ids = {
+                    state_id for pattern_id in related_pattern_ids
+                    for state_id in linked_state_ids_by_pattern.get(pattern_id, set())
+                }
+                case["related_states"] = [
+                    state_contexts[value] for value in sorted(related_state_ids)
+                ]
+                for related in case["related_patterns"]:
+                    related["linked_state_ids"] = sorted(
+                        linked_state_ids_by_pattern.get(
+                            int(related["existing_pattern"]["id"]), set(),
+                        ),
+                    )
+            domains[domain] = {
+                "input_truncated": False,
+                "update_input": {
+                    "reference_time": self._timestamp_text(reference_time),
+                    "state_domain": domain,
+                    "pattern_cases": pattern_cases,
+                    "existing_states": [
+                        state_contexts[int(item["id"])] for item in existing_states
+                        if int(item["id"]) not in detailed_state_ids
+                    ],
+                },
+                "domain_patterns": domain_patterns,
+                "domain_changed": domain_changed,
+                "domain_affected": domain_affected,
+                "domain_events": domain_events,
+                "domain_trigger_ids": domain_trigger_ids,
+                "signal_by_id": signal_by_id,
+                "existing_states": existing_states,
+                "explicitly_supported_state_ids": explicitly_supported_state_ids,
+            }
+        return {
+            "changed_pattern_count": len(changed_ids),
+            "affected_pattern_count": len(affected_ids),
+            "domains": domains,
+        }
+
     def _build_user_claim_update_inputs(
         self, *, world_owner_entity_id: int, new_claim_ids: Sequence[int],
         claim_relations: Sequence[Mapping[str, Any]],
@@ -778,6 +840,34 @@ class UserStateResolver:
             related_old_claim_ids = {
                 int(event["target_claim_id"]) for event in relations
             }
+            claims_by_id.update({
+                int(claim["id"]): claim
+                for claim in self._user_memory_db.get_user_claims_by_ids(
+                    sorted(related_old_claim_ids - claims_by_id.keys()),
+                )
+                if int(claim.get("subject_entity_id") or 0) == world_owner_entity_id
+            })
+            new_claim_cases = [
+                {
+                    "new_claim": self._claim_prompt_view(claims_by_id[claim_id]),
+                    "related_claims": [
+                        {
+                            "relation_event": {key: event.get(key) for key in (
+                                "id", "target_claim_id", "trigger_claim_id",
+                                "semantic_relation", "semantic_confidence",
+                                "effective_at", "semantic_reason",
+                            )},
+                            "existing_claim": self._claim_prompt_view(
+                                claims_by_id[int(event["target_claim_id"])],
+                            ),
+                            "linked_state_ids": [],
+                        }
+                        for event in relations_by_trigger.get(claim_id, [])
+                        if int(event["target_claim_id"]) in claims_by_id
+                    ],
+                }
+                for claim_id in sorted(changed_ids)
+            ]
             states = self._user_model_db.get_user_states(
                 state_domains=[domain],
                 state_types=["enduring_state", "recurring_state"],
@@ -792,118 +882,41 @@ class UserStateResolver:
                     for item in state["evidence_items"]
                 )
             }
-            detailed_states = [
-                state for state in states if int(state["id"]) in detailed_state_ids
-            ]
-            claim_evidence = [
-                item for state in detailed_states for item in state["evidence_items"]
-                if item["evidence_type"] == "user_claim"
-            ]
-            pattern_evidence = [
-                item for state in detailed_states for item in state["evidence_items"]
-                if item["evidence_type"] == "user_observed_pattern"
-            ]
-            required_claim_ids = (
-                set(changed_ids)
-                | related_old_claim_ids
-                | {int(item["evidence_id"]) for item in claim_evidence}
-            )
-            claims_by_id.update({
-                int(claim["id"]): claim
-                for claim in self._user_memory_db.get_user_claims_by_ids(
-                    sorted(required_claim_ids - claims_by_id.keys()),
-                )
-                if int(claim.get("subject_entity_id") or 0) == world_owner_entity_id
-            })
-            fact_evidence = self._user_memory_db.get_user_claim_evidence_fact_ids(
-                sorted(required_claim_ids & claims_by_id.keys()), limit=evidence_limit,
-            )
-            claim_views_by_id = {
-                claim_id: self._claim_prompt_view(
-                    claims_by_id[claim_id], fact_evidence.get(claim_id, []),
-                )
-                for claim_id in required_claim_ids if claim_id in claims_by_id
-            }
-            patterns_by_id = {
-                int(pattern["id"]): {
-                    "id": int(pattern["id"]),
-                    "pattern_text": str(pattern.get("pattern_text") or ""),
-                    "condition_text": str(pattern.get("condition_text") or ""),
-                    "confidence": float(pattern.get("confidence") or 0.0),
-                }
-                for pattern in self._user_memory_db.get_user_observed_patterns_by_ids(
-                    sorted({int(item["evidence_id"]) for item in pattern_evidence}),
-                )
-            }
             state_contexts = []
             linked_state_ids_by_claim: Dict[int, List[int]] = {}
+            detailed_claim_evidence_count = 0
+            detailed_pattern_evidence_count = 0
             for state in states:
                 is_detailed = int(state["id"]) in detailed_state_ids
-                support_claim_count = sum(
-                    item["evidence_type"] == "user_claim"
-                    and item["role"] in {"support", "change_trigger"}
-                    for item in state["evidence_items"]
-                )
-                support_pattern_count = sum(
-                    item["evidence_type"] == "user_observed_pattern"
-                    and item["role"] in {"support", "change_trigger"}
-                    for item in state["evidence_items"]
-                )
-                context = {
-                    "state": self._state_prompt_view(state),
-                    "evidence_detail_available": is_detailed,
-                    "claim_support_count": support_claim_count,
-                    "pattern_support_count": support_pattern_count,
-                }
                 if is_detailed:
-                    context["claim_evidence"] = [
-                        {"claim": claim_views_by_id[int(item["evidence_id"])],
-                         "role": str(item.get("role") or ""),
-                         "weight": float(item.get("weight") or 0.0)}
+                    detailed_claim_evidence_count += sum(
+                        item["evidence_type"] == "user_claim"
                         for item in state["evidence_items"]
-                        if item["evidence_type"] == "user_claim"
-                        and int(item["evidence_id"]) in claim_views_by_id
-                    ]
-                    context["pattern_evidence"] = [
-                        {"pattern_id": int(item["evidence_id"]),
-                         "pattern": patterns_by_id.get(int(item["evidence_id"])),
-                         "role": str(item.get("role") or "")}
+                    )
+                    detailed_pattern_evidence_count += sum(
+                        item["evidence_type"] == "user_observed_pattern"
                         for item in state["evidence_items"]
-                        if item["evidence_type"] == "user_observed_pattern"
-                    ]
-                state_contexts.append(context)
+                    )
+                state_contexts.append(self._build_state_context(
+                    state, detailed=is_detailed,
+                    world_owner_entity_id=world_owner_entity_id,
+                ))
                 for item in state["evidence_items"]:
                     if item["evidence_type"] == "user_claim":
                         linked_state_ids_by_claim.setdefault(
                             int(item["evidence_id"]), [],
                         ).append(int(state["id"]))
-            new_claim_cases = [
-                {
-                    "new_claim": claim_views_by_id[claim_id],
-                    "related_claims": [
-                        {
-                            "relation_event": {key: event.get(key) for key in (
-                                "id", "target_claim_id", "trigger_claim_id",
-                                "semantic_relation", "semantic_confidence",
-                                "effective_at", "semantic_reason",
-                            )},
-                            "existing_claim": claim_views_by_id[int(event["target_claim_id"])],
-                            "linked_state_ids": linked_state_ids_by_claim.get(
-                                int(event["target_claim_id"]), [],
-                            ),
-                        }
-                        for event in relations_by_trigger.get(claim_id, [])
-                        if int(event["target_claim_id"]) in claim_views_by_id
-                    ],
-                }
-                for claim_id in sorted(changed_ids)
-            ]
+            for case in new_claim_cases:
+                for related in case["related_claims"]:
+                    related["linked_state_ids"] = linked_state_ids_by_claim.get(
+                        int(related["existing_claim"]["id"]), [],
+                    )
             result[domain] = {
                 "input_truncated": (
                     len(relations) > max(400, self._update_limit * 8)
                     or len(states) > self._update_limit
-                    or len(claim_evidence) > evidence_limit
-                    or len(pattern_evidence) > evidence_limit
+                    or detailed_claim_evidence_count > evidence_limit
+                    or detailed_pattern_evidence_count > evidence_limit
                 ),
                 "state_domain": domain,
                 "reference_time": effective_reference_time,
@@ -911,6 +924,75 @@ class UserStateResolver:
                 "state_contexts": state_contexts,
             }
         return result
+
+    def _build_state_context(
+        self, state: Mapping[str, Any], *, detailed: bool,
+        world_owner_entity_id: int,
+    ) -> Dict[str, Any]:
+        """Show a compact state, expanding its supporting objects when relevant."""
+        evidence_items = state.get("evidence_items") or []
+        context = {
+            "state": self._state_prompt_view(state),
+            "evidence_detail_available": detailed,
+            "claim_support_count": sum(
+                item["evidence_type"] == "user_claim"
+                and item["role"] in {"support", "change_trigger"}
+                for item in evidence_items
+            ),
+            "pattern_support_count": sum(
+                item["evidence_type"] == "user_observed_pattern"
+                and item["role"] in {"support", "change_trigger"}
+                for item in evidence_items
+            ),
+        }
+        if not detailed:
+            return context
+
+        claim_ids = sorted({
+            int(item["evidence_id"]) for item in evidence_items
+            if item["evidence_type"] == "user_claim"
+        })
+        claims = {
+            int(claim["id"]): claim
+            for claim in self._user_memory_db.get_user_claims_by_ids(claim_ids)
+            if int(claim.get("subject_entity_id") or 0) == world_owner_entity_id
+        }
+        context["claim_evidence"] = [
+            {
+                "claim": self._claim_prompt_view(claims[int(item["evidence_id"])]),
+                "role": str(item.get("role") or ""),
+                "weight": float(item.get("weight") or 0.0),
+            }
+            for item in evidence_items
+            if item["evidence_type"] == "user_claim"
+            and int(item["evidence_id"]) in claims
+        ]
+        pattern_ids = sorted({
+            int(item["evidence_id"]) for item in evidence_items
+            if item["evidence_type"] == "user_observed_pattern"
+        })
+        patterns = {
+            int(pattern["id"]): pattern
+            for pattern in self._user_memory_db.get_user_observed_patterns_by_ids(pattern_ids)
+        }
+        context["pattern_evidence"] = [
+            {
+                "pattern_id": int(item["evidence_id"]),
+                "pattern": (
+                    {
+                        "id": int(pattern["id"]),
+                        "pattern_text": str(pattern.get("pattern_text") or ""),
+                        "condition_text": str(pattern.get("condition_text") or ""),
+                        "confidence": float(pattern.get("confidence") or 0.0),
+                    }
+                    if (pattern := patterns.get(int(item["evidence_id"]))) else None
+                ),
+                "role": str(item.get("role") or ""),
+            }
+            for item in evidence_items
+            if item["evidence_type"] == "user_observed_pattern"
+        ]
+        return context
 
     def _normalize_user_claim_state_operations(
         self, parsed: Mapping[str, Any], *, update_input: Mapping[str, Any],
@@ -1536,14 +1618,46 @@ class UserStateResolver:
         return evidence
 
     @staticmethod
-    def _claim_prompt_view(claim: Mapping[str, Any], evidence_fact_ids: Sequence[int]) -> Dict[str, Any]:
+    def _user_action_signal_prompt_view(
+        signal: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        return {
+            "signal_id": int(signal["signal_id"]),
+            "action_text": str(signal.get("action_text") or ""),
+            "action_kind": str(signal.get("action_kind") or ""),
+            "event_time": str(signal.get("event_time_key") or ""),
+            "location": str(signal.get("location") or ""),
+        }
+
+    @classmethod
+    def _user_observed_pattern_prompt_view(
+        cls, pattern: Mapping[str, Any],
+        signals_by_id: Mapping[int, Mapping[str, Any]],
+    ) -> Dict[str, Any]:
+        signal_ids = pattern.get("support_signal_ids") or []
+        representative = list(dict.fromkeys(signal_ids[:1] + signal_ids[-3:]))
+        return {
+            "id": int(pattern["id"]),
+            "primary_domain": str(pattern.get("primary_domain") or ""),
+            "pattern_text": str(pattern.get("pattern_text") or ""),
+            "condition_text": str(pattern.get("condition_text") or ""),
+            "confidence": float(pattern.get("confidence") or 0.0),
+            "support_signal_count": len(signal_ids),
+            "supporting_actions": [
+                cls._user_action_signal_prompt_view(signals_by_id[int(value)])
+                for value in representative if int(value) in signals_by_id
+            ],
+        }
+
+    @staticmethod
+    def _claim_prompt_view(claim: Mapping[str, Any]) -> Dict[str, Any]:
         return {
             "id": int(claim["id"]), "claim_text": str(claim.get("claim_text") or ""),
             "claim_type": str(claim.get("claim_type") or ""), "predicate": str(claim.get("predicate") or ""),
             "primary_domain": str(claim.get("primary_domain") or ""),
             "claim_origin": str(claim.get("claim_origin") or ""), "status": str(claim.get("status") or ""),
             "confidence": float(claim.get("confidence") or 0.0), "valid_from": str(claim.get("valid_from") or ""),
-            "valid_to": str(claim.get("valid_to") or ""), "evidence_fact_ids": [int(value) for value in evidence_fact_ids or []],
+            "valid_to": str(claim.get("valid_to") or ""),
         }
 
     @staticmethod

@@ -692,11 +692,13 @@ USER_OBSERVED_PATTERN_STATE_UPDATE_PROMPT_EN = """A user_state is the personal w
 
 A user_observed_pattern is a candidate regularity inferred from multiple independent observations of the user's behavior or choices. It is not the user's self-report of a habit, nor a guarantee that the regularity still applies under current conditions. It can support a recurring_state, but the state should express a currently valid judgment after considering the combined evidence rather than copy the pattern text.
 
-Incrementally update recurring_state from the user's newly created or newly supported observed patterns. supporting_actions are representative raw evidence. changed_patterns were created or gained support in this task; affected_patterns are older patterns touched by relation events. The relation events classify support, refinement, or contradiction. An existing state may already express the same routine based on an explicit user_claim: update that state instead of creating another state for a different evidence source.
+Incrementally update recurring_state from the user's newly created or newly supported observed patterns. Each pattern_cases entry centers on one pattern. Its pattern contains representative raw supporting_actions; update_kind=new means a newly created pattern, supported means an existing pattern gained support, and relation_only means no new pattern was saved but new actions have a relation to this older pattern. Independently assess whether a new pattern can form a recurring_state even without relation events or existing states.
+
+Within each case, related_patterns groups a relation_event with its target existing_pattern, trigger_signals, and linked_state_ids. Events classify support, refinement, or contradiction; action similarity alone is not support. trigger_pattern_id identifies the new pattern and target_pattern_id the older pattern being compared. related_states contains state_context entries linked to the case pattern or related older patterns: state is the current state, while claim_evidence and pattern_evidence provide its detailed supporting objects. Consider claim origin, status, and evidence role. existing_states supplies compact state_context entries (state plus support counts) for other states in this domain so you can recognize an equivalent routine without a pattern-evidence link. A state may already express the same routine based on an explicit user_claim: update that state rather than creating another for a different evidence source. Respect each case's evidence associations; do not attribute another case's actions to it. Multiple cases may jointly support one state.
 
 Only update recurring_state in the given state_domain. Do not invent a weekday, frequency, time, or condition that the evidence does not establish. state_text should express a reusable behavioral tendency, not copy a pattern. Use target_state_id for an equivalent existing state; otherwise create a stable, specific state_topic. state_kind must be one of daily_routine|weekly_routine|work_routine|health_routine|social_routine|conditional_behavior.
 
-New patterns or new support may create, reinforce, or revise a state. Weaken only when a relation event and concrete counterevidence justify it; a single exception rarely negates a repeated behavior. Do not expire states in this first version. Return an empty operations list when no reliable change is supported. Every operation must cite at least one changed_pattern or trigger_signal. Durable support should cite a user_observed_pattern ID; a raw counterexample may cite a user_action_signal ID. Counterexamples must not be labeled support. Cite only supplied IDs.
+New patterns or new support may create, reinforce, or revise a state. Weaken only when a relation event and concrete counterevidence justify it; a single exception rarely negates a repeated behavior. Do not expire states in this first version. Return an empty operations list when no reliable change is supported. Every operation must cite a case.pattern with update_kind=new/supported, or a trigger_signal nested under a relation event. A relation_only older pattern is not new support. Durable support should cite a user_observed_pattern ID; a raw counterexample may cite a user_action_signal ID. Counterexamples must not be labeled support. Cite only supplied IDs. Return one combined operations list, considering all relevant case evidence together when updating the same state.
 
 Return JSON only:
 {
@@ -713,13 +715,8 @@ Return JSON only:
 
 reference_time: {reference_time}
 state_domain: {state_domain}
-changed_patterns: {changed_patterns}
-affected_patterns: {affected_patterns}
-relation_events: {relation_events}
-trigger_signals: {trigger_signals}
+pattern_cases: {pattern_cases}
 existing_states: {existing_states}
-state_evidence: {state_evidence}
-supporting_claims: {supporting_claims}
 """
 
 

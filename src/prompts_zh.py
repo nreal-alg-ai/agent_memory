@@ -741,11 +741,13 @@ USER_OBSERVED_PATTERN_STATE_UPDATE_PROMPT_ZH = """user_state 是个人世界模�
 
 user_observed_pattern 是从用户本人多次独立的行为或选择观察中归纳出的候选规律，不等于用户对习惯的自述，也不保证该规律在当前条件下仍然有效。它可为 recurring_state 提供证据，但 state 要表达综合证据后的当前有效判断，不应照搬 pattern 文本。
 
-你负责根据用户本人新形成或获得新证据的 observed patterns，增量更新 recurring_state。supporting_actions 只是代表性原始证据。changed_patterns 是本轮新建或新增支持证据的规律；affected_patterns 是本轮关系事件涉及的旧规律。relation_events 已给出支持、细化或反驳关系，不要重新把动作相似当成支持。existing_states 中可能有由 explicit user_claim 建立的同一习惯；应更新那条 state，而不是按证据来源另建一条。
+你负责根据用户本人新形成或获得新证据的 observed patterns，增量更新 recurring_state。输入 pattern_cases 以每条本轮 pattern 为核心组织：pattern 是待评估的规律，supporting_actions 只是它的代表性原始证据；update_kind=new 表示新规律，supported 表示旧规律本轮获得新支持，relation_only 表示没有对应的新规律落库，仅有新动作与该旧规律的关系需要评估。即使没有关系事件和已有 state，也应独立判断新规律是否足以形成 recurring_state。
+
+每项 case 的 related_patterns 将关系事件 relation_event、该事件指向的 existing_pattern、本次触发动作 trigger_signals 及旧规律关联的 linked_state_ids 放在一起。事件已给出支持、细化或反驳关系，不要重新把动作相似当成支持；trigger_pattern_id 指向本轮新规律，target_pattern_id 指向被比较的旧规律。related_states 提供本项 pattern 及其相关旧规律已关联的 state_context：其中 state 是当前状态，claim_evidence 与 pattern_evidence 是该 state 的详细支撑证据；claim 的来源、状态和证据角色均需考虑。existing_states 提供本域其余 state 的精简 state_context（state 与支撑数量），用于识别尚无 pattern 证据关联的同一习惯。已有 state 可能由 explicit user_claim 建立，应更新那条 state，而不是按证据来源另建一条。按每项 case 的关联理解证据，不要将其他 case 的动作误归到当前规律；多项 case 可以共同支持同一个 state。
 
 只处理本轮 state_domain 的 recurring_state。规律的动作、频率、时间和适用条件必须有证据，不能由三次相似行为编造“每周三”或“每天”。state_text 应表达可用于预测的行为规律，不照抄 pattern。创建时以简短、稳定的中文 state_topic 区分具体规律，如 `周三晨间健身`；不得输出纯英文标识、拼音或英文蛇形命名。涉及外文专有名词时可以保留原名，但主题含义仍须用中文表达。语义相同的现有 state 必须使用 target_state_id。state_kind 只可为 daily_routine|weekly_routine|work_routine|health_routine|social_routine|conditional_behavior。
 
-有新 pattern 或新支持证据时可 create、reinforce 或 revise；只有关系事件和具体反例足以削弱现有规律时才可 weaken。单条反例通常不足以否定重复行为；第一版不允许 expire。没有可靠变化时返回空 operations。每项操作都必须引用至少一条本轮 changed_patterns，或一条 trigger_signals；state 的长期支持应引用 evidence_type=user_observed_pattern 的 pattern ID，原始反例可引用 evidence_type=user_action_signal 的 signal ID。反例不可作为 support。不得引用输入之外的 ID。
+有新 pattern 或新支持证据时可 create、reinforce 或 revise；只有关系事件和具体反例足以削弱现有规律时才可 weaken。单条反例通常不足以否定重复行为；第一版不允许 expire。没有可靠变化时返回空 operations。每项操作都必须引用至少一条 update_kind 为 new/supported 的 case.pattern，或关系事件下的 trigger_signals；relation_only 的旧 pattern 不构成新增支持。state 的长期支持应引用 evidence_type=user_observed_pattern 的 pattern ID，原始反例可引用 evidence_type=user_action_signal 的 signal ID。反例不可作为 support。不得引用输入之外的 ID。输出汇总为一份 operations 列表，同一 state 的证据应综合后给出操作。
 
 只返回 JSON：
 {
@@ -764,13 +766,8 @@ user_observed_pattern 是从用户本人多次独立的行为或选择观察中�
 
 reference_time：{reference_time}
 state_domain：{state_domain}
-changed_patterns：{changed_patterns}
-affected_patterns：{affected_patterns}
-relation_events：{relation_events}
-trigger_signals：{trigger_signals}
+pattern_cases：{pattern_cases}
 existing_states：{existing_states}
-state_evidence：{state_evidence}
-supporting_claims：{supporting_claims}
 """
 
 
