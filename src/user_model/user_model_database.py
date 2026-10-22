@@ -159,6 +159,8 @@ class UserModelDB:
             ON user_states(state_domain, state_type, status, updated_at DESC);
             CREATE INDEX IF NOT EXISTS idx_user_state_evidence_state
             ON user_state_evidence(state_id, role, evidence_type);
+            CREATE INDEX IF NOT EXISTS idx_user_state_evidence_claim
+            ON user_state_evidence(evidence_type, evidence_id, role, state_id);
             CREATE INDEX IF NOT EXISTS idx_user_state_events_state
             ON user_state_events(state_id, effective_at DESC, id DESC);
             CREATE INDEX IF NOT EXISTS idx_user_prediction_runs_owner
@@ -445,6 +447,40 @@ class UserModelDB:
             params,
         ).fetchall()
         return [self._row_to_dict(row) for row in rows]
+
+    def get_active_user_states_for_claim_ids(
+        self, claim_ids: Sequence[int],
+    ) -> Dict[int, List[Dict[str, Any]]]:
+        """Find every active state supported by each claim, across domains."""
+        ids = sorted({int(value) for value in claim_ids if int(value) > 0})
+        result: Dict[int, List[Dict[str, Any]]] = {claim_id: [] for claim_id in ids}
+        for start in range(0, len(ids), 400):
+            chunk = ids[start:start + 400]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = self._conn.execute(
+                "SELECT evidence.evidence_id AS claim_id, evidence.role AS evidence_role, "
+                "state.id, state.state_domain, state.state_type, state.state_kind, "
+                "state.state_topic, state.state_text, state.status, state.valid_from, "
+                "state.valid_to, state.conditions "
+                "FROM user_state_evidence AS evidence "
+                "JOIN user_states AS state ON state.id = evidence.state_id "
+                "WHERE evidence.evidence_type = 'user_claim' "
+                "AND evidence.role IN ('support', 'change_trigger') "
+                "AND state.status IN ('active', 'weakened') "
+                f"AND evidence.evidence_id IN ({placeholders}) "
+                "ORDER BY evidence.evidence_id, state.id",
+                chunk,
+            ).fetchall()
+            for row in rows:
+                item = self._row_to_dict(row)
+                item["conditions"] = _json_loads(item.get("conditions"), {})
+                claim_id = int(item.pop("claim_id"))
+                if not any(
+                    int(existing["id"]) == int(item["id"])
+                    for existing in result[claim_id]
+                ):
+                    result[claim_id].append(item)
+        return result
 
     def replace_user_state_claim_evidence(
         self, *, state_id: int, evidence: Sequence[Dict[str, Any]],

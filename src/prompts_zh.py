@@ -616,28 +616,52 @@ candidate_claim_groups：
 """
 
 
+USER_CLAIM_STATUS_REVIEW_PROMPT_ZH = """你负责复核旧 user_claim 在当前时刻是否仍有效。输入中的 user_state 操作已经过校验，但尚未写库；你只判断 claim 状态，不重新判断或输出 state 操作。
+
+每个 review_case 以一条旧 claim 为主体，包含与其有关系事件的新 claim、本轮影响它支撑的 state 的 revise/weaken/expire 操作，以及它仍支撑的其他有效 state。关系事件的 semantic_relation 已经判定，不要重新分类。state 是聚合判断，某个 state 被修订、削弱或失效，不等于其每条证据 claim 都失效；历史上成立的陈述即使不再构成当前规律，也可能仍然成立。旧 claim 仍支撑其他有效 state 时尤其需要谨慎，但也不能仅凭这种支撑就忽略明确的当前矛盾。
+
+逐项只选择：
+- keep：旧 claim 仍成立，或证据不足以改变其当前状态；不写库。
+- weakened：旧 claim 的当前适用性受到可信挑战，但尚不能确认已被替代。只有旧 claim 当前为 active 时才选择。
+- superseded：新 claim 明确取代了旧 claim 在同一时间和适用条件下的当前判断；必须有 contradicts 或 supersedes 关系事件支持。它不删除旧 claim 的历史记录。
+
+不同时间段、条件或范围下可并存的 claim 不应互相取代。不要仅把 state 的 weaken 映射为 claim 的 weakened，或把 state 的 expire 映射为 claim 的 superseded。只复核输入中的 old_claim，不修改 new_claim。每个 review_case 必须恰好返回一项决定；若决定不是 keep，trigger_claim_id 和 relation_event_id 必须指向该 case 中同一条关系。reason 说明新旧 claim 的时间、条件及 state 证据如何支持这个判断。只返回 JSON：
+{
+  "claim_decisions": [
+    {
+      "target_claim_id": 1,
+      "decision": "keep|weakened|superseded",
+      "trigger_claim_id": 2,
+      "relation_event_id": 3,
+      "reason": "简短的具体理由"
+    }
+  ]
+}
+
+reference_time：{reference_time}
+review_cases：{review_cases}
+"""
+
+
 USER_CLAIM_STATE_RESOLUTION_PROMPT_ZH = """user_state 是个人世界模型在某一时刻对用户本人的可更新状态判断，用于后续推理、预测和服务决策。它整合一条或多条可追溯证据及其时间、条件，表达相对稳定的倾向、重复行为规律或当前持续情境；它不是原始事实、单条证据或来源文本的副本。
 
 user_claim 是关于用户本人的可追溯命题，记录用户明确表达的认识或依据已有证据推导出的判断，并保留来源、置信度和时间信息。claim 是形成 state 的证据，不等于在当前时刻必然有效的 state；新旧 claim 的关系事件描述命题之间的语义关系，本身不是最终的状态裁决。
 
-你负责以本轮每条新 user_claim 为起点，更新 user_state，并在必要时裁决与新 claim 关联的旧 claim 状态。更新 user_state 是主要任务；创建新 state 不以旧 state 或 claim 关系事件存在为前提。
+你只负责以本轮每条新 user_claim 为起点更新 user_state。关系事件用于理解新旧 claim 的语义关联及其可能影响的 state；不要判断或输出旧 claim 的状态变化。创建新 state 不以旧 state 或 claim 关系事件存在为前提。
 
-输入含义：`new_claim_cases` 每项以 `new_claim` 为主体，`related_claims` 将该新 claim 的关系事件与对应旧 claim 放在一起；事件的语义关系已判定，无需重新分类。`state_contexts` 是本领域现有 enduring_state 和 recurring_state 的目录，每项把 state 及其 claim/pattern 支撑放在一起；需要检查新 claim 是否与其中任一 state 表达同一状态。列表为空只表示没有这类历史信息，不表示不能创建 state。
+输入含义：`new_claim_cases` 每项以 `new_claim` 为主体，`related_claims` 将关系事件、对应旧 claim 及该旧 claim 关联的 `linked_state_ids` 放在一起；事件的语义关系已判定，无需重新分类。`state_contexts` 包含本领域现有 enduring_state 和 recurring_state。`evidence_detail_available=true` 表示该 state 与关系事件中的旧 claim 有证据关联，提供完整的 `claim_evidence` 和 `pattern_evidence`；否则只提供 state 描述与两类支撑证据的数量，不代表它没有其他证据，也不代表这些支撑目前都有效。需要检查新 claim 是否与其中任一 state 表达同一状态。列表为空只表示没有这类历史信息，不表示不能创建 state。
 
-请按以下顺序思考，最后只输出一次联合结果：
+请按以下顺序思考，只输出 state 操作：
 1. **逐条评估新 claim。**先阅读每个 `new_claim_case.new_claim`，独立判断它是否支持值得在未来预测或服务决策中使用的长期偏好、稳定约束、行为规律；再合并指向同一状态维度的新 claim，不要对同一 state 输出重复操作。即使该 case 没有 `related_claims` 且 `state_contexts=[]`，也必须完成评估；有充分证据就输出 `create`。可以由一条直接、明确、具有持续含义的 explicit claim 创建 enduring_state，例如“我一向喜欢早上开会”可形成时间偏好；不要求凑够多条 claim。多条具体偏好也可以汇总为同一维度的 state，但不要为了聚合而混合互不相干的主题。state_text 应表达可复用的状态判断，而非粘贴或逐字改写 claim。
 2. **区分稳定倾向与重复行为。**`enduring_state` 表示跨时间或情境大致有效的偏好、风格、价值取向或长期约束；明确表达的稳定偏好不因只有一次陈述就被视为一次性事件。`recurring_state` 表示有周期、频率、反复行为或明确条件—行为规则的模式；需要 claim 明确陈述习惯/规律，或多次行为证据共同支持。不能因为用户喜欢某项活动、打算做一次、或对一次经历印象深刻，就推断其经常这么做。一次性的目标、计划、行程、近期情绪和能力担忧也不能自动升级为长期 state。只从 claim 创建 enduring_state 或 recurring_state，不创建 situational_state。
-3. **对齐旧 state。**检查所有 `state_contexts`。若同一 `state_domain`、`state_type`、`state_kind`、`state_topic` 的旧 state 已表达该状态，应根据新证据选择 `reinforce` 或 `revise`，不能重复 `create`。若新证据削弱或否定旧 state，应结合该 state 的 `claim_evidence` 和 `pattern_evidence` 判断 `weaken`、`expire` 或局部 `revise`；一条支撑 claim 失效并不意味着整个 state 失效。仍有 observed pattern 支持的 recurring_state 不应仅因 claim 变化而削弱或失效。没有受影响的旧 state 时，也要保留第 1 步得出的新建结论。
-4. **裁决旧 claim。**只有某个 case 的 `related_claims` 中，旧 claim 为关系事件 target、该 case 的新 claim 为 trigger，且关系为 `contradicts` 或 `supersedes`，才可能调整旧 claim 状态。关系事件本身不是失效判决；要结合文本、来源（通常 explicit 比 derived 更直接）、时间和适用条件判断。`contradicts` 最多使旧 claim `weakened`；明确的 `supersedes` 才可使其 `superseded`。在不同条件或时期可以并存时不变更；不要修改新 claim 的状态，也不要因为 state 失效就反向认定旧 claim 失效。没有可裁决关系时 `claim_updates=[]`，这不影响 operations 创建或更新 state。
-5. **联合检查。**state 的支撑证据要与本轮 claim 状态裁决一致；被判 superseded 的 claim 不得继续作为有效 support。缺少证据的单个候选 state 可以省略，但不能因另一个候选不成立而放弃本轮所有有根据的 state。
+3. **对齐旧 state。**检查所有 `state_contexts`。若同一 `state_domain`、`state_type`、`state_kind`、`state_topic` 的旧 state 已表达该状态，应根据新证据选择 `reinforce` 或 `revise`，不能重复 `create`。任何已有 state，包括只提供精简描述的 state，都允许 `reinforce|revise|weaken|expire`；对精简 state 作 `weaken|expire` 时，应说明新 claim 与其状态陈述、适用条件或有效时间的具体冲突，不得把未展开的证据当作不存在。对有完整证据的 state，应结合 `claim_evidence` 和 `pattern_evidence` 判断；一条支撑 claim 失效并不意味着整个 state 失效。仍有 observed pattern 支持的 recurring_state 不应仅因 claim 变化而削弱或失效。没有受影响的旧 state 时，也要保留第 1 步得出的新建结论。
+4. **处理旧 state 失效后的新状态。**如果决定对旧 state 输出 `expire`，必须继续检查导致失效的新 claim 是否同时支持另一条持续、可复用的 state。若支持，且新旧 state 的具体主题身份不同，就在同一个 `operations` 列表中同时输出旧 state 的 `expire` 和新 state 的 `create`；例如“以后固定改为每周五跑步”可以终止“每周三跑步”并创建“每周五跑步”。如果新 claim 只是终止旧规律、没有确立新规律，则只输出 `expire`。如果变化仍是同一 state 身份的延续，应输出 `revise`，而非对同一主题 `expire` 后重复 `create`。
+5. **检查证据和适用范围。**关系事件只说明 claim 之间的语义关系，不自动决定旧 claim 或 state 的当前有效性。结合文本、来源、时间和条件判断新 claim 对 state 的影响；不同条件或时期可以并存的 claim，不应据此错误地削弱 state。缺少证据的单个候选 state 可以省略，但不能因另一个候选不成立而放弃本轮所有有根据的 state。
 
 state 操作仅允许 `create|reinforce|revise|weaken|expire`。更新必须引用 `state_contexts` 中的 state id；create 的 target_state_id 为 0。state_kind 只可取：enduring_state 的 `communication_style|decision_style|value_priority|risk_preference|privacy_preference|time_preference|work_style|lifestyle_preference|long_term_constraint`，或 recurring_state 的 `daily_routine|weekly_routine|work_routine|health_routine|social_routine|conditional_behavior`。state_kind 表示状态类别，不是具体状态的唯一身份；同一类别可以有多条不同状态。创建时另输出简短、稳定、能区分具体主题的中文 `state_topic`，如 `工作日健身` 与 `晚间散步`；不得输出纯英文标识、拼音或英文蛇形命名。涉及外文专有名词时可以保留原名，但主题的含义仍须用中文表达，例如 `Imagine Dragons音乐偏好`。同义改写或新增证据若仍描述已有状态，应使用该状态的 target_state_id，而不是换一个 topic 重复创建。更新时保持目标 state_type、state_kind 和 state_topic。不得跨出本轮 state_domain。
 
-每条 state 操作的 evidence 只可引用输入 claim，格式为 `evidence_type=user_claim`、`evidence_id`、`role=change_trigger|support|counterexample|context`、`weight`。必须引用至少一条 `new_claim_cases.new_claim` 作为触发；仍被列为 support 的 claim 不得在本轮被判 superseded。expire/weaken 可以引用反例，但不应把反例写成支持。每项都要给出简短理由、0-1 的 confidence。只有逐项评估后确实没有合格操作时，operations 才输出空数组。只返回 JSON：
+每条 state 操作的 evidence 只可引用输入 claim，格式为 `evidence_type=user_claim`、`evidence_id`、`role=change_trigger|support|counterexample|context`、`weight`。必须引用至少一条 `new_claim_cases.new_claim` 作为触发；只需列出本轮判断直接使用的 claim，无需复述未提供的旧证据，系统会保留它们。expire/weaken 可以引用反例，但不应把反例写成支持。每项都要给出简短理由、0-1 的 confidence。只有逐项评估后确实没有合格操作时，operations 才输出空数组。只返回 JSON：
 {
-  "claim_updates": [
-    {"claim_id": 1, "new_status": "weakened|superseded", "relation_event_id": 1, "reason": "为什么本轮证据足以改变旧 claim"}
-  ],
   "operations": [
     {
       "operation": "create|reinforce|revise|weaken|expire",

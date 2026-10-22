@@ -2509,9 +2509,14 @@ class UserMemoryDB:
         row = self._conn.execute(
             "SELECT status FROM memory_user_claims WHERE id = ?", (int(claim_id),)
         ).fetchone()
-        if not row or str(row["status"]) == str(new_status):
+        previous_status = str(row["status"] or "") if row else ""
+        if (
+            new_status not in {"weakened", "superseded"}
+            or previous_status not in {"active", "weakened"}
+            or previous_status == new_status
+            or (new_status == "weakened" and previous_status != "active")
+        ):
             return False
-        previous_status = str(row["status"] or "")
         self._conn.execute(
             "UPDATE memory_user_claims SET status = ?, updated_at = ? WHERE id = ?",
             (str(new_status), local_now_text(), int(claim_id)),
