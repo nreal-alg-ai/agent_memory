@@ -382,29 +382,44 @@ class UserStateResolver:
     def process_user_observed_pattern_state_update_task(
         self,
         *,
-        changed_observed_pattern_ids: Optional[Sequence[int]] = None,
-        affected_observed_pattern_ids: Optional[Sequence[int]] = None,
-        trigger_user_action_signal_ids: Optional[Sequence[int]] = None,
+        new_pattern_ids: Optional[Sequence[int]] = None,
+        pattern_relation_event_ids: Optional[Sequence[int]] = None,
         reference_timestamp: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """Project changed observed behavior into recurring states by domain."""
-        changed_pattern_ids = list(changed_observed_pattern_ids or [])
-        affected_pattern_ids = list(affected_observed_pattern_ids or [])
-        trigger_signal_ids = list(trigger_user_action_signal_ids or [])
         reference_time = reference_timestamp
         owner_id = int(self._user_memory_db.add_entity_names([self._world_owner_entity_name])[
             self._world_owner_entity_name
         ])
-        changed_ids = {int(value) for value in changed_pattern_ids if int(value) > 0}
-        affected_ids = {int(value) for value in affected_pattern_ids if int(value) > 0}
-        trigger_ids = {int(value) for value in trigger_signal_ids if int(value) > 0}
+        new_ids = {int(value) for value in new_pattern_ids or [] if int(value) > 0}
+        relation_event_ids = {
+            int(value) for value in pattern_relation_event_ids or []
+        }
+        if any(event_id <= 0 for event_id in relation_event_ids):
+            raise ValueError("Pattern relation event IDs must be positive")
+        events = self._user_memory_db.get_user_observed_pattern_relation_events_by_ids(
+            relation_event_ids
+        )
+        if {int(item["id"]) for item in events} != relation_event_ids:
+            raise ValueError("Pattern relation event is missing")
+        changed_ids = new_ids | {
+            int(item["target_pattern_id"]) for item in events
+            if item["semantic_relation"] in {"supports", "duplicate"}
+        }
+        affected_ids = {
+            int(item["target_pattern_id"]) for item in events
+            if item["semantic_relation"] in {"refines", "contradicts"}
+        }
+        trigger_ids = {
+            int(value) for item in events
+            for value in item["support_signal_ids"]
+        }
         patterns = self._user_memory_db.get_user_observed_patterns_by_ids(changed_ids | affected_ids)
         patterns = [
             item for item in patterns
             if int(item.get("subject_entity_id") or 0) == owner_id
             and self._normalize_state_domain(item.get("primary_domain"))
         ]
-        events = self._user_memory_db.get_user_observed_pattern_events_for_signal_ids(trigger_ids)
         pattern_by_id = {int(item["id"]): item for item in patterns}
         events = [
             item for item in events
@@ -487,12 +502,6 @@ class UserStateResolver:
                 for signal_id in event["support_signal_ids"]
                 if int(signal_id) in trigger_ids and int(signal_id) in signal_by_id
             }
-            domain_trigger_ids.update({
-                signal_id for signal_id in trigger_ids
-                if signal_id in signal_by_id
-                and any(signal_id in (item.get("support_signal_ids") or [])
-                        for item in domain_patterns.values())
-            })
             existing_states = self._user_model_db.get_user_states(
                 state_domains=[domain],
                 state_types=["recurring_state"], statuses=["active", "weakened"],

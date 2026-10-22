@@ -1284,24 +1284,24 @@ class TaskScheduler:
     ) -> None:
         result = event.get("result")
         if (event.get("succeeded") and isinstance(result, dict)):
-            changed_ids = list(result.get("user_observed_pattern_ids") or [])
-            affected_ids = list(result.get("affected_user_observed_pattern_ids") or [])
-            if changed_ids or affected_ids:
+            new_pattern_ids = list(result.get("new_pattern_ids") or [])
+            pattern_relation_event_ids = list(
+                result.get("pattern_relation_event_ids") or []
+            )
+            if new_pattern_ids or pattern_relation_event_ids:
                 payload = {
-                    "changed_observed_pattern_ids": changed_ids,
-                    "affected_observed_pattern_ids": affected_ids,
-                    "trigger_user_action_signal_ids": list(
-                        result.get("trigger_user_action_signal_ids") or []
-                    ),
+                    "new_pattern_ids": new_pattern_ids,
+                    "pattern_relation_event_ids": pattern_relation_event_ids,
                     "reference_timestamp": result.get("reference_timestamp"),
                 }
                 self.submit(
                     "memory_user_observed_pattern_state_update", payload,
                     report_payload={
-                        "changed_observed_pattern_ids": changed_ids,
-                        "affected_observed_pattern_ids": affected_ids,
+                        "new_pattern_ids": new_pattern_ids,
+                        "pattern_relation_event_ids": pattern_relation_event_ids,
                     },
                 )
+
     def _schedule_after_user_intent_update_task(
         self, event: Dict[str, Any], completion: Dict[str, Any],
     ) -> None:

@@ -1991,6 +1991,31 @@ class UserMemoryDB:
             events.append(event)
         return events
 
+    def get_user_observed_pattern_relation_events_by_ids(
+        self, event_ids: Sequence[int],
+    ) -> List[Dict[str, Any]]:
+        """Load exact pattern relation events referenced by a state update task."""
+        ids = sorted({int(value) for value in event_ids if int(value) > 0})
+        events: List[Dict[str, Any]] = []
+        for offset in range(0, len(ids), 500):
+            chunk = ids[offset:offset + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = self._conn.execute(
+                "SELECT * FROM memory_user_observed_pattern_events "
+                f"WHERE id IN ({placeholders})",
+                chunk,
+            ).fetchall()
+            for row in rows:
+                event = self._row_to_dict(row)
+                event["support_signal_ids"] = _json_loads(
+                    event.get("support_signal_ids"), [],
+                )
+                event["candidate_snapshot"] = _json_loads(
+                    event.get("candidate_snapshot"), {},
+                )
+                events.append(event)
+        return sorted(events, key=lambda event: int(event["id"]))
+
     def record_user_claim_relation(
         self,
         *,
