@@ -616,18 +616,22 @@ candidate_claim_groups：
 """
 
 
-USER_CLAIM_STATE_RESOLUTION_PROMPT_ZH = """你负责以本轮每条新 user_claim 为起点，更新 user_state，并在必要时裁决与新 claim 关联的旧 claim 状态。更新 user_state 是主要任务；创建新 state 不以旧 state 或 claim 关系事件存在为前提。
+USER_CLAIM_STATE_RESOLUTION_PROMPT_ZH = """user_state 是个人世界模型在某一时刻对用户本人的可更新状态判断，用于后续推理、预测和服务决策。它整合一条或多条可追溯证据及其时间、条件，表达相对稳定的倾向、重复行为规律或当前持续情境；它不是原始事实、单条证据或来源文本的副本。
 
-输入含义：`new_claim_cases` 每项以 `new_claim` 为主体，`related_claims` 将该新 claim 的关系事件与对应旧 claim 放在一起；事件的语义关系已判定，无需重新分类。`relevant_state_ids` 指向由这些 claim 的已有证据直接关联的 state，但不是排他性候选列表。`state_contexts` 是本领域的现有 state 目录，每项把 state 及其 claim/pattern 支撑放在一起；即使某个 state 不在 `relevant_state_ids` 中，也要判断新 claim 是否与它表达同一状态。列表为空只表示没有这类历史信息，不表示不能创建 state。
+user_claim 是关于用户本人的可追溯命题，记录用户明确表达的认识或依据已有证据推导出的判断，并保留来源、置信度和时间信息。claim 是形成 state 的证据，不等于在当前时刻必然有效的 state；新旧 claim 的关系事件描述命题之间的语义关系，本身不是最终的状态裁决。
+
+你负责以本轮每条新 user_claim 为起点，更新 user_state，并在必要时裁决与新 claim 关联的旧 claim 状态。更新 user_state 是主要任务；创建新 state 不以旧 state 或 claim 关系事件存在为前提。
+
+输入含义：`new_claim_cases` 每项以 `new_claim` 为主体，`related_claims` 将该新 claim 的关系事件与对应旧 claim 放在一起；事件的语义关系已判定，无需重新分类。`state_contexts` 是本领域现有 enduring_state 和 recurring_state 的目录，每项把 state 及其 claim/pattern 支撑放在一起；需要检查新 claim 是否与其中任一 state 表达同一状态。列表为空只表示没有这类历史信息，不表示不能创建 state。
 
 请按以下顺序思考，最后只输出一次联合结果：
 1. **逐条评估新 claim。**先阅读每个 `new_claim_case.new_claim`，独立判断它是否支持值得在未来预测或服务决策中使用的长期偏好、稳定约束、行为规律；再合并指向同一状态维度的新 claim，不要对同一 state 输出重复操作。即使该 case 没有 `related_claims` 且 `state_contexts=[]`，也必须完成评估；有充分证据就输出 `create`。可以由一条直接、明确、具有持续含义的 explicit claim 创建 enduring_state，例如“我一向喜欢早上开会”可形成时间偏好；不要求凑够多条 claim。多条具体偏好也可以汇总为同一维度的 state，但不要为了聚合而混合互不相干的主题。state_text 应表达可复用的状态判断，而非粘贴或逐字改写 claim。
 2. **区分稳定倾向与重复行为。**`enduring_state` 表示跨时间或情境大致有效的偏好、风格、价值取向或长期约束；明确表达的稳定偏好不因只有一次陈述就被视为一次性事件。`recurring_state` 表示有周期、频率、反复行为或明确条件—行为规则的模式；需要 claim 明确陈述习惯/规律，或多次行为证据共同支持。不能因为用户喜欢某项活动、打算做一次、或对一次经历印象深刻，就推断其经常这么做。一次性的目标、计划、行程、近期情绪和能力担忧也不能自动升级为长期 state。只从 claim 创建 enduring_state 或 recurring_state，不创建 situational_state。
-3. **对齐旧 state。**检查所有 `state_contexts`，不能只检查 case 的 `relevant_state_ids`。若同一 `state_domain`、`state_type`、`state_kind`、`state_topic` 的旧 state 已表达该状态，应根据新证据选择 `reinforce` 或 `revise`，不能重复 `create`。若新证据削弱或否定旧 state，应结合该 state 的 `claim_evidence` 和 `pattern_evidence` 判断 `weaken`、`expire` 或局部 `revise`；一条支撑 claim 失效并不意味着整个 state 失效。仍有 observed pattern 支持的 recurring_state 不应仅因 claim 变化而削弱或失效。没有受影响的旧 state 时，也要保留第 1 步得出的新建结论。
+3. **对齐旧 state。**检查所有 `state_contexts`。若同一 `state_domain`、`state_type`、`state_kind`、`state_topic` 的旧 state 已表达该状态，应根据新证据选择 `reinforce` 或 `revise`，不能重复 `create`。若新证据削弱或否定旧 state，应结合该 state 的 `claim_evidence` 和 `pattern_evidence` 判断 `weaken`、`expire` 或局部 `revise`；一条支撑 claim 失效并不意味着整个 state 失效。仍有 observed pattern 支持的 recurring_state 不应仅因 claim 变化而削弱或失效。没有受影响的旧 state 时，也要保留第 1 步得出的新建结论。
 4. **裁决旧 claim。**只有某个 case 的 `related_claims` 中，旧 claim 为关系事件 target、该 case 的新 claim 为 trigger，且关系为 `contradicts` 或 `supersedes`，才可能调整旧 claim 状态。关系事件本身不是失效判决；要结合文本、来源（通常 explicit 比 derived 更直接）、时间和适用条件判断。`contradicts` 最多使旧 claim `weakened`；明确的 `supersedes` 才可使其 `superseded`。在不同条件或时期可以并存时不变更；不要修改新 claim 的状态，也不要因为 state 失效就反向认定旧 claim 失效。没有可裁决关系时 `claim_updates=[]`，这不影响 operations 创建或更新 state。
 5. **联合检查。**state 的支撑证据要与本轮 claim 状态裁决一致；被判 superseded 的 claim 不得继续作为有效 support。缺少证据的单个候选 state 可以省略，但不能因另一个候选不成立而放弃本轮所有有根据的 state。
 
-state 操作仅允许 `create|reinforce|revise|weaken|expire`。更新必须引用 `state_contexts` 中的 state id；create 的 target_state_id 为 0。state_kind 只可取：enduring_state 的 `communication_style|decision_style|value_priority|risk_preference|privacy_preference|time_preference|work_style|lifestyle_preference|long_term_constraint`，或 recurring_state 的 `daily_routine|weekly_routine|work_routine|health_routine|social_routine|conditional_behavior`。state_kind 表示状态类别，不是具体状态的唯一身份；同一类别可以有多条不同状态。创建时另输出简短、稳定、能区分具体主题的 `state_topic`，如 `weekday_gym` 与 `evening_walk`；同义改写或新增证据若仍描述已有状态，应使用该状态的 target_state_id，而不是换一个 topic 重复创建。更新时保持目标 state_type、state_kind 和 state_topic。不得跨出本轮 state_domain。
+state 操作仅允许 `create|reinforce|revise|weaken|expire`。更新必须引用 `state_contexts` 中的 state id；create 的 target_state_id 为 0。state_kind 只可取：enduring_state 的 `communication_style|decision_style|value_priority|risk_preference|privacy_preference|time_preference|work_style|lifestyle_preference|long_term_constraint`，或 recurring_state 的 `daily_routine|weekly_routine|work_routine|health_routine|social_routine|conditional_behavior`。state_kind 表示状态类别，不是具体状态的唯一身份；同一类别可以有多条不同状态。创建时另输出简短、稳定、能区分具体主题的中文 `state_topic`，如 `工作日健身` 与 `晚间散步`；不得输出纯英文标识、拼音或英文蛇形命名。涉及外文专有名词时可以保留原名，但主题的含义仍须用中文表达，例如 `Imagine Dragons音乐偏好`。同义改写或新增证据若仍描述已有状态，应使用该状态的 target_state_id，而不是换一个 topic 重复创建。更新时保持目标 state_type、state_kind 和 state_topic。不得跨出本轮 state_domain。
 
 每条 state 操作的 evidence 只可引用输入 claim，格式为 `evidence_type=user_claim`、`evidence_id`、`role=change_trigger|support|counterexample|context`、`weight`。必须引用至少一条 `new_claim_cases.new_claim` 作为触发；仍被列为 support 的 claim 不得在本轮被判 superseded。expire/weaken 可以引用反例，但不应把反例写成支持。每项都要给出简短理由、0-1 的 confidence。只有逐项评估后确实没有合格操作时，operations 才输出空数组。只返回 JSON：
 {
@@ -657,15 +661,17 @@ state_contexts：{state_contexts}
 """
 
 
-USER_ACTIVITY_STATE_UPDATE_PROMPT_ZH = """你负责根据新生成的“用户情境观察”（user activity）增量更新 situational_state。
+USER_ACTIVITY_STATE_UPDATE_PROMPT_ZH = """user_state 是个人世界模型在某一时刻对用户本人的可更新状态判断，用于后续推理、预测和服务决策。它整合一条或多条可追溯证据及其时间、条件，表达相对稳定的倾向、重复行为规律或当前持续情境；它不是原始事实、单条证据或来源文本的副本。
 
-本次触发入口是新 activity。activity 描述用户在一个连续时间窗口内实际参与的事情；facts 提供窗口中的具体证据；related_intents 是与这些 facts 有直接证据关联的、当前仍活跃的 goal/plan/work_item，只作为该情境的补充背景。activity 的 `user_role` 中，`actor` 表示证据支持用户本人正在做该事，`participant` 表示用户参与其中，`contextual` 仅表示周边背景，不可据此推断用户本人正在执行。不要把 activity、fact 或 intent 原样复制成 state，也不要仅因用户谈到某个话题就假定用户正在持续处理它。
+user_activity 是对一个连续时间窗口内用户参与的活动或其所处周边情境的观察，记录这段时间发生的交谈、参与和情境，而不是把交谈中提到的每件过去或未来行为都认作正在发生。它说明用户这段时间经历了什么，不直接断言用户目前仍处于某种持续状态。
+
+你负责根据新生成的 user_activity 增量更新 situational_state。本次触发入口是新 activity。`new_activity_cases` 以每条 activity 为主体；其 `linked_facts` 只包含这条 activity 关联的事实，用于补充和核对该情境，不能把其他 activity 的 fact 当成它的证据。related_intents 是与这些 facts 有直接证据关联的、当前仍活跃的 goal/plan/work_item，只作为情境的补充背景。activity 的 `user_role` 中，`actor` 表示证据支持用户本人正在做该事，`participant` 表示用户参与其中，`contextual` 仅表示周边背景，不可据此推断用户本人正在执行。不要把 activity、fact 或 intent 原样复制成 state，也不要仅因用户谈到某个话题就假定用户正在持续处理它。
 
 只生成或更新 `situational_state`，不生成 enduring_state 或 recurring_state。只有证据表明用户目前正处于尚未结束的阶段、持续处理某个问题、正在准备某件事、受到当前约束，或处于有明确时效的关注/可用状态时才输出操作。纯闲聊、一次性问答、回忆、偏好表达、已经结束的活动或一次性行程通常不形成 situational_state。没有充分证据时返回空 operations。
 
-每个操作必须至少引用一条本次输入的 `user_activity` 证据。fact 只能来自输入的 linked_facts；goal/plan/work_item 只能来自输入的 related_intents。related_intents 已由系统按与本次 activity 共享 fact evidence 的方式筛选，仍需判断它是否确实描述同一持续情境。不得引用未提供的 ID。activity 是触发与情境锚点，不能单独把一个已结束的活动推断成当前状态。
+每个操作必须至少引用一条本次输入的 `user_activity` 证据。引用 fact 时，只能使用同一操作所引用 activity 的 `linked_facts`；goal/plan/work_item 只能来自输入的 related_intents。related_intents 已由系统按与本次 activity 共享 fact evidence 的方式筛选，仍需判断它是否确实描述同一持续情境。不得引用未提供的 ID。activity 是触发与情境锚点，不能单独把一个已结束的活动推断成当前状态。
 
-输出的 `state_domain` 必须从 `allowed_domains` 中选择；更新已有状态时，必须使用现有 state ID，并保持其 `state_domain`、`state_type`、`state_kind` 和 `state_topic`。state_kind 只能取：`current_focus`、`current_constraint`、`current_availability`、`current_energy`、`current_stress`、`current_social_engagement`、`current_preparation`。state_kind 是类别；同一类别下不同的持续情境可以并存。创建时输出简短、稳定的 `state_topic` 来标识具体情境；如果只是已有情境的新证据，使用其 target_state_id，不要重复创建。state_text 应是自包含的当前状态陈述，不要写成历史总结。尽可能给出合理的 valid_to 或 conditions 中的结束条件；不能凭空编造期限。操作仅允许 create、reinforce、revise、weaken、expire；create 的 target_state_id 为 0。
+输出的 `state_domain` 只能取 `general`（通用）、`health`（健康）、`work`（工作）、`life`（生活）、`information`（信息）、`finance`（财务）、`family`（家庭）、`learning`（学习）、`social`（人际）、`interest`（兴趣）、`travel`（出行）；更新已有状态时，必须使用现有 state ID，并保持其 `state_domain`、`state_type`、`state_kind` 和 `state_topic`。state_kind 只能取：`current_focus`、`current_constraint`、`current_availability`、`current_energy`、`current_stress`、`current_social_engagement`、`current_preparation`。state_kind 是类别；同一类别下不同的持续情境可以并存。创建时输出简短、稳定、能区分具体情境的中文 `state_topic`，如 `徒步旅行准备`；不得输出纯英文标识、拼音或英文蛇形命名。涉及外文专有名词时可以保留原名，但主题含义仍须用中文表达。如果只是已有情境的新证据，使用其 target_state_id，不要重复创建。state_text 应是自包含的当前状态陈述，不要写成历史总结。尽可能给出合理的 valid_to 或 conditions 中的结束条件；不能凭空编造期限。操作仅允许 create、reinforce、revise、weaken、expire；create 的 target_state_id 为 0。
 
 只返回 JSON：
 {
@@ -673,7 +679,7 @@ USER_ACTIVITY_STATE_UPDATE_PROMPT_ZH = """你负责根据新生成的“用户�
     {
       "operation": "create|reinforce|revise|weaken|expire",
       "target_state_id": 0,
-      "state_domain": "allowed_domains 中的一个值",
+      "state_domain": "上述受控选项之一",
       "state_type": "situational_state",
       "state_kind": "一个受控选项",
       "state_topic": "具体情境的稳定主题标识",
@@ -693,17 +699,11 @@ USER_ACTIVITY_STATE_UPDATE_PROMPT_ZH = """你负责根据新生成的“用户�
 reference_time：
 {reference_time}
 
-allowed_domains：
-{allowed_domains}
-
 runtime_context：
 {runtime_context}
 
-new_activities：
-{activities}
-
-linked_facts：
-{facts}
+new_activity_cases：
+{activity_cases}
 
 related_active_intents：
 {related_intents}
@@ -713,11 +713,13 @@ existing_situational_states：
 """
 
 
-USER_OBSERVED_PATTERN_STATE_UPDATE_PROMPT_ZH = """你负责根据用户本人新形成或获得新证据的 observed patterns，增量更新 recurring_state。
+USER_OBSERVED_PATTERN_STATE_UPDATE_PROMPT_ZH = """user_state 是个人世界模型在某一时刻对用户本人的可更新状态判断，用于后续推理、预测和服务决策。它整合一条或多条可追溯证据及其时间、条件，表达相对稳定的倾向、重复行为规律或当前持续情境；它不是原始事实、单条证据或来源文本的副本。
 
-user_observed_pattern 是从多次独立行为观察归纳的规律，不等于用户自述；supporting_actions 只是代表性原始证据。changed_patterns 是本轮新建或新增支持证据的规律；affected_patterns 是本轮关系事件涉及的旧规律。relation_events 已给出支持、细化或反驳关系，不要重新把动作相似当成支持。existing_states 中可能有由 explicit user_claim 建立的同一习惯；应更新那条 state，而不是按证据来源另建一条。
+user_observed_pattern 是从用户本人多次独立的行为或选择观察中归纳出的候选规律，不等于用户对习惯的自述，也不保证该规律在当前条件下仍然有效。它可为 recurring_state 提供证据，但 state 要表达综合证据后的当前有效判断，不应照搬 pattern 文本。
 
-只处理本轮 state_domain 的 recurring_state。规律的动作、频率、时间和适用条件必须有证据，不能由三次相似行为编造“每周三”或“每天”。state_text 应表达可用于预测的行为规律，不照抄 pattern。创建时以稳定的 state_topic 区分具体规律；语义相同的现有 state 必须使用 target_state_id。state_kind 只可为 daily_routine|weekly_routine|work_routine|health_routine|social_routine|conditional_behavior。
+你负责根据用户本人新形成或获得新证据的 observed patterns，增量更新 recurring_state。supporting_actions 只是代表性原始证据。changed_patterns 是本轮新建或新增支持证据的规律；affected_patterns 是本轮关系事件涉及的旧规律。relation_events 已给出支持、细化或反驳关系，不要重新把动作相似当成支持。existing_states 中可能有由 explicit user_claim 建立的同一习惯；应更新那条 state，而不是按证据来源另建一条。
+
+只处理本轮 state_domain 的 recurring_state。规律的动作、频率、时间和适用条件必须有证据，不能由三次相似行为编造“每周三”或“每天”。state_text 应表达可用于预测的行为规律，不照抄 pattern。创建时以简短、稳定的中文 state_topic 区分具体规律，如 `周三晨间健身`；不得输出纯英文标识、拼音或英文蛇形命名。涉及外文专有名词时可以保留原名，但主题含义仍须用中文表达。语义相同的现有 state 必须使用 target_state_id。state_kind 只可为 daily_routine|weekly_routine|work_routine|health_routine|social_routine|conditional_behavior。
 
 有新 pattern 或新支持证据时可 create、reinforce 或 revise；只有关系事件和具体反例足以削弱现有规律时才可 weaken。单条反例通常不足以否定重复行为；第一版不允许 expire。没有可靠变化时返回空 operations。每项操作都必须引用至少一条本轮 changed_patterns，或一条 trigger_signals；state 的长期支持应引用 evidence_type=user_observed_pattern 的 pattern ID，原始反例可引用 evidence_type=user_action_signal 的 signal ID。反例不可作为 support。不得引用输入之外的 ID。
 

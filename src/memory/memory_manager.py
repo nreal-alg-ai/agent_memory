@@ -3519,7 +3519,7 @@ class MemoryNodeManager:
         }
 
     @staticmethod
-    def _user_claim_support_ids(
+    def _get_user_claim_support_fact_ids(
         candidate: Dict[str, Any],
     ) -> List[int]:
         support_ids = candidate.get("support_fact_ids")
@@ -3810,7 +3810,7 @@ class MemoryNodeManager:
         for index, candidate in enumerate(unique_candidates):
             candidate_decisions = decisions[index]
             candidate_origin = str(candidate.get("claim_origin") or "")
-            support_ids = self._user_claim_support_ids(candidate)
+            support_ids = self._get_user_claim_support_fact_ids(candidate)
             effective_at = self._user_claim_transition_effective_at(
                 candidate,
                 support_ids=support_ids,
@@ -3926,14 +3926,66 @@ class MemoryNodeManager:
         }
         if not signal_items:
             return report
+        extraction_claim_info = self._extract_explicit_user_claims_from_signals_using_llm(signal_items)
+        report.update({
+            "signal_batch_count": extraction_claim_info["signal_batch_count"],
+            "failed_signal_count": extraction_claim_info["failed_signal_count"],
+            "claim_count": extraction_claim_info["claim_count"],
+            "processed_signal_ids": extraction_claim_info["processed_signal_ids"],
+        })
+        claim_candidates = extraction_claim_info["claim_candidates"]
+        facts_by_id = {int(item["fact"]["id"]): item["fact"] for item in signal_items}
+        applied = self._reconcile_user_claims(
+            claim_candidates, facts_by_id=facts_by_id,
+        ) if claim_candidates else []
+        report["updated"] = len(applied)
+        report["created"] = sum(int(item["created"]) for item in applied)
+        report["merged"] = sum(int(item["merged"]) for item in applied)
         new_claim_ids: set[int] = set()
         claim_relations: Dict[Tuple[int, int, str], Dict[str, Any]] = {}
+        for applied_item in applied:
+            claim_id = int(applied_item["claim_id"])
+            new_claim_ids.add(claim_id)
+            for decision in applied_item.get("relations") or []:
+                existing_claim_id = int(decision.get("existing_claim_id") or 0)
+                if existing_claim_id <= 0 or existing_claim_id == claim_id:
+                    continue
+                semantic_relation = str(decision.get("semantic_relation") or "")
+                key = (claim_id, existing_claim_id, semantic_relation)
+                claim_relations[key] = {
+                    "relation_event_id": int(decision["relation_event_id"]),
+                    "new_claim_id": claim_id,
+                    "existing_claim_id": existing_claim_id,
+                    "semantic_relation": semantic_relation,
+                    "confidence": float(decision.get("confidence") or 0.0),
+                    "reason": str(decision.get("reason") or ""),
+                }
+        report["new_claim_ids"] = sorted(new_claim_ids)
+        report["claim_relations"] = [
+            claim_relations[key] for key in sorted(claim_relations)
+        ]
+        report["completed"] = report["failed_signal_count"] == 0
+        return report
+
+    def _extract_explicit_user_claims_from_signals_using_llm(
+        self,
+        signal_items: Sequence[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Extract all signal batches and merge duplicate claims across batches."""
+        result: Dict[str, Any] = {
+            "signal_batch_count": 0,
+            "failed_signal_count": 0,
+            "claim_count": 0,
+            "processed_signal_ids": [],
+            "claim_candidates": [],
+        }
+        unique_claim_candidates: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
         batch_size = max(
             1, int(self._memory_cfg.get("user_claim_signal_batch_size") or 8),
         )
         for batch_start in range(0, len(signal_items), batch_size):
             batch_signal_items = signal_items[batch_start:batch_start + batch_size]
-            report["signal_batch_count"] += 1
+            result["signal_batch_count"] += 1
             prompt_language = self._resolve_prompt_language_from_text(
                 "\n".join(str(item["fact"].get("summary") or "") for item in batch_signal_items)
             )
@@ -3956,27 +4008,24 @@ class MemoryNodeManager:
                     "error": str(exc),
                 })
             if not isinstance(parsed, dict) or not isinstance(parsed.get("results"), list):
-                report["failed_signal_count"] += len(batch_signal_items)
+                result["failed_signal_count"] += len(batch_signal_items)
                 continue
 
             results_by_id: Dict[int, List[Dict[str, Any]]] = {}
-            for result in parsed["results"]:
-                if not isinstance(result, dict):
+            for raw_result in parsed["results"]:
+                if not isinstance(raw_result, dict):
                     continue
                 try:
-                    signal_id = int(result.get("signal_id"))
+                    signal_id = int(raw_result.get("signal_id"))
                 except (TypeError, ValueError):
                     continue
-                results_by_id.setdefault(signal_id, []).append(result)
+                results_by_id.setdefault(signal_id, []).append(raw_result)
 
-            batch_claim_candidates: List[Dict[str, Any]] = []
-            batch_processed_ids: List[int] = []
-            batch_facts_by_id = {int(item["fact"]["id"]): item["fact"] for item in batch_signal_items}
             for item in batch_signal_items:
                 signal_id = int(item["signal_id"])
                 results = results_by_id.get(signal_id) or []
                 if len(results) != 1 or not isinstance(results[0].get("claims"), list):
-                    report["failed_signal_count"] += 1
+                    result["failed_signal_count"] += 1
                     continue
                 fact = item["fact"]
                 fact_id = int(fact["id"])
@@ -4007,64 +4056,31 @@ class MemoryNodeManager:
                         break
                     signal_candidates.append(claim)
                 if not valid:
-                    report["failed_signal_count"] += 1
+                    result["failed_signal_count"] += 1
                     continue
-                batch_claim_candidates.extend(signal_candidates)
-                batch_processed_ids.append(signal_id)
+                result["claim_count"] += len(signal_candidates)
+                result["processed_signal_ids"].append(signal_id)
 
-            # Several signals, including signals from different facts, can
-            # support the same proposition. Combine their fact evidence before
-            # the existing claim reconciler removes duplicate candidates.
-            unique_claim_candidates: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
-            for candidate in batch_claim_candidates:
-                key = (
-                    candidate["subject_entity_id"], candidate["claim_type"],
-                    candidate["predicate"], candidate.get("object_entity_id") or 0,
-                    candidate["claim_text"], candidate["claim_origin"],
-                )
-                existing = unique_claim_candidates.get(key)
-                if existing is None:
-                    unique_claim_candidates[key] = candidate
-                    continue
-                existing["evidence_fact_ids"] = list(dict.fromkeys(
-                    [*existing["evidence_fact_ids"], *candidate["evidence_fact_ids"]]
-                ))
-                existing["metadata"]["source_fact_count"] = len(existing["evidence_fact_ids"])
-                existing["confidence"] = max(existing["confidence"], candidate["confidence"])
-                if candidate["status"] == "active":
-                    existing["status"] = "active"
-
-            applied = self._reconcile_user_claims(
-                list(unique_claim_candidates.values()), facts_by_id=batch_facts_by_id,
-            ) if unique_claim_candidates else []
-            report["processed_signal_ids"].extend(batch_processed_ids)
-            report["claim_count"] += len(batch_claim_candidates)
-            report["updated"] += len(applied)
-            report["created"] += sum(int(item["created"]) for item in applied)
-            report["merged"] += sum(int(item["merged"]) for item in applied)
-            for applied_item in applied:
-                claim_id = int(applied_item["claim_id"])
-                new_claim_ids.add(claim_id)
-                for decision in applied_item.get("relations") or []:
-                    existing_claim_id = int(decision.get("existing_claim_id") or 0)
-                    if existing_claim_id <= 0 or existing_claim_id == claim_id:
+                # Merge equivalent claims across every batch before reconciliation.
+                for candidate in signal_candidates:
+                    key = (
+                        candidate["subject_entity_id"], candidate["claim_type"],
+                        candidate["predicate"], candidate.get("object_entity_id") or 0,
+                        candidate["claim_text"], candidate["claim_origin"],
+                    )
+                    existing = unique_claim_candidates.get(key)
+                    if existing is None:
+                        unique_claim_candidates[key] = candidate
                         continue
-                    semantic_relation = str(decision.get("semantic_relation") or "")
-                    key = (claim_id, existing_claim_id, semantic_relation)
-                    claim_relations[key] = {
-                        "relation_event_id": int(decision["relation_event_id"]),
-                        "new_claim_id": claim_id,
-                        "existing_claim_id": existing_claim_id,
-                        "semantic_relation": semantic_relation,
-                        "confidence": float(decision.get("confidence") or 0.0),
-                        "reason": str(decision.get("reason") or ""),
-                    }
-        report["new_claim_ids"] = sorted(new_claim_ids)
-        report["claim_relations"] = [
-            claim_relations[key] for key in sorted(claim_relations)
-        ]
-        report["completed"] = report["failed_signal_count"] == 0
-        return report
+                    existing["evidence_fact_ids"] = list(dict.fromkeys(
+                        [*existing["evidence_fact_ids"], *candidate["evidence_fact_ids"]]
+                    ))
+                    existing["metadata"]["source_fact_count"] = len(existing["evidence_fact_ids"])
+                    existing["confidence"] = max(existing["confidence"], candidate["confidence"])
+                    if candidate["status"] == "active":
+                        existing["status"] = "active"
+        result["claim_candidates"] = list(unique_claim_candidates.values())
+        return result
 
     def _normalize_explicit_user_claim(
         self,

@@ -240,12 +240,24 @@ class UserStateResolver:
             }
             for item in facts
         ]
+        fact_views_by_id = {int(item["id"]): item for item in fact_views}
+        activity_cases = [
+            {
+                "activity": {
+                    key: value for key, value in activity.items()
+                    if key != "evidence_fact_ids"
+                },
+                "linked_facts": [
+                    fact_views_by_id[fact_id]
+                    for fact_id in activity["evidence_fact_ids"]
+                ],
+            }
+            for activity in activity_views
+        ]
         update_input = {
             "reference_time": self._timestamp_text(effective_reference_time),
-            "allowed_domains": sorted(self.STATE_DOMAINS),
             "runtime_context": dict(runtime_context or {}),
-            "activities": activity_views,
-            "facts": fact_views,
+            "activity_cases": activity_cases,
             "related_intents": related_intents,
             "existing_states": [self._state_prompt_view(item) for item in existing_states],
         }
@@ -322,8 +334,20 @@ class UserStateResolver:
                 state_topic=normalized["state_topic"],
             ):
                 continue
-            if not any(
-                item.get("evidence_type") == "user_activity"
+            cited_activity_ids = {
+                item["evidence_id"] for item in normalized["evidence"]
+                if item["evidence_type"] == "user_activity"
+            }
+            if not cited_activity_ids:
+                continue
+            cited_activity_fact_ids = {
+                fact_id
+                for activity_id in cited_activity_ids
+                for fact_id in activity_fact_ids.get(activity_id, [])
+            }
+            if any(
+                item["evidence_type"] == "fact"
+                and item["evidence_id"] not in cited_activity_fact_ids
                 for item in normalized["evidence"]
             ):
                 continue
@@ -478,7 +502,7 @@ class UserStateResolver:
                     "status": "error", "error": "observed_pattern_state_input_limit_exceeded",
                 }
                 continue
-            state_evidence = self._user_model_db.get_user_state_evidence(
+            state_evidence = self._user_model_db.get_user_state_evidence_items(
                 [int(item["id"]) for item in existing_states],
                 limit=max(480, self._update_limit * 12),
             )
@@ -702,11 +726,12 @@ class UserStateResolver:
         claim_relations: Sequence[Mapping[str, Any]],
         reference_time: Optional[Any],
     ) -> Dict[str, Dict[str, Any]]:
-        changed = [
-            claim for claim in self._user_memory_db.get_user_claims_by_ids(new_claim_ids)
+        claims_by_id = {
+            int(claim["id"]): claim
+            for claim in self._user_memory_db.get_user_claims_by_ids(new_claim_ids)
             if int(claim.get("subject_entity_id") or 0) == world_owner_entity_id
             and self._normalize_state_domain(claim.get("primary_domain"))
-        ]
+        }
         relation_refs = {
             (int(item["new_claim_id"]), int(item["relation_event_id"]))
             for item in claim_relations
@@ -725,88 +750,55 @@ class UserStateResolver:
         }
         if loaded_refs != relation_refs:
             raise ValueError("Claim relation event is missing or mismatched")
-        by_domain: Dict[str, List[Dict[str, Any]]] = {}
-        for claim in changed:
-            by_domain.setdefault(str(claim["primary_domain"]), []).append(claim)
+        relations_by_trigger: Dict[int, List[Dict[str, Any]]] = {}
+        for event in relation_events:
+            relations_by_trigger.setdefault(int(event["trigger_claim_id"]), []).append(event)
+        by_domain: Dict[str, List[int]] = {}
+        for claim_id, claim in claims_by_id.items():
+            by_domain.setdefault(str(claim["primary_domain"]), []).append(claim_id)
         result: Dict[str, Dict[str, Any]] = {}
-        for domain, domain_claims in by_domain.items():
-            changed_ids = {int(claim["id"]) for claim in domain_claims}
-            relation_limit = max(400, self._update_limit * 8)
+        evidence_limit = max(480, self._update_limit * 12)
+        effective_reference_time = self._timestamp_text(reference_time)
+        for domain, changed_ids in by_domain.items():
             relations = [
-                event for event in relation_events
-                if int(event["trigger_claim_id"]) in changed_ids
+                event for claim_id in changed_ids
+                for event in relations_by_trigger.get(claim_id, [])
             ]
-            related_ids = {
-                int(event[key])
-                for event in relations
-                for key in ("target_claim_id", "trigger_claim_id")
-            } - changed_ids
-            linked_state_ids = self._user_model_db.get_user_state_ids_for_claim_ids(
-                sorted(changed_ids | related_ids), limit=self._update_limit + 1,
-            )
-            linked_states = [
-                state for state in self._user_model_db.get_user_states_by_ids(linked_state_ids)
-                if state.get("state_domain") == domain
-                and state.get("status") in {"active", "weakened"}
-            ]
-            domain_states = self._user_model_db.get_user_states(
+            states = self._user_model_db.get_user_states(
                 state_domains=[domain],
+                state_types=["enduring_state", "recurring_state"],
                 statuses=["active", "weakened"], limit=self._update_limit + 1,
+                include_evidence=True,
             )
-            states_by_id = {
-                int(state["id"]): state
-                for state in [*linked_states, *domain_states]
-            }
-            states = list(states_by_id.values())[:self._update_limit]
-            state_evidence_limit = max(480, self._update_limit * 12)
-            state_evidence = self._user_model_db.get_user_state_claim_evidence(
-                [int(state["id"]) for state in states],
-                limit=state_evidence_limit + 1,
-            )
+            claim_evidence = [
+                item for state in states for item in state["evidence_items"]
+                if item["evidence_type"] == "user_claim"
+            ]
             pattern_evidence = [
-                item for item in self._user_model_db.get_user_state_evidence(
-                    [int(state["id"]) for state in states],
-                    limit=state_evidence_limit + 1,
-                )
+                item for state in states for item in state["evidence_items"]
                 if item["evidence_type"] == "user_observed_pattern"
             ]
-            supporting_patterns = self._user_memory_db.get_user_observed_patterns_by_ids(
-                [int(item["evidence_id"]) for item in pattern_evidence]
+            required_claim_ids = (
+                set(changed_ids)
+                | {int(event["target_claim_id"]) for event in relations}
+                | {int(item["evidence_id"]) for item in claim_evidence}
             )
-            supporting_ids = {
-                int(item["evidence_id"]) for item in state_evidence
-            } - changed_ids - related_ids
-            all_ids = changed_ids | related_ids | supporting_ids
-            claims_by_id = {
+            claims_by_id.update({
                 int(claim["id"]): claim
-                for claim in self._user_memory_db.get_user_claims_by_ids(sorted(all_ids))
+                for claim in self._user_memory_db.get_user_claims_by_ids(
+                    sorted(required_claim_ids - claims_by_id.keys()),
+                )
                 if int(claim.get("subject_entity_id") or 0) == world_owner_entity_id
-            }
+            })
             fact_evidence = self._user_memory_db.get_user_claim_evidence_fact_ids(
-                sorted(claims_by_id), limit=max(480, self._update_limit * 12),
+                sorted(required_claim_ids & claims_by_id.keys()), limit=evidence_limit,
             )
             claim_views_by_id = {
-                claim_id: self._claim_prompt_view(claim, fact_evidence.get(claim_id, []))
-                for claim_id, claim in claims_by_id.items()
+                claim_id: self._claim_prompt_view(
+                    claims_by_id[claim_id], fact_evidence.get(claim_id, []),
+                )
+                for claim_id in required_claim_ids if claim_id in claims_by_id
             }
-            relations_by_trigger: Dict[int, List[Dict[str, Any]]] = {}
-            for event in relations:
-                trigger_id = int(event["trigger_claim_id"])
-                target_id = int(event["target_claim_id"])
-                if trigger_id not in claim_views_by_id or target_id not in claim_views_by_id:
-                    continue
-                relations_by_trigger.setdefault(trigger_id, []).append({
-                    "relation_event": {
-                        "id": int(event["id"]),
-                        "target_claim_id": target_id,
-                        "trigger_claim_id": trigger_id,
-                        "semantic_relation": str(event.get("semantic_relation") or ""),
-                        "semantic_confidence": event.get("semantic_confidence"),
-                        "effective_at": str(event.get("effective_at") or ""),
-                        "semantic_reason": str(event.get("semantic_reason") or ""),
-                    },
-                    "existing_claim": claim_views_by_id[target_id],
-                })
             patterns_by_id = {
                 int(pattern["id"]): {
                     "id": int(pattern["id"]),
@@ -814,64 +806,58 @@ class UserStateResolver:
                     "condition_text": str(pattern.get("condition_text") or ""),
                     "confidence": float(pattern.get("confidence") or 0.0),
                 }
-                for pattern in supporting_patterns
+                for pattern in self._user_memory_db.get_user_observed_patterns_by_ids(
+                    sorted({int(item["evidence_id"]) for item in pattern_evidence}),
+                )
             }
-            state_claim_evidence_by_id: Dict[int, List[Dict[str, Any]]] = {}
-            for evidence in state_evidence:
-                claim = claim_views_by_id.get(int(evidence["evidence_id"]))
-                if claim is None:
-                    continue
-                state_claim_evidence_by_id.setdefault(int(evidence["state_id"]), []).append({
-                    "claim": claim,
-                    "role": str(evidence.get("role") or ""),
-                    "weight": float(evidence.get("weight") or 0.0),
-                })
-            state_pattern_evidence_by_id: Dict[int, List[Dict[str, Any]]] = {}
-            for evidence in pattern_evidence:
-                pattern_id = int(evidence["evidence_id"])
-                state_pattern_evidence_by_id.setdefault(int(evidence["state_id"]), []).append({
-                    "pattern_id": pattern_id,
-                    "pattern": patterns_by_id.get(pattern_id),
-                    "role": str(evidence.get("role") or ""),
-                })
             state_contexts = [
                 {
                     "state": self._state_prompt_view(state),
-                    "claim_evidence": state_claim_evidence_by_id.get(int(state["id"]), []),
-                    "pattern_evidence": state_pattern_evidence_by_id.get(int(state["id"]), []),
+                    "claim_evidence": [
+                        {"claim": claim_views_by_id[int(item["evidence_id"])],
+                         "role": str(item.get("role") or ""),
+                         "weight": float(item.get("weight") or 0.0)}
+                        for item in state["evidence_items"]
+                        if item["evidence_type"] == "user_claim"
+                        and int(item["evidence_id"]) in claim_views_by_id
+                    ],
+                    "pattern_evidence": [
+                        {"pattern_id": int(item["evidence_id"]),
+                         "pattern": patterns_by_id.get(int(item["evidence_id"])),
+                         "role": str(item.get("role") or "")}
+                        for item in state["evidence_items"]
+                        if item["evidence_type"] == "user_observed_pattern"
+                    ],
                 }
                 for state in states
             ]
-            new_claim_cases = []
-            for claim_id in sorted(changed_ids):
-                new_claim = claim_views_by_id.get(claim_id)
-                if new_claim is None:
-                    continue
-                related = relations_by_trigger.get(claim_id, [])
-                case_claim_ids = {claim_id} | {
-                    int(item["existing_claim"]["id"]) for item in related
-                }
-                new_claim_cases.append({
-                    "new_claim": new_claim,
-                    "related_claims": related,
-                    "relevant_state_ids": [
-                        int(context["state"]["id"])
-                        for context in state_contexts
-                        if any(
-                            int(evidence["claim"]["id"]) in case_claim_ids
-                            for evidence in context["claim_evidence"]
-                        )
+            new_claim_cases = [
+                {
+                    "new_claim": claim_views_by_id[claim_id],
+                    "related_claims": [
+                        {
+                            "relation_event": {key: event.get(key) for key in (
+                                "id", "target_claim_id", "trigger_claim_id",
+                                "semantic_relation", "semantic_confidence",
+                                "effective_at", "semantic_reason",
+                            )},
+                            "existing_claim": claim_views_by_id[int(event["target_claim_id"])],
+                        }
+                        for event in relations_by_trigger.get(claim_id, [])
+                        if int(event["target_claim_id"]) in claim_views_by_id
                     ],
-                })
+                }
+                for claim_id in sorted(changed_ids)
+            ]
             result[domain] = {
                 "input_truncated": (
-                    len(relations) > relation_limit
-                    or len(linked_state_ids) > self._update_limit
-                    or len(domain_states) > self._update_limit
-                    or len(state_evidence) > state_evidence_limit
+                    len(relations) > max(400, self._update_limit * 8)
+                    or len(states) > self._update_limit
+                    or len(claim_evidence) > evidence_limit
+                    or len(pattern_evidence) > evidence_limit
                 ),
                 "state_domain": domain,
-                "reference_time": self._timestamp_text(reference_time),
+                "reference_time": effective_reference_time,
                 "new_claim_cases": new_claim_cases,
                 "state_contexts": state_contexts,
             }
@@ -1150,7 +1136,9 @@ class UserStateResolver:
             action = str(operation.get("operation") or "")
             target_id = int(operation.get("target_state_id") or 0)
             previous_claim_evidence = (
-                self._user_model_db.get_user_state_claim_evidence([target_id])
+                self._user_model_db.get_user_state_evidence_items(
+                    [target_id], evidence_type="user_claim",
+                )
                 if replace_claim_evidence and target_id else []
             )
             state_id, created, previous = self._user_model_db.upsert_user_state(

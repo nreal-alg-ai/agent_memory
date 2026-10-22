@@ -570,14 +570,18 @@ candidate_claim_groups:
 """
 
 
-USER_CLAIM_STATE_RESOLUTION_PROMPT_EN = """Start from each new user claim to update user states, and decide an old claim's status only when a relation to a new claim warrants it. Updating user states is the primary task. Creating a state does not require an existing state or a claim relation event.
+USER_CLAIM_STATE_RESOLUTION_PROMPT_EN = """A user_state is the personal world model's updateable judgment about the user at a given time, for later reasoning, prediction, and service decisions. It integrates one or more traceable pieces of evidence with their timing and conditions to express a relatively stable tendency, a recurring behavior, or a currently ongoing situation. It is not a copy of a raw fact, individual evidence item, or source text.
 
-Inputs: each new_claim_cases entry centers on new_claim. Its related_claims pair an already-classified relation event with the corresponding old claim; do not reclassify the relation. relevant_state_ids point to states directly linked through existing claim evidence, but are not an exclusive candidate list. state_contexts is the domain-wide catalog of existing states, each grouped with its claim and observed-pattern evidence. Check whether a new claim matches any of these states, even if its ID is absent from relevant_state_ids. An empty list means there is no such history, not that state creation is prohibited.
+A user_claim is a traceable proposition about the user: something the user explicitly expressed or a judgment derived from existing evidence, with provenance, confidence, and time information. A claim is evidence for a state, not necessarily a state that remains valid now. A relation event describes the semantic relationship between claims; it is not itself a final status decision.
+
+Start from each new user claim to update user states, and decide an old claim's status only when a relation to a new claim warrants it. Updating user states is the primary task. Creating a state does not require an existing state or a claim relation event.
+
+Inputs: each new_claim_cases entry centers on new_claim. Its related_claims pair an already-classified relation event with the corresponding old claim; do not reclassify the relation. state_contexts is the domain-wide catalog of existing enduring_state and recurring_state entries, each grouped with its claim and observed-pattern evidence. Check whether a new claim matches any of these states. An empty list means there is no such history, not that state creation is prohibited.
 
 Reason in this order, then return one joint result:
 1. Assess each new claim. Read every new_claim_cases.new_claim independently and decide whether it supports a durable preference, stable constraint, or behavioral pattern useful for future prediction or service decisions. Then combine new claims concerning the same state dimension into one operation; do not emit duplicate operations for one state. Do this even when a case has no related_claims and state_contexts=[]; emit create when evidence suffices. One direct, unambiguous explicit claim with durable meaning may establish an enduring_state, such as "I have always preferred morning meetings" establishing a time preference; multiple claims are not mandatory. Related concrete preferences may be aggregated, but do not mix unrelated subjects merely to create an aggregate. State text should express a reusable judgment, not paste or closely paraphrase claims.
 2. Distinguish durable tendencies from repetition. enduring_state covers preferences, styles, values, or constraints that broadly persist across time or situations. An explicit stable preference is not a one-off event merely because it was said once. recurring_state requires an explicitly stated habit/rule or multiple observations supporting periodic, frequent, repeated, or conditional behavior. Liking an activity, planning it once, or remembering an experience does not prove repetition. A one-time goal, plan, trip, recent emotion, or concern about ability does not automatically become a durable state. Create only enduring_state or recurring_state from claims, not situational_state.
-3. Align with existing states. Check every state_contexts entry, not only a case's relevant_state_ids. If an existing state with the same state_domain, state_type, state_kind, and state_topic already expresses the conclusion, reinforce or revise it rather than creating a duplicate. If new evidence challenges a state, examine that state's claim_evidence and pattern_evidence before weakening, expiring, or partially revising it. Losing one support claim does not necessarily invalidate the state. Do not weaken or expire a recurring_state solely because a claim changed while an observed pattern still supports it. Do not abandon a justified create decision merely because no old state is affected.
+3. Align with existing states. Check every state_contexts entry. If an existing state with the same state_domain, state_type, state_kind, and state_topic already expresses the conclusion, reinforce or revise it rather than creating a duplicate. If new evidence challenges a state, examine that state's claim_evidence and pattern_evidence before weakening, expiring, or partially revising it. Losing one support claim does not necessarily invalidate the state. Do not weaken or expire a recurring_state solely because a claim changed while an observed pattern still supports it. Do not abandon a justified create decision merely because no old state is affected.
 4. Decide old-claim status. Only a contradicts or supersedes event in a case's related_claims, with the old claim as target and that case's new claim as trigger, may justify an old-claim update. The relation alone is not a status decision: consider text, origin (explicit is usually more direct than derived), time, and conditions. Contradicts may at most weaken; only an unambiguous supersedes may supersede. Claims valid under different conditions or times may coexist. Do not alter new claims or invalidate an old claim merely because an aggregate state fails. If there is no eligible relation, claim_updates=[]; this does not prevent state operations.
 5. Check joint consistency. A claim proposed as superseded cannot remain effective support for a state. Omit individual state candidates lacking evidence, but do not discard other supported states in the same update.
 
@@ -606,15 +610,17 @@ state_contexts: {state_contexts}
 """
 
 
-USER_ACTIVITY_STATE_UPDATE_PROMPT_EN = """Incrementally update situational_state from newly generated user activity observations.
+USER_ACTIVITY_STATE_UPDATE_PROMPT_EN = """A user_state is the personal world model's updateable judgment about the user at a given time, for later reasoning, prediction, and service decisions. It integrates one or more traceable pieces of evidence with their timing and conditions to express a relatively stable tendency, a recurring behavior, or a currently ongoing situation. It is not a copy of a raw fact, individual evidence item, or source text.
 
-This update is triggered by new activity. An activity describes what the user actually participated in during a continuous time window. Facts provide concrete evidence from that window. Related intents are currently active goals/plans/work items with direct evidence links to those facts; they are supplemental context only. For `user_role`, `actor` means evidence supports that the user is doing the activity, `participant` means the user is involved, and `contextual` is background only and must not be used to infer that the user is doing it. Do not copy an activity, fact, or intent into a state, and do not assume that mentioning a topic means the user is currently working on it.
+A user_activity is an observation of an activity the user participated in, or of the surrounding context, within a continuous time window. It records conversation, participation, and situation during that window; it does not mean every past or future action mentioned in conversation is happening now. It describes what occurred during the window, not by itself an ongoing current state.
+
+Incrementally update situational_state from newly generated user activity observations. This update is triggered by new activity. Each `new_activity_cases` entry centers on one activity; its `linked_facts` contain only facts associated with that activity, to support and check that particular situation. Do not treat another activity's facts as evidence for it. Related intents are currently active goals/plans/work items with direct evidence links to these facts; they are supplemental context only. For `user_role`, `actor` means evidence supports that the user is doing the activity, `participant` means the user is involved, and `contextual` is background only and must not be used to infer that the user is doing it. Do not copy an activity, fact, or intent into a state, and do not assume that mentioning a topic means the user is currently working on it.
 
 Create or update only `situational_state`; do not create enduring_state or recurring_state here. Emit an operation only when evidence indicates that the user is in an unfinished phase, is continuing to handle an issue, is preparing for something, is subject to a current constraint, or has a time-bounded current concern/availability. Chit-chat, one-off Q&A, reminiscence, preference statements, completed activities, and one-time itineraries normally do not warrant a situational state. Return an empty operations list when evidence is insufficient.
 
-Every operation must cite at least one `user_activity` item from this input. Facts may only be cited from `linked_facts`; goals/plans/work items may only be cited from `related_active_intents`. Related intents were prefiltered by the system because they share fact evidence with the activity; still decide whether they describe the same ongoing situation. Never cite an ID not supplied here. Activity is the trigger and situation anchor; do not infer that a completed activity is still current.
+Every operation must cite at least one `user_activity` item from this input. A cited fact must be in the `linked_facts` of an activity cited by the same operation; goals/plans/work items may only be cited from `related_active_intents`. Related intents were prefiltered by the system because they share fact evidence with the activity; still decide whether they describe the same ongoing situation. Never cite an ID not supplied here. Activity is the trigger and situation anchor; do not infer that a completed activity is still current.
 
-Choose `state_domain` only from `allowed_domains`. When updating an existing state, use its ID and preserve its state_domain, state_type, state_kind, and state_topic. `state_kind` must be one of: `current_focus`, `current_constraint`, `current_availability`, `current_energy`, `current_stress`, `current_social_engagement`, `current_preparation`. It is a category; different ongoing situations in one category may coexist. On create, output a short, stable `state_topic` for the specific situation. New evidence for an existing situation must update its target_state_id rather than create a duplicate. `state_text` must be a self-contained description of the current state, not a historical summary. Provide a plausible `valid_to` or ending condition when evidence supports it; do not invent a deadline. Allowed operations are create, reinforce, revise, weaken, expire; `target_state_id` is 0 for create.
+Choose `state_domain` only from `general`, `health`, `work`, `life`, `information`, `finance`, `family`, `learning`, `social`, `interest`, or `travel`. When updating an existing state, use its ID and preserve its state_domain, state_type, state_kind, and state_topic. `state_kind` must be one of: `current_focus`, `current_constraint`, `current_availability`, `current_energy`, `current_stress`, `current_social_engagement`, `current_preparation`. It is a category; different ongoing situations in one category may coexist. On create, output a short, stable `state_topic` for the specific situation. New evidence for an existing situation must update its target_state_id rather than create a duplicate. `state_text` must be a self-contained description of the current state, not a historical summary. Provide a plausible `valid_to` or ending condition when evidence supports it; do not invent a deadline. Allowed operations are create, reinforce, revise, weaken, expire; `target_state_id` is 0 for create.
 
 Return JSON only:
 {
@@ -622,7 +628,7 @@ Return JSON only:
     {
       "operation": "create|reinforce|revise|weaken|expire",
       "target_state_id": 0,
-      "state_domain": "one allowed_domains value",
+      "state_domain": "one of the listed domain values",
       "state_type": "situational_state",
       "state_kind": "one controlled option",
       "state_topic": "stable topic for this specific situation",
@@ -642,17 +648,11 @@ Return JSON only:
 reference_time:
 {reference_time}
 
-allowed_domains:
-{allowed_domains}
-
 runtime_context:
 {runtime_context}
 
-new_activities:
-{activities}
-
-linked_facts:
-{facts}
+new_activity_cases:
+{activity_cases}
 
 related_active_intents:
 {related_intents}
@@ -662,9 +662,11 @@ existing_situational_states:
 """
 
 
-USER_OBSERVED_PATTERN_STATE_UPDATE_PROMPT_EN = """Incrementally update recurring_state from the user's newly created or newly supported observed patterns.
+USER_OBSERVED_PATTERN_STATE_UPDATE_PROMPT_EN = """A user_state is the personal world model's updateable judgment about the user at a given time, for later reasoning, prediction, and service decisions. It integrates one or more traceable pieces of evidence with their timing and conditions to express a relatively stable tendency, a recurring behavior, or a currently ongoing situation. It is not a copy of a raw fact, individual evidence item, or source text.
 
-A user_observed_pattern is inferred from independent observed actions, not self-report. supporting_actions are representative raw evidence. changed_patterns were created or gained support in this task; affected_patterns are older patterns touched by relation events. The relation events classify support, refinement, or contradiction. An existing state may already express the same routine based on an explicit user_claim: update that state instead of creating another state for a different evidence source.
+A user_observed_pattern is a candidate regularity inferred from multiple independent observations of the user's behavior or choices. It is not the user's self-report of a habit, nor a guarantee that the regularity still applies under current conditions. It can support a recurring_state, but the state should express a currently valid judgment after considering the combined evidence rather than copy the pattern text.
+
+Incrementally update recurring_state from the user's newly created or newly supported observed patterns. supporting_actions are representative raw evidence. changed_patterns were created or gained support in this task; affected_patterns are older patterns touched by relation events. The relation events classify support, refinement, or contradiction. An existing state may already express the same routine based on an explicit user_claim: update that state instead of creating another state for a different evidence source.
 
 Only update recurring_state in the given state_domain. Do not invent a weekday, frequency, time, or condition that the evidence does not establish. state_text should express a reusable behavioral tendency, not copy a pattern. Use target_state_id for an equivalent existing state; otherwise create a stable, specific state_topic. state_kind must be one of daily_routine|weekly_routine|work_routine|health_routine|social_routine|conditional_behavior.
 

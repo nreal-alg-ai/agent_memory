@@ -234,10 +234,10 @@ class PersonWorldModel:
         return self._task_scheduler.flush(timeout=timeout)
 
     def trigger_user_state_time_tick(
-        self, *, now: Optional[datetime] = None,
+        self, *, now: Optional[datetime] = None, force: bool = False,
     ) -> Dict[str, Any]:
-        """Evaluate the thirty-minute claim-to-state update window now."""
-        return self._task_scheduler.trigger_user_state_time_tick(now=now)
+        """Evaluate the claim-to-state window, optionally draining it for tests."""
+        return self._task_scheduler.trigger_user_state_time_tick(now=now, force=force)
 
     def trigger_user_prediction_time_tick(
         self, *, now: Optional[datetime] = None,

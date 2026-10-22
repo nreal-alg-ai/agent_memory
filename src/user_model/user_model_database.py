@@ -336,8 +336,9 @@ class UserModelDB:
         state_types: Optional[Sequence[str]] = None,
         statuses: Optional[Sequence[str]] = None,
         limit: int = 160,
+        include_evidence: bool = False,
     ) -> List[Dict[str, Any]]:
-        """Return current durable user states, not historical read snapshots."""
+        """Return durable states, optionally attaching all of each state's evidence."""
         clauses: List[str] = []
         params: List[Any] = []
         if state_domains:
@@ -368,6 +369,14 @@ class UserModelDB:
             item["conditions"] = _json_loads(item.get("conditions"), {})
             item["metadata"] = _json_loads(item.get("metadata"), {})
             result.append(item)
+        if include_evidence:
+            states_by_id = {int(state["id"]): state for state in result}
+            for state in result:
+                state["evidence_items"] = []
+            for evidence in self.get_user_state_evidence_items(
+                list(states_by_id), limit=None,
+            ):
+                states_by_id[int(evidence["state_id"])]["evidence_items"].append(evidence)
         return result
 
     def get_user_states_by_ids(self, state_ids: Sequence[int]) -> List[Dict[str, Any]]:
@@ -410,62 +419,30 @@ class UserModelDB:
         ).fetchone()
         return row is not None
 
-    def get_user_state_ids_for_claim_ids(
-        self, claim_ids: Sequence[int], *, limit: int = 160,
-    ) -> List[int]:
-        ids = list(dict.fromkeys(
-            int(value) for value in claim_ids or []
-            if str(value).strip().isdigit() and int(value) > 0
-        ))
-        if not ids:
-            return []
-        placeholders = ",".join("?" for _ in ids)
-        rows = self._conn.execute(
-            f"""
-            SELECT DISTINCT evidence.state_id
-            FROM user_state_evidence AS evidence
-            JOIN user_states AS state ON state.id = evidence.state_id
-            WHERE evidence.evidence_type = 'user_claim'
-              AND evidence.evidence_id IN ({placeholders})
-              AND state.status IN ('active', 'weakened')
-            LIMIT ?
-            """,
-            (*ids, max(1, int(limit))),
-        ).fetchall()
-        return [int(row["state_id"]) for row in rows]
-
-    def get_user_state_claim_evidence(
-        self, state_ids: Sequence[int], *, limit: int = 480,
+    def get_user_state_evidence_items(
+        self, state_ids: Sequence[int], *, evidence_type: Optional[str] = None,
+        limit: Optional[int] = 480,
     ) -> List[Dict[str, Any]]:
-        ids = list(dict.fromkeys(
+        """Load evidence for selected states; limit=None returns all matching rows."""
+        ids = sorted({
             int(value) for value in state_ids or []
             if str(value).strip().isdigit() and int(value) > 0
-        ))
+        })
         if not ids:
             return []
         placeholders = ",".join("?" for _ in ids)
-        rows = self._conn.execute(
-            f"""
-            SELECT * FROM user_state_evidence
-            WHERE evidence_type = 'user_claim' AND state_id IN ({placeholders})
-            ORDER BY state_id, evidence_id LIMIT ?
-            """,
-            (*ids, max(1, int(limit))),
-        ).fetchall()
-        return [self._row_to_dict(row) for row in rows]
-
-    def get_user_state_evidence(
-        self, state_ids: Sequence[int], *, limit: int = 480,
-    ) -> List[Dict[str, Any]]:
-        ids = sorted({int(value) for value in state_ids if int(value) > 0})
-        if not ids:
-            return []
-        placeholders = ",".join("?" for _ in ids)
+        type_filter = " AND evidence_type = ?" if evidence_type is not None else ""
+        params: List[Any] = [*ids]
+        if evidence_type is not None:
+            params.append(str(evidence_type))
+        limit_clause = " LIMIT ?" if limit is not None else ""
+        if limit is not None:
+            params.append(max(1, int(limit)))
         rows = self._conn.execute(
             "SELECT * FROM user_state_evidence "
-            f"WHERE state_id IN ({placeholders}) "
-            "ORDER BY state_id, evidence_type, evidence_id LIMIT ?",
-            (*ids, max(1, int(limit))),
+            f"WHERE state_id IN ({placeholders}){type_filter} "
+            f"ORDER BY state_id, evidence_type, evidence_id{limit_clause}",
+            params,
         ).fetchall()
         return [self._row_to_dict(row) for row in rows]
 
