@@ -140,10 +140,7 @@ class UserPrediction:
                 "updated_at": intent.get("updated_at") or "",
                 "fingerprint": fingerprint,
             })
-        plan_ids = [item["id"] for item in intents if item["object_type"] == "plan"]
-        unresolved = self._db.get_plan_ids_with_unresolved_relations(plan_ids)
-        return [item for item in intents
-                if item["object_type"] != "plan" or item["id"] not in unresolved]
+        return intents
 
     def _input_snapshot(
         self, *, owner_id: int, as_of: datetime,
@@ -330,9 +327,7 @@ class UserPrediction:
             }
             if (not intent or intent.get("status") not in valid_statuses.get(intent_type, set())
                     or int(intent.get("world_owner_entity_id") or 0) != owner_id
-                    or intent.get("updated_at") != intent_basis.get("updated_at")
-                    or (intent_type == "plan" and
-                        self._db.get_plan_ids_with_unresolved_relations([intent_id]))):
+                    or intent.get("updated_at") != intent_basis.get("updated_at")):
                 continue
             states = {int(item["id"]): item for item in self._model_db.get_user_states_by_ids(state_ids)}
             if any(

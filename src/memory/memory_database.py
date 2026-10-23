@@ -621,27 +621,6 @@ class UserMemoryDB:
                 PRIMARY KEY(object_type, object_id, evidence_type, evidence_id, role)
             );
 
-            CREATE TABLE IF NOT EXISTS memory_user_intent_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                lifecycle_observation_id INTEGER UNIQUE,
-                object_type TEXT NOT NULL,
-                object_id INTEGER NOT NULL,
-                event_type TEXT NOT NULL,
-                trigger_object_id INTEGER NOT NULL DEFAULT 0,
-                reconciliation_operation TEXT NOT NULL DEFAULT '',
-                previous_status TEXT NOT NULL DEFAULT '',
-                new_status TEXT NOT NULL DEFAULT '',
-                previous_payload TEXT NOT NULL DEFAULT '{}',
-                new_payload TEXT NOT NULL DEFAULT '{}',
-                evidence_fact_ids TEXT NOT NULL DEFAULT '[]',
-                effective_at TEXT NOT NULL DEFAULT '',
-                decision_source TEXT NOT NULL DEFAULT '',
-                reason TEXT NOT NULL DEFAULT '',
-                created_at TEXT NOT NULL,
-                FOREIGN KEY(lifecycle_observation_id)
-                    REFERENCES memory_user_intent_lifecycle_observations(id) ON DELETE CASCADE
-            );
-
             CREATE INDEX IF NOT EXISTS idx_memory_facts_event_time ON memory_facts(event_time_key);
             CREATE INDEX IF NOT EXISTS idx_memory_facts_dialogue_time ON memory_facts(dialogue_time_key);
             CREATE INDEX IF NOT EXISTS idx_memory_recall_documents_object
@@ -690,8 +669,6 @@ class UserMemoryDB:
             ON memory_user_intent_items(object_type, primary_entity_id, time_start, time_end);
             CREATE INDEX IF NOT EXISTS idx_memory_user_intent_evidence_object
             ON memory_user_intent_evidence(object_type, object_id, role);
-            CREATE INDEX IF NOT EXISTS idx_memory_user_intent_events_object
-            ON memory_user_intent_events(object_type, object_id, effective_at DESC, id DESC);
             """
         )
         # These tables belonged to the abandoned read-time user-state snapshot
@@ -2468,20 +2445,6 @@ class UserMemoryDB:
         ).fetchall()
         return [self._intent_row_to_api(row) for row in rows]
 
-    def get_plan_ids_with_unresolved_relations(self, plan_ids: Sequence[int]) -> set[int]:
-        """Conservatively exclude plans whose status has not absorbed relation events."""
-        ids = sorted({int(value) for value in plan_ids if int(value) > 0})
-        if not ids:
-            return set()
-        placeholders = ",".join("?" for _ in ids)
-        rows = self._conn.execute(
-            f"""SELECT DISTINCT object_id FROM memory_user_intent_events
-                WHERE object_type = 'plan' AND event_type = 'relation_observed'
-                AND object_id IN ({placeholders})""",
-            ids,
-        ).fetchall()
-        return {int(row["object_id"]) for row in rows}
-
     def get_entity_id_by_name(self, name: str) -> Optional[int]:
         row = self._conn.execute(
             "SELECT id FROM memory_entity_nodes WHERE name = ?", (str(name),)
@@ -2522,93 +2485,6 @@ class UserMemoryDB:
             changed += 1
         self._commit_if_needed()
         return changed
-
-    def insert_intent_event(
-        self,
-        *,
-        object_type: str,
-        object_id: int,
-        event_type: str,
-        trigger_object_id: int = 0,
-        reconciliation_operation: str = "",
-        previous_status: str = "",
-        new_status: str = "",
-        previous_payload: Optional[Dict[str, Any]] = None,
-        new_payload: Optional[Dict[str, Any]] = None,
-        evidence_fact_ids: Optional[Sequence[int]] = None,
-        effective_at: str = "",
-        decision_source: str = "",
-        reason: str = "",
-        lifecycle_observation_id: Optional[int] = None,
-    ) -> int:
-        normalized_type = str(object_type or "").strip().lower()
-        if normalized_type not in {"goal", "plan", "work_item"}:
-            return 0
-        if lifecycle_observation_id is not None:
-            source = self._conn.execute(
-                "SELECT observation.object_type, observation.lifecycle_evidence, "
-                "signal.subject_entity_id, signal.fact_id "
-                "FROM memory_user_intent_lifecycle_observations AS observation "
-                "JOIN memory_fact_user_intent_signals AS signal "
-                "ON signal.signal_id = observation.signal_id WHERE observation.id = ?",
-                (int(lifecycle_observation_id),),
-            ).fetchone()
-            target = self.get_intent_object(object_type=normalized_type, object_id=object_id)
-            if (not source or not target or source["object_type"] != normalized_type
-                    or int(source["subject_entity_id"]) != target["world_owner_entity_id"]
-                    or event_type != "relation_observed"
-                    or reconciliation_operation != source["lifecycle_evidence"]
-                    or list(evidence_fact_ids or []) != [source["fact_id"]]
-                    or previous_status != target["status"] or new_status != target["status"]):
-                raise ValueError("Lifecycle relation must reference a same-owner, same-type intent without changing status")
-            existing = self._conn.execute(
-                "SELECT id, object_type, object_id FROM memory_user_intent_events "
-                "WHERE lifecycle_observation_id = ?", (int(lifecycle_observation_id),),
-            ).fetchone()
-            if existing:
-                if existing["object_type"] != normalized_type or int(existing["object_id"]) != int(object_id):
-                    raise ValueError("Lifecycle observation already has a different intent relation")
-                return int(existing["id"])
-        fact_ids = [int(value) for value in (evidence_fact_ids or []) if str(value).strip().isdigit()]
-        cur = self._conn.execute(
-            """
-            INSERT INTO memory_user_intent_events (
-                object_type, object_id, event_type, trigger_object_id,
-                reconciliation_operation,
-                previous_status, new_status,
-                previous_payload, new_payload, evidence_fact_ids, effective_at,
-                decision_source, reason, created_at, lifecycle_observation_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (normalized_type, int(object_id), str(event_type or "update"),
-             int(trigger_object_id or 0), str(reconciliation_operation or ""),
-             str(previous_status or ""), str(new_status or ""),
-             _json_dumps(previous_payload or {}), _json_dumps(new_payload or {}),
-             _json_dumps(list(dict.fromkeys(fact_ids))), str(effective_at or ""),
-             str(decision_source or ""), str(reason or ""), local_now_text(), lifecycle_observation_id),
-        )
-        self._commit_if_needed()
-        return int(cur.lastrowid)
-
-    def get_intent_lifecycle_relation_events(
-        self, observation_ids: Sequence[int] = (), *, signal_ids: Optional[Sequence[int]] = None,
-    ) -> List[Dict[str, Any]]:
-        """Read saved links by observation IDs, or source signals before observation insertion."""
-        source_ids = signal_ids if signal_ids is not None else observation_ids
-        column = "observation.signal_id" if signal_ids is not None else "event.lifecycle_observation_id"
-        ids = sorted({int(value) for value in source_ids if int(value) > 0})
-        events: List[Dict[str, Any]] = []
-        for offset in range(0, len(ids), 500):
-            chunk = ids[offset:offset + 500]
-            placeholders = ",".join("?" for _ in chunk)
-            rows = self._conn.execute(
-                "SELECT event.*, observation.signal_id FROM memory_user_intent_events AS event "
-                "JOIN memory_user_intent_lifecycle_observations AS observation "
-                "ON observation.id = event.lifecycle_observation_id "
-                f"WHERE {column} IN ({placeholders}) ORDER BY event.id", chunk,
-            ).fetchall()
-            events.extend(self._row_to_dict(row) for row in rows)
-        return events
 
     def get_user_claim_events(
         self,

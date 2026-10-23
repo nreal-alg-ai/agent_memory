@@ -351,40 +351,108 @@ observation 的 `lifecycle_evidence` 必须按类型选取：goal 为 confirmed|
 observation 的 `details` 只保存当前 fact 明确给出的变更值，允许 time_start（新开始时间）、time_end（新结束/目标/截止时间）、location（新地点）、progress_text（进展细节），各项为字符串。未提供的键省略；没有变更值时为 {}，不要重建或猜测旧对象字段。只返回 JSON。"""
 
 
-INTENT_RECONCILIATION_PROMPT_ZH = """你是个人世界模型的显式 user_intent 匹配模块。你判断新的未来意图 candidate 与已有对象是否为同一个现实中的 goal、plan 或 work_item，并说明它是再次确认还是信息补充。
+INTENT_RECONCILIATION_PROMPT_ZH = """你是个人世界模型的 user_intent 保存、关系识别与生命周期裁决模块。
 
-输入含有：
-- `candidates`：由新 facts 提炼出的未来意图候选对象。
-- `existing_objects`：同一 world owner 下、当前仍可更新的已有对象。候选与目标对象必须是同一种 `object_type`。
+一、目标与职责
+依据本次新增候选和已有 intent，在一次判断中分别完成三个任务：
+1. 是否需要将本次 candidate 保存为一条独立的新 user_intent；
+2. 本次 candidate 与哪个已有 intent 存在什么关系；
+3. 已有关联的旧 intent，其当前状态或具体信息是否应当改变，如何改变。
+三项判断分别由 save_new_intent、relations、intent_updates 表达，需要独立判断并保持结果一致。不要因为“不新增 intent”就忽略关系和旧对象变化，也不要因为匹配到旧对象就自动更新它。
+本模块只提出有证据支持的裁决，不执行数据库写入，不预测用户行为，也不生成 user_state。
 
-你的工作顺序必须是：
-1. 先判断 candidate 是否与某个同类 existing object 是同一个对象；
-2. 只有确认同一对象后，才根据 candidate 是否补充或改变对象信息，选择 confirm 或 update；
-3. 没有可靠目标对象时输出 `create`，且 `target_object_type` 置为空字符串、`target_object_id` 置为 0。
+二、输入的含义
+- candidates：本批待裁决的 future_intent_candidates 列表，按原始顺序编号。每个 candidate 都是从新 fact 提炼的未来目标、安排或有界责任，只是待核验候选，不代表它已经成立或必须新增保存；summary 和 details 描述该未来对象。
+- existing_objects：同一用户下检索到的已有 intent。它们是相关候选，不是已经确认的目标，可能处于进行中、受阻、完成、发生或取消等状态。
+- 只能使用实际输入的候选、旧对象及随附来源证据。evidence_fact_ids 等 ID 不代表未提供的事实内容，不得依据 ID 补全或臆测事实。
 
-同一对象的判断规则：
-- 不要因为主题、地点、人物或关键词相近就合并。`canonical_key` 只能作为辅助线索，不能单独决定同一性。
-- goal：owner 必须相容，且 desired_outcome 指向同一持续性结果。目标时间、成功条件的补充或调整通常是 update，不代表新 goal。
-- plan：actor 与核心 event_or_activity 必须相容。同一安排的时间、地点、参与者或细节补充使用 update。不同日期的相似活动不自动等同，除非新证据明确说明它们指向同一个安排。
-- work_item：responsible_entity 与核心 action_text / deliverable 必须相容。截止时间、协作者或交付细节变化通常是 update；不同交付物或不同责任通常是新事项。
-- 不得跨类型关联：goal 不能匹配 plan 或 work_item，plan 不能匹配 work_item。
+user_intent 只包括三种对象：
+- goal：用户持续追求的期望结果，不等于单次动作或泛泛愿望。
+- plan：用户将参与的具体安排、行程、会议或活动，不等于待办。
+- work_item：用户本人承担、具有明确完成边界的责任事项或交付动作。
+第一版每个 candidate 至多关联一个同类型旧对象。不得跨类型建立关系，也不得因为一个 plan 已发生就推断相关 goal 或 work_item 也已完成。
 
-operation 选择规则：
-- `create`：没有可靠的同一 existing object。
-- `confirm`：同一未来对象得到再次明确确认，但核心字段没有实质变化。
-- `update`：同一对象的描述、参与者、地点、目标时间、截止时间、交付物或其他非终态细节得到补充或改变。
+三、判断新 candidate 是否保存
+save_new_intent 是布尔值，只决定是否在 memory_user_intent_items 中新增一行，不决定是否保留 fact 或关系事件。
+- true：候选足以构成一条有效、独立的新未来意图。可以是无关联的新事项，也可以是明确替代旧事项的新安排；不能只是同一事项的重复描述。
+- false：候选只是对旧事项的再次确认、细节补充或安排调整；候选不成立或证据不足；或者新旧同一性存在歧义，尚不足以安全新增独立事项。
+- 同一事项的再次确认或补充通常直接作用于旧对象，不另建一条重复 intent。save_new_intent=false 仍可以输出关系与旧对象更新。
+- 助手建议未被用户接受、开放假设、推测、含糊应声，以及不足以成立的候选，不得仅因已经被前一步提炼就判定需要保存。
+- 判定保存时沿用输入 candidate 的内容，不在这里重新生成或扩写整条新 intent；新对象的初始状态由其类型确定为 active、planned、open。
 
-每个 candidate_index 必须恰好输出一条 decision，按输入 candidates 的原始索引编号。target_object_id 必须为整数；create 时只能为 0 且 target_object_type 为空字符串；confirm/update 时只能选择输入中同类型的已有对象。reason 用一句简短、可追溯的中文说明同一性或 create 的依据；不要生成输入中不存在的新事实、对象或字段。
+四、判断新旧关系
+relations 为列表。没有可靠关系时返回 []；有关系时只输出一个目标：
+- same_intent：指向同一个现实事项，包括再次确认、细节补充、改期或其他安排调整。是否改变旧对象由 intent_updates 单独表达。
+- supersedes：有明确证据说明新的事项替代旧事项，不只是名称、时间或地点不同。是否新增新事项、是否取消旧事项仍需各自有证据，不能由该关系自动推出。
+- conflicts：新内容与可明确定位的旧 intent 存在冲突，但无法据此确认替代关系或哪一方当前有效。没有充分裁决依据时，intent_updates 应为 []。
 
-只返回 JSON：
+同一性与关联判断规则：
+1. canonical_key、主题、地点、人物或关键词相近只能帮助定位，不能单独证明同一性或替代关系。
+2. goal：核心主体与 desired_outcome 必须相容，指向同一持续性结果。
+3. plan：核心参与主体与 event_or_activity 必须相容。不同日期的相似活动通常是不同安排；明确说明是原安排的改期、补充或调整时，才应关联旧对象。
+4. work_item：负责人、核心 action_text 与交付物必须相容。相似动作但不同交付物、不同责任或独立的一次任务，不应合并。
+5. 改期后的新时间和变化实际发生时间不要求等于旧安排时间。旧对象已经完成或取消，也不能单独否定同一性。
+6. 无法区分多个相关旧对象时，不得随意选择第一个或最接近的对象。返回 relations=[]，并在 reason 中说明歧义；不要为了规避歧义直接新增重复事项。
+7. 每个 target_intent_id 必须是 existing_objects 中与当前 candidate 同类型的已有对象正整数 ID，不输出尚未入库的新 candidate ID。
+
+五、裁决旧 intent 的生命周期与字段变化
+intent_updates 为列表，只包含确实需要执行的旧对象变化。没有变化或证据不足时返回 []，不要为了表示“已检查”而输出无变化的更新。
+- 每条更新必须对应当前 decision 的 relations 中同一个 target_intent_id，至多一条；没有关系就不能更新旧对象。
+- status 表示更新后的业务状态。只有字段变化而状态未变时，保留原状态；只改变状态时 field_updates 为 {}。两者都未变化时，不输出这条更新。
+- field_updates 是稀疏补丁，只允许 summary、time_start、time_end、details。details 内只填写有明确证据、适用于该类型的专属字段变化。未知或未变化的字段省略，不输出完整旧对象，不清空原值，不新增任意字段。
+- status 不放入 field_updates。对象类型、主体和 ID 不得更换。
+
+允许的业务状态：
+- goal：active | blocked | completed | cancelled。
+- plan：planned | rescheduled | blocked | occurred | cancelled。
+- work_item：open | in_progress | blocked | completed | cancelled。
+
+生命周期裁决规则：
+1. 日期已过、没有后续消息、未提及完成，均不构成 occurred、completed 或 cancelled 的证据。
+2. 匹配到同一事项不必然改变其状态；明确的新事项也不必然意味着旧事项被放弃。只有直接证据支持时，才更新旧状态或字段。
+3. 保留本人自述、确认回应与第三方报告的来源区别，不得把第三方消息改写为本人确认。来源明确不等于意图已经确定，confidence 也不等于承诺程度。
+4. 保留“可能、考虑、尚未决定”等限定，不将建议、猜测或含糊回应升级为明确承诺、安排或完成证据。
+5. 区分事实发生时间、报告时间和原计划时间。较晚收到的消息不必然描述较晚的变化；不能让明确较早的证据覆盖较新状态。时序不清或冲突无法裁决时，不更新旧对象，说明不确定性。
+6. 已完成或取消的事项，不得因普通重述或旧确认而重新激活；必须有明确的恢复、重新安排或原结果被修正的证据。独立的新一次事项不是恢复旧事项。
+7. effective_at 表示本次变化实际发生或生效的时间，使用 YYYY-MM-DD 或 ISO 8601；未知时为空字符串。不得自动填原安排时间、系统时间或报告时间。改期后的安排时间写入 field_updates，不作为改期动作的 effective_at；只有日期的证据不能补成精确时刻。
+
+六、三个判断的配合示例
+- 新增一个无关的明确北京出差安排：save_new_intent=true，relations=[]，intent_updates=[]。
+- 补充原天津会议的具体时间：save_new_intent=false，关系为 same_intent，只更新旧会议有证据支持的时间字段。
+- 原定天津会议明确改到另一个时间：save_new_intent=false，关系为 same_intent，更新旧会议的时间字段及有证据支持的 rescheduled 状态。
+- 明确取消天津行程并改去北京：若新条目确实包含这些证据，save_new_intent=true，关系为 supersedes，旧天津 plan 更新为 cancelled。
+- 新消息与可定位的旧事项冲突，但无法确定哪条仍有效：不能默认新增重复事项，关系为 conflicts，无充分裁决依据时 intent_updates=[]。
+- 候选本身不成立，且没有可据以更新旧事项的证据：save_new_intent=false，relations=[]，intent_updates=[]，reason 说明原因。
+
+七、输出约定
+- 每个 candidate_index 恰好输出一条 decision，索引为输入 candidates 中从 0 开始的原始位置，不得重新编号；不输出 signal_id。
+- 每条 decision 必须包含 save_new_intent、relations、intent_updates 和 reason。布尔值必须使用 JSON 的 true/false，不得写成字符串。
+- 没有关系或旧对象变化时使用空数组，不输出占位目标 ID、空状态、null 或虚构的更新。
+- 同一批多个条目指向同一旧对象时，应结合明确的时间与内容保持裁决一致，不生成按列表顺序执行就会相互覆盖的冲突补丁；无法协调时不更新，说明冲突。
+- reason 用简短中文说明保存与否、新旧关系及旧对象变化的证据依据，或未能建立关系/执行更新的原因。
+- 仅输出约定的字段和 JSON，不输出分析过程。
+
+输出示例（新北京行程明确替代已取消的天津行程）：
 {
   "decisions": [
     {
       "candidate_index": 0,
-      "operation": "create|confirm|update",
-      "target_object_type": "goal|plan|work_item",
-      "target_object_id": 0,
-      "reason": "简短的证据性理由"
+      "save_new_intent": true,
+      "relations": [
+        {
+          "target_intent_id": 12,
+          "relation": "supersedes"
+        }
+      ],
+      "intent_updates": [
+        {
+          "target_intent_id": 12,
+          "status": "cancelled",
+          "field_updates": {},
+          "effective_at": ""
+        }
+      ],
+      "reason": "用户明确取消原天津行程并改去北京；保存新的北京安排，同时记录替代关系并取消旧天津安排"
     }
   ]
 }
@@ -397,36 +465,105 @@ existing objects：
 """
 
 
-INTENT_LIFECYCLE_RECONCILIATION_PROMPT_ZH = """你是个人世界模型的 user_intent 生命周期观察匹配模块。
+INTENT_LIFECYCLE_RECONCILIATION_PROMPT_ZH = """你是个人世界模型的 user_intent 生命周期观察匹配与裁决模块。
 
-目标是判断每条 intent_lifecycle_observation 是否指向其 existing_intents 中的同一个现实事项，只识别关系，不裁决或修改 intent 的状态。
+一、目标与职责
+依据每条 intent_lifecycle_observation、其来源 fact 和相关已有 intent，在一次判断中完成两个任务：
+1. 判断该 observation 是否指向某个已有 intent，识别同一现实事项的关系。
+2. 判断本次证据是否足以改变该 intent 的当前业务状态或具体信息，并给出必要的更新。
+分别使用 relations 和 intent_updates 表达。匹配成功不等于必须更新；确认是同一事项，但没有实际变化、证据不足或时序不清时，可以保留关系并返回 intent_updates=[]。
+本模块不创建新 intent，不决定 observation 是否保存，不改写 observation，不预测用户行为，也不生成 user_state。只提出有证据支持的裁决，不执行数据库写入或生成事件记录。
 
-输入 cases 按列表顺序组织待匹配的 observation（此时尚未写库），每条包含：
-- intent_lifecycle_observation：从一条 fact 提炼出的、关于先前目标/安排/责任的后续变化证据。target_description 描述原事项，observation_text 描述本次进展；lifecycle_evidence 只是观察到的变化类型，不是已执行的状态更新。
-- fact：这条 observation 唯一的来源，保留时间表达、主体和来源限定。
-- existing_intents：为这一条 observation 检索的同类型候选。它们是待核验对象，不是已经匹配的结果，也不一定处于 active 状态。
+二、输入的含义
+输入 cases 按原始列表顺序组织 observation（此时尚未写库），每条包含：
+- intent_lifecycle_observation：当前 fact 对用户本人先前目标、安排或责任的后续观察，不是一条新的未来意图。target_description 描述原事项，observation_text 描述进展并保留来源限定；lifecycle_evidence 是待核验的变化线索，不是最终业务状态；effective_at 是观察所述变化实际发生或生效的时间，未知时为空；details 保存当前 fact 给出的变化值。
+- fact：该 observation 唯一的来源。必须依据其中实际提供的事实核验 observation，保留时间、条件、否定、主体和第三方转述等限定，不能将 observation 当作 fact 之外的独立证据。
+- existing_intents：为当前 observation 检索的同一用户、同类型的已有对象，是待核验候选，不是已经匹配的目标。可包含当前状态、时间和 details 等业务字段，也可能已经完成、发生或取消。只能使用实际提供的字段，不得补全缺失的旧信息。
+fact 或 intent 的 ID 只用于引用，不代表未提供的证据内容。不得借用其他 case 的 fact 支持当前 observation。
 
-判断规则：
-1. 只在当前 case 的 existing_intents 中选择，且 object_type 必须与 observation 相同。每条 observation 至多匹配一个 intent。
-2. goal 需指向同一持续性期望结果；plan 需指向同一具体安排；work_item 需指向同一责任事项或交付物。主题、地点、canonical_key 或关键词相近都不能单独证明同一性。
-3. 区分不同日期的重复安排、相似但不同的交付任务。旧安排时间是身份线索；effective_at 是变化发生时间，details 中的时间可能是改期后的新值，不能要求它们等于旧安排时间。明确说明“原定事项改期/取消/已完成”时可匹配原事项。
-4. 不得因旧 intent 已过期或状态不同而直接排除；也不得仅因日期已过推断完成。观察与旧状态不一致时仍可识别同一性，留给后续步骤裁决。
-5. 不能唯一确定目标、没有同一事项证据或存在无法区分的多个安排时，matched=false。禁止猜测、选择“最接近的”目标、创建新 intent 或改写 observation。
-6. 每个 case 恰好返回一条 decision，observation_index 为它在输入 cases 列表中的原始索引，从 0 开始，不得重新编号。matched=false 时 target_object_type=""、target_object_id=0。confidence 表示同一性判断的把握，不是 observation 的真实性。reason 用一句中文说明依据或不匹配原因。
+user_intent 只包括三种对象：
+- goal：用户持续追求的期望结果，不是单次动作或泛泛愿望。
+- plan：用户参与的具体安排、行程、会议或活动，不是待办。
+- work_item：用户本人承担、具有明确完成边界的责任事项或交付动作。
+
+三、识别 observation 指向的已有 intent
+relations 为列表。没有可靠匹配时返回 []；有匹配时至多输出一条 same_intent 关系。
+1. 只能从当前 case 的 existing_intents 中选择，object_type 必须与 observation 相同，target_intent_id 必须是其中已有对象的正整数 ID。不得跨类型匹配或引用其他 case 的目标。
+2. goal 应指向同一持续性期望结果；plan 应指向同一具体安排；work_item 应指向同一责任事项或交付物。核心主体及事项内容必须相容。
+3. canonical_key、主题、地点、人物或关键词相近只是定位线索，不能单独证明同一性。不同日期的重复活动、不同交付物或独立的一次任务，不应因名称相似而合并。
+4. 区分原安排时间、变化发生时间和改期后的新安排时间。明确说明原事项被改期、取消或完成时，新时间不必与旧安排时间相同。
+5. 旧 intent 已完成、已取消或状态与 observation 不同，不自动否定同一性。先判断是否同一事项，再单独裁决是否更新。
+6. 没有目标、没有同一事项证据或多个候选无法区分时，relations=[]、intent_updates=[]，reason 说明原因。禁止猜测、随意选择第一个或“最接近”的对象，也不得为未匹配的 observation 补建 intent。
+7. same_intent 只表达观察指向同一事项。完成、取消、受阻或改期不是关系类型，不能放入 relations 代替生命周期裁决。
+
+四、裁决旧 intent 的当前状态与字段变化
+intent_updates 为列表，只包含确实需要执行的旧对象变化，至多一条。每条更新必须与当前 decision 的 relations 指向同一个 target_intent_id；没有关系就不能更新旧对象。
+
+允许的业务状态：
+- goal：active | blocked | completed | cancelled。
+- plan：planned | rescheduled | blocked | occurred | cancelled。
+- work_item：open | in_progress | blocked | completed | cancelled。
+
+不要将 lifecycle_evidence 机械复制为 status：
+- confirmed：再次确认同一事项，通常无需改变状态；只有明确恢复或状态变化的证据才更新。
+- updated：审查是否存在具体信息补充或修正；可以只改字段，保留当前状态。
+- rescheduled：审查原事项是否确实改期，分别判断新的安排时间和 rescheduled 状态。没有给出新时间时不得补造。
+- occurred：只有明确证明该 plan 已发生，才更新为 occurred。
+- completed：只有明确证明 goal 已实现或 work_item 已履行，才更新为 completed；部分进展不等于整体完成。
+- cancelled：只有明确撤回目标、取消安排或放弃责任事项的证据才更新为 cancelled，不把暂时受阻视为取消。
+- blocked：存在明确障碍、当前无法推进时才更新为 blocked，不把尚未完成本身当作受阻。
+明确开始履行但尚未完成的 work_item 可以为 in_progress；解除障碍或恢复事项也必须有直接证据，不能仅依据标签或普通重述恢复状态。
+一个 plan 已发生不意味着相关 goal 或 work_item 完成；本次只裁决匹配到的对象。
+
+字段更新规则：
+1. status 表示更新后的业务状态。仅字段变化时保留原状态；仅状态变化时 field_updates={}。状态和字段都未变化时，intent_updates=[]，不要输出“已检查”的无变化更新。
+2. field_updates 是稀疏补丁，只允许 summary、time_start、time_end、details。未知或未变化的字段省略，不输出完整旧对象，不清空原值，不新增任意字段；status 不放入 field_updates。对象类型、主体和 ID 不得更换。
+3. details 仅填写当前证据直接支持、适用于目标类型的专属业务字段：goal 的 desired_outcome、success_criteria、target_at；plan 的 event_or_activity、time_precision、location_text、participants；work_item 的 action_text、deliverable、responsibility_type、priority、completed_at、beneficiary_entities、delegator_entities、collaborator_entities。不为补齐结构而猜测字段。
+4. observation.details.time_start/time_end 应映射到 field_updates.time_start/time_end；location 应映射到 plan 的 field_updates.details.location_text。goal 的 time_end 和 details.target_at 如同时输出，必须一致。
+5. progress_text 是判断进展的证据，不必机械复制为 intent 字段。不能仅因“有进展”认定事项完成，也不能据此新增不受约束的 details 字段。
+6. summary 只有在原描述确实需要修正或补充时才更新，仍然描述原 intent 的核心事项，不要改写成整段进展记录。
+
+五、证据来源与时间约束
+1. 日期已过、没有后续消息、未提及完成，均不是 occurred、completed 或 cancelled 的证据。
+2. 保留本人自述、确认回应与第三方报告的区别。第三方明确报告可以作为证据，但不能改写为本人确认；来源存在不确定或冲突时，不强行更新。observation 的 confidence 不替代事实核验，也不等于承诺或完成程度。
+3. 保留“可能、考虑、尚未决定、如果”等限定。助手建议、猜测、开放假设、含糊应声不能升级为确定的状态变化。
+4. 区分变化实际发生时间、消息报告时间和原计划时间。较晚收到或写库的消息不一定描述较晚发生的变化；existing_intent.updated_at 是写库时间，不能直接当作业务变化的生效时间。
+5. 不得让明确较早的证据覆盖较新的有效状态；旧信息的重复报告不构成新的变化。时序不清、缺少必要证据或冲突无法裁决时，可以输出 same_intent，但 intent_updates=[]，说明不确定性。
+6. 已完成、已发生或已取消的事项，不得因普通重述或旧确认重新激活；必须有明确恢复、重新安排或原结果被修正的证据。独立的新一次事项不能用于重开旧事项。
+7. 更新中的 effective_at 表示本次变化实际发生或生效的时间，使用 YYYY-MM-DD 或 ISO 8601；未知时为空字符串。以 observation 及其来源 fact 为依据，不自动填原安排时间、报告时间或系统时间。改期后的安排时间放在 field_updates，不作为改期动作的 effective_at；只有日期的证据不得补成精确时刻。
+8. 同一批多个 observation 指向同一旧 intent 时，应结合明确时序和内容保持裁决一致。只输出对当前对象仍有依据、需要应用的变化，不生成依赖输入列表顺序相互覆盖的冲突补丁；无法协调时不更新，说明冲突。
+
+六、输出约定
+- 每个 case 恰好输出一条 decision，observation_index 为它在输入 cases 中从 0 开始的原始位置，不得重新编号，不输出 signal_id。
+- 每条 decision 只包含 observation_index、relations、intent_updates 和 reason。不输出保存新 intent 的判断，也不重复输出对象类型或匹配置信度。
+- 没有可靠匹配时 relations=[]、intent_updates=[]；匹配成立但无需变化或证据不足时，relations 中保留 same_intent，intent_updates=[]。
+- 没有关系或更新时使用空数组，不输出占位目标 ID、空状态、null 或虚构的更新。
+- reason 用简短中文说明同一性判断依据、更新或不更新的原因；不能匹配时说明歧义或缺失证据。
+- 只返回约定的 JSON，不输出分析过程。
 
 cases：
 {observation_cases}
 
-只返回 JSON：
+输出示例（明确说明原天津会议已经取消，但未给出取消时间）：
 {
   "decisions": [
     {
       "observation_index": 0,
-      "matched": true,
-      "target_object_type": "goal|plan|work_item",
-      "target_object_id": 1,
-      "confidence": 0.9,
-      "reason": "同一事项的判断依据"
+      "relations": [
+        {
+          "target_intent_id": 12,
+          "relation": "same_intent"
+        }
+      ],
+      "intent_updates": [
+        {
+          "target_intent_id": 12,
+          "status": "cancelled",
+          "field_updates": {},
+          "effective_at": ""
+        }
+      ],
+      "reason": "来源 fact 明确说明原天津会议已取消，且与已有 plan 为同一安排；更新为 cancelled，取消生效时间未知"
     }
   ]
 }

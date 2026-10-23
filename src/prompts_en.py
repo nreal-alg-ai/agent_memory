@@ -345,21 +345,108 @@ An observation's lifecycle_evidence is type-specific: goal: confirmed|updated|co
 An observation's `details` contains only explicitly supported changed values: time_start (new start), time_end (new end/target/deadline), location (new location), and progress_text (progress details), all strings. Omit unspecified keys and use {} when no changed values are given. Do not reconstruct or guess the old object's fields. Return JSON only."""
 
 
-INTENT_RECONCILIATION_PROMPT_EN = """Decide the relationship between new future user_intent candidates and existing objects. Do not invent facts or modify object fields.
+INTENT_RECONCILIATION_PROMPT_EN = """You are the user_intent persistence, relationship identification, and lifecycle adjudication module of a personal world model.
 
-For each candidate, choose a matching existing object only when it represents the same goal, plan, or work item with compatible subject, core activity/deliverable, and time. Return create when no reliable match exists, confirm when the same future object is reaffirmed without material changes, or update when information about that same object is added or revised. Similar recurring activities on different dates are not automatically the same arrangement.
+1. Goals and responsibilities
+Using the new candidates and existing intents, make three separate decisions in one assessment:
+1. Whether the current candidate should be saved as an independent new user_intent.
+2. Which existing intent the candidate relates to, and how.
+3. Whether the related existing intent's current status or specific information should change, and what should change.
+Express these decisions through save_new_intent, relations, and intent_updates, respectively. Assess them independently while keeping the results consistent. A decision not to save a new intent must not suppress relationships or changes to an existing object; matching an existing object must not automatically cause an update.
+Only propose evidence-supported decisions. Do not write to the database, predict user behavior, or generate user_state.
 
-canonical_key is only an identity clue, never sufficient evidence of the same object or an update. Return exactly one decision per candidate_index, using the original input-list index. For create, target_object_type must be an empty string and target_object_id must be the integer 0. For confirm/update, select an existing object of the same object_type and return its integer ID. Do not invent or guess targets.
+2. Meaning of the inputs
+- candidates: the current batch of future_intent_candidates, indexed in their original order. Each candidate is a future goal, arrangement, or bounded responsibility extracted from a new fact. It is an unverified candidate, not an established intention or a mandatory new record; summary and details describe that future object.
+- existing_objects: existing intents retrieved for the same user. These are potentially related objects, not confirmed matches, and may be ongoing, blocked, completed, occurred, or cancelled.
+- Use only the candidates, existing objects, and accompanying source evidence actually provided. IDs such as evidence_fact_ids do not supply the contents of missing facts; do not reconstruct or invent facts from IDs.
 
-Return JSON only:
+user_intent includes only three object types:
+- goal: a desired outcome the user continues to pursue, not a single action or vague wish.
+- plan: a specific arrangement, trip, meeting, or activity the user will participate in, not a to-do item.
+- work_item: a responsibility or deliverable action undertaken by the user with a clear completion boundary.
+In this first version, each candidate may relate to at most one existing object of the same type. Do not establish cross-type relationships or infer that a related goal or work_item is completed merely because a plan occurred.
+
+3. Decide whether to save the new candidate
+save_new_intent is a boolean that controls only whether to insert a new row into memory_user_intent_items. It does not determine whether to retain facts or relationship events.
+- true: the candidate establishes a valid, independent new future intention. It may be an unrelated new matter or a new arrangement explicitly replacing an old one; it must not merely repeat the same matter.
+- false: the candidate only reaffirms, supplements, or adjusts an existing matter; it is invalid or insufficiently supported; or identity is ambiguous and an independent new record cannot safely be justified.
+- Reaffirmations and additions to the same matter normally apply to the existing object without creating a duplicate. save_new_intent=false may still accompany relationships and updates to the existing object.
+- Unaccepted assistant suggestions, open hypotheticals, speculation, vague acknowledgments, and unsupported candidates must not be saved merely because an earlier extraction step produced them.
+- When saving is justified, retain the input candidate's contents rather than regenerating or expanding the entire new intent here. Its initial status is determined by type: active, planned, or open.
+
+4. Identify relationships between new and existing intents
+relations is a list. Return [] when no reliable relationship exists; otherwise return only one target:
+- same_intent: the same real-world matter, including reaffirmation, additional details, rescheduling, or other arrangement changes. Express any changes to the existing object separately in intent_updates.
+- supersedes: explicit evidence that a new matter replaces an old matter, not merely a difference in name, time, or place. Saving the new matter and cancelling the old matter each require their own evidence; neither follows automatically from this relationship.
+- conflicts: new information conflicts with an identifiable existing intent, but replacement or current validity cannot be established. Return intent_updates=[] when there is insufficient evidence to adjudicate the conflict.
+
+Identity and relationship rules:
+1. Similar canonical_key values, topics, places, people, or keywords only help locate potential matches; they do not establish identity or replacement by themselves.
+2. goal: the core subject and desired_outcome must be compatible and refer to the same ongoing desired result.
+3. plan: the core participants and event_or_activity must be compatible. Similar activities on different dates are normally separate arrangements. Relate them only when evidence explicitly describes rescheduling, supplementation, or adjustment of the original arrangement.
+4. work_item: the responsible person, core action_text, and deliverable must be compatible. Similar actions with different deliverables, responsibilities, or independent instances must not be merged.
+5. The rescheduled time and the actual time of a change need not equal the original scheduled time. An existing object's completed or cancelled status alone does not disprove identity.
+6. When multiple existing objects cannot be distinguished, do not arbitrarily choose the first or closest match. Return relations=[] and explain the ambiguity in reason; do not create a duplicate merely to avoid resolving ambiguity.
+7. Each target_intent_id must be the positive integer ID of an existing_objects entry of the same type as the current candidate. Do not output the ID of an unsaved candidate.
+
+5. Adjudicate lifecycle and field changes to an existing intent
+intent_updates is a list containing only necessary changes to existing objects. Return [] when nothing changes or evidence is insufficient; do not emit a no-change update merely to indicate that an object was checked.
+- Each update must target the same target_intent_id as the relationship in the current decision; allow at most one update. Without a relationship, no existing object may be updated.
+- status is the resulting business status. Retain the original status when only fields change; use field_updates={} when only status changes. If neither changes, omit the update.
+- field_updates is a sparse patch allowing only summary, time_start, time_end, and details. Inside details, include only explicitly supported changes to type-specific fields. Omit unknown or unchanged fields; do not output the complete existing object, clear existing values, or add arbitrary fields.
+- Do not place status inside field_updates. Do not change the object's type, subject, or ID.
+
+Allowed business statuses:
+- goal: active | blocked | completed | cancelled.
+- plan: planned | rescheduled | blocked | occurred | cancelled.
+- work_item: open | in_progress | blocked | completed | cancelled.
+
+Lifecycle adjudication rules:
+1. A passed date, lack of follow-up messages, or absence of completion reports is not evidence of occurred, completed, or cancelled.
+2. Matching the same matter does not necessarily change its status; a clear new matter does not necessarily mean an old matter was abandoned. Update existing status or fields only with direct supporting evidence.
+3. Preserve distinctions between self-statements, confirming responses, and third-party reports. Do not rewrite third-party information as personal confirmation. An identifiable source does not establish a firm intention, and confidence does not equal commitment.
+4. Preserve qualifiers such as possibly, considering, and undecided. Do not promote suggestions, guesses, or vague responses into definite commitments, arrangements, or completion evidence.
+5. Distinguish the time an event happened, the time it was reported, and the originally scheduled time. A later-received message need not describe a later change; clearly earlier evidence must not override a newer state. If chronology is unclear or a conflict cannot be adjudicated, do not update the existing object and explain the uncertainty.
+6. Do not reactivate completed or cancelled matters based on ordinary restatements or old confirmations. Require explicit evidence of resumption, rearrangement, or correction of the previous outcome. An independent new instance is not a reactivation of the old matter.
+7. effective_at is the time the change actually happened or took effect, in YYYY-MM-DD or ISO 8601 format; use an empty string when unknown. Do not automatically use the original scheduled time, system time, or report time. Put the rescheduled arrangement's time in field_updates, not in the rescheduling change's effective_at. Date-only evidence must not be expanded into a precise timestamp.
+
+6. Examples of the three decisions working together
+- An unrelated, definite new business trip to Beijing: save_new_intent=true, relations=[], intent_updates=[].
+- Additional timing details for the original Tianjin meeting: save_new_intent=false, same_intent relationship, and updates only to supported time fields of the existing meeting.
+- The original Tianjin meeting is explicitly rescheduled: save_new_intent=false, same_intent relationship, and updates to the existing meeting's time fields and supported rescheduled status.
+- The Tianjin trip is explicitly cancelled and replaced with a Beijing trip: if the new entry actually contains this evidence, save_new_intent=true, supersedes relationship, and the old Tianjin plan updated to cancelled.
+- New information conflicts with an identifiable existing matter, but current validity is unclear: do not create a duplicate by default; use conflicts and return intent_updates=[] without sufficient evidence for adjudication.
+- The candidate is invalid and supplies no evidence for changing an existing matter: save_new_intent=false, relations=[], intent_updates=[], with the explanation in reason.
+
+7. Output contract
+- Return exactly one decision per candidate_index, using its original zero-based position in candidates without renumbering. Do not output signal_id.
+- Each decision must contain save_new_intent, relations, intent_updates, and reason. Use JSON true/false booleans, not strings.
+- Use empty arrays when there is no relationship or existing-object change. Do not output placeholder target IDs, empty statuses, null, or invented updates.
+- When multiple entries in a batch target the same existing object, keep decisions consistent with explicit chronology and content. Do not generate conflicting patches that would overwrite each other solely according to list order. If they cannot be reconciled, omit the updates and explain the conflict.
+- reason must briefly explain in English the evidence for saving or not saving, the relationship, and changes to the existing object, or why a relationship or update could not be established.
+- Output only the specified fields and JSON, without analysis.
+
+Output example (a new Beijing trip explicitly replaces a cancelled Tianjin trip):
 {
   "decisions": [
     {
       "candidate_index": 0,
-      "operation": "create|confirm|update",
-      "target_object_type": "goal|plan|work_item",
-      "target_object_id": 0,
-      "reason": "brief evidence-grounded reason"
+      "save_new_intent": true,
+      "relations": [
+        {
+          "target_intent_id": 12,
+          "relation": "supersedes"
+        }
+      ],
+      "intent_updates": [
+        {
+          "target_intent_id": 12,
+          "status": "cancelled",
+          "field_updates": {},
+          "effective_at": ""
+        }
+      ],
+      "reason": "The user explicitly cancelled the original Tianjin trip and switched to Beijing; save the new Beijing arrangement, record the replacement relationship, and cancel the old Tianjin arrangement"
     }
   ]
 }
@@ -372,36 +459,105 @@ existing objects:
 """
 
 
-INTENT_LIFECYCLE_RECONCILIATION_PROMPT_EN = """Match user_intent lifecycle observations to existing intentions for a personal world model.
+INTENT_LIFECYCLE_RECONCILIATION_PROMPT_EN = """You are the user_intent lifecycle observation matching and adjudication module of a personal world model.
 
-Identify whether an observation concerns the same real-world item as one of its existing_intents. Record identity relationships only; do not decide or change intent status.
+1. Goals and responsibilities
+Using each intent_lifecycle_observation, its source fact, and related existing intents, make two decisions in one assessment:
+1. Whether the observation refers to an existing intent representing the same real-world matter.
+2. Whether this evidence justifies changing that intent's current business status or specific information, and which updates are necessary.
+Express these decisions through relations and intent_updates. A match does not imply an update: retain the relationship and return intent_updates=[] when nothing changes, evidence is insufficient, or chronology is unclear.
+Do not create new intents, decide whether to save an observation, rewrite observations, predict user behavior, or generate user_state. Only propose evidence-supported decisions; do not write to the database or generate event records.
 
-Cases contain not-yet-persisted observations in input-list order. Each case contains:
-- intent_lifecycle_observation: later evidence concerning an earlier goal, arrangement, or responsibility. target_description identifies the earlier item; observation_text describes the progress. lifecycle_evidence describes observed change, not an applied status transition.
-- fact: the observation's sole source, including temporal context, subject, and attribution.
-- existing_intents: same-type retrieval candidates for this case, not confirmed matches. They need not be active.
+2. Meaning of the inputs
+Input cases contain not-yet-persisted observations in their original list order. Each case contains:
+- intent_lifecycle_observation: the current fact's later evidence about the user's earlier goal, arrangement, or responsibility, not a new future intention. target_description identifies the earlier matter; observation_text describes progress while preserving attribution. lifecycle_evidence is an unverified change clue, not the final business status. effective_at is when the reported change actually happened or took effect, or an empty string if unknown. details contains change values supplied by the current fact.
+- fact: the observation's sole source. Check the observation against the actual fact provided, preserving temporal, conditional, negative, subject, and third-party attribution qualifiers. The observation is not independent evidence beyond that fact.
+- existing_intents: same-user, same-type objects retrieved for this observation, not confirmed matches. They may include current status, times, details, and other business fields, and may already be completed, occurred, or cancelled. Use only the fields actually provided; do not reconstruct missing old information.
+Fact and intent IDs are references, not the contents of missing evidence. Do not use another case's fact to support the current observation.
 
-Rules:
-1. Select only from this case's existing_intents, with the same object_type as the observation. Match at most one intent per observation.
-2. A goal must concern the same enduring desired outcome; a plan the same particular arrangement; a work_item the same responsibility or deliverable. Shared topic, location, canonical_key, or keywords alone never establish identity.
-3. Distinguish repeated events on different dates and similar but separate deliverables. The original scheduled time is an identity clue; effective_at is the change time, and details may contain rescheduled times. Do not require either to equal the original schedule. Explicit rescheduling, cancellation, or completion may refer to the original item.
-4. Do not exclude an item just because it is past or has a different status, nor infer completion from elapsed time. Conflicting status does not prevent recognizing identity; later resolution handles validity.
-5. Return matched=false if identity is unsupported, the target is not uniquely identifiable, or multiple arrangements cannot be distinguished. Never guess, choose merely the closest item, create an intent, or rewrite the observation.
-6. Return exactly one decision per case. observation_index is its original zero-based position in the input cases list; do not renumber entries. When unmatched, target_object_type="" and target_object_id=0. confidence concerns identity, not the truth of the reported observation. Give a brief evidence-grounded reason.
+user_intent includes only three object types:
+- goal: a desired outcome the user continues to pursue, not a single action or vague wish.
+- plan: a particular arrangement, trip, meeting, or activity the user participates in, not a to-do item.
+- work_item: a responsibility or deliverable action undertaken by the user with a clear completion boundary.
+
+3. Identify the existing intent referenced by the observation
+relations is a list. Return [] without a reliable match; otherwise return at most one same_intent relationship.
+1. Select only from the current case's existing_intents, with the same object_type as the observation. target_intent_id must be a positive integer ID of one of those objects. Do not match across types or reference another case's target.
+2. A goal must refer to the same ongoing desired outcome, a plan to the same particular arrangement, and a work_item to the same responsibility or deliverable. The core subject and matter must be compatible.
+3. Similar canonical_key values, topics, places, people, or keywords are only retrieval clues, not proof of identity. Do not merge recurring activities on different dates, different deliverables, or independent task instances because their names are similar.
+4. Distinguish the original scheduled time, the change time, and the new time after rescheduling. When evidence explicitly says the original matter was rescheduled, cancelled, or completed, the new time need not equal the original schedule.
+5. An existing intent's completed or cancelled status, or a status different from the observation, does not automatically disprove identity. Decide identity first, then independently adjudicate updates.
+6. When no target exists, identity is unsupported, or multiple targets cannot be distinguished, return relations=[] and intent_updates=[] with an explanation in reason. Do not guess, select the first or merely closest object, or create an intent for an unmatched observation.
+7. same_intent only identifies the matter referenced by the observation. Completion, cancellation, blockage, and rescheduling are not relationship types and must not replace lifecycle adjudication in relations.
+
+4. Adjudicate the existing intent's current status and field changes
+intent_updates is a list containing only necessary changes to an existing object, with at most one entry. Each update must target the same target_intent_id as the relationship in the current decision. No relationship means no update.
+
+Allowed business statuses:
+- goal: active | blocked | completed | cancelled.
+- plan: planned | rescheduled | blocked | occurred | cancelled.
+- work_item: open | in_progress | blocked | completed | cancelled.
+
+Do not mechanically copy lifecycle_evidence into status:
+- confirmed: reaffirms the same matter and normally requires no status change; update only with explicit evidence of resumption or another state change.
+- updated: examine whether specific information is supplemented or corrected; fields may change while current status is retained.
+- rescheduled: verify that the original matter was actually rescheduled; assess its new scheduled time and rescheduled status separately. Do not invent an unspecified new time.
+- occurred: update to occurred only when the plan is explicitly shown to have happened.
+- completed: update to completed only when the goal is explicitly achieved or the work_item fulfilled. Partial progress is not overall completion.
+- cancelled: require explicit withdrawal of the goal, cancellation of the arrangement, or abandonment of the responsibility. Temporary blockage is not cancellation.
+- blocked: require an explicit obstacle preventing current progress; incompleteness alone is not blockage.
+A work_item explicitly started but not completed may be in_progress. Removing an obstacle or resuming a matter also requires direct evidence, not just a label or ordinary restatement.
+A plan having occurred does not imply completion of related goals or work_items. Adjudicate only the matched object.
+
+Field update rules:
+1. status is the resulting business status. Retain current status when only fields change; use field_updates={} when only status changes. Return intent_updates=[] if neither changes; do not emit a no-change update merely to show the object was checked.
+2. field_updates is a sparse patch allowing only summary, time_start, time_end, and details. Omit unknown or unchanged fields; do not output the whole old object, clear existing values, or add arbitrary fields. Do not put status inside field_updates or change the object's type, subject, or ID.
+3. Inside details, include only explicitly supported, type-appropriate business fields: desired_outcome, success_criteria, target_at for goal; event_or_activity, time_precision, location_text, participants for plan; action_text, deliverable, responsibility_type, priority, completed_at, beneficiary_entities, delegator_entities, collaborator_entities for work_item. Do not guess fields to complete a structure.
+4. Map observation.details.time_start/time_end to field_updates.time_start/time_end, and location to a plan's field_updates.details.location_text. If a goal's time_end and details.target_at are both output, they must agree.
+5. progress_text is evidence for assessing progress, not a field that must be copied into the intent. Progress alone does not establish completion and does not justify adding uncontrolled details fields.
+6. Update summary only when the old description genuinely needs correction or supplementation. It must still describe the original intent's core matter, not become an entire progress report.
+
+5. Evidence attribution and temporal constraints
+1. A passed date, lack of follow-up messages, or absence of a completion report is not evidence of occurred, completed, or cancelled.
+2. Preserve distinctions between self-statements, confirming responses, and third-party reports. Explicit third-party reports may supply evidence but must not become personal confirmation. Do not force an update when sources are uncertain or contradictory. Observation confidence is not a substitute for checking facts and does not equal commitment or completion degree.
+3. Preserve qualifiers such as possibly, considering, undecided, and if. Assistant suggestions, guesses, open hypotheticals, and vague acknowledgments must not become definite state changes.
+4. Distinguish the actual change time, report time, and original scheduled time. Later receipt or persistence does not necessarily indicate a later real-world change. existing_intent.updated_at is a database write time, not automatically a business change's effective time.
+5. Do not let clearly earlier evidence override a newer valid state. Repeated reports of old information are not new changes. If chronology is unclear, necessary evidence is missing, or a conflict cannot be adjudicated, same_intent may still be returned, but use intent_updates=[] and explain the uncertainty.
+6. Do not reactivate completed, occurred, or cancelled matters based on ordinary restatements or old confirmations. Require explicit evidence of resumption, rearrangement, or correction of the previous outcome. An independent new instance must not reopen an old matter.
+7. An update's effective_at is when that change actually happened or took effect, in YYYY-MM-DD or ISO 8601 format, or an empty string if unknown. Use the observation and its source fact, not an automatic original schedule, report time, or system time. Put the rescheduled arrangement's time in field_updates, not in the rescheduling change's effective_at. Date-only evidence must not become a precise timestamp.
+8. When multiple observations in a batch refer to the same old intent, keep decisions consistent with explicit chronology and content. Output only changes still justified and necessary for the current object. Do not generate conflicting patches whose effects depend on input list order. If they cannot be reconciled, omit updates and explain the conflict.
+
+6. Output contract
+- Return exactly one decision per case. observation_index is its original zero-based position in the input cases list; do not renumber entries or output signal_id.
+- Each decision contains only observation_index, relations, intent_updates, and reason. Do not output a new-intent persistence decision, repeat the object type, or output matching confidence.
+- Without a reliable match, return relations=[] and intent_updates=[]. With a match but no necessary or justified change, retain same_intent in relations and return intent_updates=[].
+- Use empty arrays when there is no relationship or update. Do not emit placeholder target IDs, empty statuses, null, or invented updates.
+- Give a brief English reason explaining identity and why an update is or is not justified. Explain ambiguity or missing evidence when no match is possible.
+- Return only the specified JSON, without analysis.
 
 cases:
 {observation_cases}
 
-Return JSON only:
+Output example (the original Tianjin meeting is explicitly cancelled, with no cancellation time given):
 {
   "decisions": [
     {
       "observation_index": 0,
-      "matched": true,
-      "target_object_type": "goal|plan|work_item",
-      "target_object_id": 1,
-      "confidence": 0.9,
-      "reason": "evidence for identity"
+      "relations": [
+        {
+          "target_intent_id": 12,
+          "relation": "same_intent"
+        }
+      ],
+      "intent_updates": [
+        {
+          "target_intent_id": 12,
+          "status": "cancelled",
+          "field_updates": {},
+          "effective_at": ""
+        }
+      ],
+      "reason": "The source fact explicitly cancels the original Tianjin meeting and identifies the same existing plan; update to cancelled, with the cancellation effective time unknown"
     }
   ]
 }
