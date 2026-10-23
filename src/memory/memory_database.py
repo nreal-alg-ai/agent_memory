@@ -401,14 +401,13 @@ class UserMemoryDB:
                 fact_id INTEGER NOT NULL,
                 signal_key TEXT NOT NULL,
                 subject_entity_id INTEGER,
-                evidence_kind TEXT NOT NULL DEFAULT '',
+                signal_purpose TEXT NOT NULL DEFAULT '',
                 candidate_object_types TEXT NOT NULL DEFAULT '[]',
                 operation_hint TEXT NOT NULL DEFAULT '',
                 user_role TEXT NOT NULL DEFAULT '',
                 user_intent_anchor TEXT NOT NULL DEFAULT '',
                 user_intent_anchor_key TEXT NOT NULL DEFAULT '',
                 assertion_source TEXT NOT NULL DEFAULT '',
-                explicitness TEXT NOT NULL DEFAULT '',
                 evidence_basis TEXT NOT NULL DEFAULT '',
                 confidence REAL NOT NULL DEFAULT 0.0,
                 created_at TEXT NOT NULL,
@@ -586,6 +585,30 @@ class UserMemoryDB:
                 FOREIGN KEY(primary_entity_id) REFERENCES memory_entity_nodes(id) ON DELETE CASCADE
             );
 
+            CREATE TABLE IF NOT EXISTS memory_user_intent_lifecycle_observations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                signal_id INTEGER NOT NULL UNIQUE,
+                object_type TEXT NOT NULL CHECK(object_type IN ('goal', 'plan', 'work_item')),
+                target_description TEXT NOT NULL CHECK(length(trim(target_description)) > 0),
+                observation_text TEXT NOT NULL CHECK(length(trim(observation_text)) > 0),
+                lifecycle_evidence TEXT NOT NULL CHECK(
+                    (object_type = 'goal' AND lifecycle_evidence IN (
+                        'confirmed', 'updated', 'completed', 'cancelled', 'blocked'
+                    )) OR (object_type = 'plan' AND lifecycle_evidence IN (
+                        'confirmed', 'updated', 'occurred', 'cancelled', 'rescheduled', 'blocked'
+                    )) OR (object_type = 'work_item' AND lifecycle_evidence IN (
+                        'confirmed', 'updated', 'completed', 'cancelled', 'blocked'
+                    ))
+                ),
+                effective_at TEXT NOT NULL DEFAULT '',
+                confidence REAL NOT NULL DEFAULT 0.7 CHECK(confidence BETWEEN 0.0 AND 1.0),
+                details TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(signal_id) REFERENCES memory_fact_user_intent_signals(signal_id)
+                    ON DELETE CASCADE
+            );
+
             CREATE TABLE IF NOT EXISTS memory_user_intent_evidence (
                 object_type TEXT NOT NULL,
                 object_id INTEGER NOT NULL,
@@ -600,6 +623,7 @@ class UserMemoryDB:
 
             CREATE TABLE IF NOT EXISTS memory_user_intent_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                lifecycle_observation_id INTEGER UNIQUE,
                 object_type TEXT NOT NULL,
                 object_id INTEGER NOT NULL,
                 event_type TEXT NOT NULL,
@@ -613,7 +637,9 @@ class UserMemoryDB:
                 effective_at TEXT NOT NULL DEFAULT '',
                 decision_source TEXT NOT NULL DEFAULT '',
                 reason TEXT NOT NULL DEFAULT '',
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(lifecycle_observation_id)
+                    REFERENCES memory_user_intent_lifecycle_observations(id) ON DELETE CASCADE
             );
 
             CREATE INDEX IF NOT EXISTS idx_memory_facts_event_time ON memory_facts(event_time_key);
@@ -652,7 +678,7 @@ class UserMemoryDB:
             ON memory_fact_user_action_signals(subject_entity_id, event_time_key, fact_id);
             CREATE INDEX IF NOT EXISTS idx_memory_fact_user_intent_signals_group
             ON memory_fact_user_intent_signals(
-                subject_entity_id, user_intent_anchor_key, evidence_kind, fact_id
+                subject_entity_id, user_intent_anchor_key, signal_purpose, fact_id
             );
             CREATE INDEX IF NOT EXISTS idx_memory_user_claim_events_target
             ON memory_user_claim_events(target_claim_id, effective_at DESC, id DESC);
@@ -1376,13 +1402,16 @@ class UserMemoryDB:
         }.get(signal_type)
         if table is None:
             raise ValueError(f"Unknown signal type: {signal_type}")
+        columns = "signal_id, fact_id, signal_key"
+        if signal_type == "intent":
+            columns += ", signal_purpose"
         ids = sorted({int(value) for value in signal_ids if int(value) > 0})
         rows: List[Dict[str, Any]] = []
         for offset in range(0, len(ids), 500):
             chunk = ids[offset:offset + 500]
             placeholders = ",".join("?" for _ in chunk)
             rows.extend(dict(row) for row in self._conn.execute(
-                f"SELECT signal_id, fact_id, signal_key FROM {table} "
+                f"SELECT {columns} FROM {table} "
                 f"WHERE signal_id IN ({placeholders}) ORDER BY signal_id",
                 chunk,
             ).fetchall())
@@ -1605,7 +1634,7 @@ class UserMemoryDB:
         self,
         mappings: Sequence[Dict[str, Any]],
     ) -> int:
-        """Persist normalized future-facing evidence signals for one fact."""
+        """Persist normalized intent and lifecycle evidence signals for one fact."""
         now = local_now_text()
         changed = 0
         for mapping in mappings or []:
@@ -1618,12 +1647,11 @@ class UserMemoryDB:
                 subject_entity_id = int(mapping["subject_entity_id"])
             except (KeyError, TypeError, ValueError):
                 subject_entity_id = 0
-            evidence_kind = str(mapping.get("evidence_kind") or "").strip().lower()
+            signal_purpose = str(mapping.get("signal_purpose") or "").strip().lower()
             user_role = str(mapping.get("user_role") or "").strip().lower()
             user_intent_anchor = str(mapping.get("user_intent_anchor") or "").strip()
             user_intent_anchor_key = str(mapping.get("user_intent_anchor_key") or "").strip()
             assertion_source = str(mapping.get("assertion_source") or "").strip().lower()
-            explicitness = str(mapping.get("explicitness") or "").strip().lower()
             candidate_object_types = list(dict.fromkeys(
                 str(value).strip().lower()
                 for value in (mapping.get("candidate_object_types") or [])
@@ -1631,7 +1659,8 @@ class UserMemoryDB:
             ))
             if fact_id <= 0 or (
                 subject_entity_id <= 0
-                or evidence_kind not in {"goal", "plan", "responsibility", "lifecycle_update"}
+                or signal_purpose not in {"future_intent", "lifecycle_update"}
+                or not candidate_object_types
                 or user_role not in {"owner", "participant", "responsible"}
                 or not user_intent_anchor
                 or not user_intent_anchor_key
@@ -1639,28 +1668,27 @@ class UserMemoryDB:
                     "self_statement", "confirmed_response", "third_party_report",
                     "observed_event",
                 }
-                or explicitness not in {"direct", "reported", "tentative"}
             ):
                 continue
             if not signal_key:
                 signal_key = (
-                    f"{subject_entity_id}|{evidence_kind}|{user_intent_anchor_key}"
+                    f"{subject_entity_id}|{signal_purpose}|{user_intent_anchor_key}|"
+                    f"{','.join(sorted(candidate_object_types))}"
                 )
             self._conn.execute(
                 """
                 INSERT INTO memory_fact_user_intent_signals (
-                    fact_id, signal_key, subject_entity_id, evidence_kind,
+                    fact_id, signal_key, subject_entity_id, signal_purpose,
                     candidate_object_types, operation_hint, user_role,
                     user_intent_anchor, user_intent_anchor_key,
-                    assertion_source, explicitness, evidence_basis,
+                    assertion_source, evidence_basis,
                     confidence, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(fact_id, signal_key) DO UPDATE SET
                     candidate_object_types = excluded.candidate_object_types,
                     user_role = excluded.user_role,
                     user_intent_anchor = excluded.user_intent_anchor,
                     assertion_source = excluded.assertion_source,
-                    explicitness = excluded.explicitness,
                     evidence_basis = excluded.evidence_basis,
                     confidence = MAX(
                         memory_fact_user_intent_signals.confidence,
@@ -1669,10 +1697,10 @@ class UserMemoryDB:
                     updated_at = excluded.updated_at
                 """,
                 (
-                    fact_id, signal_key, subject_entity_id or None, evidence_kind,
+                    fact_id, signal_key, subject_entity_id or None, signal_purpose,
                     _json_dumps(candidate_object_types), "", user_role,
                     user_intent_anchor, user_intent_anchor_key,
-                    assertion_source, explicitness,
+                    assertion_source,
                     str(mapping.get("evidence_basis") or "").strip(),
                     float(mapping.get("confidence") or 0.0), now, now,
                 ),
@@ -1695,7 +1723,7 @@ class UserMemoryDB:
             LEFT JOIN memory_entity_nodes AS entity ON entity.id = signal.subject_entity_id
             WHERE signal.fact_id = ?
               AND signal.subject_entity_id IS NOT NULL
-            ORDER BY signal.evidence_kind, signal.user_intent_anchor_key
+            ORDER BY signal.signal_purpose, signal.user_intent_anchor_key
             """,
             (int(fact_id),),
         ).fetchall()
@@ -1737,6 +1765,73 @@ class UserMemoryDB:
                 signal["subject_entity"] = str(signal.get("subject") or "")
                 signals.append(signal)
         return signals
+
+    def upsert_user_intent_lifecycle_observation(
+        self, observation: Dict[str, Any],
+    ) -> int:
+        """Save one extracted observation using its source signal as stable identity."""
+        signal_id = int(observation["signal_id"])
+        object_type = str(observation["object_type"])
+        source = self._conn.execute(
+            "SELECT signal_purpose, candidate_object_types "
+            "FROM memory_fact_user_intent_signals WHERE signal_id = ?",
+            (signal_id,),
+        ).fetchone()
+        if (not source or source["signal_purpose"] != "lifecycle_update"
+                or object_type not in _json_loads(source["candidate_object_types"], [])):
+            raise ValueError("Observation must reference a lifecycle signal of the same object type")
+        now = local_now_text()
+        self._conn.execute(
+            """
+            INSERT INTO memory_user_intent_lifecycle_observations (
+                signal_id, object_type, target_description, observation_text,
+                lifecycle_evidence, effective_at, confidence, details,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(signal_id) DO UPDATE SET
+                object_type = excluded.object_type,
+                target_description = excluded.target_description,
+                observation_text = excluded.observation_text,
+                lifecycle_evidence = excluded.lifecycle_evidence,
+                effective_at = excluded.effective_at,
+                confidence = excluded.confidence,
+                details = excluded.details,
+                updated_at = excluded.updated_at
+            """,
+            (
+                signal_id, object_type, str(observation["target_description"]),
+                str(observation["observation_text"]), str(observation["lifecycle_evidence"]),
+                str(observation.get("effective_at") or ""),
+                float(observation.get("confidence", 0.7)),
+                _json_dumps(observation.get("details") or {}), now, now,
+            ),
+        )
+        row = self._conn.execute(
+            "SELECT id FROM memory_user_intent_lifecycle_observations WHERE signal_id = ?",
+            (signal_id,),
+        ).fetchone()
+        self._commit_if_needed()
+        return int(row["id"])
+
+    def get_user_intent_lifecycle_observations_by_ids(
+        self, observation_ids: Sequence[int],
+    ) -> List[Dict[str, Any]]:
+        """Load observations; source facts remain accessible through their signal IDs."""
+        ids = sorted({int(value) for value in observation_ids if int(value) > 0})
+        observations: List[Dict[str, Any]] = []
+        for offset in range(0, len(ids), 500):
+            chunk = ids[offset:offset + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = self._conn.execute(
+                "SELECT * FROM memory_user_intent_lifecycle_observations "
+                f"WHERE id IN ({placeholders}) ORDER BY id",
+                chunk,
+            ).fetchall()
+            for row in rows:
+                item = dict(row)
+                item["details"] = _json_loads(item["details"], {})
+                observations.append(item)
+        return observations
 
     def upsert_user_claim(
         self,
@@ -2329,6 +2424,22 @@ class UserMemoryDB:
         ).fetchall()
         return [self._intent_row_to_api(row) for row in rows]
 
+    def get_user_intent_items_by_ids(
+        self, intent_ids: Sequence[int],
+    ) -> List[Dict[str, Any]]:
+        """Read typed intent items by their IDs in the unified table."""
+        ids = sorted({int(value) for value in intent_ids if int(value) > 0})
+        items: List[Dict[str, Any]] = []
+        for offset in range(0, len(ids), 500):
+            chunk = ids[offset:offset + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = self._conn.execute(
+                f"SELECT * FROM memory_user_intent_items WHERE id IN ({placeholders}) ORDER BY id",
+                chunk,
+            ).fetchall()
+            items.extend(self._intent_row_to_api(row) for row in rows)
+        return items
+
     def get_intent_object(
         self, *, object_type: str, object_id: int
     ) -> Optional[Dict[str, Any]]:
@@ -2428,10 +2539,36 @@ class UserMemoryDB:
         effective_at: str = "",
         decision_source: str = "",
         reason: str = "",
+        lifecycle_observation_id: Optional[int] = None,
     ) -> int:
         normalized_type = str(object_type or "").strip().lower()
         if normalized_type not in {"goal", "plan", "work_item"}:
             return 0
+        if lifecycle_observation_id is not None:
+            source = self._conn.execute(
+                "SELECT observation.object_type, observation.lifecycle_evidence, "
+                "signal.subject_entity_id, signal.fact_id "
+                "FROM memory_user_intent_lifecycle_observations AS observation "
+                "JOIN memory_fact_user_intent_signals AS signal "
+                "ON signal.signal_id = observation.signal_id WHERE observation.id = ?",
+                (int(lifecycle_observation_id),),
+            ).fetchone()
+            target = self.get_intent_object(object_type=normalized_type, object_id=object_id)
+            if (not source or not target or source["object_type"] != normalized_type
+                    or int(source["subject_entity_id"]) != target["world_owner_entity_id"]
+                    or event_type != "relation_observed"
+                    or reconciliation_operation != source["lifecycle_evidence"]
+                    or list(evidence_fact_ids or []) != [source["fact_id"]]
+                    or previous_status != target["status"] or new_status != target["status"]):
+                raise ValueError("Lifecycle relation must reference a same-owner, same-type intent without changing status")
+            existing = self._conn.execute(
+                "SELECT id, object_type, object_id FROM memory_user_intent_events "
+                "WHERE lifecycle_observation_id = ?", (int(lifecycle_observation_id),),
+            ).fetchone()
+            if existing:
+                if existing["object_type"] != normalized_type or int(existing["object_id"]) != int(object_id):
+                    raise ValueError("Lifecycle observation already has a different intent relation")
+                return int(existing["id"])
         fact_ids = [int(value) for value in (evidence_fact_ids or []) if str(value).strip().isdigit()]
         cur = self._conn.execute(
             """
@@ -2440,18 +2577,38 @@ class UserMemoryDB:
                 reconciliation_operation,
                 previous_status, new_status,
                 previous_payload, new_payload, evidence_fact_ids, effective_at,
-                decision_source, reason, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                decision_source, reason, created_at, lifecycle_observation_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (normalized_type, int(object_id), str(event_type or "update"),
              int(trigger_object_id or 0), str(reconciliation_operation or ""),
              str(previous_status or ""), str(new_status or ""),
              _json_dumps(previous_payload or {}), _json_dumps(new_payload or {}),
              _json_dumps(list(dict.fromkeys(fact_ids))), str(effective_at or ""),
-             str(decision_source or ""), str(reason or ""), local_now_text()),
+             str(decision_source or ""), str(reason or ""), local_now_text(), lifecycle_observation_id),
         )
         self._commit_if_needed()
         return int(cur.lastrowid)
+
+    def get_intent_lifecycle_relation_events(
+        self, observation_ids: Sequence[int] = (), *, signal_ids: Optional[Sequence[int]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Read saved links by observation IDs, or source signals before observation insertion."""
+        source_ids = signal_ids if signal_ids is not None else observation_ids
+        column = "observation.signal_id" if signal_ids is not None else "event.lifecycle_observation_id"
+        ids = sorted({int(value) for value in source_ids if int(value) > 0})
+        events: List[Dict[str, Any]] = []
+        for offset in range(0, len(ids), 500):
+            chunk = ids[offset:offset + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = self._conn.execute(
+                "SELECT event.*, observation.signal_id FROM memory_user_intent_events AS event "
+                "JOIN memory_user_intent_lifecycle_observations AS observation "
+                "ON observation.id = event.lifecycle_observation_id "
+                f"WHERE {column} IN ({placeholders}) ORDER BY event.id", chunk,
+            ).fetchall()
+            events.extend(self._row_to_dict(row) for row in rows)
+        return events
 
     def get_user_claim_events(
         self,

@@ -44,6 +44,7 @@ from prompts_en import (
     EXPLICIT_USER_CLAIM_EXTRACTION_PROMPT_EN,
     USER_OBSERVED_PATTERN_EXTRACTION_PROMPT_EN,
     INTENT_EXTRACTION_PROMPT_EN,
+    INTENT_LIFECYCLE_RECONCILIATION_PROMPT_EN,
     INTENT_RECONCILIATION_PROMPT_EN,
     USER_ACTIVITY_EXTRACTION_PROMPT_EN,
     MEMORY_RETRIEVED_FORMAT_PROMPT_EN,
@@ -59,6 +60,7 @@ from prompts_zh import (
     EXPLICIT_USER_CLAIM_EXTRACTION_PROMPT_ZH,
     USER_OBSERVED_PATTERN_EXTRACTION_PROMPT_ZH,
     INTENT_EXTRACTION_PROMPT_ZH,
+    INTENT_LIFECYCLE_RECONCILIATION_PROMPT_ZH,
     INTENT_RECONCILIATION_PROMPT_ZH,
     USER_ACTIVITY_EXTRACTION_PROMPT_ZH,
     MEMORY_RETRIEVED_FORMAT_PROMPT_ZH,
@@ -1467,19 +1469,14 @@ class MemoryNodeManager:
         )
         if max_items <= 0:
             return []
-        default_object_types = {
-            "goal": ["goal"],
-            "plan": ["plan"],
-            "responsibility": ["work_item"],
-            "lifecycle_update": ["plan", "work_item"],
-        }
+        allowed_signal_purposes = {"future_intent", "lifecycle_update"}
         normalized: List[Dict[str, Any]] = []
-        seen: set[Tuple[str, str, str]] = set()
+        seen: set[Tuple[str, str, str, Tuple[str, ...]]] = set()
         for raw in value:
             if not isinstance(raw, dict):
                 continue
-            evidence_kind = str(raw.get("evidence_kind") or "").strip().lower()
-            if evidence_kind not in default_object_types:
+            signal_purpose = str(raw.get("signal_purpose") or "").strip().lower()
+            if signal_purpose not in allowed_signal_purposes:
                 continue
             raw_object_types = raw.get("candidate_object_types")
             if isinstance(raw_object_types, str):
@@ -1490,7 +1487,9 @@ class MemoryNodeManager:
                 str(item).strip().lower()
                 for item in raw_object_types
                 if str(item).strip().lower() in {"goal", "plan", "work_item"}
-            )) or list(default_object_types[evidence_kind])
+            ))
+            if not candidate_object_types:
+                continue
             user_role = str(raw.get("user_role") or "").strip().lower()
             if user_role not in {"owner", "participant", "responsible"}:
                 continue
@@ -1499,9 +1498,6 @@ class MemoryNodeManager:
                 "self_statement", "confirmed_response", "third_party_report",
                 "observed_event",
             }:
-                continue
-            explicitness = str(raw.get("explicitness") or "").strip().lower()
-            if explicitness not in {"direct", "reported", "tentative"}:
                 continue
             subject = raw.get("subject_entity") or raw.get("subject") or fallback_entity
             if isinstance(subject, dict):
@@ -1540,27 +1536,25 @@ class MemoryNodeManager:
                 if owner_evidence is None:
                     continue
                 owner_evidence.pop("owner_evidence_type")
-            if assertion_source == "third_party_report" and explicitness != "reported":
-                continue
             confidence = self._clamp_float(raw.get("confidence"), 0.0, 1.0, 0.75)
             if assertion_source == "third_party_report":
                 confidence = min(confidence, 0.65)
             key = (
                 subject_name.lower(),
-                evidence_kind,
+                signal_purpose,
                 self._generate_topic_name_key(user_intent_anchor),
+                tuple(sorted(candidate_object_types)),
             )
             if key in seen:
                 continue
             seen.add(key)
             normalized.append({
                 "subject_entity": subject_name,
-                "evidence_kind": evidence_kind,
+                "signal_purpose": signal_purpose,
                 "candidate_object_types": candidate_object_types,
                 "user_role": user_role,
                 "user_intent_anchor": user_intent_anchor,
                 "assertion_source": assertion_source,
-                "explicitness": explicitness,
                 "evidence_basis": evidence_basis,
                 "confidence": confidence,
                 **owner_evidence,
@@ -2420,7 +2414,7 @@ class MemoryNodeManager:
         reference_timestamp: Optional[Any] = None,
         signal_ids: Optional[Sequence[int]] = None,
     ) -> Dict[str, Any]:
-        """Extract independent intent signals in bounded LLM batches."""
+        """Extract and save future intent candidates and lifecycle observations in batches."""
         reference_timestamp = reference_timestamp or _now_text()
         selected_signal_ids = list(dict.fromkeys(
             int(value) for value in signal_ids or [] if int(value) > 0
@@ -2434,25 +2428,14 @@ class MemoryNodeManager:
         report: Dict[str, Any] = {
             "status": "empty",
             "reference_timestamp": str(reference_timestamp),
-            "seed_fact_count": len(facts),
-            "user_intent_signal_count": 0,
-            "signal_batch_count": 0,
-            "candidate_count": 0,
-            "applied_count": 0,
-            "created": 0,
-            "relations_recorded": 0,
+            "new_intent_ids": [],
+            "intent_relation_event_ids": [],
+            "intent_lifecycle_observation_ids": [],
+            "intent_lifecycle_relation_event_ids": [],
+            "unmatched_lifecycle_observation_ids": [],
             "_completed_signal_ids": [],
-            "failed_signal_count": 0,
-            "failed_batch_count": 0,
-            "affected_objects": [],
+            "failed_signal_ids": [],
         }
-        self._log_user_intent_facts_loaded(
-            "memory_user_intent_update", facts, reference_timestamp,
-        )
-        if not facts:
-            self._log_info("memory_user_intent_update", "finish", report)
-            return report
-
         facts_by_id = {
             int(fact["id"]): fact
             for fact in facts
@@ -2470,7 +2453,7 @@ class MemoryNodeManager:
                 "fact": fact,
                 "signal": signal,
             })
-        report["user_intent_signal_count"] = len(signal_items)
+        self._log_user_intent_signals_loaded(signal_items, reference_timestamp)
         if not signal_items:
             self._log_info("memory_user_intent_update", "finish", report)
             return report
@@ -2483,7 +2466,6 @@ class MemoryNodeManager:
         for batch_start in range(0, len(signal_items), batch_size):
             batch = signal_items[batch_start:batch_start + batch_size]
             batch_index = batch_start // batch_size
-            report["signal_batch_count"] += 1
             language = self._resolve_prompt_language_from_text("\n".join(
                 str(item["fact"].get("summary") or "") for item in batch
             ))
@@ -2506,8 +2488,7 @@ class MemoryNodeManager:
                 parsed = None
                 batch_error = str(exc)
             if not isinstance(parsed, dict) or not isinstance(parsed.get("results"), list):
-                report["failed_batch_count"] += 1
-                report["failed_signal_count"] += len(batch)
+                report["failed_signal_ids"].extend(item["signal_id"] for item in batch)
                 self._log_info("memory_user_intent_update", "batch_error", {
                     "batch_index": batch_index,
                     "signal_ids": [item["signal_id"] for item in batch],
@@ -2515,134 +2496,77 @@ class MemoryNodeManager:
                 })
                 continue
 
-            results_by_id: Dict[int, List[Dict[str, Any]]] = {}
-            for result in parsed["results"]:
-                if not isinstance(result, dict):
-                    continue
-                try:
-                    result_signal_id = int(result.get("signal_id"))
-                except (TypeError, ValueError):
-                    continue
-                results_by_id.setdefault(result_signal_id, []).append(result)
-            batch_candidates = 0
-            batch_applied = 0
-            for item in batch:
-                signal_id = item["signal_id"]
-                results = results_by_id.get(signal_id) or []
-                if len(results) != 1 or "intent_candidate" not in results[0]:
-                    report["failed_signal_count"] += 1
-                    self._log_info("memory_user_intent_update", "signal_error", {
-                        "signal_id": signal_id,
-                        "error": "missing_or_duplicate_signal_result",
-                    })
-                    continue
-                raw_candidate = results[0]["intent_candidate"]
-                if raw_candidate is None:
-                    report["_completed_signal_ids"].append(signal_id)
-                    continue
-                fact_id = item["fact_id"]
-                if (
-                    not isinstance(raw_candidate, dict)
-                    or raw_candidate.get("evidence_fact_ids") != [fact_id]
-                    or raw_candidate.get("object_type") not in item["signal"]["candidate_object_types"]
-                ):
-                    report["failed_signal_count"] += 1
-                    self._log_info("memory_user_intent_update", "signal_error", {
-                        "signal_id": signal_id,
-                        "error": "invalid_signal_candidate_scope",
-                    })
-                    continue
-                fact = item["fact"]
-                entity_ids_by_name = {
-                    _compact_whitespace(name): int(entity_id)
-                    for name, entity_id in zip(
-                        fact.get("entities") or [], fact.get("entity_ids") or [],
-                    )
-                    if _compact_whitespace(name) and str(entity_id).isdigit()
-                    and int(entity_id) > 0
-                }
-                candidates = self._normalize_intent_candidates(
-                    {"intent_candidates": [raw_candidate]},
-                    facts_by_id={fact_id: fact},
-                    entity_ids=entity_ids_by_name,
+            normalized = self._normalize_intent_candidates(
+                parsed["results"],
+                signal_items=batch,
+                world_owner_id=world_owner_id,
+            )
+            candidates = normalized["future_intent_candidates"]
+            observations = normalized["intent_lifecycle_observations"]
+            report["_completed_signal_ids"].extend(normalized["empty_signal_ids"])
+            report["failed_signal_ids"].extend(normalized["failed_signal_ids"])
+            try:
+                decisions = self._reconcile_future_intent_candidates(
+                    candidates,
                     world_owner_id=world_owner_id,
+                    prompt_language=language,
                 )
-                if len(candidates) != 1:
-                    report["failed_signal_count"] += 1
-                    self._log_info("memory_user_intent_update", "signal_error", {
-                        "signal_id": signal_id,
-                        "error": "invalid_normalized_intent_candidate",
-                    })
-                    continue
-                batch_candidates += 1
-                report["candidate_count"] += 1
-                try:
-                    decisions = self._reconcile_intent_candidates(
-                        candidates,
-                        world_owner_id=world_owner_id,
-                        prompt_language=language,
-                        existing_by_type=self._retrieve_user_intent_related_intent_objects(
-                            candidates,
-                            world_owner_id=world_owner_id,
-                        ),
-                    )
-                    # A lifecycle-only signal can change an existing object,
-                    # but cannot by itself create a new object.
-                    should_apply = not (
-                        item["signal"]["evidence_kind"] == "lifecycle_update"
-                        and decisions.get(0, {}).get("operation") == "create"
-                    )
-                    with self._db.transaction():
-                        applied = (
-                            self._apply_intent_candidates(
-                                candidates,
-                                decisions,
-                                observed_at=_to_timestamp_text(
-                                    fact.get("dialogue_time_key")
-                                    or fact.get("event_time_key")
-                                    or reference_timestamp
-                                ),
-                            )
-                            if should_apply else []
-                        )
-                except Exception as exc:
-                    report["failed_signal_count"] += 1
-                    self._log_info("memory_user_intent_update", "signal_error", {
-                        "signal_id": signal_id,
-                        "error": str(exc),
-                    })
-                    continue
-                report["_completed_signal_ids"].append(signal_id)
-                batch_applied += len(applied)
-                report["applied_count"] += len(applied)
-                report["created"] += sum(result["created"] for result in applied)
-                report["relations_recorded"] += sum(result["related"] for result in applied)
-                for result in applied:
-                    report["affected_objects"].append({
-                        "object_type": result["object_type"],
-                        "object_id": result["object_id"],
-                    })
-                    if result["target_object_id"]:
-                        report["affected_objects"].append({
-                            "object_type": result["object_type"],
-                            "object_id": result["target_object_id"],
-                        })
+            except Exception as exc:
+                report["failed_signal_ids"].extend(candidate["signal_id"] for candidate in candidates)
+                self._log_info("memory_user_intent_update", "batch_error", {
+                    "batch_index": batch_index,
+                    "signal_ids": [candidate["signal_id"] for candidate in candidates],
+                    "error": str(exc),
+                    "phase": "reconciliation",
+                })
+            else:
+                applied = self._save_future_intent_candidates(
+                    candidates,
+                    decisions,
+                    facts_by_id=facts_by_id,
+                    reference_timestamp=reference_timestamp,
+                )
+                report["_completed_signal_ids"].extend(applied["completed_signal_ids"])
+                report["failed_signal_ids"].extend(applied["failed_signal_ids"])
+                report["new_intent_ids"].extend(applied["new_intent_ids"])
+                report["intent_relation_event_ids"].extend(applied["intent_relation_event_ids"])
+
+            # Match after saving future candidates so this batch's newly stored
+            # intents are visible too. A failure in either branch is independent.
+            try:
+                lifecycle_decisions = self._reconcile_intent_lifecycle_observations(
+                    observations, facts_by_id=facts_by_id,
+                    world_owner_id=world_owner_id, prompt_language=language,
+                )
+            except Exception as exc:
+                lifecycle_decisions = {}
+                self._log_info("memory_user_intent_update", "lifecycle_match_error", {
+                    "signal_ids": [item["signal_id"] for item in observations], "error": str(exc),
+                })
+            saved = self._save_intent_lifecycle_observations(
+                observations, lifecycle_decisions, world_owner_id=world_owner_id,
+            )
+            report["_completed_signal_ids"].extend(saved["completed_signal_ids"])
+            report["failed_signal_ids"].extend(saved["failed_signal_ids"])
+            report["intent_lifecycle_observation_ids"].extend(saved["intent_lifecycle_observation_ids"])
+            report["intent_lifecycle_relation_event_ids"].extend(saved["relation_event_ids"])
+            report["unmatched_lifecycle_observation_ids"].extend(
+                saved["unmatched_observation_ids"],
+            )
             self._log_info("memory_user_intent_update", "batch_finish", {
                 "batch_index": batch_index,
                 "signal_ids": [item["signal_id"] for item in batch],
-                "candidate_count": batch_candidates,
-                "applied_count": batch_applied,
+                "candidate_count": len(candidates),
+                "lifecycle_observation_count": len(observations),
+                "lifecycle_observation_saved_count": len(saved["intent_lifecycle_observation_ids"]),
+                "lifecycle_relation_count": len(saved["relation_event_ids"]),
+                "unmatched_lifecycle_observation_ids": saved["unmatched_observation_ids"],
             })
 
         report["status"] = (
-            "error" if report["failed_signal_count"] == len(signal_items)
-            else "partial" if report["failed_signal_count"] else "ok"
+            "partial" if report["failed_signal_ids"] and report["_completed_signal_ids"]
+            else "error" if report["failed_signal_ids"] else "ok"
         )
-        if report["affected_objects"]:
-            report["affected_objects"] = list({
-                (item["object_type"], item["object_id"]): item
-                for item in report["affected_objects"]
-            }.values())
         self._log_info("memory_user_intent_update", "finish", report)
         return report
 
@@ -2657,9 +2581,9 @@ class MemoryNodeManager:
             "user_intent_signal": {
                 key: signal.get(key)
                 for key in (
-                    "evidence_kind", "candidate_object_types", "subject_entity",
+                    "signal_purpose", "candidate_object_types", "subject_entity",
                     "user_role", "user_intent_anchor", "assertion_source",
-                    "explicitness", "evidence_basis", "confidence",
+                    "evidence_basis", "confidence",
                 )
             },
         }
@@ -2714,20 +2638,11 @@ class MemoryNodeManager:
                     item for score, item in ranked
                     if score >= 0.35
                 ][:4]
-                # Lifecycle updates are especially important not to lose. If
-                # lexical/structured evidence is sparse, expose only the two
-                # best candidate-ranked objects rather than an arbitrary
-                # recency slice of the entire active set.
-                if (
-                    not strong_matches
-                    and candidate.get("lifecycle_evidence") != "none"
-                ):
-                    strong_matches = [item for _score, item in ranked[:2]]
                 for item in strong_matches:
                     object_id = int(item.get("id") or 0)
                     if object_id > 0:
                         selected_by_id[object_id] = item
-            related_by_type[object_type] = list(selected_by_id.values())[:16]
+            related_by_type[object_type] = list(selected_by_id.values())
         return related_by_type
 
     def _build_intent_object_match_profile(
@@ -2830,35 +2745,155 @@ class MemoryNodeManager:
 
     def _normalize_intent_candidates(
         self,
-        payload: Dict[str, Any],
+        results: Sequence[Any],
         *,
-        facts_by_id: Dict[int, Dict[str, Any]],
-        entity_ids: Dict[str, int],
+        signal_items: Sequence[Dict[str, Any]],
         world_owner_id: int,
-    ) -> List[Dict[str, Any]]:
-        """Normalize the unified prompt list into typed internal candidates."""
-        normalized: List[Dict[str, Any]] = []
-        raw_candidates = payload.get("intent_candidates")
-        if not isinstance(raw_candidates, list):
-            return normalized
-        for raw_candidate in raw_candidates:
-            if not isinstance(raw_candidate, dict):
+    ) -> Dict[str, Any]:
+        """Validate and route batch results by signal purpose before normalizing each output."""
+        results_by_id: Dict[int, List[Dict[str, Any]]] = {}
+        for result in results:
+            if not isinstance(result, dict):
                 continue
-            object_type = str(raw_candidate.get("object_type") or "").strip().lower()
-            candidate = self._normalize_intent_candidate(
-                raw_candidate,
-                object_type=object_type,
-                facts_by_id=facts_by_id,
-                entity_ids=entity_ids,
-                world_owner_id=world_owner_id,
-            )
-            if candidate is not None:
-                normalized.append(candidate)
-            if len(normalized) >= 24:
-                return normalized
-        return normalized
+            try:
+                signal_id = int(result.get("signal_id"))
+            except (TypeError, ValueError):
+                continue
+            results_by_id.setdefault(signal_id, []).append(result)
 
-    def _normalize_intent_candidate(
+        candidates: List[Dict[str, Any]] = []
+        observations: List[Dict[str, Any]] = []
+        empty_signal_ids: List[int] = []
+        errors: Dict[int, str] = {}
+        for item in signal_items:
+            signal_id = item["signal_id"]
+            signal_results = results_by_id.get(signal_id) or []
+            if len(signal_results) != 1 or not all(
+                key in signal_results[0]
+                for key in ("future_intent_candidate", "intent_lifecycle_observation")
+            ):
+                errors[signal_id] = "missing_or_duplicate_signal_result"
+                continue
+            result = signal_results[0]
+            purpose = item["signal"].get("signal_purpose")
+            output_key = {
+                "future_intent": "future_intent_candidate",
+                "lifecycle_update": "intent_lifecycle_observation",
+            }.get(purpose)
+            if output_key is None or any(
+                result[key] is not None
+                for key in ("future_intent_candidate", "intent_lifecycle_observation")
+                if key != output_key
+            ):
+                errors[signal_id] = "invalid_signal_result_route"
+                continue
+            raw_candidate = result[output_key]
+            if raw_candidate is None:
+                empty_signal_ids.append(signal_id)
+                continue
+            fact_id = item["fact_id"]
+            if (
+                not isinstance(raw_candidate, dict)
+                or raw_candidate.get("evidence_fact_ids") != [fact_id]
+                or raw_candidate.get("object_type") not in item["signal"]["candidate_object_types"]
+            ):
+                errors[signal_id] = "invalid_signal_result_scope"
+                continue
+            if purpose == "lifecycle_update":
+                observation = self._normalize_single_intent_lifecycle_observation(raw_candidate)
+                if observation is None:
+                    errors[signal_id] = "invalid_normalized_intent_lifecycle_observation"
+                    continue
+                observation["signal_id"] = signal_id
+                observations.append(observation)
+                continue
+            fact = item["fact"]
+            entity_ids_by_name = {
+                _compact_whitespace(name): int(entity_id)
+                for name, entity_id in zip(
+                    fact.get("entities") or [], fact.get("entity_ids") or [],
+                )
+                if _compact_whitespace(name) and str(entity_id).isdigit()
+                and int(entity_id) > 0
+            }
+            try:
+                candidate = self._normalize_single_intent_candidate(
+                    raw_candidate,
+                    object_type=raw_candidate["object_type"],
+                    facts_by_id={fact_id: fact},
+                    entity_ids=entity_ids_by_name,
+                    world_owner_id=world_owner_id,
+                )
+            except Exception as exc:
+                errors[signal_id] = str(exc)
+                continue
+            if candidate is None:
+                errors[signal_id] = "invalid_normalized_future_intent_candidate"
+                continue
+            candidate["signal_id"] = signal_id
+            candidates.append(candidate)
+
+        for signal_id, error in errors.items():
+            self._log_info("memory_user_intent_update", "signal_error", {
+                "signal_id": signal_id, "error": error,
+            })
+        return {
+            "future_intent_candidates": candidates,
+            "intent_lifecycle_observations": observations,
+            "empty_signal_ids": empty_signal_ids,
+            "failed_signal_ids": list(errors),
+        }
+
+    def _normalize_single_intent_lifecycle_observation(
+        self, raw: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Normalize observed changes without reconstructing or updating an intent."""
+        if any(not isinstance(raw.get(key), str) for key in (
+            "object_type", "target_description", "observation_text", "lifecycle_evidence",
+        )) or not isinstance(raw.get("effective_at", ""), str):
+            return None
+        object_type = str(raw.get("object_type") or "")
+        allowed_evidence = {
+            "goal": {"confirmed", "updated", "completed", "cancelled", "blocked"},
+            "plan": {"confirmed", "updated", "occurred", "cancelled", "rescheduled", "blocked"},
+            "work_item": {"confirmed", "updated", "completed", "cancelled", "blocked"},
+        }
+        lifecycle_evidence = str(raw.get("lifecycle_evidence") or "").strip().lower()
+        target = _compact_whitespace(raw.get("target_description") or "")[:480]
+        text = _compact_whitespace(raw.get("observation_text") or "")[:800]
+        if not target or not text or lifecycle_evidence not in allowed_evidence.get(object_type, set()):
+            return None
+        effective_at = _compact_whitespace(raw.get("effective_at") or "")
+        if effective_at:
+            try:
+                datetime.fromisoformat(effective_at.replace("Z", "+00:00"))
+            except ValueError:
+                return None
+        raw_details = raw.get("details", {})
+        if not isinstance(raw_details, dict):
+            return None
+        details: Dict[str, str] = {}
+        for key in ("time_start", "time_end", "location", "progress_text"):
+            value = raw_details.get(key)
+            if value is None or value == "":
+                continue
+            if not isinstance(value, str):
+                return None
+            text_value = _compact_whitespace(value)[:480]
+            if text_value:
+                details[key] = text_value
+        return {
+            "object_type": object_type,
+            "target_description": target,
+            "observation_text": text,
+            "lifecycle_evidence": lifecycle_evidence,
+            "effective_at": effective_at,
+            "confidence": self._clamp_float(raw.get("confidence"), 0.0, 1.0, 0.7),
+            "evidence_fact_ids": list(raw["evidence_fact_ids"]),
+            "details": details,
+        }
+
+    def _normalize_single_intent_candidate(
         self,
         raw: Any,
         *,
@@ -2892,21 +2927,12 @@ class MemoryNodeManager:
         )
         canonical_key = self._generate_topic_name_key(raw.get("canonical_key") or summary)
         confidence = self._clamp_float(raw.get("confidence"), 0.0, 1.0, 0.7)
-        lifecycle_evidence = str(raw.get("lifecycle_evidence") or "none").strip().lower()
-        allowed_lifecycle_evidence = {
-            "goal": {"none", "confirmed", "completed", "cancelled", "blocked"},
-            "plan": {"none", "confirmed", "occurred", "cancelled", "rescheduled", "blocked"},
-            "work_item": {"none", "confirmed", "completed", "cancelled", "blocked"},
-        }
-        if lifecycle_evidence not in allowed_lifecycle_evidence[object_type]:
-            lifecycle_evidence = "none"
         candidate: Dict[str, Any] = {
             "object_type": object_type, "summary": summary,
             "canonical_key": canonical_key, "confidence": confidence,
             "primary_domain": primary_domain,
             "evidence_fact_ids": evidence_ids,
             "world_owner_entity_id": world_owner_id,
-            "lifecycle_evidence": lifecycle_evidence,
         }
         def entity_id(value: Any, *, fallback: int = 0) -> int:
             name = _compact_whitespace(value or "")
@@ -3031,7 +3057,7 @@ class MemoryNodeManager:
                 })
         return candidate
 
-    def _reconcile_intent_candidates(
+    def _reconcile_future_intent_candidates(
         self,
         candidates: Sequence[Dict[str, Any]],
         *,
@@ -3039,6 +3065,9 @@ class MemoryNodeManager:
         prompt_language: str,
         existing_by_type: Optional[Dict[str, List[Dict[str, Any]]]] = None,
     ) -> Dict[int, Dict[str, Any]]:
+        """Use the LLM for related objects; never infer a relationship from canonical keys."""
+        if not candidates:
+            return {}
         if existing_by_type is None:
             existing_by_type = self._retrieve_user_intent_related_intent_objects(
                 candidates,
@@ -3049,79 +3078,81 @@ class MemoryNodeManager:
             for object_type in ("goal", "plan", "work_item")
         }
         decisions: Dict[int, Dict[str, Any]] = {}
+        matching_indices = set()
         for index, candidate in enumerate(candidates):
-            direct = next((
-                item for item in existing_by_type[candidate["object_type"]]
-                if str(item.get("canonical_key") or "") == candidate["canonical_key"]
-            ), None)
-            decisions[index] = {
-                "operation": (
-                    self._intent_operation_from_lifecycle_evidence(candidate)
-                    if direct else "create"
-                ),
-                "target_object_type": candidate["object_type"] if direct else "",
-                "target_object_id": int(direct["id"]) if direct else 0,
-                "reason": "deterministic_canonical_key_match" if direct else "no_direct_match",
-            }
+            if existing_by_type[candidate["object_type"]]:
+                matching_indices.add(index)
+            else:
+                decisions[index] = {
+                    "operation": "create", "target_object_type": "", "target_object_id": 0,
+                    "reason": "no_related_intent_of_same_type",
+                }
         existing = [
             self._intent_object_prompt_view(object_type, item)
             for object_type, items in existing_by_type.items() for item in items
         ]
-        if not candidates or not existing:
+        if not matching_indices:
             return decisions
         prompt_template = (
             INTENT_RECONCILIATION_PROMPT_EN
             if prompt_language == "en" else INTENT_RECONCILIATION_PROMPT_ZH
         )
-        raw = self._llm_client.call_llm(
-            prompt_template.replace("{candidates}", json.dumps(candidates, ensure_ascii=False, indent=2))
-            .replace("{existing_objects}", json.dumps(existing, ensure_ascii=False, indent=2))
-        )
-        parsed = self._llm_client.parse_json_object_from_llm_text(raw or "")
-        if not isinstance(parsed, dict) or not isinstance(parsed.get("decisions"), list):
+        try:
+            raw = self._llm_client.call_llm(
+                prompt_template.replace("{candidates}", json.dumps(candidates, ensure_ascii=False, indent=2))
+                .replace("{existing_objects}", json.dumps(existing, ensure_ascii=False, indent=2))
+            )
+            parsed = self._llm_client.parse_json_object_from_llm_text(raw or "")
+            if not isinstance(parsed, dict) or not isinstance(parsed.get("decisions"), list):
+                raise ValueError("invalid_future_intent_reconciliation_response")
+        except Exception as exc:
+            self._log_info("memory_user_intent_update", "batch_error", {
+                "candidate_indices": sorted(matching_indices),
+                "phase": "future_intent_reconciliation", "error": str(exc),
+            })
             return decisions
         valid_ids = {
             (object_type, int(item["id"]))
             for object_type, items in existing_by_type.items() for item in items
         }
+        results_by_index: Dict[int, List[Dict[str, Any]]] = {}
         for raw_decision in parsed["decisions"]:
             if not isinstance(raw_decision, dict):
                 continue
             index = raw_decision.get("candidate_index")
-            if not isinstance(index, int) or not 0 <= index < len(candidates):
-                continue
-            operation = str(raw_decision.get("operation") or "create").lower()
-            target_type = str(raw_decision.get("target_object_type") or "").lower()
+            if type(index) is int and index in matching_indices:
+                results_by_index.setdefault(index, []).append(raw_decision)
+        for index in sorted(matching_indices):
             try:
-                target_id = int(raw_decision.get("target_object_id") or 0)
-            except (TypeError, ValueError):
-                continue
-            if operation not in {"create", "confirm", "update", "complete", "cancel", "reschedule", "block"}:
-                continue
-            if operation != "create" and (
-                target_type != candidates[index]["object_type"]
-                or (target_type, target_id) not in valid_ids
-            ):
-                continue
-            decisions[index] = {
-                "operation": operation, "target_object_type": target_type,
-                "target_object_id": target_id,
-                "reason": _compact_whitespace(raw_decision.get("reason") or "llm_reconciliation")[:240],
-            }
+                results = results_by_index.get(index, [])
+                if len(results) != 1:
+                    raise ValueError("missing_or_duplicate_future_intent_decision")
+                result = results[0]
+                if (not isinstance(result.get("operation"), str)
+                        or not isinstance(result.get("target_object_type"), str)):
+                    raise ValueError("invalid_future_intent_decision_fields")
+                operation = result["operation"].strip().lower()
+                target_type = result["target_object_type"].strip().lower()
+                target_id = result.get("target_object_id")
+                if operation not in {"create", "confirm", "update"} or type(target_id) is not int:
+                    raise ValueError("invalid_future_intent_decision")
+                if operation == "create":
+                    if target_type != "" or target_id != 0:
+                        raise ValueError("create_intent_must_not_have_a_target")
+                elif (target_type != candidates[index]["object_type"]
+                        or (target_type, target_id) not in valid_ids):
+                    raise ValueError("invalid_future_intent_target")
+                decisions[index] = {
+                    "operation": operation, "target_object_type": target_type,
+                    "target_object_id": target_id,
+                    "reason": _compact_whitespace(result.get("reason") or "llm_reconciliation")[:240],
+                }
+            except Exception as exc:
+                self._log_info("memory_user_intent_update", "signal_error", {
+                    "signal_id": candidates[index].get("signal_id"), "candidate_index": index,
+                    "phase": "future_intent_reconciliation", "error": str(exc),
+                })
         return decisions
-
-    @staticmethod
-    def _intent_operation_from_lifecycle_evidence(candidate: Dict[str, Any]) -> str:
-        """Map fact-level lifecycle evidence to an update for a matched object."""
-        lifecycle_evidence = str(candidate.get("lifecycle_evidence") or "none").lower()
-        return {
-            "confirmed": "confirm",
-            "completed": "complete",
-            "occurred": "complete",
-            "cancelled": "cancel",
-            "rescheduled": "reschedule",
-            "blocked": "block",
-        }.get(lifecycle_evidence, "update")
 
     @staticmethod
     def _intent_object_prompt_view(object_type: str, item: Dict[str, Any]) -> Dict[str, Any]:
@@ -3219,72 +3250,271 @@ class MemoryNodeManager:
             },
         )
 
-    def _apply_intent_candidates(
+    def _retrieve_intent_lifecycle_observation_cases(
+        self, observations: Sequence[Dict[str, Any]], *,
+        facts_by_id: Dict[int, Dict[str, Any]], world_owner_id: int,
+    ) -> List[Dict[str, Any]]:
+        """Retrieve same-type identity candidates without filtering intent lifecycle status."""
+        existing_by_type = {
+            object_type: self._db.get_intent_objects(
+                object_type=object_type, world_owner_entity_id=world_owner_id, limit=120,
+            )
+            for object_type in {item["object_type"] for item in observations}
+        }
+        cases: List[Dict[str, Any]] = []
+        for observation in observations:
+            object_type = observation["object_type"]
+            identity = {"object_type": object_type, "summary": observation["target_description"]}
+            ranked = sorted(
+                ((self._score_intent_candidate_against_existing_object(identity, item), item)
+                 for item in existing_by_type[object_type]),
+                key=lambda pair: pair[0], reverse=True,
+            )
+            cases.append({
+                "intent_lifecycle_observation": {
+                    key: observation[key] for key in (
+                        "object_type", "target_description", "observation_text",
+                        "lifecycle_evidence", "effective_at", "confidence", "details",
+                    )
+                },
+                "fact": self._intent_fact_prompt_view(
+                    facts_by_id[observation["evidence_fact_ids"][0]],
+                ),
+                "existing_intents": [
+                    self._intent_object_prompt_view(object_type, item)
+                    for score, item in ranked[:6] if score >= 0.2
+                ],
+            })
+        return cases
+
+    def _reconcile_intent_lifecycle_observations(
+        self, observations: Sequence[Dict[str, Any]], *,
+        facts_by_id: Dict[int, Dict[str, Any]], world_owner_id: int, prompt_language: str,
+    ) -> Dict[int, Dict[str, Any]]:
+        """Return matching decisions keyed by observation index without writing to storage."""
+        if not observations:
+            return {}
+        decisions: Dict[int, Dict[str, Any]] = {}
+        cases = self._retrieve_intent_lifecycle_observation_cases(
+            observations, facts_by_id=facts_by_id, world_owner_id=world_owner_id,
+        )
+        matching_indices = {index for index, case in enumerate(cases) if case["existing_intents"]}
+        decisions_by_index: Dict[int, List[Dict[str, Any]]] = {}
+        if matching_indices:
+            self._log_info("memory_user_intent_update", "lifecycle_matching_inputs", {
+                "observation_cases": cases,
+            })
+            try:
+                template = (
+                    INTENT_LIFECYCLE_RECONCILIATION_PROMPT_EN if prompt_language == "en"
+                    else INTENT_LIFECYCLE_RECONCILIATION_PROMPT_ZH
+                )
+                raw = self._llm_client.call_llm(template.replace(
+                    "{observation_cases}", json.dumps(cases, ensure_ascii=False, indent=2),
+                ))
+                parsed = self._llm_client.parse_json_object_from_llm_text(raw or "")
+                if not isinstance(parsed, dict) or not isinstance(parsed.get("decisions"), list):
+                    raise ValueError("invalid_lifecycle_matching_response")
+                for decision in parsed["decisions"]:
+                    if not isinstance(decision, dict):
+                        continue
+                    index = decision.get("observation_index")
+                    if type(index) is int and index in matching_indices:
+                        decisions_by_index.setdefault(index, []).append(decision)
+            except Exception as exc:
+                self._log_info("memory_user_intent_update", "lifecycle_match_error", {
+                    "observation_indices": sorted(matching_indices),
+                    "error": str(exc),
+                })
+
+        for index, case in enumerate(cases):
+            try:
+                if not case["existing_intents"]:
+                    decision = {"matched": False, "target_object_type": "", "target_object_id": 0,
+                                "reason": "no_related_intent"}
+                else:
+                    results = decisions_by_index.get(index, [])
+                    if len(results) != 1:
+                        raise ValueError("missing_or_duplicate_lifecycle_matching_decision")
+                    decision = results[0]
+                if type(decision.get("matched")) is not bool:
+                    raise ValueError("invalid_lifecycle_matched_flag")
+                target_type = decision.get("target_object_type")
+                target_id = decision.get("target_object_id")
+                if not decision["matched"]:
+                    if target_type != "" or type(target_id) is not int or target_id != 0:
+                        raise ValueError("unmatched_observation_must_not_have_a_target")
+                elif (target_type != case["intent_lifecycle_observation"]["object_type"]
+                        or type(target_id) is not int
+                        or target_id not in {item["id"] for item in case["existing_intents"]}):
+                    raise ValueError("invalid_lifecycle_matching_target")
+                decisions[index] = {
+                    key: decision[key] for key in (
+                        "matched", "target_object_type", "target_object_id", "confidence", "reason",
+                    ) if key in decision
+                }
+            except Exception as exc:
+                self._log_info("memory_user_intent_update", "signal_error", {
+                    "observation_index": index, "phase": "lifecycle_reconciliation", "error": str(exc),
+                })
+        return decisions
+
+    def _save_intent_lifecycle_observations(
+        self, observations: Sequence[Dict[str, Any]], decisions: Dict[int, Dict[str, Any]], *,
+        world_owner_id: int,
+    ) -> Dict[str, Any]:
+        """Read decisions by observation index and atomically save each observation and event."""
+        report: Dict[str, Any] = {
+            "intent_lifecycle_observation_ids": [], "relation_event_ids": [],
+            "unmatched_observation_ids": [], "completed_signal_ids": [], "failed_signal_ids": [],
+        }
+        for index, observation in enumerate(observations):
+            signal_id = observation["signal_id"]
+            try:
+                decision = decisions.get(index)
+                if decision is None:
+                    raise ValueError("missing_valid_lifecycle_matching_decision")
+                event_id = None
+                with self._db.transaction():
+                    observation_id = self._db.upsert_user_intent_lifecycle_observation(observation)
+                    if decision["matched"]:
+                        target_type = decision["target_object_type"]
+                        target_id = decision["target_object_id"]
+                        target = self._db.get_intent_object(object_type=target_type, object_id=target_id)
+                        if (not target or target_type != observation["object_type"]
+                                or target["world_owner_entity_id"] != world_owner_id):
+                            raise ValueError("invalid_lifecycle_matching_target")
+                        event_id = self._db.insert_intent_event(
+                            object_type=target_type, object_id=target_id, event_type="relation_observed",
+                            lifecycle_observation_id=observation_id,
+                            reconciliation_operation=observation["lifecycle_evidence"],
+                            previous_status=target["status"], new_status=target["status"],
+                            previous_payload=target,
+                            new_payload={"intent_lifecycle_observation": {**observation, "id": observation_id},
+                                         "match_confidence": self._clamp_float(
+                                             decision.get("confidence"), 0.0, 1.0, 0.7,
+                                         )},
+                            evidence_fact_ids=observation["evidence_fact_ids"],
+                            effective_at=observation["effective_at"],
+                            decision_source="intent_lifecycle_reconciliation",
+                            reason=_compact_whitespace(decision.get("reason") or "")[:480],
+                        )
+            except Exception as exc:
+                report["failed_signal_ids"].append(signal_id)
+                self._log_info("memory_user_intent_update", "signal_error", {
+                    "signal_id": signal_id, "phase": "lifecycle_observation_save", "error": str(exc),
+                })
+                continue
+            report["intent_lifecycle_observation_ids"].append(observation_id)
+            report["completed_signal_ids"].append(signal_id)
+            if event_id is not None:
+                report["relation_event_ids"].append(event_id)
+            else:
+                report["unmatched_observation_ids"].append(observation_id)
+            self._log_info("memory_user_intent_update", "lifecycle_relation", {
+                **decision, "signal_id": signal_id,
+                "observation_id": observation_id, "relation_event_id": event_id,
+            })
+        return report
+
+    def _save_future_intent_candidates(
         self,
         candidates: Sequence[Dict[str, Any]],
         decisions: Dict[int, Dict[str, Any]],
         *,
-        observed_at: str,
-    ) -> List[Dict[str, Any]]:
-        applied: List[Dict[str, Any]] = []
+        facts_by_id: Dict[int, Dict[str, Any]],
+        reference_timestamp: Any,
+    ) -> Dict[str, Any]:
+        """Save a candidate batch with independent transactions and signal outcomes."""
+        report: Dict[str, Any] = {
+            "new_intent_ids": [],
+            "intent_relation_event_ids": [],
+            "completed_signal_ids": [],
+            "failed_signal_ids": [],
+        }
         for index, candidate in enumerate(candidates):
-            decision = decisions.get(index) or {"operation": "create", "target_object_id": 0}
-            object_type = candidate["object_type"]
-            operation = str(decision.get("operation") or "create")
-            target_id = int(decision.get("target_object_id") or 0)
-            target = self._db.get_intent_object(
-                object_type=object_type, object_id=target_id,
-            ) if target_id else None
-            status = (
-                "candidate" if target else {
-                    "goal": "active", "plan": "planned", "work_item": "open",
-                }[object_type]
-            )
-            payload = self._intent_storage_payload(candidate, status=status)
-            object_id = self._db.create_intent_object(
-                object_type=object_type, payload=payload,
-            )
-            stored_object = self._db.get_intent_object(
-                object_type=object_type, object_id=object_id,
-            )
-            if stored_object:
-                self._sync_user_intent_recall_document(
-                    object_type=object_type, item=stored_object,
+            signal_id = candidate["signal_id"]
+            try:
+                fact = facts_by_id[candidate["evidence_fact_ids"][0]]
+                observed_at = _to_timestamp_text(
+                    fact.get("dialogue_time_key")
+                    or fact.get("event_time_key")
+                    or reference_timestamp
                 )
-            previous_status = str(target.get("status") or "") if target else ""
-            previous_payload = dict(target) if target else {}
-            evidence_role = {
-                "create": "creation", "confirm": "confirmation", "complete": "completion",
-                "cancel": "cancellation", "block": "block",
-            }.get(operation, "update")
-            self._db.upsert_intent_evidence([{
-                "object_type": object_type, "object_id": object_id,
-                "evidence_type": "fact", "evidence_id": fact_id,
-                "role": evidence_role, "observed_at": observed_at,
-            } for fact_id in candidate["evidence_fact_ids"]])
-            self._db.insert_intent_event(
-                object_type=object_type,
-                object_id=int(target["id"]) if target else object_id,
-                event_type="relation_observed" if target else "create",
-                trigger_object_id=object_id if target else 0,
-                reconciliation_operation=operation,
-                previous_status=previous_status,
-                new_status=previous_status if target else status,
-                previous_payload=previous_payload,
-                new_payload=candidate if target else stored_object,
-                evidence_fact_ids=candidate["evidence_fact_ids"],
-                effective_at=observed_at,
-                decision_source="intent_reconciliation",
-                reason=str(decision.get("reason") or ""),
-            )
-            applied.append({
-                "object_type": object_type,
-                "object_id": object_id,
-                "target_object_id": int(target["id"]) if target else 0,
-                "created": True,
-                "related": target is not None,
-            })
-        return applied
+                decision = decisions.get(index)
+                if decision is None:
+                    raise ValueError("missing_valid_future_intent_decision")
+                object_type = candidate["object_type"]
+                operation = decision["operation"]
+                target_type = decision["target_object_type"]
+                target_id = decision["target_object_id"]
+                if operation not in {"create", "confirm", "update"} or type(target_id) is not int:
+                    raise ValueError("invalid_future_intent_decision")
+                if operation == "create":
+                    if target_type != "" or target_id != 0:
+                        raise ValueError("create_intent_must_not_have_a_target")
+                elif target_type != object_type or target_id <= 0:
+                    raise ValueError("invalid_future_intent_target")
+                with self._db.transaction():
+                    target = self._db.get_intent_object(
+                        object_type=object_type, object_id=target_id,
+                    ) if target_id else None
+                    if operation != "create" and (
+                        not target or target["world_owner_entity_id"] != candidate["world_owner_entity_id"]
+                    ):
+                        raise ValueError("future_intent_target_missing_or_owner_mismatch")
+                    status = (
+                        "candidate" if target else {
+                            "goal": "active", "plan": "planned", "work_item": "open",
+                        }[object_type]
+                    )
+                    payload = self._intent_storage_payload(candidate, status=status)
+                    object_id = self._db.create_intent_object(
+                        object_type=object_type, payload=payload,
+                    )
+                    stored_object = self._db.get_intent_object(
+                        object_type=object_type, object_id=object_id,
+                    )
+                    if stored_object:
+                        self._sync_user_intent_recall_document(
+                            object_type=object_type, item=stored_object,
+                        )
+                    previous_status = str(target.get("status") or "") if target else ""
+                    previous_payload = dict(target) if target else {}
+                    evidence_role = {
+                        "create": "creation", "confirm": "confirmation",
+                    }.get(operation, "update")
+                    self._db.upsert_intent_evidence([{
+                        "object_type": object_type, "object_id": object_id,
+                        "evidence_type": "fact", "evidence_id": fact_id,
+                        "role": evidence_role, "observed_at": observed_at,
+                    } for fact_id in candidate["evidence_fact_ids"]])
+                    event_id = self._db.insert_intent_event(
+                        object_type=object_type,
+                        object_id=int(target["id"]) if target else object_id,
+                        event_type="relation_observed" if target else "create",
+                        trigger_object_id=object_id if target else 0,
+                        reconciliation_operation=operation,
+                        previous_status=previous_status,
+                        new_status=previous_status if target else status,
+                        previous_payload=previous_payload,
+                        new_payload=candidate if target else stored_object,
+                        evidence_fact_ids=candidate["evidence_fact_ids"],
+                        effective_at=observed_at,
+                        decision_source="intent_reconciliation",
+                        reason=str(decision.get("reason") or ""),
+                    )
+            except Exception as exc:
+                report["failed_signal_ids"].append(signal_id)
+                self._log_info("memory_user_intent_update", "signal_error", {
+                    "signal_id": signal_id, "error": str(exc),
+                })
+                continue
+            report["completed_signal_ids"].append(signal_id)
+            report["new_intent_ids"].append(object_id)
+            if target:
+                report["intent_relation_event_ids"].append(event_id)
+        return report
 
     def _intent_storage_payload(self, candidate: Dict[str, Any], *, status: str) -> Dict[str, Any]:
         payload = {key: value for key, value in candidate.items() if key in {
@@ -5145,17 +5375,17 @@ class MemoryNodeManager:
             updates.append({
                 "fact_id": int(fact_id),
                 "signal_key": (
-                    f"{int(entity_mapping[subject_name])}|{signal['evidence_kind']}|"
-                    f"{user_intent_anchor_key}"
+                    f"{int(entity_mapping[subject_name])}|{signal['signal_purpose']}|"
+                    f"{user_intent_anchor_key}|"
+                    f"{','.join(sorted(signal['candidate_object_types']))}"
                 ),
                 "subject_entity_id": int(entity_mapping[subject_name]),
-                "evidence_kind": signal["evidence_kind"],
+                "signal_purpose": signal["signal_purpose"],
                 "candidate_object_types": signal["candidate_object_types"],
                 "user_role": signal["user_role"],
                 "user_intent_anchor": user_intent_anchor,
                 "user_intent_anchor_key": user_intent_anchor_key,
                 "assertion_source": signal["assertion_source"],
-                "explicitness": signal["explicitness"],
                 "evidence_basis": signal["evidence_basis"],
                 "confidence": signal["confidence"],
             })
@@ -5463,20 +5693,19 @@ class MemoryNodeManager:
         target = _compact_whitespace(object_name)
         return _compact_whitespace(f"{subject} {predicate} {target}")[:480]
 
-    def _log_user_intent_facts_loaded(
+    def _log_user_intent_signals_loaded(
         self,
-        processing_target: str,
-        facts: List[Dict[str, Any]],
+        signal_items: Sequence[Dict[str, Any]],
         reference_timestamp: Any,
     ) -> None:
-        """Log the independent fact batch consumed by future-commitment update."""
-        self._log_info("memory_user_intent_update", "facts_loaded", {
-            "processing_target": processing_target,
-            "fact_count": len(facts),
-            "fact_ids": [fact.get("id") for fact in facts],
+        """Log each intent signal together with the fact supporting its extraction."""
+        self._log_info("memory_user_intent_update", "signals_loaded", {
+            "signal_count": len(signal_items),
+            "signal_ids": [item["signal_id"] for item in signal_items],
             "reference_timestamp": reference_timestamp,
-            "time_start": facts[0].get("dialogue_time_key") if facts else "",
-            "time_end": facts[-1].get("dialogue_time_key") if facts else "",
+            "signal_items": [
+                self._user_intent_signal_prompt_view(item) for item in signal_items
+            ],
         })
 
     @staticmethod

@@ -189,16 +189,16 @@ user_action_signals 输出规则：
 - 每条 fact 最多输出 3 个 signal。每个 signal 都包含 subject_entity、action_kind、action_text、owner_evidence_type、owner_evidence_text、other_evidence_text、evidence_basis、confidence；evidence_basis 必须指出同一 fact 中支撑该行为的具体内容。事件时间沿用 fact 的 event_time_key，不在 signal 中重复输出。
 
 user_intent_signals 输出规则：
-- `user_intent_signals` 是当前 fact 对用户未来世界的证据提示，不是最终 goal、plan 或 work_item，也不能直接决定创建、更新或覆盖已有对象。
-- 只记录“用户本人”的未来导向信息：`subject_entity` 必须固定填写“用户本人”（英文输出填写 `user self`），不得填写任何其他人、团队、组织、产品用户或环境录音 speaker。
-- 当用户本人直接表达未来目标、安排、责任或生命周期变化，或明确接受、承诺、确认或修正他人提出的事项时，可输出 signal。第三方明确谈到已确认别名所指向佩戴者的未来安排或责任时，也可输出 `third_party_report` signal，但不得把对方指派、猜测或建议写成用户本人承诺；同一 fact 的 `text` 必须保留说话人与具体内容。
+- `user_intent_signals` 是当前 fact 对用户未来意图及其后续进展的证据提示，不是最终 goal、plan 或 work_item，也不能直接决定创建、更新或覆盖已有对象。
+- 只记录“用户本人”的未来目标、安排、责任，以及这些既有意图后来发生的变化：`subject_entity` 必须固定填写“用户本人”（英文输出填写 `user self`），不得填写任何其他人、团队、组织、产品用户或环境录音 speaker。
+- 当用户本人直接表达未来目标、安排、责任，或明确接受、承诺、确认或修正他人提出的事项时，可输出 signal。若同一 fact 明确指出用户本人先前的目标已实现、原定安排已发生、承诺事项已完成，或既有目标、安排、责任已取消，也必须输出 `signal_purpose=lifecycle_update` 的 signal；不要因为事件已过去或事项已结束而漏掉。第三方明确谈到已确认别名所指向佩戴者的未来安排、责任或既有意图的后续结果时，也可输出 `third_party_report` signal，但不得把对方指派、猜测或建议写成用户本人承诺；同一 fact 的 `text` 必须保留说话人与具体内容。
 - `assertion_source` 同时标明证据来源：`self_statement|confirmed_response|third_party_report|observed_event`。本人自述与确认回应在 `owner_evidence_text` 中摘取用户本人原话；确认回应还要在 `other_evidence_text` 中摘取先前对方原话。第三方报告的 `owner_evidence_text` 为空，`other_evidence_text` 是包含已确认别名的第三方原话；不得编造用户回应。`observed_event` 仅用于同一 fact 明确记录的客观事件，两项原话字段留空。
-- `evidence_kind` 只能是 `goal`、`plan`、`responsibility`、`lifecycle_update`。`candidate_object_types` 只能包含 goal、plan、work_item；第三方关于目标或责任的报告只是线索，不能单独证明用户已设定目标或承担承诺。
+- `signal_purpose` 只区分 signal 的处理用途：`future_intent` 表示仍面向未来的目标、安排或责任，`lifecycle_update` 表示可识别的先前意图后来得到确认、调整、受阻、实现、发生、完成或取消；不要在此字段中填写 goal、plan 或 responsibility。`candidate_object_types` 必须非空，只能包含 goal、plan、work_item，用它表示对象可能的类型；第三方关于目标或责任的报告只是线索，不能单独证明用户已设定目标或承担承诺。
 - `user_role` 只能是 owner、participant、responsible，表示用户本人分别是目标拥有者、安排参与者或责任承担者。产品用户、客户、消费者或环境录音中的未知说话人只是被顺带提及时不得输出 signal。
-- `explicitness` 只能是 direct、reported、tentative。第三方报告须填 `assertion_source=third_party_report` 与 `explicitness=reported`；对方提出事项而用户明确接受时填写 `assertion_source=confirmed_response`。助手建议、开放假设、条件讨论和推测本身不得输出 signal。
+- 对方提出事项而用户明确接受时填写 `assertion_source=confirmed_response`。助手建议、开放假设、条件讨论和推测本身不得输出 signal。来源明确不等于意图已经确定；fact 的 `text` 和 `evidence_basis` 必须保留“可能、考虑、尚未决定”等意愿与承诺程度的限定，不能把这些表达改写为已落实安排或明确承诺。
 - `user_intent_anchor` 是简短、稳定的事件/事项/目标聚合标签，例如“天津客户会议”“半马训练目标”“客户报告交付”；它不是完整句子，也不是最终对象描述。
-- 信号与 fact 必须严格一致：future goal、安排、责任或生命周期变化本身必须明确写在同一 fact 的 `text` 中。不得因为原始 unit 批次中存在相关内容，就把它挂到未保留该内容的 fact 上；无法由该 fact `text` 独立支撑时输出空数组。
-- 每条 fact 最多输出 2 个 signal。每个 signal 必须包含 subject_entity、evidence_kind、candidate_object_types、user_role、user_intent_anchor、assertion_source、explicitness、owner_evidence_text、other_evidence_text、evidence_basis、confidence；其中 evidence_basis 必须是当前 fact `text` 中可直接定位的内容。
+- 信号与 fact 必须严格一致：未来目标、安排、责任或既有意图的后续结果本身必须明确写在同一 fact 的 `text` 中。不得因为原始 unit 批次中存在相关内容，就把它挂到未保留该内容的 fact 上；无法由该 fact `text` 独立支撑时输出空数组。
+- 每条 fact 最多输出 2 个 signal。每个 signal 必须包含 subject_entity、signal_purpose、candidate_object_types、user_role、user_intent_anchor、assertion_source、owner_evidence_text、other_evidence_text、evidence_basis、confidence；其中 evidence_basis 必须是当前 fact `text` 中可直接定位的内容。
 
 输出格式：
 {
@@ -250,12 +250,11 @@ user_intent_signals 输出规则：
       "user_intent_signals": [
         {
           "subject_entity": "固定为‘用户本人’；英文输出固定为‘user self’",
-          "evidence_kind": "goal|plan|responsibility|lifecycle_update",
+          "signal_purpose": "future_intent|lifecycle_update",
           "candidate_object_types": ["goal|plan|work_item"],
           "user_role": "owner|participant|responsible",
           "user_intent_anchor": "用于跨 fact 聚合的目标、安排或事项标签",
           "assertion_source": "self_statement|confirmed_response|third_party_report|observed_event",
-          "explicitness": "direct|reported|tentative",
           "owner_evidence_text": "本人发言摘取 speaker_用户本人 原话；第三方报告为空",
           "other_evidence_text": "回应型或第三方报告摘取其他说话人原话；直接陈述型为空",
           "evidence_basis": "当前 fact 中支持该 signal 的具体证据",
@@ -279,27 +278,30 @@ user_intent_signals 输出规则：
 INTENT_EXTRACTION_PROMPT_ZH = """你是个人世界模型的显式 user_intent 提炼模块。
 
 一、目标
-逐条审查输入的 `user_intent_signal` 及其所属 fact，判断该 fact 是否直接支持一个关于用户本人的未来目标、明确安排或可闭环责任事项。成立时生成一个 `intent_candidate`；证据不足时返回 null。本模块不根据多个 signal 归纳意图，也不判断新旧对象是否相同。
+逐条审查输入的 `user_intent_signal` 及其所属 fact。`signal_purpose=future_intent` 时，提炼关于用户本人的未来目标、明确安排或可闭环责任事项，输出 `future_intent_candidate`；`signal_purpose=lifecycle_update` 时，提炼先前意图的后续进展，输出 `intent_lifecycle_observation`。证据不足时两个字段都返回 null。本模块不根据多个 signal 归纳意图，不匹配数据库对象，也不裁决已有 intent 的最终状态。
 
 二、user_intent 的含义
-`user_intent` 是用户未来导向的目标、安排或责任，不是对 fact 的逐字复述。fact 保存发生过的陈述和情境，intent candidate 提取其中可追踪、可更新的未来对象。只允许三类：
+`user_intent` 是用户未来导向的目标、安排或责任，不是对 fact 的逐字复述。fact 保存发生过的陈述和情境，future intent candidate 提取其中可追踪、可更新的未来对象。只允许三类：
 - `goal`：用户明确追求、跨越多个动作的持续性期望结果；一次性愿望或单次动作不是 goal。
 - `plan`：用户将参与的明确未来安排、行程、会议、活动或事件；必须有时间/时间窗口，或“已约定、已报名、已安排”等安排性证据；它不是待办。
 - `work_item`：用户本人负责的有界事项；除具体动作外，必须有交付物、截止时间、明确承诺或用户本人明确接受的分配中的至少一项完成锚点。它可以是 personal_action、commitment、assigned 或 external_commitment。
 goal 或 plan 不得自动拆出 work_item；只有 fact 明确提供下一步动作、交付、承诺或分配的独立证据时，才可由对应 signal 提炼 work_item。
 
-三、输入 user_intent_signal 的含义
-每个条目包含独立的 `signal_id`、一条 `user_intent_signal` 及其所属 fact。同一 fact 可能因多个 signal 重复出现，但仍是同一份证据。signal 是 fact 提炼阶段给出的待核验线索，不是已经成立的 user_intent，也不是 fact 之外的新证据：`evidence_kind` 提示 goal、plan、responsibility 或 lifecycle_update，`candidate_object_types` 限定可输出的类型，`subject_entity` 与 `user_role` 提示用户在其中的身份，`user_intent_anchor` 帮助定位对象，`assertion_source`、`explicitness` 与 `evidence_basis` 帮助审查证据来源；signal 的 `confidence` 只是前一阶段的估计。必须用当前条目的 fact `summary` 核验 signal，不得照搬 signal 的结论、借用其他条目的事实，或把重复 fact 当作多次独立证据。当前时间只用于理解 fact 中已有的相对时间，不是安排或截止日期的独立证据。
+三、intent_lifecycle_observation 的含义
+它是当前 fact 对用户本人先前目标、安排或责任的后续观察，例如目标已经实现、原定会议已发生、承诺事项已完成、安排被取消或改期、事项受阻。它提供变化证据，不是一条新的未来意图，也不是数据库更新操作。必须能描述先前指向的具体事项；不要求知道该事项是否已经入库，也不要求当前 fact 重新给出创建未来对象时的全部字段。单纯的过去行为或一次性事件，没有先前目标、安排或责任的证据时不能生成 observation。
 
-四、输出规则
-1. 每个输入 `signal_id` 恰好返回一条结果，其 `intent_candidate` 只能是一个对象或 null；当前 signal 与 fact 不符、事实不足或没有合格未来对象时返回 null，不得省略该 signal。candidate 的 `object_type` 必须属于该 signal 的 `candidate_object_types`。
-2. 只能使用当前 fact 直接支持的内容。助手建议、推测、行为规律、prediction 和“也许”“如果”“要不要”“考虑一下”等未确定假设不能生成对象。对方提出要求也不等于用户承担责任；只有 fact 明确保留用户本人的接受、承诺或修正回应才可生成相应责任，普通应声或“知道了”不足以构成承诺。
-3. `assertion_source=third_party_report` 只是可核查的第三方线索，不能据此认定用户已设定 goal 或承担 work_item。仅当 fact 明确描述已落实的未来安排时，才可谨慎输出低置信度 plan，并在 summary 保留“据某人所述”等来源限定。
-4. `summary` 应自包含地说明对象、用户角色及必要的时间或条件。`evidence_fact_ids` 必须恰好为当前条目 fact 的 `[fact.id]`；`confidence` 要按 fact 对最终 candidate 的支持程度重新判断，不得直接照搬 signal 的 confidence。
-5. `lifecycle_evidence` 只描述当前 fact 直接观察到的状态证据，不是数据库操作；plan 已发生是 `occurred`，work_item 已完成是 `completed`，不能混淆。`lifecycle_update` 可以生成关于已有对象变化的 candidate，但后续 reconciliation 匹配不到已有对象时不得创建新对象。
-6. `primary_domain` 只能为 `general|health|work|life|information|finance|family|learning|social|interest|travel`；优先选择最具体的用户生活领域，`general` 只用于真正跨领域的对象，不能作为不确定时的兜底。没有证据的时间和专属细节留空，不得编造。只返回 JSON。
+四、输入 user_intent_signal 的含义
+每个条目包含独立的 `signal_id`、一条 `user_intent_signal` 及其所属 fact。同一 fact 可能因多个 signal 重复出现，但仍是同一份证据。signal 是 fact 提炼阶段给出的待核验线索，不是已经成立的 user_intent，也不是 fact 之外的新证据：`signal_purpose` 决定处理未来意图还是先前意图的后续变化；`candidate_object_types` 限定可输出的 goal、plan 或 work_item 类型；`subject_entity` 与 `user_role` 提示用户在其中的身份，`user_intent_anchor` 帮助定位事项，`assertion_source` 与 `evidence_basis` 帮助审查来源。signal 的 `confidence` 只是前一阶段的估计。必须用当前条目的 fact `summary` 核验 signal，不得照搬 signal 的结论、借用其他条目的事实，或把重复 fact 当作多次独立证据。时间信息只用于理解 fact 中已有的表达，不是安排、截止日期或完成情况的独立证据。来源明确不等于意图已经确定；必须保留 fact 中的意愿和承诺程度限定，不能仅因是本人自述就认定安排已落实或责任已承担，也不能把 confidence 当作承诺程度。
 
-world owner：{world_owner_name}
+五、输出规则
+1. 每个输入 `signal_id` 恰好返回一条结果，必须同时包含 `future_intent_candidate` 和 `intent_lifecycle_observation`。`future_intent` signal 只能将前者设为对象，后者必须为 null；`lifecycle_update` signal 只能将后者设为对象，前者必须为 null。最多一个字段非空。signal 与 fact 不符或证据不足时两个字段都为 null，不得跨分支改写 signal，也不得省略该 signal。非空结果的 `object_type` 必须属于当前 signal 的 `candidate_object_types`。
+2. 只能使用当前 fact 直接支持的内容。助手建议、推测、行为规律、prediction 和未确定假设不能生成结果。生成 future candidate 时，对方提出要求不等于用户承担责任；必须有本人明确接受、承诺或修正回应，普通应声不足以构成承诺。
+3. `assertion_source=third_party_report` 不能单独证明用户已设定 goal 或承担 work_item；只有明确描述已落实的未来安排时才可谨慎输出低置信度 plan。第三方对先前事项进展的明确报告可形成 observation，但其 observation_text 必须保留“据某人所述”等来源限定，不能改写成本人自述或确定事实。
+4. future candidate 的 `summary` 应自包含地说明对象、用户角色及必要时间或条件。observation 的 `target_description` 描述先前指向的事项，保留已知原时间或对象线索；`observation_text` 完整说明本次观察到的变化，不能把取消、完成等结果改写成未来安排。
+5. 两类结果的 `evidence_fact_ids` 都必须恰好为当前条目 fact 的 `[fact.id]`；`confidence` 根据 fact 对最终结果的支持程度判断，不得照搬 signal 的 confidence。
+6. observation 的 `effective_at` 只表示进展实际发生或生效的时间，使用 YYYY-MM-DD 或 ISO 8601。未知时为空；只有 fact 明确给出时间，或能依据所属 fact 的 dialogue_time 无歧义换算相对时间时才填写。不得自动用原安排时间、报告时间或系统时间填充，也不得把只有日期的证据补成精确时刻。
+7. `primary_domain` 只用于 future candidate，只能为 `general|health|work|life|information|finance|family|learning|social|interest|travel`；优先选择最具体的用户生活领域。没有证据的时间和专属细节留空，不得编造。只返回 JSON。
+
 当前时间：{reference_timestamp}
 输入的独立 signal 条目（每条含整数 `signal_id`、`fact` 和唯一的 `user_intent_signal`）：
 {signal_items}
@@ -309,7 +311,7 @@ world owner：{world_owner_name}
   "results": [
     {
       "signal_id": 1,
-      "intent_candidate": {
+      "future_intent_candidate": {
         "object_type": "goal|plan|work_item",
         "summary": "完整、可展示的对象描述",
         "canonical_key": "用于同类对象匹配的简短稳定名称",
@@ -317,59 +319,69 @@ world owner：{world_owner_name}
         "subject_entity": "对象的核心主体：goal owner、plan actor 或 work_item 负责人",
         "time_start": "开始/可开始时间；没有证据时为空",
         "time_end": "目标时间/安排结束时间/截止时间；没有证据时为空",
-        "lifecycle_evidence": "由 object_type 决定的生命周期证据枚举",
         "confidence": 0.0,
         "evidence_fact_ids": [1],
+        "details": {}
+      },
+      "intent_lifecycle_observation": null
+    },
+    {
+      "signal_id": 2,
+      "future_intent_candidate": null,
+      "intent_lifecycle_observation": {
+        "object_type": "goal|plan|work_item",
+        "target_description": "先前目标、安排或责任的具体描述",
+        "observation_text": "当前 fact 直接支持的后续进展，保留来源限定",
+        "lifecycle_evidence": "confirmed|updated|occurred|completed|cancelled|rescheduled|blocked",
+        "effective_at": "变化实际发生或生效的日期/时间；未知时为空",
+        "confidence": 0.0,
+        "evidence_fact_ids": [2],
         "details": {}
       }
     }
   ]
 }
 
-`details` 是对象专属字段的结构化容器，不要把其中的内容重复拼成多个顶层字段：
+future candidate 的 `details` 是对象专属字段的结构化容器，不要把其中的内容重复拼成多个顶层字段：
 - goal：`desired_outcome`（必需）、`success_criteria`、`target_at`。`time_end` 可同时表达 target_at。
 - plan：`event_or_activity`（必需）、`time_precision`、`location`、`participants`。
 - work_item：`action_text`（必需）、`deliverable`、`responsibility_type`、`priority`、`beneficiary_entities`、`delegator_entities`、`collaborator_entities`。
 
-`lifecycle_evidence` 的允许值：goal 为 `none|confirmed|completed|cancelled|blocked`；plan 为 `none|confirmed|occurred|cancelled|rescheduled|blocked`；work_item 为 `none|confirmed|completed|cancelled|blocked`。没有合格对象的条目仍须返回该 signal_id，并将 intent_candidate 置为 null。只返回 JSON。"""
+observation 的 `lifecycle_evidence` 必须按类型选取：goal 为 confirmed|updated|completed|cancelled|blocked；plan 为 confirmed|updated|occurred|cancelled|rescheduled|blocked；work_item 为 confirmed|updated|completed|cancelled|blocked。confirmed 是再次确认原意图，updated 是非终态信息补充或调整，occurred 是安排已发生，completed 是目标已实现或责任已履行；不得仅因时间已过而推断完成或发生。
+observation 的 `details` 只保存当前 fact 明确给出的变更值，允许 time_start（新开始时间）、time_end（新结束/目标/截止时间）、location（新地点）、progress_text（进展细节），各项为字符串。未提供的键省略；没有变更值时为 {}，不要重建或猜测旧对象字段。只返回 JSON。"""
 
 
-INTENT_RECONCILIATION_PROMPT_ZH = """你是个人世界模型的显式 user_intent 匹配与更新模块。你只判断新的 candidate 与已有对象是否为同一个现实中的 goal、plan 或 work_item，并在确认同一对象后给出其生命周期更新操作。
+INTENT_RECONCILIATION_PROMPT_ZH = """你是个人世界模型的显式 user_intent 匹配模块。你判断新的未来意图 candidate 与已有对象是否为同一个现实中的 goal、plan 或 work_item，并说明它是再次确认还是信息补充。
 
 输入含有：
-- `candidates`：由新 facts 提炼出的候选对象。`lifecycle_evidence` 仅表示新 fact 直接观察到的状态证据，不是数据库操作，也不保证已经能定位到已有对象。
+- `candidates`：由新 facts 提炼出的未来意图候选对象。
 - `existing_objects`：同一 world owner 下、当前仍可更新的已有对象。候选与目标对象必须是同一种 `object_type`。
 
 你的工作顺序必须是：
 1. 先判断 candidate 是否与某个同类 existing object 是同一个对象；
-2. 只有确认同一对象后，才根据 candidate 的内容和 `lifecycle_evidence` 决定 operation；
+2. 只有确认同一对象后，才根据 candidate 是否补充或改变对象信息，选择 confirm 或 update；
 3. 没有可靠目标对象时输出 `create`，且 `target_object_type` 置为空字符串、`target_object_id` 置为 0。
 
 同一对象的判断规则：
 - 不要因为主题、地点、人物或关键词相近就合并。`canonical_key` 只能作为辅助线索，不能单独决定同一性。
 - goal：owner 必须相容，且 desired_outcome 指向同一持续性结果。目标时间、成功条件的补充或调整通常是 update，不代表新 goal。
-- plan：actor 与核心 event_or_activity 必须相容。相同活动的时间变化是 reschedule；仅地点、参与者或细节补充通常是 update。不同日期的相似活动不自动等同，除非新证据明确说明它是原安排的改期。
+- plan：actor 与核心 event_or_activity 必须相容。同一安排的时间、地点、参与者或细节补充使用 update。不同日期的相似活动不自动等同，除非新证据明确说明它们指向同一个安排。
 - work_item：responsible_entity 与核心 action_text / deliverable 必须相容。截止时间、协作者或交付细节变化通常是 update；不同交付物或不同责任通常是新事项。
 - 不得跨类型关联：goal 不能匹配 plan 或 work_item，plan 不能匹配 work_item。
 
 operation 选择规则：
 - `create`：没有可靠的同一 existing object。
-- `confirm`：同一对象得到再次明确确认，但核心字段和生命周期没有实质变化。
+- `confirm`：同一未来对象得到再次明确确认，但核心字段没有实质变化。
 - `update`：同一对象的描述、参与者、地点、目标时间、截止时间、交付物或其他非终态细节得到补充或改变。
-- `complete`：仅当新证据明确表示 goal 已实现、plan 已发生（`lifecycle_evidence=occurred`）或 work_item 已完成（`lifecycle_evidence=completed`）时使用。
-- `cancel`：仅当新证据明确表示对象被取消、放弃或不再执行时使用。
-- `reschedule`：仅用于同一 plan 的明确改期；work_item 截止时间变化使用 update。
-- `block`：仅当新证据明确表示该对象当前受阻、无法推进时使用。
-- 当 `lifecycle_evidence=none` 时，不要凭空输出 complete、cancel、reschedule 或 block。
 
-每个 candidate_index 必须恰好输出一条 decision，按输入 candidates 的索引编号。reason 用一句简短、可追溯的中文说明同一性或 create 的依据；不要生成输入中不存在的新事实、对象或字段。
+每个 candidate_index 必须恰好输出一条 decision，按输入 candidates 的原始索引编号。target_object_id 必须为整数；create 时只能为 0 且 target_object_type 为空字符串；confirm/update 时只能选择输入中同类型的已有对象。reason 用一句简短、可追溯的中文说明同一性或 create 的依据；不要生成输入中不存在的新事实、对象或字段。
 
 只返回 JSON：
 {
   "decisions": [
     {
       "candidate_index": 0,
-      "operation": "create|confirm|update|complete|cancel|reschedule|block",
+      "operation": "create|confirm|update",
       "target_object_type": "goal|plan|work_item",
       "target_object_id": 0,
       "reason": "简短的证据性理由"
@@ -382,6 +394,42 @@ candidates：
 
 existing objects：
 {existing_objects}
+"""
+
+
+INTENT_LIFECYCLE_RECONCILIATION_PROMPT_ZH = """你是个人世界模型的 user_intent 生命周期观察匹配模块。
+
+目标是判断每条 intent_lifecycle_observation 是否指向其 existing_intents 中的同一个现实事项，只识别关系，不裁决或修改 intent 的状态。
+
+输入 cases 按列表顺序组织待匹配的 observation（此时尚未写库），每条包含：
+- intent_lifecycle_observation：从一条 fact 提炼出的、关于先前目标/安排/责任的后续变化证据。target_description 描述原事项，observation_text 描述本次进展；lifecycle_evidence 只是观察到的变化类型，不是已执行的状态更新。
+- fact：这条 observation 唯一的来源，保留时间表达、主体和来源限定。
+- existing_intents：为这一条 observation 检索的同类型候选。它们是待核验对象，不是已经匹配的结果，也不一定处于 active 状态。
+
+判断规则：
+1. 只在当前 case 的 existing_intents 中选择，且 object_type 必须与 observation 相同。每条 observation 至多匹配一个 intent。
+2. goal 需指向同一持续性期望结果；plan 需指向同一具体安排；work_item 需指向同一责任事项或交付物。主题、地点、canonical_key 或关键词相近都不能单独证明同一性。
+3. 区分不同日期的重复安排、相似但不同的交付任务。旧安排时间是身份线索；effective_at 是变化发生时间，details 中的时间可能是改期后的新值，不能要求它们等于旧安排时间。明确说明“原定事项改期/取消/已完成”时可匹配原事项。
+4. 不得因旧 intent 已过期或状态不同而直接排除；也不得仅因日期已过推断完成。观察与旧状态不一致时仍可识别同一性，留给后续步骤裁决。
+5. 不能唯一确定目标、没有同一事项证据或存在无法区分的多个安排时，matched=false。禁止猜测、选择“最接近的”目标、创建新 intent 或改写 observation。
+6. 每个 case 恰好返回一条 decision，observation_index 为它在输入 cases 列表中的原始索引，从 0 开始，不得重新编号。matched=false 时 target_object_type=""、target_object_id=0。confidence 表示同一性判断的把握，不是 observation 的真实性。reason 用一句中文说明依据或不匹配原因。
+
+cases：
+{observation_cases}
+
+只返回 JSON：
+{
+  "decisions": [
+    {
+      "observation_index": 0,
+      "matched": true,
+      "target_object_type": "goal|plan|work_item",
+      "target_object_id": 1,
+      "confidence": 0.9,
+      "reason": "同一事项的判断依据"
+    }
+  ]
+}
 """
 
 

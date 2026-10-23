@@ -184,16 +184,17 @@ user_action_signals rules:
 - Return at most 3 signals per fact. Each has subject_entity, action_kind, action_text, owner_evidence_type, owner_evidence_text, other_evidence_text, evidence_basis, and confidence. evidence_basis must identify the supporting content in this fact. The signal inherits the fact's event_time_key; do not output another time field.
 
 user_intent_signals rules:
-- `user_intent_signals` are structured hints that this fact is evidence about the wearer's future world. They are not final goals, plans, or work items, and must not directly create, update, or override an existing object.
-- Record only user self's future-facing information: `subject_entity` must always be exactly `user self` (use `用户本人` in Chinese output). Never use another person, team, organization, product user, or ambient-recording speaker as the subject.
-- Output a signal when the wearer directly expresses or clearly confirms a future goal, arrangement, responsibility, or lifecycle change. A third party may also explicitly report an arrangement or responsibility concerning the wearer through a confirmed alias; mark this `third_party_report` and never turn an assignment, guess, or suggestion into the wearer's own commitment. Preserve speaker attribution in this fact.
+- `user_intent_signals` are structured hints that this fact is evidence about the wearer's future intentions or their later progress. They are not final goals, plans, or work items, and must not directly create, update, or override an existing object.
+- Record only user self's future goals, arrangements, responsibilities, and subsequent changes to those existing intentions: `subject_entity` must always be exactly `user self` (use `用户本人` in Chinese output). Never use another person, team, organization, product user, or ambient-recording speaker as the subject.
+- Output a signal when the wearer directly expresses or clearly confirms a future goal, arrangement, or responsibility, or accepts, commits to, confirms, or revises another person's proposal. If the same fact clearly states that the wearer's earlier goal was achieved, a scheduled arrangement occurred, a committed item was completed, or an existing goal, arrangement, or responsibility was cancelled, also output a signal with `signal_purpose=lifecycle_update`; do not omit it merely because the event is past or the item has ended. A third party may explicitly report an arrangement, responsibility, or later outcome concerning the wearer through a confirmed alias; mark this `third_party_report` and never turn an assignment, guess, or suggestion into the wearer's own commitment. Preserve speaker attribution in this fact.
+- A `lifecycle_update` must be traceable in this fact to an earlier goal, arrangement, or responsibility. Use `candidate_object_types` to indicate the possible goal, plan, or work_item type, `user_intent_anchor` to identify the original item, and `evidence_basis` to state the direct evidence that it occurred, was completed, or was cancelled. Do not require proof that the object exists in the database at this stage, and do not infer its final status. A mere past action or one-off event is not a lifecycle update without evidence that it belonged to an earlier intention.
 - `assertion_source` also identifies the evidence source: `self_statement|confirmed_response|third_party_report|observed_event`. Wearer statements and confirmations require an exact wearer quote in `owner_evidence_text`; confirmations also need the earlier other-speaker quote. Third-party reports have empty `owner_evidence_text` and an exact quote containing the confirmed alias in `other_evidence_text`. Use `observed_event` only for an objective event explicitly recorded in the same fact, with both quote fields empty.
-- `evidence_kind` must be one of goal, plan, responsibility, or lifecycle_update. `candidate_object_types` may contain only goal, plan, and work_item. A third-party report about a goal or responsibility is only a hint, not proof that the wearer set the goal or accepted a commitment.
+- `signal_purpose` describes only the signal's processing purpose: `future_intent` for a still-future goal, arrangement, or responsibility; `lifecycle_update` for a recognizable earlier intention that was later confirmed, revised, blocked, achieved, occurred, completed, or cancelled. Do not put goal, plan, or responsibility in this field. `candidate_object_types` must be nonempty and contain only goal, plan, and work_item; it expresses the possible object type. A third-party report about a goal or responsibility is only a hint, not proof that the wearer set the goal or accepted a commitment.
 - `user_role` must be owner, participant, or responsible: user self respectively owns the goal, participates in the arrangement, or bears the responsibility. Do not output a signal for a product user, customer, consumer, or an ambient speaker merely mentioned in the evidence.
-- `explicitness` must be direct, reported, or tentative. For a third-party report use `assertion_source=third_party_report` and `explicitness=reported`. When the wearer accepts another person's proposal, use `assertion_source=confirmed_response`. Assistant suggestions, open hypotheticals, and speculation do not themselves create signals.
+- When the wearer explicitly accepts another person's proposal, use `assertion_source=confirmed_response`. Assistant suggestions, open hypotheticals, conditional discussion, and speculation do not themselves create signals. Clear provenance does not imply a settled intention: preserve qualifiers such as "might", "considering", or "not yet decided" in the fact's `text` and `evidence_basis`; never rewrite them as established arrangements or firm commitments.
 - `user_intent_anchor` is a short, stable grouping label for the goal, event, or responsibility, such as "Tianjin client meeting", "half-marathon training goal", or "client report delivery". It is not a full sentence or the final object description.
-- Signal-to-fact grounding is mandatory: the future goal, arrangement, responsibility, or lifecycle change itself must be explicitly retained in the same fact's `text`. Do not attach information found elsewhere in the raw unit batch to a fact that does not preserve it; output an empty array when the fact text cannot independently support the signal.
-- Return at most 2 signals per fact. Every signal must include subject_entity, evidence_kind, candidate_object_types, user_role, user_intent_anchor, assertion_source, explicitness, owner_evidence_text, other_evidence_text, evidence_basis, and confidence. evidence_basis must be concrete evidence directly locatable in this fact's `text`.
+- Signal-to-fact grounding is mandatory: the future goal, arrangement, responsibility, or later outcome of an existing intention must be explicitly retained in the same fact's `text`. Do not attach information found elsewhere in the raw unit batch to a fact that does not preserve it; output an empty array when the fact text cannot independently support the signal.
+- Return at most 2 signals per fact. Every signal must include subject_entity, signal_purpose, candidate_object_types, user_role, user_intent_anchor, assertion_source, owner_evidence_text, other_evidence_text, evidence_basis, and confidence. evidence_basis must be concrete evidence directly locatable in this fact's `text`.
 
 Output schema:
 {
@@ -243,12 +244,11 @@ Output schema:
       "user_intent_signals": [
         {
           "subject_entity": "always `user self`; use `用户本人` in Chinese output",
-          "evidence_kind": "goal|plan|responsibility|lifecycle_update",
+          "signal_purpose": "future_intent|lifecycle_update",
           "candidate_object_types": ["goal|plan|work_item"],
           "user_role": "owner|participant|responsible",
           "user_intent_anchor": "a stable label for grouping the goal, arrangement, or responsibility",
           "assertion_source": "self_statement|confirmed_response|third_party_report|observed_event",
-          "explicitness": "direct|reported|tentative",
           "owner_evidence_text": "exact wearer quote for self/response; empty for third-party report",
           "other_evidence_text": "exact other-speaker quote for response/report; otherwise empty",
           "evidence_basis": "concrete evidence from this fact supporting the signal",
@@ -272,7 +272,7 @@ Dialogue/transcript evidence batch:
 INTENT_EXTRACTION_PROMPT_EN = """You extract explicit user_intents for a personal world model.
 
 1. Objective
-Review each input `user_intent_signal` together with its own fact. Determine whether the fact directly supports one future-facing goal, established arrangement, or bounded responsibility of user self. Return one `intent_candidate` when supported, or null when it is not. Do not infer an intent by combining multiple signals or decide whether a new candidate matches an existing object.
+Review each `user_intent_signal` together with its own fact. For `signal_purpose=future_intent`, extract a future-facing goal, established arrangement, or bounded responsibility of user self as a `future_intent_candidate`. For `signal_purpose=lifecycle_update`, extract later progress concerning an earlier intention as an `intent_lifecycle_observation`. Set both fields to null when evidence is insufficient. Do not combine signals to infer intentions, match database objects, or decide an existing intent's final status.
 
 2. Meaning of user_intent
 A `user_intent` is a trackable, updateable future object, not a verbatim restatement of the fact. The fact preserves the statement and its context. Only these object types are allowed:
@@ -281,16 +281,20 @@ A `user_intent` is a trackable, updateable future object, not a verbatim restate
 - `work_item`: a bounded action for which user self is responsible, with at least one completion anchor beyond the action: a deliverable, deadline, explicit commitment, or assignment explicitly accepted by user self. It may be personal_action, commitment, assigned, or external_commitment.
 Never derive a work item automatically from a goal or plan. A corresponding signal may yield a work item only when the fact independently supports a next action, deliverable, commitment, or assignment.
 
-3. Meaning of the input user_intent_signal
-Each item has its own `signal_id`, one `user_intent_signal`, and its associated fact. The same fact may appear under multiple signals, but remains one piece of evidence. The signal is a lead from fact extraction, neither an established user_intent nor new evidence beyond the fact: `evidence_kind` hints at goal, plan, responsibility, or lifecycle_update; `candidate_object_types` limits permitted output types; `subject_entity` and `user_role` hint at user self's role; `user_intent_anchor` locates the object; `assertion_source`, `explicitness`, and `evidence_basis` help inspect provenance. Its `confidence` is only a prior estimate. Verify the signal against the current fact's `summary`; do not copy its conclusion, use another item's evidence, or treat a repeated fact as independent evidence. Reference time only helps interpret relative times already present in the fact; it is not evidence of an arrangement or deadline.
+3. Meaning of intent_lifecycle_observation
+An observation records this fact's evidence about later progress of user self's earlier goal, arrangement, or responsibility: an achieved goal, a scheduled meeting that occurred, a completed commitment, cancellation, rescheduling, or blockage. It is evidence of change, not a new future intention or a database operation. The earlier item must be identifiable, but you need not know whether it exists in the database or reconstruct all fields required to create a future object. A mere past action or one-off event without evidence of an earlier intention does not qualify.
 
-4. Output rules
-1. Return exactly one result for every input `signal_id`, with one candidate object or null. Return null when the signal and fact disagree, the fact is insufficient, or no qualifying future object exists. The candidate's `object_type` must be in that signal's `candidate_object_types`.
-2. Use only direct evidence from the current fact. Assistant suggestions, speculation, behavior patterns, predictions, and unresolved hypotheticals such as maybe, if, should we, or consider cannot create an object. Another person's request does not assign responsibility to user self; the fact must preserve user self's clear acceptance, commitment, or correction. A mere acknowledgment or "got it" is insufficient.
-3. `assertion_source=third_party_report` is a verifiable lead, not proof that user self set a goal or accepted a work item. A low-confidence plan is possible only when the fact clearly describes an established future arrangement; qualify its summary with the third-party source.
-4. Make `summary` self-contained, including the object, user role, and material time or conditions. `evidence_fact_ids` must be exactly `[fact.id]` for the current item. Judge final confidence from the fact; do not copy the signal's confidence.
-5. `lifecycle_evidence` describes only a change directly observed in the fact, not a database operation. A plan that happened is `occurred`; a finished work item is `completed`. A `lifecycle_update` may describe a change to an existing object, but later reconciliation must not create a new object if no matching existing object is found.
-6. `primary_domain` must be one of `general|health|work|life|information|finance|family|learning|social|interest|travel`. Prefer the most specific user-life domain; reserve `general` for genuinely cross-domain objects, not uncertainty. Leave unsupported times and details empty. Return JSON only.
+4. Meaning of the input user_intent_signal
+Each item has its own `signal_id`, one `user_intent_signal`, and its associated fact. The same fact may appear under multiple signals, but remains one piece of evidence. The signal is a lead from fact extraction, neither an established user_intent nor new evidence beyond the fact: `signal_purpose` selects future intention or later lifecycle progress; `candidate_object_types` limits the permitted goal, plan, or work_item type. `subject_entity` and `user_role` indicate user self's role; `user_intent_anchor` locates the item; `assertion_source` and `evidence_basis` help inspect provenance. Its `confidence` is only a prior estimate. Verify the signal against the current fact's `summary`; do not copy its conclusion, use another item's evidence, or treat a repeated fact as independent evidence. Time information helps interpret the fact; it is not independent evidence of an arrangement, deadline, or completion. Clear provenance does not imply a settled intention. Preserve the fact's qualifiers about willingness or commitment; a self-statement alone does not establish an arrangement or accepted responsibility, and confidence is not a measure of commitment.
+
+5. Output rules
+1. Return exactly one result per input `signal_id`, always including both `future_intent_candidate` and `intent_lifecycle_observation`. A future_intent signal permits only a non-null candidate; a lifecycle_update signal permits only a non-null observation. At most one field may be non-null. Set both to null if the signal disagrees with the fact or evidence is insufficient; do not reroute or omit the signal. A non-null result's `object_type` must be in its signal's `candidate_object_types`.
+2. Use only direct evidence from the current fact. Assistant suggestions, speculation, behavior patterns, predictions, or unresolved hypotheticals do not qualify. A future responsibility requires user self's explicit acceptance, commitment, or correction; another person's request or a mere acknowledgment is insufficient.
+3. `third_party_report` alone does not prove that user self set a goal or accepted a work item. Only an explicitly established future arrangement may yield a cautious, low-confidence plan. An explicit third-party report of earlier-item progress may yield an observation, but its observation_text must preserve attribution such as "according to ..." rather than present it as user self's statement or certain fact.
+4. A future candidate's `summary` must describe the object, user role, and material time or conditions. An observation's `target_description` identifies the earlier item with any supported original time or identity clues; `observation_text` describes the later progress. Never rewrite a completion or cancellation as a future arrangement.
+5. For both output types, `evidence_fact_ids` must be exactly `[fact.id]` for the current item. Reassess confidence from the fact rather than copying the signal's estimate.
+6. An observation's `effective_at` is when the progress actually occurred or took effect, formatted as YYYY-MM-DD or ISO 8601. Leave it empty when unknown. Fill it only from explicit fact evidence or relative time unambiguously resolved against that fact's dialogue_time. Never automatically substitute the original schedule, report time, or system time, or invent a precise time from date-only evidence.
+7. `primary_domain` applies only to future candidates and must be `general|health|work|life|information|finance|family|learning|social|interest|travel`. Prefer the most specific domain. Leave unsupported times and details empty. Return JSON only.
 
 Reference time: {reference_timestamp}
 Independent signal items (each has an integer `signal_id`, `fact`, and one `user_intent_signal`):
@@ -301,7 +305,7 @@ Return JSON only:
   "results": [
     {
       "signal_id": 1,
-      "intent_candidate": {
+      "future_intent_candidate": {
         "object_type": "goal|plan|work_item",
         "summary": "complete, user-facing object description",
         "canonical_key": "short stable identity key for matching objects of the same type",
@@ -309,33 +313,50 @@ Return JSON only:
         "subject_entity": "core subject: goal owner, plan actor, or work-item responsible party",
         "time_start": "start/available time, or empty when unsupported",
         "time_end": "target/end/due time, or empty when unsupported",
-        "lifecycle_evidence": "type-specific lifecycle evidence value",
         "confidence": 0.0,
         "evidence_fact_ids": [1],
+        "details": {}
+      },
+      "intent_lifecycle_observation": null
+    },
+    {
+      "signal_id": 2,
+      "future_intent_candidate": null,
+      "intent_lifecycle_observation": {
+        "object_type": "goal|plan|work_item",
+        "target_description": "the earlier goal, arrangement, or responsibility",
+        "observation_text": "later progress directly supported by this fact, preserving attribution",
+        "lifecycle_evidence": "confirmed|updated|occurred|completed|cancelled|rescheduled|blocked",
+        "effective_at": "date/time when the change occurred or took effect, or empty if unknown",
+        "confidence": 0.0,
+        "evidence_fact_ids": [2],
         "details": {}
       }
     }
   ]
 }
 
-Put type-specific structured fields only in `details`; do not duplicate them as top-level fields:
+For future candidates, put type-specific structured fields only in `details`; do not duplicate them as top-level fields:
 - goal: `desired_outcome` (required), `success_criteria`, `target_at`. `time_end` may also represent target_at.
 - plan: `event_or_activity` (required), `time_precision`, `location`, `participants`.
 - work_item: `action_text` (required), `deliverable`, `responsibility_type`, `priority`, `beneficiary_entities`, `delegator_entities`, `collaborator_entities`.
 
-Lifecycle values: goal: `none|confirmed|completed|cancelled|blocked`; plan: `none|confirmed|occurred|cancelled|rescheduled|blocked`; work_item: `none|confirmed|completed|cancelled|blocked`. For an unqualified item, still return its signal_id with `intent_candidate: null`. Return JSON only."""
+An observation's lifecycle_evidence is type-specific: goal: confirmed|updated|completed|cancelled|blocked; plan: confirmed|updated|occurred|cancelled|rescheduled|blocked; work_item: confirmed|updated|completed|cancelled|blocked. confirmed reaffirms the earlier intention; updated adds or revises nonterminal information; occurred means an arrangement happened; completed means a goal was achieved or a responsibility fulfilled. Passage of time alone never proves occurrence or completion.
+An observation's `details` contains only explicitly supported changed values: time_start (new start), time_end (new end/target/deadline), location (new location), and progress_text (progress details), all strings. Omit unspecified keys and use {} when no changed values are given. Do not reconstruct or guess the old object's fields. Return JSON only."""
 
 
-INTENT_RECONCILIATION_PROMPT_EN = """Decide only the relationship between new Intent & Execution candidates and existing objects. Do not invent facts or modify object fields.
+INTENT_RECONCILIATION_PROMPT_EN = """Decide the relationship between new future user_intent candidates and existing objects. Do not invent facts or modify object fields.
 
-For each candidate, choose a matching existing object only when it represents the same goal, plan, or work item with compatible subject, core activity/deliverable, and time. Return create when no reliable match exists. Plan `occurred` means the event happened; work_item `completed` means the responsibility was fulfilled.
+For each candidate, choose a matching existing object only when it represents the same goal, plan, or work item with compatible subject, core activity/deliverable, and time. Return create when no reliable match exists, confirm when the same future object is reaffirmed without material changes, or update when information about that same object is added or revised. Similar recurring activities on different dates are not automatically the same arrangement.
+
+canonical_key is only an identity clue, never sufficient evidence of the same object or an update. Return exactly one decision per candidate_index, using the original input-list index. For create, target_object_type must be an empty string and target_object_id must be the integer 0. For confirm/update, select an existing object of the same object_type and return its integer ID. Do not invent or guess targets.
 
 Return JSON only:
 {
   "decisions": [
     {
       "candidate_index": 0,
-      "operation": "create|confirm|update|complete|cancel|reschedule|block",
+      "operation": "create|confirm|update",
       "target_object_type": "goal|plan|work_item",
       "target_object_id": 0,
       "reason": "brief evidence-grounded reason"
@@ -348,6 +369,42 @@ candidates:
 
 existing objects:
 {existing_objects}
+"""
+
+
+INTENT_LIFECYCLE_RECONCILIATION_PROMPT_EN = """Match user_intent lifecycle observations to existing intentions for a personal world model.
+
+Identify whether an observation concerns the same real-world item as one of its existing_intents. Record identity relationships only; do not decide or change intent status.
+
+Cases contain not-yet-persisted observations in input-list order. Each case contains:
+- intent_lifecycle_observation: later evidence concerning an earlier goal, arrangement, or responsibility. target_description identifies the earlier item; observation_text describes the progress. lifecycle_evidence describes observed change, not an applied status transition.
+- fact: the observation's sole source, including temporal context, subject, and attribution.
+- existing_intents: same-type retrieval candidates for this case, not confirmed matches. They need not be active.
+
+Rules:
+1. Select only from this case's existing_intents, with the same object_type as the observation. Match at most one intent per observation.
+2. A goal must concern the same enduring desired outcome; a plan the same particular arrangement; a work_item the same responsibility or deliverable. Shared topic, location, canonical_key, or keywords alone never establish identity.
+3. Distinguish repeated events on different dates and similar but separate deliverables. The original scheduled time is an identity clue; effective_at is the change time, and details may contain rescheduled times. Do not require either to equal the original schedule. Explicit rescheduling, cancellation, or completion may refer to the original item.
+4. Do not exclude an item just because it is past or has a different status, nor infer completion from elapsed time. Conflicting status does not prevent recognizing identity; later resolution handles validity.
+5. Return matched=false if identity is unsupported, the target is not uniquely identifiable, or multiple arrangements cannot be distinguished. Never guess, choose merely the closest item, create an intent, or rewrite the observation.
+6. Return exactly one decision per case. observation_index is its original zero-based position in the input cases list; do not renumber entries. When unmatched, target_object_type="" and target_object_id=0. confidence concerns identity, not the truth of the reported observation. Give a brief evidence-grounded reason.
+
+cases:
+{observation_cases}
+
+Return JSON only:
+{
+  "decisions": [
+    {
+      "observation_index": 0,
+      "matched": true,
+      "target_object_type": "goal|plan|work_item",
+      "target_object_id": 1,
+      "confidence": 0.9,
+      "reason": "evidence for identity"
+    }
+  ]
+}
 """
 
 

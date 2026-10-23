@@ -1307,7 +1307,11 @@ class TaskScheduler:
     ) -> None:
         result = event.get("result")
         if (not event.get("succeeded") or not isinstance(result, dict)
-                or not result.get("affected_objects")):
+                or not result.get("new_intent_ids") or self._claim_state_database is None):
+            return
+        with self._claim_state_database.reader_transaction() as reader_db:
+            new_intents = reader_db.get_user_intent_items_by_ids(result["new_intent_ids"])
+        if not new_intents:
             return
         reference_text = str(result.get("reference_timestamp") or "").strip()
         try:
@@ -1320,9 +1324,9 @@ class TaskScheduler:
             now=prediction_as_of,
             trigger_source="new_intent",
             intent_refs=[{
-                "object_type": item.get("object_type"),
-                "object_id": item.get("object_id"),
-            } for item in result["affected_objects"]],
+                "object_type": item["object_type"],
+                "object_id": item["id"],
+            } for item in new_intents],
         )
 
     def _record_fact_extraction_task_result(
