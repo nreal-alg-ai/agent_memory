@@ -609,6 +609,24 @@ class UserMemoryDB:
                     ON DELETE CASCADE
             );
 
+            CREATE TABLE IF NOT EXISTS memory_user_intent_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                intent_id INTEGER NOT NULL,
+                event_type TEXT NOT NULL CHECK(event_type IN ('created', 'updated')),
+                previous_payload TEXT NOT NULL DEFAULT '{}',
+                new_payload TEXT NOT NULL,
+                source_signal_id INTEGER NOT NULL,
+                lifecycle_observation_id INTEGER,
+                effective_at TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                UNIQUE(source_signal_id, intent_id, event_type),
+                FOREIGN KEY(intent_id) REFERENCES memory_user_intent_items(id) ON DELETE CASCADE,
+                FOREIGN KEY(source_signal_id) REFERENCES memory_fact_user_intent_signals(signal_id)
+                    ON DELETE CASCADE,
+                FOREIGN KEY(lifecycle_observation_id)
+                    REFERENCES memory_user_intent_lifecycle_observations(id) ON DELETE CASCADE
+            );
+
             CREATE TABLE IF NOT EXISTS memory_user_intent_evidence (
                 object_type TEXT NOT NULL,
                 object_id INTEGER NOT NULL,
@@ -669,6 +687,8 @@ class UserMemoryDB:
             ON memory_user_intent_items(object_type, primary_entity_id, time_start, time_end);
             CREATE INDEX IF NOT EXISTS idx_memory_user_intent_evidence_object
             ON memory_user_intent_evidence(object_type, object_id, role);
+            CREATE INDEX IF NOT EXISTS idx_memory_user_intent_events_intent
+            ON memory_user_intent_events(intent_id, id);
             """
         )
         # These tables belonged to the abandoned read-time user-state snapshot
@@ -2416,6 +2436,97 @@ class UserMemoryDB:
             ).fetchall()
             items.extend(self._intent_row_to_api(row) for row in rows)
         return items
+
+    def insert_user_intent_event(
+        self,
+        *,
+        intent_id: int,
+        event_type: str,
+        new_payload: Dict[str, Any],
+        source_signal_id: int,
+        previous_payload: Optional[Dict[str, Any]] = None,
+        lifecycle_observation_id: Optional[int] = None,
+        effective_at: str = "",
+    ) -> int:
+        """Record an applied intent mutation; callers share its write transaction."""
+        if event_type not in {"created", "updated"}:
+            raise ValueError("Intent event must be created or updated")
+        if (event_type == "created" and previous_payload) or (
+            event_type == "updated" and not previous_payload
+        ):
+            raise ValueError("Intent event has an invalid previous payload")
+        intent = self._conn.execute(
+            "SELECT * FROM memory_user_intent_items WHERE id = ?", (int(intent_id),),
+        ).fetchone()
+        signal = self._conn.execute(
+            "SELECT subject_entity_id FROM memory_fact_user_intent_signals WHERE signal_id = ?",
+            (int(source_signal_id),),
+        ).fetchone()
+        if (not intent or not signal
+                or signal["subject_entity_id"] != intent["world_owner_entity_id"]):
+            raise ValueError("Intent event must reference a same-owner source signal")
+        if lifecycle_observation_id is not None:
+            observation = self._conn.execute(
+                "SELECT signal_id, object_type FROM memory_user_intent_lifecycle_observations "
+                "WHERE id = ?", (int(lifecycle_observation_id),),
+            ).fetchone()
+            if (not observation or observation["signal_id"] != int(source_signal_id)
+                    or observation["object_type"] != intent["object_type"]):
+                raise ValueError("Intent event observation does not match its source and type")
+        # Store physical business fields, excluding timestamps and typed API aliases.
+        _, columns = self._intent_object_spec(intent["object_type"])
+        current = self._intent_row_to_api(intent)
+        previous = {key: previous_payload[key] for key in columns} if previous_payload else {}
+        updated = {key: new_payload[key] for key in columns}
+        if updated != {key: current[key] for key in columns}:
+            raise ValueError("Intent event must describe the persisted intent")
+        if event_type == "updated" and previous == updated:
+            raise ValueError("Intent event must contain an actual change")
+        cursor = self._conn.execute(
+            """INSERT INTO memory_user_intent_events (
+                intent_id, event_type, previous_payload, new_payload,
+                source_signal_id, lifecycle_observation_id, effective_at, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                int(intent_id), event_type, _json_dumps(previous), _json_dumps(updated),
+                int(source_signal_id), lifecycle_observation_id,
+                str(effective_at or ""), local_now_text(),
+            ),
+        )
+        self._commit_if_needed()
+        return int(cursor.lastrowid)
+
+    def get_user_intent_events(
+        self, *, event_ids: Optional[Sequence[int]] = None,
+        source_signal_id: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Read applied changes in event order, optionally scoped to a source signal."""
+        ids = None if event_ids is None else sorted({
+            int(value) for value in event_ids if int(value) > 0
+        })
+        events: List[Dict[str, Any]] = []
+        chunks = [None] if ids is None else [
+            ids[offset:offset + 500] for offset in range(0, len(ids), 500)
+        ]
+        for chunk in chunks:
+            clauses: List[str] = []
+            params: List[Any] = []
+            if chunk is not None:
+                clauses.append(f"id IN ({','.join('?' for _ in chunk)})")
+                params.extend(chunk)
+            if source_signal_id is not None:
+                clauses.append("source_signal_id = ?")
+                params.append(int(source_signal_id))
+            where = " WHERE " + " AND ".join(clauses) if clauses else ""
+            rows = self._conn.execute(
+                f"SELECT * FROM memory_user_intent_events{where} ORDER BY id", params,
+            ).fetchall()
+            for row in rows:
+                item = dict(row)
+                for key in ("previous_payload", "new_payload"):
+                    item[key] = _json_loads(item[key], {})
+                events.append(item)
+        return events
 
     def get_intent_object(
         self, *, object_type: str, object_id: int

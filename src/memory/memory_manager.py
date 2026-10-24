@@ -2414,7 +2414,7 @@ class MemoryNodeManager:
         reference_timestamp: Optional[Any] = None,
         signal_ids: Optional[Sequence[int]] = None,
     ) -> Dict[str, Any]:
-        """Extract and save future intent candidates and lifecycle observations in batches."""
+        """Save intent updates in batches and return their committed change events."""
         reference_timestamp = reference_timestamp or _now_text()
         selected_signal_ids = list(dict.fromkeys(
             int(value) for value in signal_ids or [] if int(value) > 0
@@ -2428,9 +2428,7 @@ class MemoryNodeManager:
         report: Dict[str, Any] = {
             "status": "empty",
             "reference_timestamp": str(reference_timestamp),
-            "new_intent_ids": [],
-            "intent_lifecycle_observation_ids": [],
-            "unmatched_lifecycle_observation_ids": [],
+            "intent_event_ids": [],
             "_completed_signal_ids": [],
             "failed_signal_ids": [],
         }
@@ -2526,7 +2524,7 @@ class MemoryNodeManager:
                 )
                 report["_completed_signal_ids"].extend(applied["completed_signal_ids"])
                 report["failed_signal_ids"].extend(applied["failed_signal_ids"])
-                report["new_intent_ids"].extend(applied["new_intent_ids"])
+                report["intent_event_ids"].extend(applied["intent_event_ids"])
 
             # Match after saving future candidates so this batch's newly stored
             # intents are visible too. A failure in either branch is independent.
@@ -2545,10 +2543,7 @@ class MemoryNodeManager:
             )
             report["_completed_signal_ids"].extend(saved["completed_signal_ids"])
             report["failed_signal_ids"].extend(saved["failed_signal_ids"])
-            report["intent_lifecycle_observation_ids"].extend(saved["intent_lifecycle_observation_ids"])
-            report["unmatched_lifecycle_observation_ids"].extend(
-                saved["unmatched_observation_ids"],
-            )
+            report["intent_event_ids"].extend(saved["intent_event_ids"])
             self._log_info("memory_user_intent_update", "batch_finish", {
                 "batch_index": batch_index,
                 "signal_ids": [item["signal_id"] for item in batch],
@@ -2562,6 +2557,7 @@ class MemoryNodeManager:
                 "unmatched_lifecycle_observation_ids": saved["unmatched_observation_ids"],
             })
 
+        report["intent_event_ids"] = sorted(set(report["intent_event_ids"]))
         report["status"] = (
             "partial" if report["failed_signal_ids"] and report["_completed_signal_ids"]
             else "error" if report["failed_signal_ids"] else "ok"
@@ -3548,17 +3544,27 @@ class MemoryNodeManager:
         """Atomically save each observation, its adjudicated intent changes, and fact evidence."""
         report: Dict[str, Any] = {
             "intent_lifecycle_observation_ids": [],
+            "intent_event_ids": [],
             "unmatched_observation_ids": [], "completed_signal_ids": [], "failed_signal_ids": [],
         }
         for index, observation in enumerate(observations):
             signal_id = observation["signal_id"]
             try:
+                recorded_events = self._db.get_user_intent_events(source_signal_id=signal_id)
+                if recorded_events:
+                    report["intent_event_ids"].extend(event["id"] for event in recorded_events)
+                    report["intent_lifecycle_observation_ids"].extend(
+                        sorted({event["lifecycle_observation_id"] for event in recorded_events
+                                if event["lifecycle_observation_id"] is not None})
+                    )
+                    report["completed_signal_ids"].append(signal_id)
+                    continue
                 decision = decisions.get(index)
                 if decision is None:
                     raise ValueError("missing_valid_lifecycle_matching_decision")
                 relation = decision["relations"][0] if decision["relations"] else None
                 update = decision["intent_updates"][0] if decision["intent_updates"] else None
-                updated = False
+                event_id = None
                 with self._db.transaction():
                     observation_id = self._db.upsert_user_intent_lifecycle_observation(observation)
                     if relation:
@@ -3594,7 +3600,20 @@ class MemoryNodeManager:
                                     object_type=object_type, object_id=target_id, payload=payload,
                                 ):
                                     raise ValueError("lifecycle_intent_update_failed")
-                                updated = True
+                                updated_target = self._db.get_intent_object(
+                                    object_type=object_type, object_id=target_id,
+                                )
+                                if not updated_target:
+                                    raise ValueError("updated_lifecycle_intent_missing")
+                                event_id = self._db.insert_user_intent_event(
+                                    intent_id=target_id,
+                                    event_type="updated",
+                                    previous_payload=target,
+                                    new_payload=updated_target,
+                                    source_signal_id=signal_id,
+                                    lifecycle_observation_id=observation_id,
+                                    effective_at=update["effective_at"],
+                                )
                         facts = self._db.get_memory_facts_by_ids(observation["evidence_fact_ids"])
                         if len(facts) != len(observation["evidence_fact_ids"]):
                             raise ValueError("missing_lifecycle_evidence_fact")
@@ -3612,11 +3631,13 @@ class MemoryNodeManager:
                 continue
             report["intent_lifecycle_observation_ids"].append(observation_id)
             report["completed_signal_ids"].append(signal_id)
+            if event_id is not None:
+                report["intent_event_ids"].append(event_id)
             if not relation:
                 report["unmatched_observation_ids"].append(observation_id)
             self._log_info("memory_user_intent_update", "lifecycle_relation", {
                 **decision, "signal_id": signal_id,
-                "observation_id": observation_id, "intent_updated": updated,
+                "observation_id": observation_id, "intent_event_id": event_id,
             })
         return report
 
@@ -3630,14 +3651,19 @@ class MemoryNodeManager:
     ) -> Dict[str, Any]:
         """Atomically save new intents, existing-intent changes, and their fact evidence."""
         report: Dict[str, Any] = {
-            "new_intent_ids": [],
+            "intent_event_ids": [],
             "completed_signal_ids": [],
             "failed_signal_ids": [],
         }
         for index, candidate in enumerate(candidates):
             signal_id = candidate["signal_id"]
             try:
-                object_id = 0
+                recorded_events = self._db.get_user_intent_events(source_signal_id=signal_id)
+                if recorded_events:
+                    report["intent_event_ids"].extend(event["id"] for event in recorded_events)
+                    report["completed_signal_ids"].append(signal_id)
+                    continue
+                signal_event_ids: List[int] = []
                 fact = facts_by_id[candidate["evidence_fact_ids"][0]]
                 observed_at = _to_timestamp_text(
                     fact.get("dialogue_time_key")
@@ -3677,6 +3703,12 @@ class MemoryNodeManager:
                             "evidence_type": "fact", "evidence_id": fact_id,
                             "role": "creation", "observed_at": observed_at,
                         } for fact_id in candidate["evidence_fact_ids"]])
+                        signal_event_ids.append(self._db.insert_user_intent_event(
+                            intent_id=object_id,
+                            event_type="created",
+                            new_payload=stored_object,
+                            source_signal_id=signal_id,
+                        ))
                     if target:
                         if update:
                             # The DB accepts typed full payloads. Merge the sparse patch
@@ -3709,6 +3741,14 @@ class MemoryNodeManager:
                                 )
                                 if not updated_target:
                                     raise ValueError("updated_future_intent_missing")
+                                signal_event_ids.append(self._db.insert_user_intent_event(
+                                    intent_id=target_id,
+                                    event_type="updated",
+                                    previous_payload=target,
+                                    new_payload=updated_target,
+                                    source_signal_id=signal_id,
+                                    effective_at=update["effective_at"],
+                                ))
                         self._db.upsert_intent_evidence([{
                             "object_type": object_type, "object_id": target_id,
                             "evidence_type": "fact", "evidence_id": fact_id,
@@ -3721,11 +3761,10 @@ class MemoryNodeManager:
                 })
                 continue
             report["completed_signal_ids"].append(signal_id)
-            if object_id:
-                report["new_intent_ids"].append(object_id)
+            report["intent_event_ids"].extend(signal_event_ids)
             self._log_info("memory_user_intent_update", "future_intent_saved", {
                 "candidate_index": index, "signal_id": signal_id,
-                "new_intent_id": object_id, **decision,
+                "intent_event_ids": signal_event_ids, **decision,
             })
         return report
 
