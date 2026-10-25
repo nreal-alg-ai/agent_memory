@@ -93,12 +93,9 @@ class TaskExecutionDB:
                 result_json TEXT NOT NULL DEFAULT '{}',
                 PRIMARY KEY(run_id, task_id)
             );
-            CREATE TABLE IF NOT EXISTS user_prediction_intent_progress (
-                object_type TEXT NOT NULL,
-                object_id INTEGER NOT NULL,
-                fingerprint TEXT NOT NULL,
-                completed_at TEXT NOT NULL,
-                PRIMARY KEY(object_type, object_id)
+            CREATE TABLE IF NOT EXISTS user_prediction_intent_event_progress (
+                event_id INTEGER PRIMARY KEY,
+                completed_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS user_claim_signal_consolidation_task_info (
                 batch_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -201,36 +198,28 @@ class TaskExecutionDB:
         self._conn.commit()
 
     @_locked
-    def completed_prediction_intents(
-        self, intents: Sequence[Dict[str, Any]],
-    ) -> set[Tuple[str, int, str]]:
-        completed: set[Tuple[str, int, str]] = set()
-        for intent in intents:
-            object_type = str(intent["object_type"])
-            object_id = int(intent["id"])
-            row = self._conn.execute(
-                """SELECT fingerprint FROM user_prediction_intent_progress
-                   WHERE object_type = ? AND object_id = ?""",
-                (object_type, object_id),
-            ).fetchone()
-            fingerprint = str(intent["fingerprint"])
-            if row and row["fingerprint"] == fingerprint:
-                completed.add((object_type, object_id, fingerprint))
+    def completed_prediction_intent_events(
+        self, event_ids: Sequence[int],
+    ) -> set[int]:
+        ids = sorted(set(_ids(event_ids)))
+        completed: set[int] = set()
+        for offset in range(0, len(ids), 500):
+            chunk = ids[offset:offset + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            completed.update(int(row["event_id"]) for row in self._conn.execute(
+                f"SELECT event_id FROM user_prediction_intent_event_progress "
+                f"WHERE event_id IN ({placeholders})", chunk,
+            ))
         return completed
 
     @_locked
-    def complete_prediction_intents(
-        self, intents: Sequence[Dict[str, Any]],
+    def complete_prediction_intent_events(
+        self, event_ids: Sequence[int],
     ) -> None:
         self._conn.executemany(
-            """INSERT INTO user_prediction_intent_progress
-               (object_type, object_id, fingerprint, completed_at)
-               VALUES (?, ?, ?, ?)
-               ON CONFLICT(object_type, object_id) DO UPDATE SET
-                 fingerprint = excluded.fingerprint,
-                 completed_at = excluded.completed_at""",
-            [(str(item["object_type"]), int(item["id"]),
-              str(item["fingerprint"]), _now()) for item in intents],
+            """INSERT OR IGNORE INTO user_prediction_intent_event_progress
+               (event_id, completed_at) VALUES (?, ?)""",
+            [(event_id, _now()) for event_id in _ids(event_ids)],
         )
         self._conn.commit()
 

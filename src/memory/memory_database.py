@@ -2538,24 +2538,6 @@ class UserMemoryDB:
         ).fetchone()
         return self._intent_row_to_api(row) if row else None
 
-    def get_time_bearing_user_intents(
-        self, *, world_owner_entity_id: int,
-    ) -> List[Dict[str, Any]]:
-        """Read all potentially actionable intents, including older rows nearing due time."""
-        rows = self._conn.execute(
-            """SELECT * FROM memory_user_intent_items
-               WHERE world_owner_entity_id = ? AND primary_entity_id = ?
-                 AND ((object_type = 'goal' AND status = 'active')
-                   OR (object_type = 'plan' AND status IN ('planned', 'rescheduled'))
-                   OR (object_type = 'work_item'
-                       AND status IN ('open', 'in_progress', 'blocked')))
-                 AND ((object_type = 'plan' AND time_start != '')
-                   OR (object_type != 'plan' AND time_end != ''))
-               ORDER BY id""",
-            (int(world_owner_entity_id), int(world_owner_entity_id)),
-        ).fetchall()
-        return [self._intent_row_to_api(row) for row in rows]
-
     def get_entity_id_by_name(self, name: str) -> Optional[int]:
         row = self._conn.execute(
             "SELECT id FROM memory_entity_nodes WHERE name = ?", (str(name),)

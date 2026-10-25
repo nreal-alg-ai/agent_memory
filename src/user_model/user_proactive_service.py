@@ -117,6 +117,9 @@ class UserProactiveService:
         predictions = self._model_db.get_user_predictions_by_ids(prediction_ids)
         decisions = []
         for prediction in predictions:
+            # A later intent event may invalidate a forecast before this FIFO task runs.
+            if prediction.get("status") != "pending":
+                continue
             user_id = int(prediction["user_entity_id"])
             current_states = self._active_user_states(
                 as_of=now, model_db=self._model_db,

@@ -105,22 +105,8 @@ class UserModelDB:
                 created_at TEXT NOT NULL,
                 FOREIGN KEY(state_id) REFERENCES user_states(id) ON DELETE CASCADE
             );
-            CREATE TABLE IF NOT EXISTS user_prediction_runs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_entity_id INTEGER NOT NULL,
-                prediction_kind TEXT NOT NULL,
-                as_of TEXT NOT NULL,
-                horizon_start TEXT NOT NULL,
-                horizon_end TEXT NOT NULL,
-                status TEXT NOT NULL CHECK(status IN ('ok', 'empty', 'error')),
-                input_snapshot TEXT NOT NULL DEFAULT '{}',
-                predictor_version TEXT NOT NULL DEFAULT '',
-                error TEXT NOT NULL DEFAULT '',
-                created_at TEXT NOT NULL
-            );
             CREATE TABLE IF NOT EXISTS user_predictions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                run_id INTEGER NOT NULL,
                 user_entity_id INTEGER NOT NULL,
                 prediction_key TEXT NOT NULL,
                 basis_hash TEXT NOT NULL,
@@ -135,8 +121,40 @@ class UserModelDB:
                 status TEXT NOT NULL DEFAULT 'pending',
                 outcome TEXT NOT NULL DEFAULT '{}',
                 resolved_at TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS user_prediction_evidence (
+                prediction_id INTEGER NOT NULL,
+                intent_id INTEGER NOT NULL CHECK(intent_id > 0),
                 created_at TEXT NOT NULL,
-                FOREIGN KEY(run_id) REFERENCES user_prediction_runs(id) ON DELETE CASCADE
+                PRIMARY KEY(prediction_id, intent_id),
+                FOREIGN KEY(prediction_id) REFERENCES user_predictions(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS user_prediction_reviews (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                prediction_id INTEGER NOT NULL,
+                intent_event_ids TEXT NOT NULL,
+                decision TEXT NOT NULL CHECK(decision IN ('retain', 'invalidate', 'replace')),
+                reason TEXT NOT NULL,
+                intent_snapshot TEXT NOT NULL,
+                replacement_prediction_ids TEXT NOT NULL DEFAULT '[]',
+                created_at TEXT NOT NULL,
+                UNIQUE(prediction_id, intent_event_ids),
+                FOREIGN KEY(prediction_id) REFERENCES user_predictions(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS user_prediction_reassessment_schedule (
+                intent_id INTEGER PRIMARY KEY CHECK(intent_id > 0),
+                user_entity_id INTEGER NOT NULL,
+                next_evaluate_at TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                evaluated_at TEXT NOT NULL,
+                intent_basis_hash TEXT NOT NULL,
+                intent_event_ids TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                CHECK(julianday(next_evaluate_at) IS NOT NULL
+                      AND julianday(evaluated_at) IS NOT NULL
+                      AND julianday(next_evaluate_at) > julianday(evaluated_at))
             );
             CREATE TABLE IF NOT EXISTS user_proactive_decisions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -163,10 +181,14 @@ class UserModelDB:
             ON user_state_evidence(evidence_type, evidence_id, role, state_id);
             CREATE INDEX IF NOT EXISTS idx_user_state_events_state
             ON user_state_events(state_id, effective_at DESC, id DESC);
-            CREATE INDEX IF NOT EXISTS idx_user_prediction_runs_owner
-            ON user_prediction_runs(user_entity_id, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_user_predictions_active
             ON user_predictions(user_entity_id, status, window_end);
+            CREATE INDEX IF NOT EXISTS idx_user_prediction_evidence_intent
+            ON user_prediction_evidence(intent_id, prediction_id);
+            CREATE INDEX IF NOT EXISTS idx_user_prediction_reviews_prediction
+            ON user_prediction_reviews(prediction_id, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_user_prediction_reassessment_due
+            ON user_prediction_reassessment_schedule(julianday(next_evaluate_at), intent_id);
             CREATE INDEX IF NOT EXISTS idx_user_proactive_decisions_user_time
             ON user_proactive_decisions(user_entity_id, evaluated_at DESC, id DESC);
             CREATE UNIQUE INDEX IF NOT EXISTS idx_user_predictions_pending_key
@@ -175,61 +197,290 @@ class UserModelDB:
         """)
         self._commit_if_needed()
 
-    def insert_user_prediction_run(self, payload: Dict[str, Any]) -> int:
-        cursor = self._conn.execute(
-            """INSERT INTO user_prediction_runs (
-                user_entity_id, prediction_kind, as_of, horizon_start, horizon_end,
-                status, input_snapshot, predictor_version, error, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                int(payload["user_entity_id"]), str(payload["prediction_kind"]),
-                str(payload["as_of"]), str(payload["horizon_start"]),
-                str(payload["horizon_end"]), str(payload["status"]),
-                _json_dumps(payload.get("input_snapshot") or {}),
-                str(payload.get("predictor_version") or ""),
-                str(payload.get("error") or ""), local_now_text(),
-            ),
-        )
-        self._commit_if_needed()
-        return int(cursor.lastrowid)
+    def upsert_user_prediction_reassessment_schedule(
+        self, *, intent_id: int, user_entity_id: int, next_evaluate_at: str,
+        reason: str, evaluated_at: str, intent_basis_hash: str,
+        intent_event_ids: Sequence[int],
+    ) -> None:
+        """Keep only the latest deferred assessment for an intent; no full intent copy."""
+        event_ids = sorted({int(value) for value in intent_event_ids})
+        if (int(intent_id) <= 0 or int(user_entity_id) <= 0 or not event_ids
+                or any(value <= 0 for value in event_ids) or not str(reason).strip()
+                or not str(intent_basis_hash).strip()):
+            raise ValueError("Invalid prediction reassessment schedule")
+        with self.transaction():
+            existing = self._conn.execute(
+                "SELECT user_entity_id FROM user_prediction_reassessment_schedule WHERE intent_id = ?",
+                (int(intent_id),),
+            ).fetchone()
+            if existing and existing["user_entity_id"] != int(user_entity_id):
+                raise ValueError("Cannot replace another user's reassessment schedule")
+            now = local_now_text()
+            self._conn.execute(
+                """INSERT INTO user_prediction_reassessment_schedule (
+                    intent_id, user_entity_id, next_evaluate_at, reason, evaluated_at,
+                    intent_basis_hash, intent_event_ids, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(intent_id) DO UPDATE SET
+                    next_evaluate_at=excluded.next_evaluate_at, reason=excluded.reason,
+                    evaluated_at=excluded.evaluated_at, intent_basis_hash=excluded.intent_basis_hash,
+                    intent_event_ids=excluded.intent_event_ids, updated_at=excluded.updated_at""",
+                (int(intent_id), int(user_entity_id), str(next_evaluate_at), str(reason).strip(),
+                 str(evaluated_at), str(intent_basis_hash), _json_dumps(event_ids), now, now),
+            )
+
+    def get_user_prediction_reassessment_schedules(
+        self, *, intent_ids: Optional[Sequence[int]] = None,
+        user_entity_id: Optional[int] = None, due_at: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Read deferred assessments; due_at only filters, it does not submit tasks."""
+        ids = None if intent_ids is None else sorted({int(value) for value in intent_ids if int(value) > 0})
+        chunks = [None] if ids is None else [ids[offset:offset + 500] for offset in range(0, len(ids), 500)]
+        schedules = []
+        for chunk in chunks:
+            clauses, params = [], []
+            if chunk is not None:
+                clauses.append(f"intent_id IN ({','.join('?' for _ in chunk)})")
+                params.extend(chunk)
+            if user_entity_id is not None:
+                clauses.append("user_entity_id = ?")
+                params.append(int(user_entity_id))
+            if due_at is not None:
+                clauses.append("julianday(next_evaluate_at) <= julianday(?)")
+                params.append(str(due_at))
+            where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+            rows = self._conn.execute(
+                f"SELECT *, julianday(next_evaluate_at) AS due_order "
+                f"FROM user_prediction_reassessment_schedule {where}", params,
+            ).fetchall()
+            for row in rows:
+                item = dict(row)
+                item["intent_event_ids"] = _json_loads(item["intent_event_ids"], [])
+                schedules.append(item)
+        schedules.sort(key=lambda item: (item["due_order"], item["intent_id"]))
+        for item in schedules:
+            item.pop("due_order")
+        return schedules
+
+    def delete_user_prediction_reassessment_schedules(
+        self, intent_ids: Sequence[int], *, user_entity_id: int,
+    ) -> int:
+        ids = sorted({int(value) for value in intent_ids if int(value) > 0})
+        deleted = 0
+        with self.transaction():
+            for offset in range(0, len(ids), 500):
+                chunk = ids[offset:offset + 500]
+                cursor = self._conn.execute(
+                    f"DELETE FROM user_prediction_reassessment_schedule "
+                    f"WHERE intent_id IN ({','.join('?' for _ in chunk)}) AND user_entity_id = ?",
+                    [*chunk, int(user_entity_id)],
+                )
+                deleted += cursor.rowcount
+        return deleted
 
     def save_user_prediction(self, payload: Dict[str, Any]) -> Tuple[int, str]:
-        """Reuse an unchanged pending forecast, supersede it when evidence changes."""
+        """Atomically save a forecast and link its intent, retaining the basis snapshot."""
         owner_id = int(payload["user_entity_id"])
         prediction_key = str(payload["prediction_key"])
         basis_hash = str(payload["basis_hash"])
-        existing = self._conn.execute(
-            """SELECT id, basis_hash FROM user_predictions
-            WHERE user_entity_id = ? AND prediction_key = ? AND status = 'pending'""",
-            (owner_id, prediction_key),
-        ).fetchone()
-        if existing and existing["basis_hash"] == basis_hash:
-            return int(existing["id"]), "reused"
-        if existing:
-            self._conn.execute(
-                """UPDATE user_predictions SET status = 'superseded',
-                resolved_at = ? WHERE id = ?""",
-                (local_now_text(), int(existing["id"])),
+        basis = payload.get("basis") or {}
+        with self.transaction():
+            existing = self._conn.execute(
+                """SELECT * FROM user_predictions
+                WHERE user_entity_id = ? AND prediction_key = ? AND status = 'pending'""",
+                (owner_id, prediction_key),
+            ).fetchone()
+            forecast_fields = {
+                "behavior_text": str(payload["behavior_text"]),
+                "window_start": str(payload["window_start"]),
+                "window_end": str(payload["window_end"]),
+                "conditions": payload.get("conditions") or [],
+                "likelihood_band": str(payload["likelihood_band"]),
+                "uncertainties": payload.get("uncertainties") or [],
+                "rationale": str(payload.get("rationale") or ""),
+            }
+            existing_payload = self._prediction_row_to_api(existing) if existing else {}
+            if (existing and existing["basis_hash"] == basis_hash
+                    and all(existing_payload[key] == value for key, value in forecast_fields.items())):
+                prediction_id, save_action = int(existing["id"]), "reused"
+                basis = _json_loads(existing["basis"], {})
+            else:
+                if existing:
+                    self._conn.execute(
+                        """UPDATE user_predictions SET status = 'superseded',
+                        resolved_at = ? WHERE id = ?""",
+                        (local_now_text(), int(existing["id"])),
+                    )
+                cursor = self._conn.execute(
+                    """INSERT INTO user_predictions (
+                        user_entity_id, prediction_key, basis_hash, behavior_text,
+                        window_start, window_end, conditions, likelihood_band,
+                        uncertainties, rationale, basis, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        owner_id, prediction_key, basis_hash,
+                        str(payload["behavior_text"]), str(payload["window_start"]),
+                        str(payload["window_end"]),
+                        _json_dumps(payload.get("conditions") or []),
+                        str(payload["likelihood_band"]),
+                        _json_dumps(payload.get("uncertainties") or []),
+                        str(payload.get("rationale") or ""),
+                        _json_dumps(payload.get("basis") or {}), local_now_text(),
+                    ),
+                )
+                prediction_id, save_action = int(cursor.lastrowid), "created"
+            intent = basis.get("intent")
+            if intent is not None:
+                self.upsert_user_prediction_evidence([{
+                    "prediction_id": prediction_id, "intent_id": intent["id"],
+                }])
+        return prediction_id, save_action
+
+    def upsert_user_prediction_evidence(self, evidence: Sequence[Dict[str, Any]]) -> int:
+        """Link predictions to memory-db intents through logical IDs, without duplicates."""
+        added = 0
+        with self.transaction():
+            for item in evidence:
+                prediction_id, intent_id = int(item["prediction_id"]), int(item["intent_id"])
+                if prediction_id <= 0 or intent_id <= 0:
+                    raise ValueError("Prediction evidence IDs must be positive")
+                cursor = self._conn.execute(
+                    """INSERT OR IGNORE INTO user_prediction_evidence
+                    (prediction_id, intent_id, created_at) VALUES (?, ?, ?)""",
+                    (prediction_id, intent_id, local_now_text()),
+                )
+                added += cursor.rowcount
+        return added
+
+    def get_user_prediction_evidence(
+        self, prediction_ids: Sequence[int],
+    ) -> List[Dict[str, Any]]:
+        ids = sorted({int(value) for value in prediction_ids if int(value) > 0})
+        evidence: List[Dict[str, Any]] = []
+        for offset in range(0, len(ids), 500):
+            chunk = ids[offset:offset + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            evidence.extend(dict(row) for row in self._conn.execute(
+                "SELECT * FROM user_prediction_evidence "
+                f"WHERE prediction_id IN ({placeholders}) ORDER BY prediction_id, intent_id",
+                chunk,
+            ))
+        return evidence
+
+    def get_user_predictions_by_intent_ids(
+        self, intent_ids: Sequence[int], *,
+        statuses: Optional[Sequence[str]] = None,
+        user_entity_id: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Read linked forecasts, including invalid or expired ones unless filtered."""
+        ids = sorted({int(value) for value in intent_ids if int(value) > 0})
+        predictions: Dict[int, Dict[str, Any]] = {}
+        for offset in range(0, len(ids), 500):
+            chunk = ids[offset:offset + 500]
+            clauses = [f"evidence.intent_id IN ({','.join('?' for _ in chunk)})"]
+            params: List[Any] = list(chunk)
+            if statuses:
+                clauses.append(f"prediction.status IN ({','.join('?' for _ in statuses)})")
+                params.extend(statuses)
+            if user_entity_id is not None:
+                clauses.append("prediction.user_entity_id = ?")
+                params.append(int(user_entity_id))
+            rows = self._conn.execute(
+                "SELECT DISTINCT prediction.* FROM user_predictions AS prediction "
+                "JOIN user_prediction_evidence AS evidence ON evidence.prediction_id = prediction.id "
+                f"WHERE {' AND '.join(clauses)} ORDER BY prediction.id", params,
+            ).fetchall()
+            for row in rows:
+                predictions[int(row["id"])] = self._prediction_row_to_api(row)
+        return [predictions[prediction_id] for prediction_id in sorted(predictions)]
+
+    def save_user_prediction_review(
+        self, *, prediction_id: int, user_entity_id: int,
+        intent_event_ids: Sequence[int], decision: str, reason: str,
+        intent_snapshot: Dict[str, Any], replacement_prediction_ids: Sequence[int] = (),
+    ) -> int:
+        """Save a review without overwriting the forecast's original basis."""
+        if decision not in {"retain", "invalidate", "replace"}:
+            raise ValueError("Unsupported prediction review decision")
+        event_ids = sorted({int(value) for value in intent_event_ids})
+        if not event_ids or any(value <= 0 for value in event_ids):
+            raise ValueError("Prediction reviews require positive intent event IDs")
+        event_ids_json = _json_dumps(event_ids)
+        replacements = sorted({int(value) for value in replacement_prediction_ids})
+        if bool(replacements) != (decision == "replace"):
+            raise ValueError("Only a replacement review must reference new predictions")
+        with self.transaction():
+            prediction = self._conn.execute(
+                "SELECT user_entity_id, status FROM user_predictions WHERE id = ?",
+                (int(prediction_id),),
+            ).fetchone()
+            evidence = self.get_user_prediction_evidence([prediction_id])
+            if (not prediction or prediction["user_entity_id"] != int(user_entity_id)
+                    or int(intent_snapshot["id"]) not in {row["intent_id"] for row in evidence}):
+                raise ValueError("Prediction review must reference a pending same-owner forecast and its intent")
+            existing = self._conn.execute(
+                "SELECT * FROM user_prediction_reviews WHERE prediction_id = ? AND intent_event_ids = ?",
+                (int(prediction_id), event_ids_json),
+            ).fetchone()
+            if existing:
+                if (existing["decision"] != decision
+                        or _json_loads(existing["intent_snapshot"], {}) != intent_snapshot
+                        or _json_loads(existing["replacement_prediction_ids"], []) != replacements):
+                    raise ValueError("The same intent events cannot produce conflicting prediction reviews")
+                return int(existing["id"])
+            if prediction["status"] != "pending":
+                raise ValueError("Only pending predictions can receive a new review")
+            for replacement_id in replacements:
+                replacement = self._conn.execute(
+                    "SELECT user_entity_id, status FROM user_predictions WHERE id = ?",
+                    (replacement_id,),
+                ).fetchone()
+                if (replacement_id == prediction_id or not replacement
+                        or replacement["status"] != "pending"
+                        or replacement["user_entity_id"] != prediction["user_entity_id"]
+                        or not any(row["intent_id"] == int(intent_snapshot["id"])
+                                   for row in self.get_user_prediction_evidence([replacement_id]))):
+                    raise ValueError("Invalid replacement prediction")
+            cursor = self._conn.execute(
+                """INSERT INTO user_prediction_reviews (
+                    prediction_id, intent_event_ids, decision, reason, intent_snapshot,
+                    replacement_prediction_ids, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (int(prediction_id), event_ids_json, decision, str(reason),
+                 _json_dumps(intent_snapshot), _json_dumps(replacements), local_now_text()),
             )
-        cursor = self._conn.execute(
-            """INSERT INTO user_predictions (
-                run_id, user_entity_id, prediction_key, basis_hash, behavior_text,
-                window_start, window_end, conditions, likelihood_band,
-                uncertainties, rationale, basis, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                int(payload["run_id"]), owner_id, prediction_key, basis_hash,
-                str(payload["behavior_text"]), str(payload["window_start"]),
-                str(payload["window_end"]),
-                _json_dumps(payload.get("conditions") or []),
-                str(payload["likelihood_band"]),
-                _json_dumps(payload.get("uncertainties") or []),
-                str(payload.get("rationale") or ""),
-                _json_dumps(payload.get("basis") or {}), local_now_text(),
-            ),
-        )
-        self._commit_if_needed()
-        return int(cursor.lastrowid), "created"
+            if decision != "retain":
+                self._conn.execute(
+                    """UPDATE user_predictions SET status = ?, outcome = ?, resolved_at = ?
+                    WHERE id = ? AND status = 'pending'""",
+                    ("superseded" if decision == "replace" else "invalidated",
+                     _json_dumps({"source": "intent_event_review", "review_id": int(cursor.lastrowid),
+                                  "intent_event_ids": event_ids,
+                                  "reason": str(reason), "replacement_prediction_ids": replacements}),
+                     local_now_text(), int(prediction_id)),
+                )
+            return int(cursor.lastrowid)
+
+    def get_latest_user_prediction_reviews(
+        self, prediction_ids: Sequence[int],
+    ) -> Dict[int, Dict[str, Any]]:
+        ids = sorted({int(value) for value in prediction_ids if int(value) > 0})
+        reviews = {}
+        for offset in range(0, len(ids), 500):
+            chunk = ids[offset:offset + 500]
+            rows = self._conn.execute(
+                "SELECT * FROM user_prediction_reviews WHERE id IN ("
+                "SELECT MAX(id) FROM user_prediction_reviews "
+                f"WHERE prediction_id IN ({','.join('?' for _ in chunk)}) GROUP BY prediction_id)",
+                chunk,
+            ).fetchall()
+            for row in rows:
+                item = dict(row)
+                item["intent_event_ids"] = _json_loads(item["intent_event_ids"], [])
+                item["intent_snapshot"] = _json_loads(item["intent_snapshot"], {})
+                item["replacement_prediction_ids"] = _json_loads(item["replacement_prediction_ids"], [])
+                reviews[item["prediction_id"]] = item
+        return reviews
 
     @staticmethod
     def _prediction_row_to_api(row: sqlite3.Row) -> Dict[str, Any]:

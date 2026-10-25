@@ -205,6 +205,7 @@ personal_world_model:
     task_queue_maxsize: 100
     enable_user_prediction: true
     enable_user_proactive_policy_evaluation: true
+    # Forecast behavior within this horizon; do not gate on intent deadlines.
     user_prediction_horizon_hours: 6
     enable_memory_user_claim_update: true
     enable_memory_user_observed_pattern_update: true

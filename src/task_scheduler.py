@@ -247,7 +247,7 @@ class TaskOperationReporter:
             "memory_user_claim_state_update",
             "memory_user_activity_state_update",
             "memory_user_observed_pattern_state_update",
-            "user_prediction_near_term_preparation",
+            "user_prediction_update_from_intent_events",
             "user_proactive_policy_evaluation",
         }:
             if not isinstance(result, dict):
@@ -350,7 +350,7 @@ class TaskScheduler:
             "memory_user_claim_state_update": user_state_updates_enabled,
             "memory_user_activity_state_update": user_state_updates_enabled,
             "memory_user_observed_pattern_state_update": user_state_updates_enabled,
-            "user_prediction_near_term_preparation": self._config_bool(
+            "user_prediction_update_from_intent_events": self._config_bool(
                 settings.get("enable_user_prediction"), True,
             ),
             "user_proactive_policy_evaluation": self._config_bool(
@@ -360,9 +360,8 @@ class TaskScheduler:
         self._user_prediction_horizon_hours = max(
             0.1, float(settings.get("user_prediction_horizon_hours", 6) or 6),
         )
-        self._prediction_candidate_provider: Optional[Callable[..., List[Dict[str, Any]]]] = None
         self._prediction_lock = threading.RLock()
-        self._prediction_inflight: set[tuple[str, int, str]] = set()
+        self._prediction_events_inflight: set[int] = set()
         self._claim_state_database = claim_state_database
         self._task_execution_db: Optional[TaskExecutionDB] = None
         if claim_state_database is not None and hasattr(claim_state_database, "db_path"):
@@ -533,12 +532,6 @@ class TaskScheduler:
             if task_kind in self._handlers:
                 raise ValueError(f"Task handler already registered: {task_kind}")
             self._handlers[task_kind] = handler
-
-    def register_prediction_candidate_provider(
-        self, provider: Callable[..., List[Dict[str, Any]]],
-    ) -> None:
-        """Supply the scheduler with the predictor's time-aware intent selection."""
-        self._prediction_candidate_provider = provider
 
     @staticmethod
     def _config_bool(value: Any, default: bool = False) -> bool:
@@ -964,58 +957,6 @@ class TaskScheduler:
             "oldest_change_age_seconds": round(age_seconds, 1),
         }
 
-    def trigger_user_prediction_time_tick(
-        self, *, now: Optional[datetime] = None,
-    ) -> Dict[str, Any]:
-        """Find existing intents newly inside the rolling prediction window."""
-        return self._schedule_due_user_predictions(
-            now=now, trigger_source="time_tick",
-        )
-
-    def _schedule_due_user_predictions(
-        self, *, now: Optional[datetime], trigger_source: str,
-        intent_refs: Optional[List[Dict[str, Any]]] = None,
-    ) -> Dict[str, Any]:
-        if self._prediction_candidate_provider is None:
-            return {"queued": False, "reason": "prediction_provider_unavailable"}
-        effective_now = now or datetime.now().astimezone()
-        if effective_now.tzinfo is None:
-            effective_now = effective_now.replace(tzinfo=datetime.now().astimezone().tzinfo)
-        with self._prediction_lock:
-            # A read-only snapshot is enough here; the handler rechecks intent validity.
-            with self._execution_lock:
-                candidates = self._prediction_candidate_provider(
-                    as_of=effective_now,
-                    horizon_hours=self._user_prediction_horizon_hours,
-                    intent_refs=intent_refs,
-                )
-            completed = (
-                self._task_execution_db.completed_prediction_intents(candidates)
-                if self._task_execution_db is not None else set()
-            )
-            selected = [item for item in candidates if (
-                str(item["object_type"]), int(item["id"]), str(item["fingerprint"])
-            ) not in completed | self._prediction_inflight]
-            if not selected:
-                return {"queued": False, "reason": "no_unpredicted_due_intents",
-                        "due_intent_count": len(candidates)}
-            refs = [{"object_type": item["object_type"], "object_id": item["id"],
-                     "fingerprint": item["fingerprint"]} for item in selected]
-            report = self.submit(
-                "user_prediction_near_term_preparation",
-                {"as_of": effective_now, "horizon_hours": self._user_prediction_horizon_hours,
-                 "intent_refs": refs},
-                completion_context={"prediction_intents": refs},
-                report_payload={"trigger_source": trigger_source,
-                                "due_intent_count": len(refs),
-                                "as_of": effective_now.isoformat()},
-            )
-            if report.get("queued"):
-                self._prediction_inflight.update((item["object_type"],
-                    item["object_id"], item["fingerprint"]) for item in refs)
-            return {**report, "due_intent_count": len(candidates),
-                    "selected_intent_count": len(refs)}
-
     def submit_flush_fact_followup_tasks(self) -> Dict[str, Any]:
         """Queue a FIFO boundary; resolve pending signals only when it executes."""
         return self.submit("memory_flush_fact_followups", {})
@@ -1067,7 +1008,7 @@ class TaskScheduler:
             "memory_user_claim_state_update": (
                 self._postprocess_user_claim_state_update_task
             ),
-            "user_prediction_near_term_preparation": self._postprocess_user_prediction_task,
+            "user_prediction_update_from_intent_events": self._postprocess_user_prediction_task,
         }
         completion: Dict[str, Any] = {"postprocessed": False}
         postprocess = postprocessors.get(task_kind)
@@ -1090,7 +1031,7 @@ class TaskScheduler:
             "memory_user_claim_state_update": (
                 self._schedule_after_user_claim_state_update_task
             ),
-            "user_prediction_near_term_preparation": self._schedule_after_user_prediction_task,
+            "user_prediction_update_from_intent_events": self._schedule_after_user_prediction_task,
         }
         schedule = schedulers.get(task_kind)
         if schedule is None:
@@ -1153,19 +1094,15 @@ class TaskScheduler:
         self, event: Dict[str, Any],
     ) -> None:
         context = event.get("completion_context") or {}
-        refs = context.get("prediction_intents") or []
+        event_ids = context.get("prediction_intent_event_ids") or []
         result = event.get("result") or {}
         with self._prediction_lock:
-            for ref in refs:
-                self._prediction_inflight.discard((
-                    str(ref["object_type"]), int(ref["object_id"]),
-                    str(ref["fingerprint"]),
-                ))
+            self._prediction_events_inflight.difference_update(event_ids)
             if (event.get("succeeded") and isinstance(result, dict)
                     and result.get("status") in {"ok", "empty"}
                     and self._task_execution_db is not None):
-                self._task_execution_db.complete_prediction_intents(
-                    result.get("processed_intents") or [],
+                self._task_execution_db.complete_prediction_intent_events(
+                    sorted(set(result.get("processed_intent_event_ids") or []) & set(event_ids)),
                 )
 
     def _schedule_after_user_prediction_task(
@@ -1307,27 +1244,29 @@ class TaskScheduler:
     ) -> None:
         result = event.get("result")
         if (not event.get("succeeded") or not isinstance(result, dict)
-                or not result.get("new_intent_ids") or self._claim_state_database is None):
+                or not result.get("intent_event_ids")):
             return
-        with self._claim_state_database.reader_transaction() as reader_db:
-            new_intents = reader_db.get_user_intent_items_by_ids(result["new_intent_ids"])
-        if not new_intents:
-            return
-        reference_text = str(result.get("reference_timestamp") or "").strip()
-        try:
-            prediction_as_of = datetime.fromisoformat(
-                reference_text.replace("Z", "+00:00"),
+        event_ids = sorted({int(value) for value in result["intent_event_ids"] if int(value) > 0})
+        with self._prediction_lock:
+            completed = (
+                self._task_execution_db.completed_prediction_intent_events(event_ids)
+                if self._task_execution_db is not None else set()
             )
-        except ValueError:
-            prediction_as_of = datetime.now().astimezone()
-        self._schedule_due_user_predictions(
-            now=prediction_as_of,
-            trigger_source="new_intent",
-            intent_refs=[{
-                "object_type": item["object_type"],
-                "object_id": item["id"],
-            } for item in new_intents],
-        )
+            selected = sorted(set(event_ids) - completed - self._prediction_events_inflight)
+            if not selected:
+                return
+            payload = {
+                "intent_event_ids": selected,
+                "reference_timestamp": result.get("reference_timestamp"),
+                "horizon_hours": self._user_prediction_horizon_hours,
+            }
+            report = self.submit(
+                "user_prediction_update_from_intent_events", payload,
+                completion_context={"prediction_intent_event_ids": selected},
+                report_payload={"trigger_source": "intent_update", **payload},
+            )
+            if report.get("queued"):
+                self._prediction_events_inflight.update(selected)
 
     def _record_fact_extraction_task_result(
         self, result: Dict[str, Any], *, completion_context: Any,

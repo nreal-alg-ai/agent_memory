@@ -239,12 +239,6 @@ class PersonWorldModel:
         """Evaluate the claim-to-state window, optionally draining it for tests."""
         return self._task_scheduler.trigger_user_state_time_tick(now=now, force=force)
 
-    def trigger_user_prediction_time_tick(
-        self, *, now: Optional[datetime] = None,
-    ) -> Dict[str, Any]:
-        """Scan active intents that have entered the configured forecast window."""
-        return self._task_scheduler.trigger_user_prediction_time_tick(now=now)
-
     def get_user_states(
         self,
         *,
@@ -259,12 +253,6 @@ class PersonWorldModel:
                 state_types=state_types,
                 statuses=statuses,
             )
-
-    def predict_near_term_preparation(
-        self, *, as_of: Optional[datetime] = None,
-    ) -> Dict[str, Any]:
-        """Evaluate current near-term intents and enqueue only unseen versions."""
-        return self._task_scheduler.trigger_user_prediction_time_tick(now=as_of)
 
     def get_active_predictions(
         self, *, as_of: Optional[datetime] = None,
