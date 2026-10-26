@@ -63,7 +63,8 @@ DEFAULT_INPUT = (
 DEFAULT_OUTPUT_ROOT_DIR = REPO_ROOT / "tmp" / "clongeval_conversation"
 
 DATE_HEADER_RE = re.compile(
-    r"以下是(?P<date>\d{4}年\d{1,2}月\d{1,2}日)的对话记录\s*[:：]?"
+    r"以下是(?P<date>\d{4}年\d{1,2}月\d{1,2}日)"
+    r"(?:\s*(?P<time>\d{1,2}:\d{2}(?::\d{2})?))?的对话记录\s*[:：]?"
 )
 ROLE_LINE_RE = re.compile(r"^[“”]?\s*(用户|AI|助手)\s*[:：]\s*(.*)$")
 CONTEXT_END_MARKERS = ("请记住以上全部对话记录", "问题：", "问题:")
@@ -252,9 +253,15 @@ def parse_context_days(context: str) -> List[Dict[str, Any]]:
         if not pairs:
             logging.warning("No user/assistant pairs parsed for %s", header.group("date"))
             continue
+        clock_text = header.group("time")
+        timestamp = parse_date(header.group("date"))
+        if clock_text:
+            clock = datetime.strptime(clock_text, "%H:%M:%S" if clock_text.count(":") == 2 else "%H:%M")
+            timestamp = timestamp.replace(hour=clock.hour, minute=clock.minute, second=clock.second)
         days.append({
-            "date_text": header.group("date"),
-            "date": parse_date(header.group("date")),
+            "date_text": header.group("date") + (f" {clock_text}" if clock_text else ""),
+            "date": timestamp,
+            "has_explicit_time": bool(clock_text),
             "pairs": pairs,
         })
     if not days:
@@ -339,7 +346,7 @@ def replay_context_into_memory(
         for pair_index, (user, assistant) in enumerate(day["pairs"]):
             pair_count += 1
             turn_timestamp = normalize_unique_timestamp(
-                day["date"] + timedelta(seconds=pair_index),
+                day["date"] + timedelta(seconds=pair_index * (120 if day.get("has_explicit_time") else 1)),
                 seen_timestamps,
             )
             store_report = pwm.accept_memory_input(

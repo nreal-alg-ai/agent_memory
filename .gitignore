@@ -5,7 +5,10 @@ __pycache__/
 *.pyc
 .DS_Store
 external/
-test_data/
+test_data/*
+!test_data/user_dialogue/
+test_data/user_dialogue/*
+!test_data/user_dialogue/user_prediction/
 tmp_result/
 result*.json
 models/

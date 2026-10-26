@@ -9,6 +9,8 @@ window before recording a progress snapshot.
 
 CLongEval contexts may represent different fictional people. A shared database
 is useful for pipeline testing, but is not an identity-isolated benchmark.
+Use --prediction-eval with single-user, explicitly timed records to save
+prefix-only prediction checkpoints before later outcome feedback is replayed.
 """
 
 from __future__ import annotations
@@ -21,6 +23,7 @@ import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
+from zoneinfo import ZoneInfo
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 SRC_ROOT = REPO_ROOT / "src"
@@ -69,6 +72,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                         help="Skip this many distinct contexts in input order.")
     parser.add_argument("--limit", type=int, default=0,
                         help="Maximum distinct contexts; 0 means all.")
+    parser.add_argument(
+        "--prediction-eval", action="store_true",
+        help="Require one user and strictly increasing explicit times; save prediction checkpoints before later feedback.",
+    )
+    parser.add_argument("--timezone", default="Asia/Shanghai",
+                        help="Timezone of prediction-eval dialogue timestamps (default: Asia/Shanghai).")
     parser.add_argument("--llm-model")
     parser.add_argument("--llm-base-url")
     parser.add_argument("--llm-api-key")
@@ -79,6 +88,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.start < 0 or args.limit < 0:
         parser.error("--start and --limit must be nonnegative")
+    try:
+        ZoneInfo(args.timezone)
+    except (KeyError, ValueError):
+        parser.error(f"Unknown timezone: {args.timezone}")
     return args
 
 
@@ -136,6 +149,10 @@ def select_contexts(
             "context_id": f"context_{len(seen):04d}_{digest[:12]}",
             "source_index": source_index,
             "source_id": str(record.get("id") or ""),
+            "prediction_test": {
+                key: record[key] for key in ("user_id", "scenario_id", "phase", "expectations", "behavior_observations")
+                if key in record
+            },
         })
         if limit and len(selected) >= limit:
             break
@@ -149,9 +166,9 @@ def _table_counts(pwm: PersonWorldModel) -> Dict[str, int]:
         table: int(memory_conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
         for table in MEMORY_COUNT_TABLES
     }
-    counts["user_states"] = int(
-        model_conn.execute("SELECT COUNT(*) FROM user_states").fetchone()[0]
-    )
+    for table in ("user_states", "user_predictions",
+                  "user_prediction_reassessment_schedule", "user_proactive_decisions"):
+        counts[table] = int(model_conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
     return counts
 
 
@@ -226,37 +243,90 @@ def _state_snapshot(pwm: PersonWorldModel) -> List[Dict[str, Any]]:
     ]
 
 
+def _context_replay_turns(
+    context: str, *, timezone_name: Optional[str] = None,
+) -> Tuple[int, List[Dict[str, Any]]]:
+    days = parse_context_days(context)
+    turns = []
+    for day in days:
+        if timezone_name and not day.get("has_explicit_time"):
+            raise ValueError("Prediction evaluation requires a date and time in every dialogue header")
+        beginning = day["date"]
+        if timezone_name:
+            beginning = beginning.replace(tzinfo=ZoneInfo(timezone_name))
+        step = 120 if day.get("has_explicit_time") else 1
+        for index, (user, assistant) in enumerate(day["pairs"]):
+            turns.append({
+                "timestamp": beginning + timedelta(seconds=index * step),
+                "user": user, "assistant": assistant, "date_text": day["date_text"],
+            })
+    return len(days), turns
+
+
+def _validate_prediction_timeline(contexts: Sequence[Dict[str, Any]], timezone_name: str) -> None:
+    """Validate before opening the model; never repair an out-of-order test clock."""
+    user_ids = {str(item["prediction_test"].get("user_id") or "").strip() for item in contexts}
+    if len(user_ids) != 1 or not next(iter(user_ids), ""):
+        raise ValueError("Prediction evaluation requires the same nonempty user_id on every record")
+    previous: Optional[datetime] = None
+    for item in contexts:
+        _, turns = _context_replay_turns(item["context"], timezone_name=timezone_name)
+        for turn in turns:
+            if previous is not None and turn["timestamp"] <= previous:
+                raise ValueError(
+                    f"Prediction timeline is not strictly increasing at {item['source_id'] or item['context_id']}: "
+                    f"{turn['timestamp'].isoformat()} <= {previous.isoformat()}; "
+                    "allow two minutes per turn or give each turn its own time header"
+                )
+            previous = turn["timestamp"]
+
+
+def _prediction_checkpoint(pwm: PersonWorldModel, *, as_of: datetime) -> Dict[str, Any]:
+    """Freeze prefix-only outputs before the next record's feedback is ingested."""
+    with pwm.task_scheduler.execution_lock:
+        ids = [int(row["id"]) for row in pwm.user_model_database._conn.execute(
+            "SELECT id FROM user_predictions ORDER BY id"
+        )]
+        return {
+            "as_of": as_of.isoformat(),
+            "predictions": pwm.user_model_database.get_user_predictions_by_ids(ids),
+            "active_prediction_ids": [int(row["id"]) for row in pwm.get_active_predictions(as_of=as_of)],
+            "reassessment_schedules": pwm.user_model_database.get_user_prediction_reassessment_schedules(),
+            "proactive_decisions": pwm.get_recent_proactive_decisions(limit=1000),
+            "latest_prediction_task": pwm.operation_reporter.snapshot().get("latest_reports", {}).get(
+                "user_prediction_update_from_intent_events"
+            ),
+        }
+
+
 def replay_context(
     pwm: PersonWorldModel, context_item: Dict[str, Any],
-    seen_timestamps: set[str],
+    seen_timestamps: set[str], *, timezone_name: Optional[str] = None,
 ) -> Dict[str, Any]:
     context_id = str(context_item["context_id"])
-    days = parse_context_days(str(context_item["context"]))
+    day_count, replay_turns = _context_replay_turns(str(context_item["context"]), timezone_name=timezone_name)
     turns = 0
     last_timestamp: Optional[datetime] = None
-    for day in days:
-        for pair_index, (user, assistant) in enumerate(day["pairs"]):
-            timestamp = normalize_unique_timestamp(
-                day["date"] + timedelta(seconds=pair_index), seen_timestamps,
-            )
-            report = pwm.accept_memory_input(
-                interaction_turn={
-                    "user_message": user,
-                    "assistant_response": assistant,
-                    "turn_timestamp": timestamp,
-                },
-                tags=["clongeval_continuous", f"context:{context_id}",
-                      f"date:{day['date_text']}"],
-                ambient_recording_enabled=False,
-            )
-            if report.get("reason") in {
-                "expected_one_input_kind", "memory_disabled", "empty_turn",
-                "queue_rejected", "worker_queue_full", "worker_shutdown",
-                "task_handler_not_registered", "task_disabled",
-            }:
-                raise RuntimeError(f"Input rejected for {context_id}: {report}")
-            turns += 1
-            last_timestamp = timestamp
+    for turn in replay_turns:
+        timestamp = turn["timestamp"] if timezone_name else normalize_unique_timestamp(
+            turn["timestamp"], seen_timestamps,
+        )
+        report = pwm.accept_memory_input(
+            interaction_turn={
+                "user_message": turn["user"], "assistant_response": turn["assistant"],
+                "turn_timestamp": timestamp,
+            },
+            tags=["clongeval_continuous", f"context:{context_id}", f"date:{turn['date_text']}"],
+            ambient_recording_enabled=False,
+        )
+        if report.get("reason") in {
+            "expected_one_input_kind", "memory_disabled", "empty_turn",
+            "queue_rejected", "worker_queue_full", "worker_shutdown",
+            "task_handler_not_registered", "task_disabled",
+        }:
+            raise RuntimeError(f"Input rejected for {context_id}: {report}")
+        turns += 1
+        last_timestamp = timestamp
 
     finalization = pwm.finalize_memory_session(
         reason="clongeval_context_boundary",
@@ -268,7 +338,7 @@ def replay_context(
         raise RuntimeError(f"Memory task queue did not drain for {context_id}")
     # The normal claim-state task uses a thirty-minute window. A benchmark
     # context boundary explicitly drains it so this context's state is visible.
-    state_tick = pwm.trigger_user_state_time_tick(force=True)
+    state_tick = pwm.trigger_user_state_time_tick(now=last_timestamp, force=True)
     if state_tick.get("reason") in {
         "worker_queue_full", "worker_shutdown", "task_handler_not_registered",
     }:
@@ -276,7 +346,7 @@ def replay_context(
     if not pwm.wait_for_memory_tasks():
         raise RuntimeError(f"State task queue did not drain for {context_id}")
     return {
-        "parsed_days": len(days),
+        "parsed_days": day_count,
         "turn_pairs": turns,
         "last_turn_timestamp": last_timestamp.isoformat() if last_timestamp else None,
         "finalization": finalization,
@@ -295,6 +365,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     contexts = select_contexts(input_path, start=args.start, limit=args.limit)
     if not contexts:
         raise RuntimeError("No distinct CLongEval contexts selected")
+    if args.prediction_eval:
+        _validate_prediction_timeline(contexts, args.timezone)
 
     output_dir = (
         args.output_dir.expanduser().resolve() if args.output_dir else
@@ -306,10 +378,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
     configure_logging(output_dir / "run.log", args.log_level, args.manager_log_level)
     logging.info(
-        "Continuous extraction started contexts=%s input=%s output=%s; "
-        "different CLongEval contexts may represent different users",
-        len(contexts), input_path, output_dir,
+        "Continuous extraction started contexts=%s input=%s output=%s prediction_eval=%s timezone=%s",
+        len(contexts), input_path, output_dir, args.prediction_eval,
+        args.timezone if args.prediction_eval else "legacy",
     )
+    if not args.prediction_eval:
+        logging.info("Different CLongEval contexts may represent different users")
 
     sections = split_memory_config(args.config)
     llm_config = sections.llm_model
@@ -358,7 +432,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 index, len(contexts), context_item["context_id"],
                 context_item["source_index"], len(context_item["context"]),
             )
-            replay = replay_context(pwm, context_item, seen_timestamps)
+            replay = replay_context(
+                pwm, context_item, seen_timestamps,
+                timezone_name=args.timezone if args.prediction_eval else None,
+            )
             delta = _operation_delta(before, _operation_counts(reporter))
             failures, skipped_tasks = _classify_task_outcomes(reporter, delta)
             result = {
@@ -373,8 +450,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "skipped_tasks": skipped_tasks,
                 "states": _state_snapshot(pwm),
             }
+            if args.prediction_eval:
+                result["prediction_test"] = context_item["prediction_test"]
+                result["prediction_checkpoint"] = _prediction_checkpoint(
+                    pwm, as_of=datetime.fromisoformat(replay["last_turn_timestamp"]),
+                )
             results.append(result)
             _write_json(output_dir / "context_progress.json", results)
+            if args.prediction_eval:
+                _write_json(output_dir / "prediction_checkpoints.json", [
+                    {"source_id": item["source_id"], "prediction_test": item["prediction_test"],
+                     **item["prediction_checkpoint"]} for item in results
+                ])
             logging.info(
                 "Context completed index=%s/%s id=%s turns=%s facts=%s "
                 "claims=%s states=%s skipped_tasks=%s failures=%s",
@@ -390,6 +477,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         summary = {
             "input": str(input_path),
+            "prediction_eval": args.prediction_eval,
+            "timezone": args.timezone if args.prediction_eval else None,
             "output_dir": str(output_dir),
             "contexts_processed": len(results),
             "turn_pairs_processed": sum(row["replay"]["turn_pairs"] for row in results),

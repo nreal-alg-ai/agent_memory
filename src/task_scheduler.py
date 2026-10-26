@@ -1121,16 +1121,19 @@ class TaskScheduler:
         })
         if not new_prediction_ids:
             return
+        reference_timestamp = (result.get("prediction_context") or {}).get("as_of")
         report = self.submit(
             "user_proactive_policy_evaluation",
             {
                 "prediction_ids": new_prediction_ids,
                 "source_prediction_task_id": str(event.get("task_id") or ""),
                 "runtime_context": {},
+                "reference_timestamp": reference_timestamp,
             },
             report_payload={
                 "prediction_ids": new_prediction_ids,
                 "source_prediction_task_id": str(event.get("task_id") or ""),
+                "reference_timestamp": reference_timestamp,
             },
         )
         if not report.get("queued"):

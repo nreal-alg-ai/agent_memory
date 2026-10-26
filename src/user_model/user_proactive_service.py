@@ -110,16 +110,19 @@ class UserProactiveService:
     def evaluate_new_predictions(
         self, *, prediction_ids: Sequence[int], source_prediction_task_id: str = "",
         runtime_context: Optional[Dict[str, Any]] = None,
+        reference_timestamp: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """Persist one policy decision per newly created prediction."""
         now = datetime.now().astimezone()
+        if reference_timestamp is not None:
+            reference = self._as_datetime(reference_timestamp, now)
+            if reference is None:
+                raise ValueError("Invalid proactive policy reference_timestamp")
+            now = reference
         context = dict(runtime_context) if isinstance(runtime_context, dict) else {}
         predictions = self._model_db.get_user_predictions_by_ids(prediction_ids)
         decisions = []
         for prediction in predictions:
-            # A later intent event may invalidate a forecast before this FIFO task runs.
-            if prediction.get("status") != "pending":
-                continue
             user_id = int(prediction["user_entity_id"])
             current_states = self._active_user_states(
                 as_of=now, model_db=self._model_db,

@@ -29,7 +29,7 @@ class UserPrediction:
     """Generate, inspect and verify preparation forecasts without changing intent."""
 
     TASK_KIND = "user_prediction_update_from_intent_events"
-    MODEL_VERSION = "intent_preparation_v4"
+    MODEL_VERSION = "intent_preparation_v5"
     ACTIVE_INTENT_STATUSES = {
         "goal": {"active"}, "plan": {"planned", "rescheduled"},
         "work_item": {"open", "in_progress", "blocked"},
@@ -178,10 +178,11 @@ class UserPrediction:
         reference_timestamp: Optional[Any] = None,
         horizon_hours: float = 6.0,
     ) -> Dict[str, Any]:
-        """Generate for created intents; review and regenerate for updated intents."""
+        """Generate for created intents; retain or invalidate forecasts for updated intents."""
         event_ids = sorted({int(value) for value in intent_event_ids if int(value) > 0})
         if not event_ids:
-            return {"status": "empty", "predictions": [], "intent_assessments": [],
+            return {"status": "empty", "predictions": [], "prediction_assessments": [],
+                    "retained_prediction_ids": [], "invalidated_prediction_ids": [],
                     "processed_intent_event_ids": []}
         local_now = self._now(None)
         now = self._as_datetime(reference_timestamp, local_now) or local_now
@@ -193,11 +194,12 @@ class UserPrediction:
             owner_id=owner_id, as_of=now, horizon_end=end, intent_event_ids=event_ids,
         )
         states = snapshot["recurring_states"]
-        predictions, decisions, assessments = [], [], []
+        updated_cases = [case for case in snapshot["intent_cases"] if case["event_type"] == "updated"]
+        provided_prediction_ids = {item["id"] for case in updated_cases for item in case["existing_predictions"]}
+        predictions, retained_prediction_ids, assessments = [], [], []
         status, error = "empty", ""
         try:
             created_cases = [case for case in snapshot["intent_cases"] if case["event_type"] == "created"]
-            updated_cases = [case for case in snapshot["intent_cases"] if case["event_type"] == "updated"]
             if created_cases:
                 generated, assessed = self._generate_predictions_for_created_intents_with_llm(
                     created_cases, states=states, as_of=now, horizon_end=end,
@@ -205,42 +207,37 @@ class UserPrediction:
                 predictions.extend(generated)
                 assessments.extend(assessed)
             if updated_cases:
-                generated, reviewed = self._update_predictions_for_updated_intents_with_llm(
+                generated, retained, assessed = self._update_predictions_for_updated_intents_with_llm(
                     updated_cases, states=states, as_of=now, horizon_end=end,
                 )
                 predictions.extend(generated)
-                decisions.extend(reviewed)
-            status = "ok" if predictions or decisions or any(
+                retained_prediction_ids.extend(retained)
+                assessments.extend(assessed)
+            status = "ok" if predictions or provided_prediction_ids or any(
                 item["decision"] == "defer" for item in assessments
             ) else "empty"
         except Exception as exc:
-            predictions, decisions, assessments = [], [], []
+            predictions, retained_prediction_ids, assessments = [], [], []
             status, error = "error", f"{type(exc).__name__}: {exc}"
             self._logger.exception("Intent-event prediction evaluation failed")
         with self._model_db.transaction():
+            invalidated_prediction_ids = []
+            if status != "error":
+                # Invalidate first so regenerating the same key cannot reuse a
+                # record that is about to be invalidated. All writes are atomic.
+                invalidated_prediction_ids = self._model_db.invalidate_user_predictions(
+                    sorted(provided_prediction_ids - set(retained_prediction_ids)), user_entity_id=owner_id,
+                )
             saved = []
             for item in predictions:
                 prediction_id, save_action = self._model_db.save_user_prediction({
                     **item, "user_entity_id": owner_id,
                 })
                 saved.append({"id": prediction_id, "save_action": save_action, **item})
-            for decision in decisions:
-                replacements = [item["id"] for item in saved
-                                if decision["prediction_id"] in item.get("replaces_prediction_ids", [])]
-                review_id = self._model_db.save_user_prediction_review(
-                    prediction_id=decision["prediction_id"], user_entity_id=owner_id,
-                    intent_event_ids=decision["intent_event_ids"],
-                    decision=decision["decision"], reason=decision["reason"],
-                    intent_snapshot=decision["intent_snapshot"],
-                    replacement_prediction_ids=replacements,
-                )
-                decision["review_id"] = review_id
-                decision["replacement_prediction_ids"] = replacements
             if status != "error":
-                # An intent change invalidates its old deferral. The update prompt
-                # still only reviews/regenerates forecasts in this first version.
-                clear_ids = [case["current_intent"]["id"] for case in updated_cases]
-                clear_ids.extend(item["intent_id"] for item in assessments if item["decision"] != "defer")
+                # Replace schedules for evaluated intents as one batch: a now/wait
+                # result must not erase a different behavior's deferred assessment.
+                clear_ids = [case["current_intent"]["id"] for case in snapshot["intent_cases"]]
                 self._model_db.delete_user_prediction_reassessment_schedules(
                     clear_ids, user_entity_id=owner_id,
                 )
@@ -248,19 +245,21 @@ class UserPrediction:
                     if assessment["decision"] == "defer":
                         self._model_db.upsert_user_prediction_reassessment_schedule(
                             intent_id=assessment["intent_id"], user_entity_id=owner_id,
+                            assessment_key=assessment["assessment_key"],
                             next_evaluate_at=assessment["next_evaluate_at"], reason=assessment["reason"],
                             evaluated_at=assessment["evaluated_at"], intent_basis_hash=assessment["intent_basis_hash"],
                             intent_event_ids=assessment["intent_event_ids"],
                         )
         self._logger.info(
-            "intent prediction update status=%s events=%s predictions=%s reviews=%s assessments=%s",
-            status, event_ids, len(saved), len(decisions),
+            "intent prediction update status=%s events=%s predictions=%s retained=%s invalidated=%s assessments=%s",
+            status, event_ids, len(saved), retained_prediction_ids, invalidated_prediction_ids,
             [{"intent_id": item["intent_id"], "decision": item["decision"],
               "next_evaluate_at": item["next_evaluate_at"]} for item in assessments],
         )
         return {"status": status, "predictions": saved,
-                "prediction_decisions": decisions,
-                "intent_assessments": assessments,
+                "retained_prediction_ids": retained_prediction_ids,
+                "invalidated_prediction_ids": invalidated_prediction_ids,
+                "prediction_assessments": assessments,
                 "prediction_context": {
                     "as_of": now.isoformat(), "horizon_start": now.isoformat(),
                     "horizon_end": end.isoformat(), "predictor_version": self.MODEL_VERSION,
@@ -273,7 +272,7 @@ class UserPrediction:
         self, cases: Sequence[Dict[str, Any]], *, states: Sequence[Dict[str, Any]],
         as_of: datetime, horizon_end: datetime,
     ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-        """Assess each new intent: predict now, defer, or wait for changed evidence."""
+        """Assess individual behavior directions for newly created intents."""
         source = " ".join(case["current_intent"]["summary"] for case in cases)
         chinese = bool(re.search(r"[\u4e00-\u9fff]", source))
         template = (USER_PREDICTION_NEAR_TERM_PREPARATION_PROMPT_ZH if chinese
@@ -283,66 +282,128 @@ class UserPrediction:
             intent_cases=json.dumps(cases, ensure_ascii=False), states=json.dumps(states, ensure_ascii=False),
         )
         raw = self._llm_client.call_llm(prompt)
-        parsed = self._llm_client.parse_json_object_from_llm_text(raw or "")
-        if not isinstance(parsed, dict):
-            raise ValueError("Prediction response must be a JSON object")
-        return self._normalize_created_intent_prediction_results(
-            parsed.get("intent_results"), cases=cases, states=states, as_of=as_of, horizon_end=horizon_end,
+        try:
+            parsed = self._llm_client.parse_json_object_from_llm_text(raw or "")
+            if not isinstance(parsed, dict) or set(parsed) != {"prediction_results"}:
+                raise ValueError("Created-intent response must contain only prediction_results")
+            return self._normalize_prediction_results(
+                parsed["prediction_results"], cases=cases, states=states, as_of=as_of, horizon_end=horizon_end,
+            )
+        except Exception as exc:
+            self._log_prediction_response_failure(
+                "created", raw=raw, error=exc, cases=cases, states=states,
+                as_of=as_of, horizon_end=horizon_end,
+            )
+            raise
+
+    def _log_prediction_response_failure(
+        self, stage: str, *, raw: Any, error: Exception,
+        cases: Sequence[Dict[str, Any]], states: Sequence[Dict[str, Any]],
+        as_of: datetime, horizon_end: datetime,
+    ) -> None:
+        """Keep model output and validation scope together, only on failure."""
+        payload = {
+            "stage": stage, "error": f"{type(error).__name__}: {error}",
+            "horizon_start": as_of.isoformat(), "horizon_end": horizon_end.isoformat(),
+            "intent_cases": [{
+                "current_intent": case["current_intent"],
+                "intent_event_ids": [event["id"] for event in case["intent_events"]],
+                "existing_prediction_ids": [item["id"] for item in case["existing_predictions"]],
+            } for case in cases],
+            "allowed_state_ids": [state["id"] for state in states],
+            "raw_response": raw,
+        }
+        self._logger.error(
+            "User prediction response rejected diagnostics=%s",
+            json.dumps(payload, ensure_ascii=False, default=str),
         )
 
-    def _normalize_created_intent_prediction_results(
+    def _normalize_prediction_results(
         self, results: Any, *, cases: Sequence[Dict[str, Any]], states: Sequence[Dict[str, Any]],
         as_of: datetime, horizon_end: datetime,
     ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-        if not isinstance(results, list) or len(results) != len(cases):
-            raise ValueError("Every new intent requires exactly one assessment")
+        """Normalize one assessment per behavior, allowing several per intent."""
+        if not isinstance(results, list):
+            raise ValueError("prediction_results must be an array")
         cases_by_id = {case["current_intent"]["id"]: case for case in cases}
-        generated, assessments, seen = [], [], set()
-        for result in results:
-            if not isinstance(result, dict):
-                raise ValueError("Invalid intent prediction assessment")
-            intent_id = int(result["intent_id"])
-            if intent_id not in cases_by_id or intent_id in seen:
-                raise ValueError("Unknown or duplicate intent assessment")
-            seen.add(intent_id)
+        generated, assessments, seen_behaviors, seen_assessments = [], [], set(), set()
+        counts = {}
+        for index, result in enumerate(results):
+            if not isinstance(result, dict) or set(result) != {
+                "intent_id", "decision", "reason", "next_evaluate_at", "prediction",
+            }:
+                raise ValueError(f"Invalid prediction_results[{index}] fields")
+            intent_id = result["intent_id"]
+            if type(intent_id) is not int or intent_id not in cases_by_id:
+                raise ValueError(f"Unknown intent_id in prediction_results[{index}]: {intent_id!r}")
             case = cases_by_id[intent_id]
             current = case["current_intent"]
             decision = result.get("decision")
-            reason = str(result.get("reason") or "").strip()
-            if decision not in {"predict_now", "defer", "wait_for_change"} or not reason:
-                raise ValueError("Invalid intent assessment decision or reason")
-            new = self._normalize_case_predictions(
-                result.get("predictions"), cases=[case], states=states,
-                as_of=as_of, horizon_end=horizon_end,
-            )
-            if bool(new) != (decision == "predict_now"):
-                raise ValueError("Only predict_now must contain one or more valid forecasts")
+            reason = result["reason"]
+            if (decision not in {"predict_now", "defer", "wait_for_change"}
+                    or not isinstance(reason, str) or not reason.strip()):
+                raise ValueError(f"Invalid prediction_results[{index}] decision or reason")
+            reason = reason.strip()
+            if decision == "predict_now":
+                prediction = result["prediction"]
+                if not isinstance(prediction, dict) or set(prediction) != {
+                    "intent_type", "state_ids", "behavior_text", "window_start", "window_end",
+                    "conditions", "likelihood_band", "uncertainties", "rationale",
+                }:
+                    raise ValueError(f"prediction_results[{index}] requires one prediction object without intent_id")
+                try:
+                    new = self._normalize_case_predictions(
+                        [{**prediction, "intent_id": intent_id}], cases=[case], states=states,
+                        as_of=as_of, horizon_end=horizon_end,
+                    )
+                except ValueError as exc:
+                    raise ValueError(f"prediction_results[{index}]: {exc}") from exc
+                identity = (intent_id, self._normalize_behavior_text(new[0]["behavior_text"]))
+                if identity in seen_behaviors:
+                    raise ValueError("Duplicate predicted behavior")
+                seen_behaviors.add(identity)
+                counts[intent_id] = counts.get(intent_id, 0) + 1
+                if counts[intent_id] > 5:
+                    raise ValueError("Expected at most five new predictions per intent")
+                generated.extend(new)
+            elif result["prediction"] is not None:
+                raise ValueError(f"prediction_results[{index}]: only predict_now may contain a prediction")
             next_evaluate_at = None
             if decision == "defer":
                 value = result.get("next_evaluate_at")
                 next_time = self._as_datetime(value, as_of)
                 if (not isinstance(value, str) or not re.search(r"[T\s]\d{2}:\d{2}", value)
-                        or next_time is None or next_time <= as_of):
+                        or next_time is None or next_time.tzinfo is None
+                        or not re.search(r"(?:Z|[+-]\d{2}:\d{2})$", value)
+                        or next_time <= as_of):
                     raise ValueError("Deferred assessment requires a future evaluation datetime")
                 if current["status"] not in self.ACTIVE_INTENT_STATUSES.get(current["object_type"], set()):
                     raise ValueError("Terminal intents cannot be deferred for preparation prediction")
                 next_evaluate_at = next_time.isoformat()
             elif result.get("next_evaluate_at") is not None:
                 raise ValueError("Only defer may specify next_evaluate_at")
+            assessment_key = self._hash({
+                "intent_id": intent_id, "decision": decision, "reason": reason,
+                "next_evaluate_at": next_evaluate_at,
+                "prediction_key": new[0]["prediction_key"] if decision == "predict_now" else None,
+            })
+            if assessment_key in seen_assessments:
+                raise ValueError("Duplicate behavior assessment")
+            seen_assessments.add(assessment_key)
             assessments.append({
+                "assessment_key": assessment_key,
                 "intent_id": intent_id, "decision": decision, "reason": reason,
                 "next_evaluate_at": next_evaluate_at, "evaluated_at": as_of.isoformat(),
                 "intent_basis_hash": self._hash(current),
                 "intent_event_ids": sorted({int(event["id"]) for event in case["intent_events"]}),
             })
-            generated.extend(new)
         return generated, assessments
 
     def _update_predictions_for_updated_intents_with_llm(
         self, cases: Sequence[Dict[str, Any]], *, states: Sequence[Dict[str, Any]],
         as_of: datetime, horizon_end: datetime,
-    ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-        """Review old forecasts and generate replacements in one LLM call."""
+    ) -> tuple[List[Dict[str, Any]], List[int], List[Dict[str, Any]]]:
+        """Reconcile retained IDs and per-behavior assessments in one LLM call."""
         source = " ".join(case["current_intent"]["summary"] for case in cases)
         chinese = bool(re.search(r"[\u4e00-\u9fff]", source))
         template = (USER_PREDICTION_INTENT_UPDATE_PROMPT_ZH if chinese
@@ -352,69 +413,51 @@ class UserPrediction:
             intent_cases=json.dumps(cases, ensure_ascii=False), states=json.dumps(states, ensure_ascii=False),
         )
         raw = self._llm_client.call_llm(prompt)
-        parsed = self._llm_client.parse_json_object_from_llm_text(raw or "")
-        if not isinstance(parsed, dict):
-            raise ValueError("Prediction response must be a JSON object")
-        generated, reviews = [], []
-        results = parsed.get("intent_results")
-        if not isinstance(results, list) or len(results) != len(cases):
-            raise ValueError("Every updated intent requires exactly one result")
-        cases_by_id = {case["current_intent"]["id"]: case for case in cases}
-        seen = set()
-        for result in results:
-            if not isinstance(result, dict):
-                raise ValueError("Invalid updated intent result")
-            intent_id = int(result["intent_id"])
-            if intent_id not in cases_by_id or intent_id in seen:
-                raise ValueError("Unknown or duplicate intent result")
-            seen.add(intent_id)
-            case = cases_by_id[intent_id]
-            current = case["current_intent"]
-            old = {item["id"]: item for item in case["existing_predictions"]}
-            raw_decisions = result.get("existing_prediction_decisions")
-            if not isinstance(raw_decisions, list):
-                raise ValueError("Missing prediction decisions")
-            decisions_by_id = {}
-            for decision in raw_decisions:
-                if not isinstance(decision, dict):
-                    raise ValueError("Invalid prediction decision")
-                prediction_id = int(decision["prediction_id"])
-                action = decision.get("decision")
-                reason = str(decision.get("reason") or "").strip()
-                if (prediction_id not in old or prediction_id in decisions_by_id
-                        or action not in {"retain", "invalidate", "replace"} or not reason):
-                    raise ValueError("Invalid, unknown or duplicate prediction decision")
-                if (action == "retain" and current["status"] not in
-                        self.ACTIVE_INTENT_STATUSES.get(current["object_type"], set())):
-                    raise ValueError("Terminal intents cannot retain preparation predictions")
-                decisions_by_id[prediction_id] = {
-                    "prediction_id": prediction_id, "decision": action,
-                    "reason": reason, "intent_snapshot": current,
-                    "intent_event_ids": sorted({int(event["id"]) for event in case["intent_events"]}),
-                }
-            if set(decisions_by_id) != set(old):
-                raise ValueError("Every existing prediction must be reviewed explicitly")
-            new = self._normalize_case_predictions(
-                result.get("new_predictions"), cases=[case], states=states,
+        try:
+            parsed = self._llm_client.parse_json_object_from_llm_text(raw or "")
+            if not isinstance(parsed, dict) or set(parsed) != {"retained_prediction_ids", "prediction_results"}:
+                raise ValueError("Updated-intent response requires retained_prediction_ids and prediction_results")
+            return self._normalize_updated_intent_prediction_results(
+                parsed["prediction_results"], retained_prediction_ids=parsed["retained_prediction_ids"],
+                cases=cases, states=states,
                 as_of=as_of, horizon_end=horizon_end,
             )
-            replaced = set()
-            for item in new:
-                for prediction_id in item["replaces_prediction_ids"]:
-                    if (prediction_id not in decisions_by_id
-                            or decisions_by_id[prediction_id]["decision"] != "replace"):
-                        raise ValueError("Replacement references a prediction not marked replace")
-                    replaced.add(prediction_id)
-            if replaced != {key for key, decision in decisions_by_id.items()
-                            if decision["decision"] == "replace"}:
-                raise ValueError("Every replace decision requires a valid new prediction")
-            retained_texts = {self._normalize_behavior_text(old[key]["behavior_text"])
-                              for key, decision in decisions_by_id.items() if decision["decision"] == "retain"}
-            if any(self._normalize_behavior_text(item["behavior_text"]) in retained_texts for item in new):
+        except Exception as exc:
+            self._log_prediction_response_failure(
+                "updated", raw=raw, error=exc, cases=cases, states=states,
+                as_of=as_of, horizon_end=horizon_end,
+            )
+            raise
+
+    def _normalize_updated_intent_prediction_results(
+        self, results: Any, *, retained_prediction_ids: Any,
+        cases: Sequence[Dict[str, Any]], states: Sequence[Dict[str, Any]],
+        as_of: datetime, horizon_end: datetime,
+    ) -> tuple[List[Dict[str, Any]], List[int], List[Dict[str, Any]]]:
+        if (not isinstance(retained_prediction_ids, list)
+                or any(type(value) is not int or value <= 0 for value in retained_prediction_ids)
+                or len(set(retained_prediction_ids)) != len(retained_prediction_ids)):
+            raise ValueError("retained_prediction_ids must contain unique positive integer IDs")
+        retained = set(retained_prediction_ids)
+        provided = {item["id"] for case in cases for item in case["existing_predictions"]}
+        if retained - provided:
+            raise ValueError(f"Unknown retained prediction IDs: {sorted(retained - provided)}")
+        generated, assessments = self._normalize_prediction_results(
+            results, cases=cases, states=states, as_of=as_of, horizon_end=horizon_end,
+        )
+        for case in cases:
+            current = case["current_intent"]
+            old = {item["id"]: item for item in case["existing_predictions"]}
+            if (retained.intersection(old) and current["status"] not in
+                    self.ACTIVE_INTENT_STATUSES.get(current["object_type"], set())):
+                raise ValueError("Terminal intents cannot retain preparation predictions")
+            retained_texts = {self._normalize_behavior_text(item["behavior_text"])
+                              for key, item in old.items() if key in retained}
+            if any(item["basis"]["intent"]["id"] == current["id"]
+                   and self._normalize_behavior_text(item["behavior_text"]) in retained_texts
+                   for item in generated):
                 raise ValueError("New prediction duplicates a retained prediction")
-            reviews.extend(decisions_by_id.values())
-            generated.extend(new)
-        return generated, reviews
+        return generated, sorted(retained), assessments
 
     @staticmethod
     def _normalize_behavior_text(text: str) -> str:
@@ -430,22 +473,18 @@ class UserPrediction:
                    in self.ACTIVE_INTENT_STATUSES.get(case["current_intent"]["object_type"], set())]
         normalized = []
         seen = set()
-        for candidate in raw:
-            accepted = self._validate_predictions(
-                [candidate], intents=intents, states=states, as_of=as_of, horizon_end=horizon_end,
-                intent_events=[event for case in cases for event in case["intent_events"]],
-            )
-            if len(accepted) != 1:
-                raise ValueError("Prediction references invalid evidence, behavior or time window")
+        for index, candidate in enumerate(raw):
+            try:
+                accepted = self._validate_predictions(
+                    [candidate], intents=intents, states=states, as_of=as_of, horizon_end=horizon_end,
+                    intent_events=[event for case in cases for event in case["intent_events"]],
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    f"Prediction candidate[{index}] for intent_ids="
+                    f"{[case['current_intent']['id'] for case in cases]} rejected: {exc}"
+                ) from exc
             item = accepted[0]
-            replacements = candidate.get("replaces_prediction_ids", [])
-            if not isinstance(replacements, list):
-                raise ValueError("Replacement IDs must be an array")
-            item["replaces_prediction_ids"] = sorted({int(value) for value in replacements})
-            if any(value <= 0 for value in item["replaces_prediction_ids"]):
-                raise ValueError("Replacement IDs must be positive")
-            if any(case["event_type"] == "created" for case in cases) and replacements:
-                raise ValueError("New intent predictions cannot replace existing predictions")
             identity = (item["basis"]["intent"]["id"], self._normalize_behavior_text(item["behavior_text"]))
             if identity in seen:
                 raise ValueError("Duplicate predicted behavior")
@@ -463,23 +502,31 @@ class UserPrediction:
         accepted = []
         for candidate in raw[:5]:
             if not isinstance(candidate, dict):
-                continue
+                raise ValueError("candidate_not_object")
             try:
                 intent_type = str(candidate.get("intent_type") or "")
                 intent_id = int(candidate.get("intent_id"))
                 state_ids = sorted({int(value) for value in candidate.get("state_ids") or []})
-            except (TypeError, ValueError):
-                continue
+            except (TypeError, ValueError) as exc:
+                raise ValueError("invalid_intent_or_state_id_format") from exc
             intent = intent_by_key.get((intent_type, intent_id))
-            if intent is None or any(
-                state_id not in state_by_id for state_id in state_ids
-            ):
-                continue
+            if intent is None:
+                raise ValueError(
+                    f"unknown_or_inactive_intent_reference: intent_type={intent_type!r}, "
+                    f"intent_id={intent_id}, allowed_intents={sorted(intent_by_key)}"
+                )
+            unknown_state_ids = [value for value in state_ids if value not in state_by_id]
+            if unknown_state_ids:
+                raise ValueError(
+                    f"unknown_state_ids: {unknown_state_ids}, allowed_state_ids={sorted(state_by_id)}"
+                )
             behavior = str(candidate.get("behavior_text") or "").strip()
+            if not behavior:
+                raise ValueError("empty_behavior_text")
             if re.sub(r"\s+", "", behavior).casefold() == re.sub(
                 r"\s+", "", str(intent["summary"])
             ).casefold():
-                continue
+                raise ValueError("behavior_restates_intent_summary")
             band = str(candidate.get("likelihood_band") or "").lower().strip()
             beginning = self._as_datetime(candidate.get("window_start"), as_of)
             ending = self._as_datetime(candidate.get("window_end"), as_of)
@@ -491,12 +538,24 @@ class UserPrediction:
                 precise_anchor = False
             # Keep coarse or unknown anchors as uncertainty, never midnight deadlines.
             intent_anchor = self._as_datetime(anchor_text, as_of) if precise_anchor else None
-            if (not behavior or band not in {"low", "medium", "high"}
-                    or beginning is None or ending is None
-                    or beginning < as_of or ending > horizon_end
-                    or not beginning < ending
-                    or (intent_anchor is not None and ending > intent_anchor)):
-                continue
+            reasons = []
+            if band not in {"low", "medium", "high"}:
+                reasons.append(f"invalid_likelihood_band: {band!r}")
+            if beginning is None:
+                reasons.append(f"invalid_window_start: {candidate.get('window_start')!r}")
+            elif beginning < as_of:
+                reasons.append(f"window_start_before_horizon: {beginning.isoformat()} < {as_of.isoformat()}")
+            if ending is None:
+                reasons.append(f"invalid_window_end: {candidate.get('window_end')!r}")
+            else:
+                if ending > horizon_end:
+                    reasons.append(f"window_end_after_horizon: {ending.isoformat()} > {horizon_end.isoformat()}")
+                if intent_anchor is not None and ending > intent_anchor:
+                    reasons.append(f"window_end_after_intent_anchor: {ending.isoformat()} > {intent_anchor.isoformat()}")
+            if beginning is not None and ending is not None and not beginning < ending:
+                reasons.append(f"non_positive_window: {beginning.isoformat()} >= {ending.isoformat()}")
+            if reasons:
+                raise ValueError("; ".join(reasons))
             basis = {
                 "intent": intent,
                 "recurring_states": [state_by_id[value] for value in state_ids],
@@ -541,7 +600,6 @@ class UserPrediction:
         rows = self._model_db.get_active_user_predictions(
             user_entity_id=owner_id, as_of=reference.isoformat(),
         )
-        reviews = self._model_db.get_latest_user_prediction_reviews([row["id"] for row in rows])
         current = []
         for row in rows:
             basis = row.get("basis") or {}
@@ -556,12 +614,9 @@ class UserPrediction:
             intent = self._db.get_intent_object(
                 object_type=intent_type, object_id=intent_id,
             )
-            review = reviews.get(int(row["id"]))
-            validated_intent = review["intent_snapshot"] if review and review["decision"] == "retain" else intent_basis
             if (not intent or intent.get("status") not in self.ACTIVE_INTENT_STATUSES.get(intent_type, set())
                     or int(intent.get("world_owner_entity_id") or 0) != owner_id
-                    or int(intent.get("primary_entity_id") or 0) != owner_id
-                    or self._intent_snapshot(intent) != validated_intent):
+                    or int(intent.get("primary_entity_id") or 0) != owner_id):
                 continue
             states = {int(item["id"]): item for item in self._model_db.get_user_states_by_ids(state_ids)}
             if any(
