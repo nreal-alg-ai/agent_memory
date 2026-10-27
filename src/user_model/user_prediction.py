@@ -591,17 +591,25 @@ class UserPrediction:
 
     def get_active_predictions(
         self, *, as_of: Optional[datetime] = None,
+        prediction_ids: Optional[Sequence[int]] = None,
     ) -> List[Dict[str, Any]]:
         """Read unexpired, unresolved hypotheses; no delivery decision here."""
         owner_id = self._db.get_entity_id_by_name(self._owner_name)
         if owner_id is None:
             return []
         reference = self._now(as_of)
-        rows = self._model_db.get_active_user_predictions(
-            user_entity_id=owner_id, as_of=reference.isoformat(),
-        )
+        if prediction_ids is None:
+            rows = self._model_db.get_active_user_predictions(
+                user_entity_id=owner_id, as_of=reference.isoformat(),
+            )
+        else:
+            rows = self._model_db.get_user_predictions_by_ids(prediction_ids)
         current = []
         for row in rows:
+            ending = self._as_datetime(row.get("window_end"), reference)
+            if (row.get("user_entity_id") != owner_id or row.get("status") != "pending"
+                    or ending is None or ending <= reference):
+                continue
             basis = row.get("basis") or {}
             intent_basis = basis.get("intent") or {}
             try:

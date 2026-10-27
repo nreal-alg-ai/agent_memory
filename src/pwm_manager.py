@@ -102,9 +102,12 @@ class PersonWorldModel:
                 logger=self._logger.getChild("user_prediction"),
             )
             self._user_proactive_service = UserProactiveService(
+                memory_db=self._user_memory_database,
                 model_db=self._user_model_database,
+                prediction_reader=self._user_prediction.get_active_predictions,
                 task_scheduler=self._task_scheduler,
                 llm_client=self._llm_client,
+                world_owner_entity_name=self._memory_runtime.manager.world_owner_entity_name,
                 logger=self._logger.getChild("user_proactive_service"),
             )
             self._task_scheduler.start()
@@ -272,16 +275,16 @@ class PersonWorldModel:
                 observed_at=observed_at, evidence_refs=evidence_refs, note=note,
             )
 
-    def get_recent_proactive_decisions(
-        self, *, limit: int = 100,
+    def get_proactive_services(
+        self, *, statuses: Optional[Sequence[str]] = None, limit: int = 100,
     ) -> List[Dict[str, Any]]:
         with self._task_scheduler.execution_lock:
             owner_name = self.memory_manager.world_owner_entity_name
             owner_id = self._user_memory_database.get_entity_id_by_name(owner_name)
             if owner_id is None:
                 return []
-            return self._user_proactive_service.get_recent_decisions(
-                user_entity_id=owner_id, limit=limit,
+            return self._user_proactive_service.get_services(
+                user_entity_id=owner_id, statuses=statuses, limit=limit,
             )
 
     def close(self, timeout: Optional[float] = 30.0) -> None:

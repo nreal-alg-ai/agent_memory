@@ -1119,19 +1119,25 @@ class TaskScheduler:
             and str(item.get("id") or "").isdigit()
             and int(item["id"]) > 0
         })
-        if not new_prediction_ids:
+        invalidated_prediction_ids = [
+            int(value) for value in result.get("invalidated_prediction_ids") or []
+            if str(value).isdigit() and int(value) > 0
+        ]
+        # Closing services for invalidated sources is cleanup, not a fresh LLM evaluation.
+        prediction_ids = sorted(set(new_prediction_ids + invalidated_prediction_ids))
+        if not prediction_ids:
             return
         reference_timestamp = (result.get("prediction_context") or {}).get("as_of")
         report = self.submit(
             "user_proactive_policy_evaluation",
             {
-                "prediction_ids": new_prediction_ids,
+                "prediction_ids": prediction_ids,
                 "source_prediction_task_id": str(event.get("task_id") or ""),
                 "runtime_context": {},
                 "reference_timestamp": reference_timestamp,
             },
             report_payload={
-                "prediction_ids": new_prediction_ids,
+                "prediction_ids": prediction_ids,
                 "source_prediction_task_id": str(event.get("task_id") or ""),
                 "reference_timestamp": reference_timestamp,
             },
@@ -1139,7 +1145,7 @@ class TaskScheduler:
         if not report.get("queued"):
             self._logger.warning(
                 "proactive policy evaluation was not queued prediction_ids=%s reason=%s",
-                new_prediction_ids, report.get("reason") or "unknown",
+                prediction_ids, report.get("reason") or "unknown",
             )
 
     def _postprocess_user_claim_state_update_task(

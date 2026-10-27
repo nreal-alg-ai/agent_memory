@@ -146,22 +146,35 @@ class UserModelDB:
                       AND julianday(evaluated_at) IS NOT NULL
                       AND julianday(next_evaluate_at) > julianday(evaluated_at))
             );
-            CREATE TABLE IF NOT EXISTS user_proactive_decisions (
+            CREATE TABLE IF NOT EXISTS user_proactive_services (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 prediction_id INTEGER NOT NULL,
                 user_entity_id INTEGER NOT NULL,
-                policy_version TEXT NOT NULL,
-                decision TEXT NOT NULL CHECK(decision IN (
-                    'recommend_service', 'defer', 'suppress'
+                service_key TEXT NOT NULL,
+                service_type TEXT NOT NULL CHECK(service_type IN (
+                    'notify', 'suggest', 'clarify', 'offer_assistance', 'prepare', 'delegate'
                 )),
-                reason_code TEXT NOT NULL DEFAULT '',
-                rationale TEXT NOT NULL DEFAULT '',
-                runtime_context TEXT NOT NULL DEFAULT '{}',
-                prediction_snapshot TEXT NOT NULL DEFAULT '{}',
+                objective TEXT NOT NULL,
+                agent_guidance TEXT NOT NULL,
+                constraints TEXT NOT NULL DEFAULT '[]',
+                status TEXT NOT NULL CHECK(status IN ('ready', 'waiting', 'cancelled', 'expired')),
+                reason TEXT NOT NULL,
+                next_evaluate_at TEXT,
+                recheck_condition TEXT NOT NULL DEFAULT '',
+                expires_at TEXT NOT NULL,
+                policy_version TEXT NOT NULL,
                 source_prediction_task_id TEXT NOT NULL DEFAULT '',
                 evaluated_at TEXT NOT NULL,
-                UNIQUE(prediction_id, policy_version),
-                FOREIGN KEY(prediction_id) REFERENCES user_predictions(id) ON DELETE CASCADE
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(prediction_id, service_key),
+                FOREIGN KEY(prediction_id) REFERENCES user_predictions(id) ON DELETE CASCADE,
+                CHECK(julianday(expires_at) IS NOT NULL),
+                CHECK(next_evaluate_at IS NULL OR (
+                    julianday(next_evaluate_at) > julianday(evaluated_at)
+                    AND julianday(next_evaluate_at) < julianday(expires_at)
+                )),
+                CHECK(status != 'ready' OR next_evaluate_at IS NULL)
             );
             CREATE INDEX IF NOT EXISTS idx_user_states_domain_type_status
             ON user_states(state_domain, state_type, status, updated_at DESC);
@@ -177,8 +190,8 @@ class UserModelDB:
             ON user_prediction_evidence(intent_id, prediction_id);
             CREATE INDEX IF NOT EXISTS idx_user_prediction_reassessment_due
             ON user_prediction_reassessment_schedule(julianday(next_evaluate_at), intent_id);
-            CREATE INDEX IF NOT EXISTS idx_user_proactive_decisions_user_time
-            ON user_proactive_decisions(user_entity_id, evaluated_at DESC, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_user_proactive_services_user_status
+            ON user_proactive_services(user_entity_id, status, evaluated_at DESC);
             CREATE UNIQUE INDEX IF NOT EXISTS idx_user_predictions_pending_key
             ON user_predictions(user_entity_id, prediction_key)
             WHERE status = 'pending';
@@ -440,56 +453,107 @@ class UserModelDB:
         ).fetchall()
         return [self._prediction_row_to_api(row) for row in rows]
 
-    def save_user_proactive_decision(
+    def save_user_proactive_service(
         self, payload: Dict[str, Any],
-    ) -> Tuple[int, bool]:
-        cursor = self._conn.execute(
-            """INSERT OR IGNORE INTO user_proactive_decisions (
-                prediction_id, user_entity_id, policy_version, decision,
-                reason_code, rationale, runtime_context, prediction_snapshot,
-                source_prediction_task_id, evaluated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                int(payload["prediction_id"]), int(payload["user_entity_id"]),
-                str(payload["policy_version"]), str(payload["decision"]),
-                str(payload.get("reason_code") or ""),
-                str(payload.get("rationale") or ""),
-                _json_dumps(payload.get("runtime_context") or {}),
-                _json_dumps(payload.get("prediction_snapshot") or {}),
-                str(payload.get("source_prediction_task_id") or ""),
-                str(payload["evaluated_at"]),
-            ),
-        )
-        self._commit_if_needed()
-        created = cursor.rowcount == 1
-        row = self._conn.execute(
-            """SELECT id FROM user_proactive_decisions
-               WHERE prediction_id = ? AND policy_version = ?""",
-            (int(payload["prediction_id"]), str(payload["policy_version"])),
-        ).fetchone()
-        return int(row["id"]), created
+    ) -> Tuple[int, str]:
+        """Create or update a service, never a delivery or execution record."""
+        prediction_id, owner_id = int(payload["prediction_id"]), int(payload["user_entity_id"])
+        with self.transaction():
+            prediction = self._conn.execute(
+                "SELECT user_entity_id FROM user_predictions WHERE id = ?", (prediction_id,),
+            ).fetchone()
+            if not prediction or prediction["user_entity_id"] != owner_id:
+                raise ValueError("Service must reference the same owner's prediction")
+            service_id = payload.get("service_id")
+            if service_id is not None:
+                existing = self._conn.execute(
+                    "SELECT * FROM user_proactive_services WHERE id = ?", (int(service_id),),
+                ).fetchone()
+                if (not existing or existing["prediction_id"] != prediction_id
+                        or existing["user_entity_id"] != owner_id):
+                    raise ValueError("Service update references an unrelated service")
+            else:
+                existing = self._conn.execute(
+                    "SELECT * FROM user_proactive_services WHERE prediction_id = ? AND service_key = ?",
+                    (prediction_id, payload["service_key"]),
+                ).fetchone()
+            fields = {
+                key: payload[key] for key in (
+                    "service_key", "service_type", "objective", "agent_guidance", "status", "reason",
+                    "next_evaluate_at", "recheck_condition", "expires_at", "policy_version",
+                    "source_prediction_task_id", "evaluated_at",
+                )
+            }
+            fields["constraints"] = _json_dumps(payload["constraints"])
+            now = local_now_text()
+            if existing:
+                if existing["status"] in {"cancelled", "expired"}:
+                    raise ValueError("Closed services cannot be silently reactivated")
+                if all(existing[key] == value for key, value in fields.items()):
+                    return int(existing["id"]), "reused"
+                self._conn.execute(
+                    f"UPDATE user_proactive_services SET {', '.join(key + ' = ?' for key in fields)}, "
+                    "updated_at = ? WHERE id = ?",
+                    [*fields.values(), now, int(existing["id"])],
+                )
+                return int(existing["id"]), "updated"
+            fields = {"prediction_id": prediction_id, "user_entity_id": owner_id, **fields,
+                      "created_at": now, "updated_at": now}
+            cursor = self._conn.execute(
+                f"INSERT INTO user_proactive_services ({', '.join(fields)}) "
+                f"VALUES ({','.join('?' for _ in fields)})", list(fields.values()),
+            )
+            return int(cursor.lastrowid), "created"
 
-    def get_user_proactive_decisions(
+    def get_user_proactive_services(
         self, *, user_entity_id: Optional[int] = None, limit: int = 100,
+        prediction_id: Optional[int] = None, statuses: Optional[Sequence[str]] = None,
     ) -> List[Dict[str, Any]]:
         clauses = []
         params: List[Any] = []
         if user_entity_id is not None:
             clauses.append("user_entity_id = ?")
             params.append(int(user_entity_id))
+        if prediction_id is not None:
+            clauses.append("prediction_id = ?")
+            params.append(int(prediction_id))
+        if statuses:
+            clauses.append(f"status IN ({','.join('?' for _ in statuses)})")
+            params.extend(statuses)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         rows = self._conn.execute(
-            f"""SELECT * FROM user_proactive_decisions {where}
+            f"""SELECT * FROM user_proactive_services {where}
                 ORDER BY evaluated_at DESC, id DESC LIMIT ?""",
             (*params, max(1, int(limit))),
         ).fetchall()
         result = []
         for row in rows:
             item = dict(row)
-            item["runtime_context"] = _json_loads(item.get("runtime_context"), {})
-            item["prediction_snapshot"] = _json_loads(item.get("prediction_snapshot"), {})
+            item["constraints"] = _json_loads(item.get("constraints"), [])
             result.append(item)
         return result
+
+    def close_user_proactive_services(
+        self, *, prediction_id: int, user_entity_id: int, status: str, reason: str,
+        as_of: str, expired_only: bool = False,
+    ) -> List[int]:
+        """Close unprovided services without rewriting their original content."""
+        if status not in {"cancelled", "expired"}:
+            raise ValueError("Unsupported closed service status")
+        clauses = ["prediction_id = ?", "user_entity_id = ?", "status IN ('ready', 'waiting')"]
+        params: List[Any] = [int(prediction_id), int(user_entity_id)]
+        if expired_only:
+            clauses.append("julianday(expires_at) <= julianday(?)")
+            params.append(str(as_of))
+        where = " AND ".join(clauses)
+        with self.transaction():
+            rows = self._conn.execute(f"SELECT id FROM user_proactive_services WHERE {where}", params).fetchall()
+            self._conn.execute(
+                "UPDATE user_proactive_services SET status = ?, reason = ?, next_evaluate_at = NULL, "
+                f"evaluated_at = ?, updated_at = ? WHERE {where}",
+                [status, str(reason), str(as_of), local_now_text(), *params],
+            )
+        return [int(row["id"]) for row in rows]
 
     def record_user_prediction_outcome(
         self, *, prediction_id: int, outcome_status: str,

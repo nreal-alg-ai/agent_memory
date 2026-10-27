@@ -167,7 +167,7 @@ def _table_counts(pwm: PersonWorldModel) -> Dict[str, int]:
         for table in MEMORY_COUNT_TABLES
     }
     for table in ("user_states", "user_predictions",
-                  "user_prediction_reassessment_schedule", "user_proactive_decisions"):
+                  "user_prediction_reassessment_schedule", "user_proactive_services"):
         counts[table] = int(model_conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
     return counts
 
@@ -292,7 +292,7 @@ def _prediction_checkpoint(pwm: PersonWorldModel, *, as_of: datetime) -> Dict[st
             "predictions": pwm.user_model_database.get_user_predictions_by_ids(ids),
             "active_prediction_ids": [int(row["id"]) for row in pwm.get_active_predictions(as_of=as_of)],
             "reassessment_schedules": pwm.user_model_database.get_user_prediction_reassessment_schedules(),
-            "proactive_decisions": pwm.get_recent_proactive_decisions(limit=1000),
+            "proactive_services": pwm.get_proactive_services(limit=1000),
             "latest_prediction_task": pwm.operation_reporter.snapshot().get("latest_reports", {}).get(
                 "user_prediction_update_from_intent_events"
             ),
