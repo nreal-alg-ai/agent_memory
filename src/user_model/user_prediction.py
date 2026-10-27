@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import re
+import time
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence
 
@@ -50,6 +51,13 @@ class UserPrediction:
         task_scheduler.register_handler(
             self.TASK_KIND, self.process_user_prediction_update_from_intent_events_task,
         )
+
+    def _log_event(self, event: str, payload: Dict[str, Any], *, level: int = logging.INFO) -> None:
+        if self._logger.isEnabledFor(level):
+            self._logger.log(level, "\n%s", json.dumps(
+                {"scope": self.TASK_KIND, "event": event, "payload": payload},
+                ensure_ascii=False, indent=2, default=str,
+            ))
 
     @staticmethod
     def _as_datetime(value: Any, reference: datetime) -> Optional[datetime]:
@@ -179,21 +187,53 @@ class UserPrediction:
         horizon_hours: float = 6.0,
     ) -> Dict[str, Any]:
         """Generate for created intents; retain or invalidate forecasts for updated intents."""
+        started_at = time.monotonic()
         event_ids = sorted({int(value) for value in intent_event_ids if int(value) > 0})
+        self._log_event("user_prediction_update_start", {
+            "intent_event_ids": event_ids, "reference_timestamp": reference_timestamp,
+            "horizon_hours": horizon_hours,
+        })
         if not event_ids:
+            self._log_event("finish", {
+                "status": "empty", "reason": "no_intent_events",
+                "total_elapsed_ms": round((time.monotonic() - started_at) * 1000, 2),
+            })
             return {"status": "empty", "predictions": [], "prediction_assessments": [],
                     "retained_prediction_ids": [], "invalidated_prediction_ids": [],
                     "processed_intent_event_ids": []}
         local_now = self._now(None)
         now = self._as_datetime(reference_timestamp, local_now) or local_now
+        if reference_timestamp is not None and self._as_datetime(reference_timestamp, local_now) is None:
+            self._logger.warning(
+                "Prediction reference time could not be parsed; using current time "
+                "intent_event_ids=%s reference_timestamp=%r effective_reference_time=%s",
+                event_ids, reference_timestamp, now.isoformat(),
+            )
         end = now + timedelta(hours=max(0.1, float(horizon_hours)))
         owner_id = self._db.get_entity_id_by_name(self._owner_name)
         if owner_id is None:
+            self._logger.error("Prediction world owner is missing intent_event_ids=%s owner_name=%s",
+                               event_ids, self._owner_name)
             raise ValueError("Prediction world owner is missing")
-        snapshot = self._build_user_prediction_prediction_inputs_using_intents(
-            owner_id=owner_id, as_of=now, horizon_end=end, intent_event_ids=event_ids,
-        )
+        try:
+            snapshot = self._build_user_prediction_prediction_inputs_using_intents(
+                owner_id=owner_id, as_of=now, horizon_end=end, intent_event_ids=event_ids,
+            )
+        except Exception:
+            self._logger.exception("Prediction input loading failed intent_event_ids=%s as_of=%s",
+                                   event_ids, now.isoformat())
+            raise
         states = snapshot["recurring_states"]
+        self._log_event("inputs_loaded", {
+            "intent_event_ids": event_ids, "owner_id": owner_id,
+            "horizon_start": now.isoformat(), "horizon_end": end.isoformat(),
+            "intent_cases": [{
+                "event_type": case["event_type"], "current_intent": case["current_intent"],
+                "intent_event_ids": [item["id"] for item in case["intent_events"]],
+                "existing_prediction_ids": [item["id"] for item in case["existing_predictions"]],
+            } for case in snapshot["intent_cases"]],
+            "recurring_states": states,
+        })
         updated_cases = [case for case in snapshot["intent_cases"] if case["event_type"] == "updated"]
         provided_prediction_ids = {item["id"] for case in updated_cases for item in case["existing_predictions"]}
         predictions, retained_prediction_ids, assessments = [], [], []
@@ -219,43 +259,70 @@ class UserPrediction:
         except Exception as exc:
             predictions, retained_prediction_ids, assessments = [], [], []
             status, error = "error", f"{type(exc).__name__}: {exc}"
-            self._logger.exception("Intent-event prediction evaluation failed")
-        with self._model_db.transaction():
-            invalidated_prediction_ids = []
-            if status != "error":
-                # Invalidate first so regenerating the same key cannot reuse a
-                # record that is about to be invalidated. All writes are atomic.
-                invalidated_prediction_ids = self._model_db.invalidate_user_predictions(
-                    sorted(provided_prediction_ids - set(retained_prediction_ids)), user_entity_id=owner_id,
-                )
-            saved = []
-            for item in predictions:
-                prediction_id, save_action = self._model_db.save_user_prediction({
-                    **item, "user_entity_id": owner_id,
-                })
-                saved.append({"id": prediction_id, "save_action": save_action, **item})
-            if status != "error":
-                # Replace schedules for evaluated intents as one batch: a now/wait
-                # result must not erase a different behavior's deferred assessment.
-                clear_ids = [case["current_intent"]["id"] for case in snapshot["intent_cases"]]
-                self._model_db.delete_user_prediction_reassessment_schedules(
-                    clear_ids, user_entity_id=owner_id,
-                )
-                for assessment in assessments:
-                    if assessment["decision"] == "defer":
-                        self._model_db.upsert_user_prediction_reassessment_schedule(
-                            intent_id=assessment["intent_id"], user_entity_id=owner_id,
-                            assessment_key=assessment["assessment_key"],
-                            next_evaluate_at=assessment["next_evaluate_at"], reason=assessment["reason"],
-                            evaluated_at=assessment["evaluated_at"], intent_basis_hash=assessment["intent_basis_hash"],
-                            intent_event_ids=assessment["intent_event_ids"],
-                        )
-        self._logger.info(
-            "intent prediction update status=%s events=%s predictions=%s retained=%s invalidated=%s assessments=%s",
-            status, event_ids, len(saved), retained_prediction_ids, invalidated_prediction_ids,
-            [{"intent_id": item["intent_id"], "decision": item["decision"],
-              "next_evaluate_at": item["next_evaluate_at"]} for item in assessments],
-        )
+            self._logger.exception(
+                "Intent-event prediction evaluation failed intent_event_ids=%s as_of=%s "
+                "pending_predictions_unchanged=True", event_ids, now.isoformat(),
+            )
+        try:
+            with self._model_db.transaction():
+                invalidated_prediction_ids = []
+                if status != "error":
+                    # Invalidate first so regenerating the same key cannot reuse a
+                    # record that is about to be invalidated. All writes are atomic.
+                    invalidated_prediction_ids = self._model_db.invalidate_user_predictions(
+                        sorted(provided_prediction_ids - set(retained_prediction_ids)), user_entity_id=owner_id,
+                    )
+                saved = []
+                for item in predictions:
+                    prediction_id, save_action = self._model_db.save_user_prediction({
+                        **item, "user_entity_id": owner_id,
+                    })
+                    saved.append({"id": prediction_id, "save_action": save_action, **item})
+                if status != "error":
+                    # Replace schedules for evaluated intents as one batch: a now/wait
+                    # result must not erase a different behavior's deferred assessment.
+                    clear_ids = [case["current_intent"]["id"] for case in snapshot["intent_cases"]]
+                    self._model_db.delete_user_prediction_reassessment_schedules(
+                        clear_ids, user_entity_id=owner_id,
+                    )
+                    for assessment in assessments:
+                        if assessment["decision"] == "defer":
+                            self._model_db.upsert_user_prediction_reassessment_schedule(
+                                intent_id=assessment["intent_id"], user_entity_id=owner_id,
+                                assessment_key=assessment["assessment_key"],
+                                next_evaluate_at=assessment["next_evaluate_at"], reason=assessment["reason"],
+                                evaluated_at=assessment["evaluated_at"], intent_basis_hash=assessment["intent_basis_hash"],
+                                intent_event_ids=assessment["intent_event_ids"],
+                            )
+        except Exception:
+            self._logger.exception(
+                "Prediction result persistence failed intent_event_ids=%s as_of=%s transaction_rolled_back=True",
+                event_ids, now.isoformat(),
+            )
+            raise
+        # Log committed results only; a failed transaction must never look like a successful save.
+        self._log_event("results_saved" if status != "error" else "results_not_saved", {
+            "status": status, "intent_event_ids": event_ids,
+            "predictions": [{
+                **{key: item[key] for key in (
+                    "id", "save_action", "behavior_text", "window_start", "window_end",
+                    "conditions", "likelihood_band", "uncertainties", "rationale",
+                )},
+                "intent_id": item["basis"]["intent"]["id"],
+                "state_ids": [state["id"] for state in item["basis"]["recurring_states"]],
+            } for item in saved],
+            "retained_prediction_ids": retained_prediction_ids,
+            "invalidated_prediction_ids": invalidated_prediction_ids,
+            "prediction_assessments": assessments,
+            "reassessment_schedules_replaced": status != "error",
+        })
+        self._log_event("finish", {
+            "status": status, "intent_event_ids": event_ids, "prediction_count": len(saved),
+            "retained_prediction_ids": retained_prediction_ids,
+            "invalidated_prediction_ids": invalidated_prediction_ids,
+            "assessment_count": len(assessments), "error": error,
+            "total_elapsed_ms": round((time.monotonic() - started_at) * 1000, 2),
+        })
         return {"status": status, "predictions": saved,
                 "retained_prediction_ids": retained_prediction_ids,
                 "invalidated_prediction_ids": invalidated_prediction_ids,
@@ -281,14 +348,31 @@ class UserPrediction:
             as_of=as_of.isoformat(), horizon_start=as_of.isoformat(), horizon_end=horizon_end.isoformat(),
             intent_cases=json.dumps(cases, ensure_ascii=False), states=json.dumps(states, ensure_ascii=False),
         )
-        raw = self._llm_client.call_llm(prompt)
+        started_at = time.monotonic()
+        self._log_event("llm_started", {
+            "stage": "created", "intent_ids": [case["current_intent"]["id"] for case in cases],
+            "prompt_language": "zh" if chinese else "en", "prompt_chars": len(prompt),
+            "state_ids": [state["id"] for state in states],
+            "horizon_start": as_of.isoformat(), "horizon_end": horizon_end.isoformat(),
+        })
+        self._log_event("llm_request", {"stage": "created", "prompt": prompt}, level=logging.DEBUG)
+        raw = None
         try:
+            raw = self._llm_client.call_llm(prompt)
+            self._log_event("llm_response", {"stage": "created", "raw_response": raw}, level=logging.DEBUG)
             parsed = self._llm_client.parse_json_object_from_llm_text(raw or "")
             if not isinstance(parsed, dict) or set(parsed) != {"prediction_results"}:
                 raise ValueError("Created-intent response must contain only prediction_results")
-            return self._normalize_prediction_results(
+            predictions, assessments = self._normalize_prediction_results(
                 parsed["prediction_results"], cases=cases, states=states, as_of=as_of, horizon_end=horizon_end,
             )
+            self._log_event("llm_finished", {
+                "stage": "created", "intent_ids": [case["current_intent"]["id"] for case in cases],
+                "prediction_count": len(predictions), "assessments": assessments,
+                "response_chars": len(raw or ""),
+                "elapsed_ms": round((time.monotonic() - started_at) * 1000, 2),
+            })
+            return predictions, assessments
         except Exception as exc:
             self._log_prediction_response_failure(
                 "created", raw=raw, error=exc, cases=cases, states=states,
@@ -412,16 +496,37 @@ class UserPrediction:
             as_of=as_of.isoformat(), horizon_start=as_of.isoformat(), horizon_end=horizon_end.isoformat(),
             intent_cases=json.dumps(cases, ensure_ascii=False), states=json.dumps(states, ensure_ascii=False),
         )
-        raw = self._llm_client.call_llm(prompt)
+        started_at = time.monotonic()
+        self._log_event("llm_started", {
+            "stage": "updated", "intent_ids": [case["current_intent"]["id"] for case in cases],
+            "existing_prediction_ids": [item["id"] for case in cases for item in case["existing_predictions"]],
+            "prompt_language": "zh" if chinese else "en", "prompt_chars": len(prompt),
+            "state_ids": [state["id"] for state in states],
+            "horizon_start": as_of.isoformat(), "horizon_end": horizon_end.isoformat(),
+        })
+        self._log_event("llm_request", {"stage": "updated", "prompt": prompt}, level=logging.DEBUG)
+        raw = None
         try:
+            raw = self._llm_client.call_llm(prompt)
+            self._log_event("llm_response", {"stage": "updated", "raw_response": raw}, level=logging.DEBUG)
             parsed = self._llm_client.parse_json_object_from_llm_text(raw or "")
             if not isinstance(parsed, dict) or set(parsed) != {"retained_prediction_ids", "prediction_results"}:
                 raise ValueError("Updated-intent response requires retained_prediction_ids and prediction_results")
-            return self._normalize_updated_intent_prediction_results(
+            predictions, retained, assessments = self._normalize_updated_intent_prediction_results(
                 parsed["prediction_results"], retained_prediction_ids=parsed["retained_prediction_ids"],
                 cases=cases, states=states,
                 as_of=as_of, horizon_end=horizon_end,
             )
+            self._log_event("llm_finished", {
+                "stage": "updated", "intent_ids": [case["current_intent"]["id"] for case in cases],
+                "prediction_count": len(predictions), "retained_prediction_ids": retained,
+                "proposed_invalidated_prediction_ids": sorted({
+                    item["id"] for case in cases for item in case["existing_predictions"]
+                } - set(retained)),
+                "assessments": assessments, "response_chars": len(raw or ""),
+                "elapsed_ms": round((time.monotonic() - started_at) * 1000, 2),
+            })
+            return predictions, retained, assessments
         except Exception as exc:
             self._log_prediction_response_failure(
                 "updated", raw=raw, error=exc, cases=cases, states=states,
@@ -596,6 +701,9 @@ class UserPrediction:
         """Read unexpired, unresolved hypotheses; no delivery decision here."""
         owner_id = self._db.get_entity_id_by_name(self._owner_name)
         if owner_id is None:
+            self._log_event("active_predictions_read", {
+                "reason": "world_owner_missing", "prediction_ids": prediction_ids,
+            }, level=logging.DEBUG)
             return []
         reference = self._now(as_of)
         if prediction_ids is None:
@@ -609,6 +717,11 @@ class UserPrediction:
             ending = self._as_datetime(row.get("window_end"), reference)
             if (row.get("user_entity_id") != owner_id or row.get("status") != "pending"
                     or ending is None or ending <= reference):
+                self._log_event("active_prediction_skipped", {
+                    "prediction_id": row["id"], "reason": "owner_status_or_window_invalid",
+                    "status": row.get("status"), "window_end": row.get("window_end"),
+                    "as_of": reference.isoformat(),
+                }, level=logging.DEBUG)
                 continue
             basis = row.get("basis") or {}
             intent_basis = basis.get("intent") or {}
@@ -618,6 +731,9 @@ class UserPrediction:
                 state_basis = basis["recurring_states"]
                 state_ids = [int(state["id"]) for state in state_basis]
             except (KeyError, TypeError, ValueError):
+                self._log_event("active_prediction_skipped", {
+                    "prediction_id": row["id"], "reason": "invalid_basis",
+                }, level=logging.DEBUG)
                 continue
             intent = self._db.get_intent_object(
                 object_type=intent_type, object_id=intent_id,
@@ -625,6 +741,11 @@ class UserPrediction:
             if (not intent or intent.get("status") not in self.ACTIVE_INTENT_STATUSES.get(intent_type, set())
                     or int(intent.get("world_owner_entity_id") or 0) != owner_id
                     or int(intent.get("primary_entity_id") or 0) != owner_id):
+                self._log_event("active_prediction_skipped", {
+                    "prediction_id": row["id"], "intent_id": intent_id,
+                    "reason": "source_intent_missing_inactive_or_foreign",
+                    "intent_status": intent.get("status") if intent else None,
+                }, level=logging.DEBUG)
                 continue
             states = {int(item["id"]): item for item in self._model_db.get_user_states_by_ids(state_ids)}
             if any(
@@ -637,8 +758,16 @@ class UserPrediction:
                 )
                 for state_id, source in zip(state_ids, state_basis)
             ):
+                self._log_event("active_prediction_skipped", {
+                    "prediction_id": row["id"], "state_ids": state_ids,
+                    "reason": "supporting_state_missing_changed_inactive_or_expired",
+                }, level=logging.DEBUG)
                 continue
             current.append(row)
+        self._log_event("active_predictions_read", {
+            "as_of": reference.isoformat(), "requested_prediction_ids": prediction_ids,
+            "loaded_count": len(rows), "active_prediction_ids": [row["id"] for row in current],
+        }, level=logging.DEBUG)
         return current
 
     def record_prediction_outcome(
@@ -652,6 +781,11 @@ class UserPrediction:
             "observed_at": self._now(observed_at).isoformat(),
             "evidence_refs": list(evidence_refs or []), "note": str(note),
         }
-        return self._model_db.record_user_prediction_outcome(
+        changed = self._model_db.record_user_prediction_outcome(
             prediction_id=prediction_id, outcome_status=status, outcome=outcome,
         )
+        self._log_event("prediction_outcome_recorded", {
+            "prediction_id": prediction_id, "status": status, "changed": changed,
+            "outcome": outcome,
+        })
+        return changed
