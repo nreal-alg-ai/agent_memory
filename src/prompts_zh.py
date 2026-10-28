@@ -961,7 +961,9 @@ existing_states：{existing_states}
 """
 
 
-USER_PREDICTION_NEAR_TERM_PREPARATION_PROMPT_ZH = """你是个人世界模型的预测生成模块。本次只处理新建 user_intent 的 cases。每个 case 以 current_intent 为主体，intent_events 记录来源事件，existing_predictions 是已有关联预测（通常为空）。结合当前 intent 和可选周期状态，对每个有依据、值得评估的行为方向分别判断：现在预测、推迟评估，还是当前无需预测。只有现在值得预测时，才生成指定预测窗口内可能发生的准备行为。不裁决旧预测，也不输出旧预测操作或保留 ID 列表。
+USER_PREDICTION_NEAR_TERM_PREPARATION_PROMPT_ZH = """你是个人世界模型的预测生成模块。本次只处理新建 user_intent 的 cases。每个 case 以 current_intent 为主体，intent_events 记录来源事件，related_facts 提供该 intent 直接关联的事实，existing_predictions 是已有关联预测（通常为空）。结合当前 intent、相关事实和可选周期状态，对每个有依据、值得评估的行为方向分别判断：现在预测、推迟评估，还是当前无需预测。只有现在值得预测时，才生成指定预测窗口内可能发生的准备行为。不裁决旧预测，也不输出旧预测操作或保留 ID 列表。
+
+related_facts 仅来自该 intent 的直接事实证据关联，不是全量历史检索。每条包含 fact_id、summary、event_time_key（事实描述的事件时间）和 dialogue_time_key（相关对话的记录时间）。用它们识别本次事项的准备进展、前置条件、实际约束和未知信息：明确已完成的同一次准备，不应再次预测为未来行为；若新需求要求重新准备，应依据新证据判断。核对事项、版本和时间，不把另一次活动的完成记录套用于本次事项，也不能用历史事实中的旧日期、地点覆盖 current_intent 的最新安排。时间缺失时保留不确定性；缺少相关 fact 不代表用户尚未准备或没有行动。
 
 prediction_results 为扁平列表，每个元素只评估一个行为方向，不再为每个 intent 包装一组预测。同一个 intent 可以产生多个条目，各自选择不同 decision；例如，有证据支持现在确认交通，同时有依据将晚间整理材料推迟评估。同一个行为方向本轮只能出现一次。只输出证据支持、值得评估的方向，不穷举通用准备清单，不为覆盖每个 intent 或凑齐三种 decision 而编造行为。没有值得评估的方向时返回 prediction_results=[]。
 
@@ -1021,9 +1023,11 @@ prediction_results 为扁平列表，每个元素只评估一个行为方向，�
 """
 
 
-USER_PREDICTION_INTENT_UPDATE_PROMPT_ZH = """你是个人世界模型的预测更新模块。本次只处理发生变化的 user_intent。结合当前 intent、变化事件、已有预测和可选周期状态，保留仍有效的已有预测，并对每个有依据、值得评估的行为方向分别判断：现在预测、推迟评估，还是当前无需预测。
+USER_PREDICTION_INTENT_UPDATE_PROMPT_ZH = """你是个人世界模型的预测更新模块。本次只处理发生变化的 user_intent。结合当前 intent、变化事件、直接关联的 related_facts、已有预测和可选周期状态，保留仍有效的已有预测，并对每个有依据、值得评估的行为方向分别判断：现在预测、推迟评估，还是当前无需预测。
 
 prediction 是关于用户可能行为的可检验假设，不是事实、安排的复述或助手应该做的事。每个 case 的 current_intent 是数据库当前最终内容，intent_events 提供变化前后信息；existing_predictions 是当前 case 关联的待处理预测，其 basis 是最初生成依据。不得用中间事件覆盖当前状态。recurring_states 是可选辅助证据，不要求每个新预测必须引用。
+
+related_facts 仅来自该 intent 的直接事实证据关联，不是全量历史检索。每条包含 fact_id、summary、event_time_key（事实描述的事件时间）和 dialogue_time_key（相关对话的记录时间）。结合事实判断本次准备的进展、前置条件及实际约束；明确已完成的同一次准备，不应再次生成未来准备预测，新要求导致需要重做时除外。核对事项、材料版本和时间，不把另一次活动的完成记录套用于当前事项，也不能用旧事实覆盖 current_intent 的最新日期、地点和状态。时间缺失时保留不确定性；缺少记录不代表没有行动。事实可影响本次评估，但本次输出仍只处理预测保留及新的行为评估，不输出真实行为确认或反驳的验证结果。
 
 一、保留仍有效的已有预测
 顶层 retained_prediction_ids 为本次全部输入 cases 中仍有效的已有预测 ID 列表。必须审查每个 case 的 existing_predictions：

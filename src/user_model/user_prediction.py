@@ -135,6 +135,22 @@ class UserPrediction:
         ):
             raise ValueError("Prediction events must refer to the world owner's intents")
         intents = [self._intent_snapshot(intent) for intent in rows]
+        fact_ids_by_intent = {}
+        for intent in intents:
+            key = (intent["object_type"], intent["id"])
+            # Query each intent separately so the shared query limit cannot starve another case.
+            fact_ids_by_intent[intent["id"]] = self._db.get_intent_evidence_fact_ids([key]).get(key, [])
+        fact_ids = sorted({fact_id for ids in fact_ids_by_intent.values() for fact_id in ids})
+        related_facts = {}
+        for fact in self._db.get_memory_facts_by_ids(fact_ids) if fact_ids else []:
+            observed_at = self._as_datetime(fact.get("dialogue_time_key"), as_of)
+            if observed_at is not None and observed_at > as_of:
+                continue
+            related_facts[int(fact["id"])] = {
+                "fact_id": int(fact["id"]), "summary": fact.get("summary") or "",
+                "event_time_key": fact.get("event_time_key") or "",
+                "dialogue_time_key": fact.get("dialogue_time_key") or "",
+            }
         existing = self._model_db.get_user_predictions_by_intent_ids(
             intent_ids, statuses=["pending"], user_entity_id=owner_id,
         )
@@ -155,6 +171,9 @@ class UserPrediction:
                     event["event_type"] == "updated" for event in related_events
                 ) else "created",
                 "current_intent": intent, "intent_events": related_events,
+                "related_facts": [related_facts[fact_id]
+                                  for fact_id in fact_ids_by_intent[intent["id"]]
+                                  if fact_id in related_facts],
                 "existing_predictions": [prediction for prediction in existing
                                          if prediction["id"] in links.get(intent["id"], set())],
             })
@@ -230,6 +249,7 @@ class UserPrediction:
             "intent_cases": [{
                 "event_type": case["event_type"], "current_intent": case["current_intent"],
                 "intent_event_ids": [item["id"] for item in case["intent_events"]],
+                "related_facts": case["related_facts"],
                 "existing_prediction_ids": [item["id"] for item in case["existing_predictions"]],
             } for case in snapshot["intent_cases"]],
             "recurring_states": states,
@@ -392,6 +412,7 @@ class UserPrediction:
             "intent_cases": [{
                 "current_intent": case["current_intent"],
                 "intent_event_ids": [event["id"] for event in case["intent_events"]],
+                "related_facts": case.get("related_facts", []),
                 "existing_prediction_ids": [item["id"] for item in case["existing_predictions"]],
             } for case in cases],
             "allowed_state_ids": [state["id"] for state in states],

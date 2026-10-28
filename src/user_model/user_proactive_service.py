@@ -154,21 +154,10 @@ class UserProactiveService:
             "prompt_language": "zh" if chinese else "en", "prompt_chars": len(prompt),
             "runtime_context": runtime_context, "agent_capabilities": agent_capabilities,
         })
-        self._log_event("llm_request", {
-            "prediction_id": prediction_id, "prompt": prompt,
-        }, level=logging.DEBUG)
         raw = None
         try:
             raw = self._llm_client.call_llm(prompt)
-            self._log_event("llm_response", {
-                "prediction_id": prediction_id, "raw_response": raw,
-            }, level=logging.DEBUG)
             parsed = self._llm_client.parse_json_object_from_llm_text(raw or "")
-            self._log_event("llm_finished", {
-                "prediction_id": prediction_id, "response_chars": len(raw or ""),
-                "parse_status": "object" if isinstance(parsed, dict) else "invalid_or_empty",
-                "elapsed_ms": round((time.monotonic() - started_at) * 1000, 2),
-            })
             if not isinstance(parsed, dict):
                 self._logger.error(
                     "proactive service invalid JSON prediction_id=%s response=%r", prediction_id, raw,
@@ -327,7 +316,7 @@ class UserProactiveService:
     ) -> Dict[str, Any]:
         """Persist service opportunities; ready does not mean dispatched or delivered."""
         started_at = time.monotonic()
-        self._log_event("start", {
+        self._log_event("proactive_services_generation_start", {
             "prediction_ids": prediction_ids, "source_prediction_task_id": source_prediction_task_id,
             "reference_timestamp": reference_timestamp,
             "runtime_context": runtime_context, "agent_capabilities": agent_capabilities,

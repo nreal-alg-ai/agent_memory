@@ -85,9 +85,9 @@ class UserStateResolver:
     }
     EVIDENCE_ROLES = {"support", "change_trigger", "counterexample", "context"}
 
-    CLAIM_STATE_TASK_KIND = "memory_user_claim_state_update"
-    ACTIVITY_STATE_TASK_KIND = "memory_user_activity_state_update"
-    OBSERVED_PATTERN_STATE_TASK_KIND = "memory_user_observed_pattern_state_update"
+    USER_STATE_UPDATE_FROM_USER_CLAIMS_TASK_KIND = "user_state_update_from_user_claims"
+    USER_STATE_UPDATE_FROM_USER_ACTIVITIES_TASK_KIND = "user_state_update_from_user_activities"
+    USER_STATE_UPDATE_FROM_USER_OBSERVED_PATTERNS_TASK_KIND = "user_state_update_from_user_observed_patterns"
 
     def __init__(
         self,
@@ -115,22 +115,22 @@ class UserStateResolver:
             or "source"
         ).strip().lower()
         task_scheduler.register_handler(
-            self.CLAIM_STATE_TASK_KIND,
-            self.process_user_claim_state_update_task,
+            self.USER_STATE_UPDATE_FROM_USER_CLAIMS_TASK_KIND,
+            self.process_user_state_update_from_user_claims_task,
         )
         task_scheduler.register_handler(
-            self.ACTIVITY_STATE_TASK_KIND,
-            self.process_user_activity_state_update_task,
+            self.USER_STATE_UPDATE_FROM_USER_ACTIVITIES_TASK_KIND,
+            self.process_user_state_update_from_user_activities_task,
         )
         task_scheduler.register_handler(
-            self.OBSERVED_PATTERN_STATE_TASK_KIND,
-            self.process_user_observed_pattern_state_update_task,
+            self.USER_STATE_UPDATE_FROM_USER_OBSERVED_PATTERNS_TASK_KIND,
+            self.process_user_state_update_from_user_observed_patterns_task,
         )
 
     def set_logger(self, logger: Optional[logging.Logger]) -> None:
         self._logger = logger or logging.getLogger(__name__)
 
-    def process_user_activity_state_update_task(
+    def process_user_state_update_from_user_activities_task(
         self,
         *,
         changed_user_activity_ids: Optional[Sequence[int]] = None,
@@ -149,7 +149,7 @@ class UserStateResolver:
                 "status": "empty", "activity_count": 0,
                 "operation_count": 0, "state_ids": [],
             }
-            self._log_update(result, task_kind=self.ACTIVITY_STATE_TASK_KIND)
+            self._log_update(result, task_kind=self.USER_STATE_UPDATE_FROM_USER_ACTIVITIES_TASK_KIND)
             return result
         activity_timestamps = [
             str(item.get("ended_at") or item.get("started_at") or "").strip()
@@ -295,7 +295,7 @@ class UserStateResolver:
         }
         if not isinstance(parsed, Mapping) or not isinstance(parsed.get("operations"), list):
             report.update({"status": "error", "error": "invalid_llm_activity_state_response"})
-            self._log_update(report, task_kind=self.ACTIVITY_STATE_TASK_KIND)
+            self._log_update(report, task_kind=self.USER_STATE_UPDATE_FROM_USER_ACTIVITIES_TASK_KIND)
             return report
 
         existing_by_id = {int(item["id"]): item for item in existing_states}
@@ -366,7 +366,7 @@ class UserStateResolver:
 
         if not operations:
             report["status"] = "ok"
-            self._log_update(report, task_kind=self.ACTIVITY_STATE_TASK_KIND)
+            self._log_update(report, task_kind=self.USER_STATE_UPDATE_FROM_USER_ACTIVITIES_TASK_KIND)
             return report
         with self._user_model_db.transaction():
             applied = self.save_user_state_update_operations(
@@ -376,10 +376,10 @@ class UserStateResolver:
             )
         report.update(applied)
         report["status"] = "ok"
-        self._log_update(report, task_kind=self.ACTIVITY_STATE_TASK_KIND)
+        self._log_update(report, task_kind=self.USER_STATE_UPDATE_FROM_USER_ACTIVITIES_TASK_KIND)
         return report
 
-    def process_user_observed_pattern_state_update_task(
+    def process_user_state_update_from_user_observed_patterns_task(
         self,
         *,
         new_pattern_ids: Optional[Sequence[int]] = None,
@@ -391,7 +391,7 @@ class UserStateResolver:
         owner_id = int(self._user_memory_db.add_entity_names([self._world_owner_entity_name])[
             self._world_owner_entity_name
         ])
-        update_inputs = self._build_user_observed_pattern_update_inputs(
+        update_inputs = self._build_user_update_inputs_using_observed_pattern(
             world_owner_entity_id=owner_id,
             new_pattern_ids=new_pattern_ids or [],
             pattern_relation_event_ids=pattern_relation_event_ids or [],
@@ -564,7 +564,7 @@ class UserStateResolver:
             "error" if failed == len(domains) and domains
             else "partial" if failed else "ok" if domains else "empty"
         )
-        self._log_update(report, task_kind=self.OBSERVED_PATTERN_STATE_TASK_KIND)
+        self._log_update(report, task_kind=self.USER_STATE_UPDATE_FROM_USER_OBSERVED_PATTERNS_TASK_KIND)
         return report
 
     def _resolve_prompt_language(self, text: str) -> str:
@@ -583,7 +583,7 @@ class UserStateResolver:
             json.dumps(record, ensure_ascii=False, sort_keys=False, indent=2, default=str),
         )
 
-    def _build_user_observed_pattern_update_inputs(
+    def _build_user_update_inputs_using_observed_pattern(
         self, *, world_owner_entity_id: int, new_pattern_ids: Sequence[int],
         pattern_relation_event_ids: Sequence[int], reference_time: Optional[Any],
     ) -> Dict[str, Any]:
@@ -794,7 +794,7 @@ class UserStateResolver:
             "domains": domains,
         }
 
-    def _build_user_claim_update_inputs(
+    def _build_user_update_inputs_using_claim(
         self, *, world_owner_entity_id: int, new_claim_ids: Sequence[int],
         claim_relations: Sequence[Mapping[str, Any]],
         reference_time: Optional[Any],
@@ -1233,7 +1233,7 @@ class UserStateResolver:
                 })
         return decisions
 
-    def process_user_claim_state_update_task(
+    def process_user_state_update_from_user_claims_task(
         self,
         *,
         new_claim_ids: Optional[Sequence[int]] = None,
@@ -1246,7 +1246,7 @@ class UserStateResolver:
         world_owner_entity_id = int(self._user_memory_db.add_entity_names([self._world_owner_entity_name])[
             self._world_owner_entity_name
         ])
-        update_inputs = self._build_user_claim_update_inputs(
+        update_inputs = self._build_user_update_inputs_using_claim(
             world_owner_entity_id=world_owner_entity_id,
             new_claim_ids=new_claim_ids,
             claim_relations=list(claim_relations or []),
@@ -1365,7 +1365,7 @@ class UserStateResolver:
         )
         if failed_count:
             report["failed_domain_count"] = failed_count
-        self._log_update(report, task_kind=self.CLAIM_STATE_TASK_KIND)
+        self._log_update(report, task_kind=self.USER_STATE_UPDATE_FROM_USER_CLAIMS_TASK_KIND)
         return report
 
     def save_user_state_update_operations(

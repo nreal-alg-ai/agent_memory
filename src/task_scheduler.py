@@ -244,9 +244,9 @@ class TaskOperationReporter:
             "memory_user_claim_update",
             "memory_user_observed_pattern_update",
             "memory_user_intent_update",
-            "memory_user_claim_state_update",
-            "memory_user_activity_state_update",
-            "memory_user_observed_pattern_state_update",
+            "user_state_update_from_user_claims",
+            "user_state_update_from_user_activities",
+            "user_state_update_from_user_observed_patterns",
             "user_prediction_update_from_intent_events",
             "user_proactive_policy_evaluation",
         }:
@@ -347,9 +347,9 @@ class TaskScheduler:
             "memory_user_intent_update": self._config_bool(
                 settings.get("enable_memory_user_intent_update"), True,
             ),
-            "memory_user_claim_state_update": user_state_updates_enabled,
-            "memory_user_activity_state_update": user_state_updates_enabled,
-            "memory_user_observed_pattern_state_update": user_state_updates_enabled,
+            "user_state_update_from_user_claims": user_state_updates_enabled,
+            "user_state_update_from_user_activities": user_state_updates_enabled,
+            "user_state_update_from_user_observed_patterns": user_state_updates_enabled,
             "user_prediction_update_from_intent_events": self._config_bool(
                 settings.get("enable_user_prediction"), True,
             ),
@@ -929,7 +929,7 @@ class TaskScheduler:
             "reference_timestamp": reference_timestamp,
         }
         report = self.submit(
-            "memory_user_claim_state_update",
+            "user_state_update_from_user_claims",
             state_payload,
             completion_context={
                 "claim_state_window_versions": versions,
@@ -1005,8 +1005,8 @@ class TaskScheduler:
             "memory_user_claim_update": self._postprocess_user_claim_update_task,
             "memory_user_observed_pattern_update": self._postprocess_fact_followup_task,
             "memory_user_intent_update": self._postprocess_fact_followup_task,
-            "memory_user_claim_state_update": (
-                self._postprocess_user_claim_state_update_task
+            "user_state_update_from_user_claims": (
+                self._postprocess_user_state_update_from_user_claims_task
             ),
             "user_prediction_update_from_intent_events": self._postprocess_user_prediction_task,
         }
@@ -1028,8 +1028,8 @@ class TaskScheduler:
                 self._schedule_after_user_observed_pattern_update_task
             ),
             "memory_user_intent_update": self._schedule_after_user_intent_update_task,
-            "memory_user_claim_state_update": (
-                self._schedule_after_user_claim_state_update_task
+            "user_state_update_from_user_claims": (
+                self._schedule_after_user_state_update_from_user_claims_task
             ),
             "user_prediction_update_from_intent_events": self._schedule_after_user_prediction_task,
         }
@@ -1083,7 +1083,7 @@ class TaskScheduler:
             "runtime_context": {},
         }
         self.submit(
-            "memory_user_activity_state_update",
+            "user_state_update_from_user_activities",
             payload,
             report_payload={
                 "changed_user_activity_ids": payload["changed_user_activity_ids"],
@@ -1148,7 +1148,7 @@ class TaskScheduler:
                 prediction_ids, report.get("reason") or "unknown",
             )
 
-    def _postprocess_user_claim_state_update_task(
+    def _postprocess_user_state_update_from_user_claims_task(
         self, event: Dict[str, Any],
     ) -> Dict[str, Any]:
         context = event.get("completion_context") or {}
@@ -1187,7 +1187,7 @@ class TaskScheduler:
             "force_requested": force_requested,
         }
 
-    def _schedule_after_user_claim_state_update_task(
+    def _schedule_after_user_state_update_from_user_claims_task(
         self, event: Dict[str, Any], completion: Dict[str, Any],
     ) -> None:
         context = event.get("completion_context") or {}
@@ -1241,7 +1241,7 @@ class TaskScheduler:
                     "reference_timestamp": result.get("reference_timestamp"),
                 }
                 self.submit(
-                    "memory_user_observed_pattern_state_update", payload,
+                    "user_state_update_from_user_observed_patterns", payload,
                     report_payload={
                         "new_pattern_ids": new_pattern_ids,
                         "pattern_relation_event_ids": pattern_relation_event_ids,

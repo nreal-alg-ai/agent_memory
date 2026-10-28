@@ -507,9 +507,9 @@ def build_sample_memory_context(
                 for kind in (
                     "memory_user_claim_update",
                     "memory_user_intent_update",
-                    "memory_user_claim_state_update",
-                    "memory_user_activity_state_update",
-                    "memory_user_observed_pattern_state_update",
+                    "user_state_update_from_user_claims",
+                    "user_state_update_from_user_activities",
+                    "user_state_update_from_user_observed_patterns",
                 )
             ]
             replay_stats = LocomoReplayStats(
