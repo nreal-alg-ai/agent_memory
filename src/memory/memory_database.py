@@ -274,6 +274,41 @@ class UserMemoryDB:
                 updated_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS memory_user_threads (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                creation_key TEXT NOT NULL UNIQUE,
+                title TEXT NOT NULL CHECK(length(trim(title)) > 0),
+                identity_description TEXT NOT NULL,
+                current_summary TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('active', 'closed')),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS memory_user_thread_links (
+                thread_id INTEGER NOT NULL REFERENCES memory_user_threads(id),
+                object_type TEXT NOT NULL CHECK(object_type IN ('user_activity', 'fact')),
+                object_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY(thread_id, object_type, object_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_user_thread_links_object
+                ON memory_user_thread_links(object_type, object_id);
+            CREATE TABLE IF NOT EXISTS memory_user_thread_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                thread_id INTEGER NOT NULL REFERENCES memory_user_threads(id),
+                event_key TEXT NOT NULL UNIQUE,
+                event_type TEXT NOT NULL CHECK(event_type IN
+                    ('progress', 'change', 'blocked', 'resolved', 'closed', 'reopened')),
+                summary TEXT NOT NULL CHECK(length(trim(summary)) > 0),
+                evidence_activity_ids TEXT NOT NULL DEFAULT '[]',
+                evidence_fact_ids TEXT NOT NULL DEFAULT '[]',
+                occurred_at TEXT,
+                known_at TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_user_thread_events_thread
+                ON memory_user_thread_events(thread_id, id);
+
             CREATE TABLE IF NOT EXISTS memory_source_segments (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 processed_for_user_activity INTEGER NOT NULL DEFAULT 0,
@@ -938,6 +973,123 @@ class UserMemoryDB:
                 item["metadata"] = {}
             result.append(item)
         return result
+
+    def get_user_threads_by_ids(self, thread_ids: Sequence[int]) -> List[Dict[str, Any]]:
+        ids = list(dict.fromkeys(int(value) for value in thread_ids))
+        if not ids:
+            return []
+        rows = self._conn.execute(
+            f"SELECT * FROM memory_user_threads WHERE id IN ({','.join('?' for _ in ids)})",
+            ids,
+        ).fetchall()
+        by_id = {int(row['id']): dict(row) for row in rows}
+        return [by_id[value] for value in ids if value in by_id]
+
+    def search_user_threads(
+        self, terms: Sequence[str], *, activity_id: int, limit: int = 12,
+    ) -> List[Dict[str, Any]]:
+        """Recall identities, not membership decisions; include closed lexical matches.
+
+        Existing activity links take precedence on retries. A small recent-active
+        fallback handles references whose project name is omitted from the activity.
+        """
+        limit = max(1, int(limit))
+        linked = self._conn.execute(
+            "SELECT t.* FROM memory_user_threads t JOIN memory_user_thread_links l "
+            "ON t.id=l.thread_id WHERE l.object_type='user_activity' AND l.object_id=? "
+            "ORDER BY t.id DESC LIMIT ?", (activity_id, limit),
+        ).fetchall()
+        normalized_terms = self._normalize_search_terms(terms)
+        matched = []
+        if normalized_terms:
+            text_column = "lower(title || ' ' || identity_description || ' ' || current_summary)"
+            conditions = [f"{text_column} LIKE ? ESCAPE '\\'" for _ in normalized_terms]
+            parameters = [
+                '%' + term.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_') + '%'
+                for term in normalized_terms
+            ]
+            matched = self._conn.execute(
+                "SELECT * FROM memory_user_threads WHERE " + ' OR '.join(conditions)
+                + " ORDER BY (" + ' + '.join(f"({condition})" for condition in conditions)
+                + ") DESC, updated_at DESC, id DESC LIMIT ?",
+                [*parameters, *parameters, limit],
+            ).fetchall()
+        recent = self._conn.execute(
+            "SELECT * FROM memory_user_threads WHERE status='active' "
+            "ORDER BY updated_at DESC, id DESC LIMIT ?", (min(3, limit),),
+        ).fetchall()
+        by_id = {}
+        for row in [*linked, *matched, *recent]:
+            by_id.setdefault(int(row['id']), dict(row))
+        return list(by_id.values())[:limit]
+
+    def get_user_thread_events(self, thread_id: int, *, limit: int = 16) -> List[Dict[str, Any]]:
+        """Bound prompt context only; stored history is never truncated."""
+        rows = self._conn.execute(
+            "SELECT * FROM memory_user_thread_events WHERE thread_id=? "
+            "ORDER BY id DESC LIMIT ?", (int(thread_id), max(1, int(limit))),
+        ).fetchall()
+        return [self._row_to_dict(row) for row in reversed(rows)]
+
+    def save_user_thread(
+        self, *, thread_id: Optional[int], creation_key: str,
+        title: str, identity_description: str, current_summary: str, status: str,
+    ) -> int:
+        now = local_now_text()
+        if thread_id is None:
+            self._conn.execute(
+                "INSERT INTO memory_user_threads "
+                "(creation_key,title,identity_description,current_summary,status,created_at,updated_at) "
+                "VALUES (?,?,?,?,?,?,?) ON CONFLICT(creation_key) DO NOTHING",
+                (creation_key, title, identity_description, current_summary, status, now, now),
+            )
+            thread_id = int(self._conn.execute(
+                "SELECT id FROM memory_user_threads WHERE creation_key=?", (creation_key,),
+            ).fetchone()['id'])
+        else:
+            cursor = self._conn.execute(
+                "UPDATE memory_user_threads SET title=?,identity_description=?,current_summary=?,"
+                "status=?,updated_at=? WHERE id=?",
+                (title, identity_description, current_summary, status, now, int(thread_id)),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError(f'Unknown user thread: {thread_id}')
+        self._commit_if_needed()
+        return int(thread_id)
+
+    def link_user_thread_evidence(
+        self, thread_id: int, *, activity_ids: Sequence[int], fact_ids: Sequence[int],
+    ) -> None:
+        now = local_now_text()
+        self._conn.executemany(
+            "INSERT OR IGNORE INTO memory_user_thread_links "
+            "(thread_id,object_type,object_id,created_at) VALUES (?,?,?,?)",
+            [(int(thread_id), object_type, int(value), now)
+             for object_type, ids in (('user_activity', activity_ids), ('fact', fact_ids))
+             for value in set(ids)],
+        )
+        self._commit_if_needed()
+
+    def insert_user_thread_event(
+        self, thread_id: int, *, event_type: str, summary: str,
+        evidence_activity_ids: Sequence[int], evidence_fact_ids: Sequence[int],
+        occurred_at: Optional[str], known_at: str,
+    ) -> Optional[int]:
+        # Retry-safe for the same grounded delta; different evidence remains auditable.
+        activity_ids = sorted(set(evidence_activity_ids))
+        fact_ids = sorted(set(evidence_fact_ids))
+        event_key = hashlib.sha256(_json_dumps([
+            thread_id, event_type, summary.strip(), activity_ids, fact_ids, occurred_at,
+        ]).encode('utf-8')).hexdigest()
+        cursor = self._conn.execute(
+            "INSERT OR IGNORE INTO memory_user_thread_events "
+            "(thread_id,event_key,event_type,summary,evidence_activity_ids,evidence_fact_ids,"
+            "occurred_at,known_at,created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+            (thread_id, event_key, event_type, summary.strip(), _json_dumps(activity_ids),
+             _json_dumps(fact_ids), occurred_at, known_at, local_now_text()),
+        )
+        self._commit_if_needed()
+        return int(cursor.lastrowid) if cursor.rowcount else None
 
     def insert_memory_source_segments(
         self,
@@ -3671,6 +3823,7 @@ class UserMemoryDB:
             "previous_payload",
             "new_payload",
             "evidence_fact_ids",
+            "evidence_activity_ids",
             "fact_ids",
             "source_segment_ids",
         ):

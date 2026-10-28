@@ -241,6 +241,7 @@ class TaskOperationReporter:
         if operation_type in {
             "memory_flush_fact_followups",
             "memory_user_activity_extraction",
+            "memory_user_thread_update",
             "memory_user_claim_update",
             "memory_user_observed_pattern_update",
             "memory_user_intent_update",
@@ -338,6 +339,9 @@ class TaskScheduler:
             settings.get("enable_memory_user_state_update"), True,
         )
         self._task_enabled = {
+            "memory_user_thread_update": self._config_bool(
+                settings.get("enable_memory_user_thread_update"), True,
+            ),
             "memory_user_claim_update": self._config_bool(
                 settings.get("enable_memory_user_claim_update"), True,
             ),
@@ -593,6 +597,17 @@ class TaskScheduler:
             }
             if self._queue.full():
                 return self._reject_locked(task_kind, task_id, "worker_queue_full")
+            if task_kind == "memory_user_thread_update":
+                if self._task_execution_db is None:
+                    return self._reject_locked(task_kind, task_id, "task_execution_database_unavailable")
+                activity_ids = task_payload.get("activity_ids")
+                if activity_ids is None:
+                    activity_ids = self._task_execution_db.pending_user_thread_activity_ids()
+                task_payload["activity_ids"] = self._task_execution_db.reserve_user_thread_activities(
+                    activity_ids, task_id=task_id,
+                )
+                if not task_payload["activity_ids"]:
+                    return self._reject_locked(task_kind, task_id, "no_pending_activities")
             signal_target = self._SIGNAL_TASK_TARGETS.get(task_kind)
             if signal_target is not None:
                 signal_ids = task_payload.get("signal_ids") or []
@@ -1002,6 +1017,8 @@ class TaskScheduler:
         task_kind = str(event.get("task_kind") or "")
         postprocessors = {
             "memory_fact_extraction": self._postprocess_fact_extraction_task,
+            "memory_user_activity_extraction": self._postprocess_user_activity_task,
+            "memory_user_thread_update": self._postprocess_user_thread_update_task,
             "memory_user_claim_update": self._postprocess_user_claim_update_task,
             "memory_user_observed_pattern_update": self._postprocess_fact_followup_task,
             "memory_user_intent_update": self._postprocess_fact_followup_task,
@@ -1065,6 +1082,24 @@ class TaskScheduler:
             for task_kind in self._FACT_FOLLOWUP_TASK_KINDS:
                 self._schedule_fact_followup_if_eligible(task_kind)
 
+    def _postprocess_user_activity_task(self, event: Dict[str, Any]) -> None:
+        result = event.get("result")
+        if event.get("succeeded") and isinstance(result, dict) and self._task_execution_db:
+            self._task_execution_db.register_user_thread_activities(
+                result.get("user_activity_item_ids") or [],
+            )
+
+    def _postprocess_user_thread_update_task(self, event: Dict[str, Any]) -> None:
+        if self._task_execution_db is None:
+            return
+        result = event.get("result")
+        # Earlier batches may have committed even if a later batch failed.
+        completed = result.get("processed_activity_ids", []) if isinstance(result, dict) else []
+        self._task_execution_db.finish_user_thread_activities(
+            task_id=event["task_id"], activity_ids=event["payload"].get("activity_ids") or [],
+            completed_ids=completed,
+        )
+
     def _schedule_after_user_activity_task(
         self, event: Dict[str, Any], completion: Dict[str, Any],
     ) -> None:
@@ -1089,6 +1124,12 @@ class TaskScheduler:
                 "changed_user_activity_ids": payload["changed_user_activity_ids"],
             },
         )
+        # Preserve the original state-update ordering. Thread tracking is an
+        # independent UserMemory projection, not a prerequisite for that task.
+        if self._task_enabled["memory_user_thread_update"]:
+            report = self.submit("memory_user_thread_update", {})
+            if not report.get("queued"):
+                self._logger.warning("User thread update not queued: %s", report)
 
     def _postprocess_user_prediction_task(
         self, event: Dict[str, Any],

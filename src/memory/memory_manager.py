@@ -35,6 +35,7 @@ from embedding_client import EmbeddingClient
 from llm_client import LLMClient
 from .memory_database import UserMemoryDB
 from .memory_types import MemoryUnit
+from .user_thread_updater import UserThreadUpdater
 from task_scheduler import TaskScheduler
 from prompts_en import (
     DERIVED_USER_CLAIM_EXTRACTION_PROMPT_EN,
@@ -240,11 +241,21 @@ class MemoryNodeManager:
         )
         self._initialize_recall_config()
         self._embedding_client: Optional[EmbeddingClient] = None
+        self._user_thread_updater = UserThreadUpdater(
+            memory_db=self._db, llm_client=self._llm_client,
+            resolve_language=self._resolve_prompt_language_from_text, log=self._log_info,
+            batch_size=self._memory_cfg.get("user_thread_activity_batch_size", 8),
+            candidate_limit=self._memory_cfg.get("user_thread_candidate_limit", 12),
+            event_context_limit=self._memory_cfg.get("user_thread_event_context_limit", 16),
+        )
         self._task_scheduler.register_handler(
             "memory_fact_extraction", self._process_memory_fact_extraction_task,
         )
         self._task_scheduler.register_handler(
             "memory_user_activity_extraction", self._process_memory_user_activity_extraction_task,
+        )
+        self._task_scheduler.register_handler(
+            "memory_user_thread_update", self._process_memory_user_thread_update_task,
         )
         self._task_scheduler.register_handler(
             "memory_user_claim_update", self._process_memory_user_claim_update_task,
@@ -559,6 +570,14 @@ class MemoryNodeManager:
     def set_embedding_client(self, embedding_client: Optional[EmbeddingClient]) -> None:
         """Share a pre-initialized embedding client with memory runtime callers."""
         self._embedding_client = embedding_client
+
+    def _process_memory_user_thread_update_task(
+        self, *, activity_ids: List[int], reference_timestamp: Any = None,
+    ) -> Dict[str, Any]:
+        """Resolve activity membership first, then incrementally update matters."""
+        return self._user_thread_updater.process_update_task(
+            activity_ids=activity_ids, reference_timestamp=reference_timestamp,
+        )
 
     def _process_memory_user_activity_extraction_task(
         self,

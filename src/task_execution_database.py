@@ -97,6 +97,14 @@ class TaskExecutionDB:
                 event_id INTEGER PRIMARY KEY,
                 completed_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS user_thread_activity_progress (
+                activity_id INTEGER PRIMARY KEY,
+                status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK(status IN ('pending', 'queued', 'completed')),
+                run_id TEXT,
+                task_id TEXT,
+                updated_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS user_claim_signal_consolidation_task_info (
                 batch_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 source_task_id TEXT NOT NULL UNIQUE,
@@ -153,6 +161,10 @@ class TaskExecutionDB:
         # Queued tasks are process-local. Restore unfinished reservations after
         # a restart; rows with no pending IDs remain processed.
         with self._conn:
+            self._conn.execute(
+                "UPDATE user_thread_activity_progress SET status='pending',run_id=NULL,task_id=NULL "
+                "WHERE status='queued'"
+            )
             for signal_type, table in self._SIGNAL_BATCHES.items():
                 _, pending_column, processed_column = next(
                     columns for columns in self._PENDING_COLUMNS.values()
@@ -166,6 +178,54 @@ class TaskExecutionDB:
             signal_type: self._load_registered_signal_ids(table)
             for signal_type, table in self._SIGNAL_BATCHES.items()
         }
+
+    @_locked
+    def register_user_thread_activities(self, activity_ids: Sequence[int]) -> None:
+        """Register activity results even if their downstream task is disabled/full."""
+        with self._conn:
+            self._conn.executemany(
+                "INSERT OR IGNORE INTO user_thread_activity_progress(activity_id,updated_at) "
+                "VALUES (?,?)", [(value, _now()) for value in _ids(activity_ids)],
+            )
+
+    @_locked
+    def pending_user_thread_activity_ids(self) -> List[int]:
+        return [int(row['activity_id']) for row in self._conn.execute(
+            "SELECT activity_id FROM user_thread_activity_progress "
+            "WHERE status='pending' ORDER BY activity_id",
+        )]
+
+    @_locked
+    def reserve_user_thread_activities(
+        self, activity_ids: Sequence[int], *, task_id: str,
+    ) -> List[int]:
+        """Freeze unreserved activities; overlapping submissions cannot claim them twice."""
+        self.register_user_thread_activities(activity_ids)
+        reserved = []
+        with self._conn:
+            for value in _ids(activity_ids):
+                cursor = self._conn.execute(
+                    "UPDATE user_thread_activity_progress SET status='queued',run_id=?,"
+                    "task_id=?,updated_at=? WHERE activity_id=? AND status='pending'",
+                    (self._run_id, task_id, _now(), value),
+                )
+                if cursor.rowcount:
+                    reserved.append(value)
+        return reserved
+
+    @_locked
+    def finish_user_thread_activities(
+        self, *, task_id: str, activity_ids: Sequence[int], completed_ids: Sequence[int],
+    ) -> None:
+        completed = set(_ids(completed_ids)) & set(_ids(activity_ids))
+        with self._conn:
+            for value in _ids(activity_ids):
+                self._conn.execute(
+                    "UPDATE user_thread_activity_progress SET status=?,updated_at=? "
+                    "WHERE activity_id=? AND run_id=? AND task_id=? AND status='queued'",
+                    ('completed' if value in completed else 'pending', _now(),
+                     value, self._run_id, task_id),
+                )
 
     @_locked
     def close(self) -> None:
