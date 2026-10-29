@@ -14,13 +14,13 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Sequence
 
 from prompts_en import (
-    USER_ACTIVITY_STATE_UPDATE_PROMPT_EN,
+    USER_THREAD_STATE_UPDATE_PROMPT_EN,
     USER_CLAIM_STATUS_REVIEW_PROMPT_EN,
     USER_CLAIM_STATE_RESOLUTION_PROMPT_EN,
     USER_OBSERVED_PATTERN_STATE_UPDATE_PROMPT_EN,
 )
 from prompts_zh import (
-    USER_ACTIVITY_STATE_UPDATE_PROMPT_ZH,
+    USER_THREAD_STATE_UPDATE_PROMPT_ZH,
     USER_CLAIM_STATUS_REVIEW_PROMPT_ZH,
     USER_CLAIM_STATE_RESOLUTION_PROMPT_ZH,
     USER_OBSERVED_PATTERN_STATE_UPDATE_PROMPT_ZH,
@@ -34,7 +34,7 @@ if TYPE_CHECKING:
 
 
 class UserStateResolver:
-    """Turn new activity and changed claims into incremental user states."""
+    """Project claims, observed patterns, and thread changes into user states."""
 
     RESOLVER_VERSION = "user_state_incremental_v1"
     CLAIM_RESOLVER_VERSION = "user_claim_state_only_v1"
@@ -74,19 +74,14 @@ class UserStateResolver:
         },
     }
     OPERATIONS = {"create", "reinforce", "revise", "weaken", "expire"}
-    ACTIVE_INTENT_STATUSES = {
-        "goal": {"active"},
-        "plan": {"planned", "rescheduled"},
-        "work_item": {"open", "blocked"},
-    }
     EVIDENCE_TYPES = {
         "user_claim", "goal", "plan", "work_item", "user_activity", "fact",
-        "user_observed_pattern", "user_action_signal",
+        "user_observed_pattern", "user_action_signal", "user_thread", "user_thread_event",
     }
     EVIDENCE_ROLES = {"support", "change_trigger", "counterexample", "context"}
 
     USER_STATE_UPDATE_FROM_USER_CLAIMS_TASK_KIND = "user_state_update_from_user_claims"
-    USER_STATE_UPDATE_FROM_USER_ACTIVITIES_TASK_KIND = "user_state_update_from_user_activities"
+    USER_STATE_UPDATE_FROM_USER_THREADS_TASK_KIND = "user_state_update_from_user_threads"
     USER_STATE_UPDATE_FROM_USER_OBSERVED_PATTERNS_TASK_KIND = "user_state_update_from_user_observed_patterns"
 
     def __init__(
@@ -119,8 +114,8 @@ class UserStateResolver:
             self.process_user_state_update_from_user_claims_task,
         )
         task_scheduler.register_handler(
-            self.USER_STATE_UPDATE_FROM_USER_ACTIVITIES_TASK_KIND,
-            self.process_user_state_update_from_user_activities_task,
+            self.USER_STATE_UPDATE_FROM_USER_THREADS_TASK_KIND,
+            self.process_user_state_update_from_user_threads_task,
         )
         task_scheduler.register_handler(
             self.USER_STATE_UPDATE_FROM_USER_OBSERVED_PATTERNS_TASK_KIND,
@@ -130,253 +125,288 @@ class UserStateResolver:
     def set_logger(self, logger: Optional[logging.Logger]) -> None:
         self._logger = logger or logging.getLogger(__name__)
 
-    def process_user_state_update_from_user_activities_task(
-        self,
-        *,
-        changed_user_activity_ids: Optional[Sequence[int]] = None,
+    def _build_user_update_inputs_using_thread(
+        self, thread_changes: Sequence[Mapping[str, Any]], *,
         reference_timestamp: Optional[Any] = None,
         runtime_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Update situational states from a new activity window and linked evidence."""
-        activity_ids = list(changed_user_activity_ids or [])
-        reference_time = reference_timestamp
-        owner_id = int(self._user_memory_db.add_entity_names([self._world_owner_entity_name])[
-            self._world_owner_entity_name
-        ])
+        """Build thread-centered cases from fixed updates, not all thread history."""
+        changes_by_id: Dict[int, Dict[str, Any]] = {}
+        for change in thread_changes:
+            thread = dict(change["thread"])
+            thread_id = self._positive_int(thread.get("id"))
+            if not thread_id:
+                raise ValueError("Expected a positive thread ID")
+            if thread_id not in changes_by_id:
+                changes_by_id[thread_id] = {
+                    "thread": thread, "previous_thread": change.get("previous_thread"),
+                    "thread_event_ids": set(), "evidence_activity_ids": set(),
+                    "evidence_fact_ids": set(), "reference_time": change["reference_time"],
+                }
+            merged = changes_by_id[thread_id]
+            merged["thread"] = thread
+            merged["reference_time"] = change["reference_time"]
+            for field in ("thread_event_ids", "evidence_activity_ids", "evidence_fact_ids"):
+                merged[field].update(int(value) for value in change.get(field) or [])
+
+        event_ids = sorted({value for change in changes_by_id.values()
+                            for value in change["thread_event_ids"]})
+        if {int(thread["id"]) for thread in self._user_memory_db.get_user_threads_by_ids(
+            list(changes_by_id)
+        )} != set(changes_by_id):
+            raise ValueError("Unknown thread IDs")
+        events = self._user_memory_db.get_user_thread_events_by_ids(event_ids)
+        if {int(event["id"]) for event in events} != set(event_ids):
+            raise ValueError("Unknown thread change event IDs")
+        events_by_id = {int(event["id"]): event for event in events}
+        activity_ids = sorted({value for change in changes_by_id.values()
+                               for value in change["evidence_activity_ids"]})
         activities = self._user_memory_db.get_user_activity_items_by_ids(activity_ids)
-        if not activities:
-            result = {
-                "status": "empty", "activity_count": 0,
-                "operation_count": 0, "state_ids": [],
-            }
-            self._log_update(result, task_kind=self.USER_STATE_UPDATE_FROM_USER_ACTIVITIES_TASK_KIND)
-            return result
-        activity_timestamps = [
-            str(item.get("ended_at") or item.get("started_at") or "").strip()
-            for item in activities
-            if str(item.get("ended_at") or item.get("started_at") or "").strip()
-        ]
-        effective_reference_time = reference_time or (
-            max(activity_timestamps) if activity_timestamps else None
-        )
-
-        fact_ids = sorted({
-            int(fact_id)
-            for activity in activities
-            for fact_id in activity.get("evidence_fact_ids") or []
-            if self._positive_int(fact_id)
-        })
-        facts = self._user_memory_db.get_memory_facts_by_ids(fact_ids) if fact_ids else []
-        facts_by_id = {int(item["id"]): item for item in facts}
-        activity_fact_ids = {
-            int(activity["id"]): [
-                int(fact_id) for fact_id in activity.get("evidence_fact_ids") or []
-                if self._positive_int(fact_id) in facts_by_id
-            ]
-            for activity in activities
+        if {int(item["id"]) for item in activities} != set(activity_ids):
+            raise ValueError("Unknown thread activity evidence IDs")
+        activities_by_id = {int(item["id"]): item for item in activities}
+        fact_ids = sorted({value for change in changes_by_id.values()
+                           for value in change["evidence_fact_ids"]})
+        facts_by_id = {
+            int(item["id"]): item
+            for item in self._user_memory_db.get_memory_facts_by_ids(fact_ids)
         }
-        linked_fact_ids = sorted({
-            fact_id for values in activity_fact_ids.values() for fact_id in values
-        })
+        if set(facts_by_id) != set(fact_ids):
+            raise ValueError("Unknown thread fact evidence IDs")
 
-        related_intents: List[Dict[str, Any]] = []
-        intent_owner_columns = {
-            "goal": "owner_entity_id",
-            "plan": "actor_entity_id",
-            "work_item": "responsible_entity_id",
-        }
-        for object_type, active_statuses in self.ACTIVE_INTENT_STATUSES.items():
-            items = self._user_memory_db.get_intent_objects(
-                object_type=object_type,
-                world_owner_entity_id=owner_id,
-                statuses=sorted(active_statuses),
-                limit=self._update_limit,
-            )
-            owned_items = [
-                item for item in items
-                if int(item.get(intent_owner_columns[object_type]) or 0) == owner_id
-            ]
-            evidence_by_object = self._user_memory_db.get_intent_evidence_fact_ids(
-                [(object_type, int(item["id"])) for item in owned_items],
-                limit=max(120, self._update_limit * 4),
-            )
-            for item in owned_items:
-                key = (object_type, int(item["id"]))
-                supporting_fact_ids = evidence_by_object.get(key, [])
-                if not set(supporting_fact_ids).intersection(linked_fact_ids):
-                    continue
-                view = self._intent_prompt_view(object_type, item)
-                view["evidence_fact_ids"] = [
-                    int(value) for value in supporting_fact_ids
-                    if int(value) in facts_by_id
-                ]
-                related_intents.append(view)
-
-        existing_states = self._user_model_db.get_user_states(
-            state_types=["situational_state"],
-            statuses=["active", "weakened"],
-            limit=max(40, self._update_limit * 2),
+        states = self._user_model_db.get_user_states(
+            state_types=["situational_state"], statuses=["active", "weakened"],
+            limit=max(40, self._update_limit * 2), include_evidence=True,
         )
-        activity_views = [
-            {
-                "id": int(item["id"]),
-                "activity_text": str(item.get("activity_text") or ""),
-                "user_role": str(item.get("user_role") or ""),
-                "confidence": float(item.get("confidence") or 0.0),
-                "started_at": str(item.get("started_at") or ""),
-                "ended_at": str(item.get("ended_at") or ""),
-                "evidence_fact_ids": activity_fact_ids.get(int(item["id"]), []),
-            }
-            for item in activities
-        ]
-        fact_views = [
-            {
-                "id": int(item["id"]),
-                "fact_type": str(item.get("fact_type") or ""),
-                "summary": str(item.get("summary") or ""),
-                "fact_topic": str(item.get("fact_topic") or ""),
-                "event_time_key": str(item.get("event_time_key") or ""),
-                "dialogue_time_key": str(item.get("dialogue_time_key") or ""),
-                "entities": item.get("entities") or [],
-                "confidence": float(item.get("confidence") or 0.0),
-            }
-            for item in facts
-        ]
-        fact_views_by_id = {int(item["id"]): item for item in fact_views}
-        activity_cases = [
-            {
-                "activity": {
-                    key: value for key, value in activity.items()
-                    if key != "evidence_fact_ids"
-                },
-                "linked_facts": [
-                    fact_views_by_id[fact_id]
-                    for fact_id in activity["evidence_fact_ids"]
+        states_by_id = {int(state["id"]): state for state in states}
+        for state in self._user_model_db.get_user_states_for_thread_ids(list(changes_by_id)):
+            states_by_id[int(state["id"])] = state
+
+        cases = []
+        detailed_state_ids = set()
+        for thread_id, change in changes_by_id.items():
+            case_events = [events_by_id[value] for value in sorted(change["thread_event_ids"])]
+            if any(int(event["thread_id"]) != thread_id for event in case_events):
+                raise ValueError("Thread event belongs to another thread")
+            case_activities = [
+                activities_by_id[value] for value in sorted(change["evidence_activity_ids"])
+            ]
+            case_fact_ids = change["evidence_fact_ids"]
+            linked_facts = {int(value) for activity in case_activities
+                            for value in activity.get("evidence_fact_ids") or []}
+            if not case_fact_ids.issubset(linked_facts):
+                raise ValueError("Thread facts are not linked to the supplied activities")
+            for event in case_events:
+                if (not set(event["evidence_activity_ids"]).issubset(change["evidence_activity_ids"])
+                        or not set(event["evidence_fact_ids"]).issubset(case_fact_ids)):
+                    raise ValueError("Thread event evidence exceeds this update")
+
+            linked_state_ids = [
+                state_id for state_id, state in states_by_id.items()
+                if any(
+                    (item["evidence_type"] == "user_thread"
+                     and int(item["evidence_id"]) == thread_id)
+                    or (item["evidence_type"] == "fact"
+                        and int(item["evidence_id"]) in case_fact_ids)
+                    or (item["evidence_type"] == "user_activity"
+                        and int(item["evidence_id"]) in change["evidence_activity_ids"])
+                    for item in state.get("evidence_items") or []
+                )
+            ]
+            detailed_state_ids.update(linked_state_ids)
+            cases.append({
+                "thread": change["thread"], "previous_thread": change["previous_thread"],
+                "reference_time": str(change["reference_time"]),
+                "change_events": [
+                    {key: event.get(key) for key in (
+                        "id", "thread_id", "event_type", "summary", "occurred_at",
+                        "known_at", "evidence_activity_ids", "evidence_fact_ids",
+                    )} for event in case_events
                 ],
-            }
-            for activity in activity_views
-        ]
-        update_input = {
-            "reference_time": self._timestamp_text(effective_reference_time),
-            "runtime_context": dict(runtime_context or {}),
-            "activity_cases": activity_cases,
-            "related_intents": related_intents,
-            "existing_states": [self._state_prompt_view(item) for item in existing_states],
+                "activity_cases": [
+                    {
+                        "activity": {key: activity.get(key) for key in (
+                            "id", "activity_text", "user_role", "confidence",
+                            "started_at", "ended_at",
+                        )},
+                        "linked_facts": [
+                            {key: facts_by_id[int(value)].get(key) for key in (
+                                "id", "summary", "fact_topic", "event_time_key",
+                                "dialogue_time_key", "confidence",
+                            )}
+                            for value in activity.get("evidence_fact_ids") or []
+                            if int(value) in case_fact_ids
+                        ],
+                    } for activity in case_activities
+                ],
+                "linked_state_ids": linked_state_ids,
+            })
+        times = [str(change["reference_time"]) for change in changes_by_id.values()]
+        effective_time = reference_timestamp or (
+            max(times, key=lambda value: datetime.fromisoformat(
+                value.replace("Z", "+00:00")
+            ).astimezone()) if times else None
+        )
+        owner_id = int(self._user_memory_db.add_entity_names(
+            [self._world_owner_entity_name]
+        )[self._world_owner_entity_name])
+        return {
+            "update_input": {
+                "reference_time": self._timestamp_text(effective_time),
+                "runtime_context": dict(runtime_context or {}),
+                "thread_cases": cases,
+                "state_contexts": [
+                    self._build_state_context(
+                        state, detailed=state_id in detailed_state_ids,
+                        world_owner_entity_id=owner_id,
+                    ) for state_id, state in states_by_id.items()
+                ],
+            },
+            "existing_states": states_by_id,
         }
-        source_text = "\n".join(
-            [item["activity_text"] for item in activity_views]
-            + [item["summary"] for item in fact_views]
-        )
-        template = (
-            USER_ACTIVITY_STATE_UPDATE_PROMPT_EN
-            if self._resolve_prompt_language(source_text) == "en"
-            else USER_ACTIVITY_STATE_UPDATE_PROMPT_ZH
-        )
-        prompt = template
-        for key, value in update_input.items():
-            serialized = json.dumps(value, ensure_ascii=False, indent=2)
-            prompt = prompt.replace("{" + key + "}", serialized)
-        parsed = self._llm_client.parse_json_object_from_llm_text(
-            self._llm_client.call_llm(prompt) or ""
-        )
-        report: Dict[str, Any] = {
-            "status": "empty",
-            "activity_count": len(activity_views),
-            "linked_fact_count": len(fact_views),
-            "related_intent_count": len(related_intents),
-            "existing_state_count": len(existing_states),
-            "operation_count": 0,
-            "created": 0,
-            "reinforced": 0,
-            "revised": 0,
-            "weakened": 0,
-            "expired": 0,
-            "state_ids": [],
-        }
-        if not isinstance(parsed, Mapping) or not isinstance(parsed.get("operations"), list):
-            report.update({"status": "error", "error": "invalid_llm_activity_state_response"})
-            self._log_update(report, task_kind=self.USER_STATE_UPDATE_FROM_USER_ACTIVITIES_TASK_KIND)
-            return report
 
-        existing_by_id = {int(item["id"]): item for item in existing_states}
-        allowed_evidence: Dict[tuple[str, int], Mapping[str, Any]] = {}
-        for item in activity_views:
-            allowed_evidence[("user_activity", int(item["id"]))] = item
-        for item in fact_views:
-            allowed_evidence[("fact", int(item["id"]))] = item
-        for item in related_intents:
-            key = (str(item["object_type"]), int(item["id"]))
-            allowed_evidence[key] = item
+    def _normalize_user_thread_state_operations(
+        self, raw_operations: Sequence[Any], *,
+        update_input: Mapping[str, Any],
+        existing_states: Mapping[int, Mapping[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Limit this route to situational states and each cited thread's evidence."""
+        cases = {int(case["thread"]["id"]): case for case in update_input["thread_cases"]}
+        allowed: Dict[tuple[str, int], Mapping[str, Any]] = {}
+        scope_by_thread: Dict[int, set[tuple[str, int]]] = {}
+        for thread_id, case in cases.items():
+            scope = {("user_thread", thread_id)}
+            allowed[("user_thread", thread_id)] = case["thread"]
+            for event in case["change_events"]:
+                key = ("user_thread_event", int(event["id"]))
+                scope.add(key)
+                allowed[key] = event
+            for activity_case in case["activity_cases"]:
+                activity = activity_case["activity"]
+                key = ("user_activity", int(activity["id"]))
+                scope.add(key)
+                allowed[key] = activity
+                for fact in activity_case["linked_facts"]:
+                    key = ("fact", int(fact["id"]))
+                    scope.add(key)
+                    allowed[key] = fact
+            scope_by_thread[thread_id] = scope
 
-        operations: List[Dict[str, Any]] = []
-        seen: set[tuple[str, int, str, str, str]] = set()
-        for raw in parsed["operations"][:24]:
-            if not isinstance(raw, Mapping):
-                continue
-            if str(raw.get("operation") or "").strip().lower() not in {
-                "create", "reinforce", "revise", "weaken", "expire",
-            }:
+        operations = []
+        seen_targets = set()
+        seen_identities = set()
+        for raw in raw_operations:
+            if not isinstance(raw, Mapping) or raw.get("state_type") != "situational_state":
                 continue
             domain = self._normalize_state_domain(raw.get("state_domain"))
-            if not domain or str(raw.get("state_type") or "") != "situational_state":
+            if not domain:
+                continue
+            evidence = raw.get("evidence")
+            if not isinstance(evidence, list) or any(
+                not isinstance(item, Mapping)
+                or (str(item.get("evidence_type") or ""), self._positive_int(item.get("evidence_id")))
+                not in allowed for item in evidence
+            ):
                 continue
             normalized = self._normalize_operation(
-                raw,
-                existing_states=existing_by_id,
-                allowed_evidence=allowed_evidence,
-                state_domain=domain,
-                reference_time=update_input["reference_time"],
+                raw, existing_states=existing_states, allowed_evidence=allowed,
+                state_domain=domain, reference_time=update_input["reference_time"],
             )
             if normalized is None:
                 continue
-            if normalized["operation"] == "create" and self._user_model_db.user_state_identity_exists(
-                state_domain=normalized["state_domain"],
-                state_type=normalized["state_type"],
-                state_kind=normalized["state_kind"],
-                state_topic=normalized["state_topic"],
-            ):
-                continue
-            cited_activity_ids = {
+            cited_threads = {
                 item["evidence_id"] for item in normalized["evidence"]
-                if item["evidence_type"] == "user_activity"
+                if item["evidence_type"] == "user_thread"
             }
-            if not cited_activity_ids:
+            if not cited_threads:
                 continue
-            cited_activity_fact_ids = {
-                fact_id
-                for activity_id in cited_activity_ids
-                for fact_id in activity_fact_ids.get(activity_id, [])
-            }
-            if any(
-                item["evidence_type"] == "fact"
-                and item["evidence_id"] not in cited_activity_fact_ids
-                for item in normalized["evidence"]
-            ):
+            cited_scope = set().union(*(scope_by_thread[value] for value in cited_threads))
+            if any((item["evidence_type"], item["evidence_id"]) not in cited_scope
+                   for item in normalized["evidence"]):
                 continue
-            dedupe_key = (
-                str(normalized["operation"]),
-                int(normalized.get("target_state_id") or 0),
-                str(normalized["state_domain"]),
-                str(normalized["state_kind"]),
-                str(normalized["state_topic"]),
-            )
-            if dedupe_key not in seen:
-                seen.add(dedupe_key)
-                operations.append(normalized)
+            if not any(item["evidence_type"] != "user_thread"
+                       and item["role"] != "context" for item in normalized["evidence"]):
+                continue
+            target_id = normalized["target_state_id"]
+            identity = (domain, normalized["state_kind"], normalized["state_topic"])
+            if target_id and target_id in seen_targets:
+                continue
+            if normalized["operation"] == "create":
+                if identity in seen_identities or self._user_model_db.user_state_identity_exists(
+                    state_domain=domain, state_type="situational_state",
+                    state_kind=normalized["state_kind"], state_topic=normalized["state_topic"],
+                ):
+                    continue
+                seen_identities.add(identity)
+            if target_id:
+                seen_targets.add(target_id)
+            for item in normalized["evidence"]:
+                if item["evidence_type"] == "user_thread":
+                    case = cases[item["evidence_id"]]
+                    item["details"] = {
+                        "source": "user_thread_situational_state_v1",
+                        "thread_snapshot": case["thread"],
+                        "thread_event_ids": [event["id"] for event in case["change_events"]],
+                        "reference_time": case["reference_time"],
+                    }
+            operations.append(normalized)
+        return operations
 
-        if not operations:
-            report["status"] = "ok"
-            self._log_update(report, task_kind=self.USER_STATE_UPDATE_FROM_USER_ACTIVITIES_TASK_KIND)
+    def process_user_state_update_from_user_threads_task(
+        self, *, thread_changes: Optional[Sequence[Mapping[str, Any]]] = None,
+        reference_timestamp: Optional[Any] = None,
+        runtime_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Assess personal-state implications of newly committed thread changes."""
+        task_kind = self.USER_STATE_UPDATE_FROM_USER_THREADS_TASK_KIND
+        if not thread_changes:
+            report = {"status": "empty", "thread_count": 0, "operation_count": 0, "state_ids": []}
+            self._log_update(report, task_kind=task_kind)
             return report
-        with self._user_model_db.transaction():
-            applied = self.save_user_state_update_operations(
-                operations=operations,
-                reference_time=update_input["reference_time"],
-                decision_source="user_activity_situational_state_v1",
+        inputs = self._build_user_update_inputs_using_thread(
+            thread_changes, reference_timestamp=reference_timestamp, runtime_context=runtime_context,
+        )
+        update_input = inputs["update_input"]
+        language = self._resolve_prompt_language(
+            "\n".join(case["thread"]["current_summary"] for case in update_input["thread_cases"])
+        )
+        template = (USER_THREAD_STATE_UPDATE_PROMPT_EN if language == "en"
+                    else USER_THREAD_STATE_UPDATE_PROMPT_ZH)
+        prompt = template
+        for key, value in update_input.items():
+            prompt = prompt.replace("{" + key + "}", json.dumps(value, ensure_ascii=False, indent=2))
+        self._logger.info("\n%s", json.dumps({
+            "scope": task_kind, "event": "input", "payload": update_input,
+        }, ensure_ascii=False, indent=2, default=str))
+        parsed = self._llm_client.parse_json_object_from_llm_text(
+            self._llm_client.call_llm(prompt) or ""
+        )
+        self._logger.info("\n%s", json.dumps({
+            "scope": task_kind, "event": "llm_result", "payload": parsed,
+        }, ensure_ascii=False, indent=2, default=str))
+        report = {
+            "status": "ok", "thread_count": len(update_input["thread_cases"]),
+            "thread_event_count": sum(len(case["change_events"])
+                                      for case in update_input["thread_cases"]),
+            "operation_count": 0, "state_ids": [],
+        }
+        if not isinstance(parsed, Mapping) or not isinstance(parsed.get("operations"), list):
+            report.update(status="error", error="invalid_llm_thread_state_response")
+        else:
+            operations = self._normalize_user_thread_state_operations(
+                parsed["operations"], update_input=update_input,
+                existing_states=inputs["existing_states"],
             )
-        report.update(applied)
-        report["status"] = "ok"
-        self._log_update(report, task_kind=self.USER_STATE_UPDATE_FROM_USER_ACTIVITIES_TASK_KIND)
+            report["rejected_operation_count"] = len(parsed["operations"]) - len(operations)
+            if parsed["operations"] and not operations:
+                report.update(status="error", error="no_valid_thread_state_operations")
+            else:
+                with self._user_model_db.transaction():
+                    report.update(self.save_user_state_update_operations(
+                        operations=operations, reference_time=update_input["reference_time"],
+                        decision_source="user_thread_situational_state_v1",
+                    ))
+        self._log_update(report, task_kind=task_kind)
         return report
 
     def process_user_state_update_from_user_observed_patterns_task(
@@ -870,7 +900,7 @@ class UserStateResolver:
             ]
             states = self._user_model_db.get_user_states(
                 state_domains=[domain],
-                state_types=["enduring_state", "recurring_state"],
+                state_types=sorted(self.STATE_TYPES),
                 statuses=["active", "weakened"], limit=self._update_limit + 1,
                 include_evidence=True,
             )
@@ -944,6 +974,11 @@ class UserStateResolver:
                 and item["role"] in {"support", "change_trigger"}
                 for item in evidence_items
             ),
+            "thread_support_count": sum(
+                item["evidence_type"] == "user_thread"
+                and item["role"] in {"support", "change_trigger"}
+                for item in evidence_items
+            ),
         }
         if not detailed:
             return context
@@ -992,6 +1027,29 @@ class UserStateResolver:
             for item in evidence_items
             if item["evidence_type"] == "user_observed_pattern"
         ]
+        context["thread_evidence"] = []
+        event_ids = [int(item["evidence_id"]) for item in evidence_items
+                     if item["evidence_type"] == "user_thread_event"]
+        events_by_id = {
+            int(event["id"]): event
+            for event in self._user_memory_db.get_user_thread_events_by_ids(event_ids)
+        }
+        for item in evidence_items:
+            if item["evidence_type"] not in {"user_thread", "user_thread_event"}:
+                continue
+            details = item.get("details") or {}
+            if isinstance(details, str):
+                details = json.loads(details)
+            context["thread_evidence"].append({
+                "evidence_type": item["evidence_type"],
+                "evidence_id": int(item["evidence_id"]),
+                "role": item["role"],
+                "weight": float(item.get("weight") or 0.0),
+                "observed_at": item.get("observed_at"),
+                "thread_snapshot": details.get("thread_snapshot"),
+                "event": events_by_id.get(int(item["evidence_id"]))
+                if item["evidence_type"] == "user_thread_event" else None,
+            })
         return context
 
     def _normalize_user_claim_state_operations(
@@ -1037,9 +1095,7 @@ class UserStateResolver:
                 state_domain=str(update_input["state_domain"]),
                 reference_time=str(update_input["reference_time"]),
             )
-            if not operation or operation["state_type"] not in {
-                "enduring_state", "recurring_state",
-            } or operation["operation"] == "no_change":
+            if operation is None:
                 return None
             if (operation["operation"] in {"weaken", "expire"}
                     and operation["state_type"] == "recurring_state"
@@ -1240,7 +1296,7 @@ class UserStateResolver:
         claim_relations: Optional[Sequence[Mapping[str, Any]]] = None,
         reference_timestamp: Optional[Any] = None,
     ) -> Dict[str, Any]:
-        """Update enduring and recurring states from changed user claims."""
+        """Update enduring, recurring and situational states from new claims."""
         new_claim_ids = list(new_claim_ids or [])
         reference_time = reference_timestamp
         world_owner_entity_id = int(self._user_memory_db.add_entity_names([self._world_owner_entity_name])[
@@ -1439,7 +1495,7 @@ class UserStateResolver:
                 new_payload={
                     **current,
                     "claim_evidence": claim_evidence,
-                } if merge_claim_evidence else current,
+                } if merge_claim_evidence else {**current, "evidence": evidence},
                 trigger_claim_ids=[
                     item["evidence_id"] for item in evidence
                     if item["evidence_type"] == "user_claim"
@@ -1674,22 +1730,6 @@ class UserStateResolver:
             "valid_to": str(state.get("valid_to") or ""), "last_observed_at": str(state.get("last_observed_at") or ""),
         }
 
-    @staticmethod
-    def _intent_prompt_view(object_type: str, item: Mapping[str, Any]) -> Dict[str, Any]:
-        fields = {
-            "goal": ("summary", "desired_outcome", "success_criteria", "target_at"),
-            "plan": ("summary", "event_or_activity", "start_at", "end_at", "location_text"),
-            "work_item": ("summary", "action_text", "deliverable", "due_at", "start_at", "priority"),
-        }
-        result = {
-            "object_type": object_type,
-            "id": int(item["id"]),
-            "primary_domain": str(item.get("primary_domain") or ""),
-            "status": str(item.get("status") or ""),
-            "confidence": float(item.get("confidence") or 0.0),
-        }
-        result.update({field: str(item.get(field) or "") for field in fields[object_type]})
-        return result
 
     @staticmethod
     def _normalize_state_kind(value: Any) -> str:

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Sequence
 
@@ -211,7 +212,18 @@ class UserThreadUpdater:
                 if occurred_at is not None:
                     if not isinstance(occurred_at, str):
                         raise ValueError('Invalid thread occurrence time')
-                    datetime.fromisoformat(occurred_at.replace('Z', '+00:00'))
+                    occurred_at = occurred_at.strip()
+                    if not occurred_at:
+                        occurred_at = None
+                    elif re.fullmatch(r'\d{4}(?:-\d{2})?', occurred_at):
+                        # Validate coarse calendar values without persisting an
+                        # invented day/time (e.g. keep "2023-05", not May 1).
+                        datetime.strptime(
+                            occurred_at, '%Y' if len(occurred_at) == 4 else '%Y-%m',
+                        )
+                    else:
+                        datetime.fromisoformat(occurred_at.replace('Z', '+00:00'))
+                    event['occurred_at'] = occurred_at
             old_status = (case['existing_thread'] or {}).get('status', 'active')
             if update['status'] != old_status:
                 required = 'closed' if update['status'] == 'closed' else 'reopened'
@@ -229,8 +241,11 @@ class UserThreadUpdater:
 
     def _save_updates(
         self, cases: List[Dict[str, Any]], updates: List[Dict[str, Any]],
-    ) -> Dict[str, List[int]]:
-        report = {'new_thread_ids': [], 'updated_thread_ids': [], 'thread_event_ids': []}
+    ) -> Dict[str, Any]:
+        report = {
+            'new_thread_ids': [], 'updated_thread_ids': [],
+            'thread_event_ids': [], 'thread_changes': [],
+        }
         by_ref = {case['thread_ref']: case for case in cases}
         with self._db.transaction():
             for update in updates:
@@ -253,6 +268,7 @@ class UserThreadUpdater:
                     thread_id, activity_ids=activities, fact_ids=facts,
                 )
                 known_at = str(case['reference_time'])
+                event_ids = []
                 for event in update['events']:
                     event_id = self._db.insert_user_thread_event(
                         thread_id, known_at=known_at,
@@ -263,6 +279,26 @@ class UserThreadUpdater:
                     )
                     if event_id is not None:
                         report['thread_event_ids'].append(event_id)
+                        event_ids.append(event_id)
+                identity_changed = old is not None and any(
+                    old[field] != update[field]
+                    for field in ('identity_description', 'status')
+                )
+                if old is None or event_ids or identity_changed:
+                    # Freeze this committed update, not a future version read by
+                    # the state task after other thread tasks in the FIFO.
+                    fields = ('title', 'identity_description', 'current_summary', 'status')
+                    report['thread_changes'].append({
+                        'thread': {'id': thread_id, **{key: update[key] for key in fields}},
+                        'previous_thread': (
+                            {'id': thread_id, **{key: old[key] for key in fields}}
+                            if old is not None else None
+                        ),
+                        'thread_event_ids': event_ids,
+                        'evidence_activity_ids': sorted(set(activities)),
+                        'evidence_fact_ids': facts,
+                        'reference_time': known_at,
+                    })
         return report
 
     def process_update_task(
@@ -272,6 +308,7 @@ class UserThreadUpdater:
         report: Dict[str, Any] = {
             'status': 'ok' if ids else 'empty', 'processed_activity_ids': [],
             'new_thread_ids': [], 'updated_thread_ids': [], 'thread_event_ids': [],
+            'thread_changes': [],
         }
         for offset in range(0, len(ids), self._batch_size):
             batch_ids = ids[offset:offset + self._batch_size]

@@ -1031,6 +1031,19 @@ class UserMemoryDB:
         ).fetchall()
         return [self._row_to_dict(row) for row in reversed(rows)]
 
+    def get_user_thread_events_by_ids(self, event_ids: Sequence[int]) -> List[Dict[str, Any]]:
+        """Load only the immutable changes supplied by a thread-update task."""
+        ids = list(dict.fromkeys(int(value) for value in event_ids))
+        by_id = {}
+        for start in range(0, len(ids), 400):
+            chunk = ids[start:start + 400]
+            rows = self._conn.execute(
+                "SELECT * FROM memory_user_thread_events WHERE id IN ("
+                + ','.join('?' for _ in chunk) + ')', chunk,
+            ).fetchall()
+            by_id.update({int(row['id']): self._row_to_dict(row) for row in rows})
+        return [by_id[value] for value in ids if value in by_id]
+
     def save_user_thread(
         self, *, thread_id: Optional[int], creation_key: str,
         title: str, identity_description: str, current_summary: str, status: str,

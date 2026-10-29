@@ -681,7 +681,7 @@ def main() -> int:
             "memory_user_claim_update",
             "memory_user_intent_update",
             "user_state_update_from_user_claims",
-            "user_state_update_from_user_activities",
+            "user_state_update_from_user_threads",
             "user_state_update_from_user_observed_patterns",
         )
     ]

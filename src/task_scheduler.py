@@ -246,7 +246,7 @@ class TaskOperationReporter:
             "memory_user_observed_pattern_update",
             "memory_user_intent_update",
             "user_state_update_from_user_claims",
-            "user_state_update_from_user_activities",
+            "user_state_update_from_user_threads",
             "user_state_update_from_user_observed_patterns",
             "user_prediction_update_from_intent_events",
             "user_proactive_policy_evaluation",
@@ -352,7 +352,7 @@ class TaskScheduler:
                 settings.get("enable_memory_user_intent_update"), True,
             ),
             "user_state_update_from_user_claims": user_state_updates_enabled,
-            "user_state_update_from_user_activities": user_state_updates_enabled,
+            "user_state_update_from_user_threads": user_state_updates_enabled,
             "user_state_update_from_user_observed_patterns": user_state_updates_enabled,
             "user_prediction_update_from_intent_events": self._config_bool(
                 settings.get("enable_user_prediction"), True,
@@ -1041,6 +1041,7 @@ class TaskScheduler:
         schedulers = {
             "memory_fact_extraction": self._schedule_after_fact_extraction_task,
             "memory_user_activity_extraction": self._schedule_after_user_activity_task,
+            "memory_user_thread_update": self._schedule_after_user_thread_update_task,
             "memory_user_observed_pattern_update": (
                 self._schedule_after_user_observed_pattern_update_task
             ),
@@ -1109,27 +1110,34 @@ class TaskScheduler:
         activity_ids = result.get("user_activity_item_ids") or []
         if not activity_ids:
             return
-        payload = {
-            "changed_user_activity_ids": sorted({
-                int(value) for value in activity_ids
-                if str(value).strip().isdigit() and int(value) > 0
-            }),
-            "reference_timestamp": None,
-            "runtime_context": {},
-        }
-        self.submit(
-            "user_state_update_from_user_activities",
-            payload,
-            report_payload={
-                "changed_user_activity_ids": payload["changed_user_activity_ids"],
-            },
-        )
-        # Preserve the original state-update ordering. Thread tracking is an
-        # independent UserMemory projection, not a prerequisite for that task.
         if self._task_enabled["memory_user_thread_update"]:
             report = self.submit("memory_user_thread_update", {})
             if not report.get("queued"):
                 self._logger.warning("User thread update not queued: %s", report)
+
+    def _schedule_after_user_thread_update_task(
+        self, event: Dict[str, Any], completion: Dict[str, Any],
+    ) -> None:
+        result = event.get("result")
+        if not self._task_enabled["user_state_update_from_user_threads"]:
+            return
+        if event.get("error") is not None or not isinstance(result, dict):
+            return
+        changes = result.get("thread_changes") or []
+        if not changes:
+            return
+        # A failed later batch may still have committed earlier changes. Those
+        # completed batches also need their state projection.
+        report = self.submit(
+            "user_state_update_from_user_threads",
+            {"thread_changes": changes, "runtime_context": {}},
+            report_payload={
+                "thread_ids": [change["thread"]["id"] for change in changes],
+                "thread_event_ids": result.get("thread_event_ids") or [],
+            },
+        )
+        if not report.get("queued"):
+            self._logger.warning("Thread state update not queued: %s", report)
 
     def _postprocess_user_prediction_task(
         self, event: Dict[str, Any],

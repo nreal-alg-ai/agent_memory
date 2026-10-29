@@ -227,7 +227,7 @@ def main() -> None:
         task_kind: operation_reporter.latest_report(task_kind)
         for task_kind in (
             "user_state_update_from_user_claims",
-            "user_state_update_from_user_activities",
+            "user_state_update_from_user_threads",
             "user_state_update_from_user_observed_patterns",
         )
     }

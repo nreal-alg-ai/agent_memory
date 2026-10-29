@@ -579,7 +579,7 @@ class UserModelDB:
         limit: int = 160,
         include_evidence: bool = False,
     ) -> List[Dict[str, Any]]:
-        """Return durable states, optionally attaching all of each state's evidence."""
+        """Return user states, optionally attaching all of each state's evidence."""
         clauses: List[str] = []
         params: List[Any] = []
         if state_domains:
@@ -686,6 +686,31 @@ class UserModelDB:
             params,
         ).fetchall()
         return [self._row_to_dict(row) for row in rows]
+
+    def get_user_states_for_thread_ids(
+        self, thread_ids: Sequence[int],
+    ) -> List[Dict[str, Any]]:
+        """Keep linked active situational states even outside the recent-state limit."""
+        ids = sorted({int(value) for value in thread_ids if int(value) > 0})
+        state_ids = set()
+        for start in range(0, len(ids), 400):
+            chunk = ids[start:start + 400]
+            rows = self._conn.execute(
+                "SELECT DISTINCT s.id FROM user_states s "
+                "JOIN user_state_evidence e ON e.state_id=s.id "
+                "WHERE s.state_type='situational_state' "
+                "AND s.status IN ('active','weakened') "
+                "AND e.evidence_type='user_thread' AND e.evidence_id IN ("
+                + ','.join('?' for _ in chunk) + ')', chunk,
+            ).fetchall()
+            state_ids.update(int(row['id']) for row in rows)
+        states = self.get_user_states_by_ids(sorted(state_ids))
+        evidence_by_state: Dict[int, List[Dict[str, Any]]] = {}
+        for item in self.get_user_state_evidence_items(sorted(state_ids), limit=None):
+            evidence_by_state.setdefault(int(item['state_id']), []).append(item)
+        for state in states:
+            state['evidence_items'] = evidence_by_state.get(int(state['id']), [])
+        return states
 
     def get_active_user_states_for_claim_ids(
         self, claim_ids: Sequence[int],
