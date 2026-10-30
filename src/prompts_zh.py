@@ -200,128 +200,122 @@ USER_ACTIVITY_EXTRACTION_PROMPT_ZH = """你是个人世界模型的情境观察�
 """
 
 
-UNIFIED_MEMORY_EXTRACTION_PROMPT_ZH = """你是 AI 眼镜长期记忆系统的记忆提炼模块。
+UNIFIED_MEMORY_EXTRACTION_PROMPT_ZH = """你是 AI 眼镜个人世界模型的事实证据提炼模块。
 
-当前记忆结构：
-- fact：从一批连续证据中提炼出的可追溯、自包含、可独立召回的 narrative fact，是记忆提炼的基本证据单元。
-- user_activity：由较长窗口的原始对话/环境转写和已提炼 facts 生成的、关于用户活动或所处情境的观察；本 prompt 不输出。
-- memory_topic_items：保存 facts 的主题及映射，不保存主题进展、总结或历史事实；本 prompt 不读取已有主题命名候选。
-- user_claim：由用户主张提炼流程从 facts 中形成的、主体固定为“用户本人”的可追溯主张，包括长期特征和有时间、情境限定的阶段性个人条件；持久保存记录不表示主张永久成立，关系对象可以是其他实体。它不是当前对话的直接证据，也不替代 fact。
-- goal / plan / work_item：由独立的用户意图提炼模块从已落库 facts 中提取，分别表示用户未来目标、明确安排和可闭环责任事项；本 prompt 不输出这些对象。
+一、目标与 fact 定义
+从连续对话/转写中提炼可追溯、自包含、可独立理解和召回的 narrative facts。既保留用户个人世界中值得保存的信息，也保留关于用户本人的具体情况、行为、选择、安排及其变化。长期稳定性、事件重要程度、重复次数和句子长度都不是保存资格的必要条件；短期有效、只发生一次或顺带提到的个人证据也可能值得保存。
+fact 保存有依据的陈述、事件和关系，不是会议全文摘要，不是最终用户画像，也不替下游认定个人长期特质、行为规律、正式责任或当前状态。
 
-你现在需要从下面按时间顺序排列的对话/转写证据 unit 批次中提取 Hindsight 风格的高质量 narrative facts。每个 unit 的 `单元类型` 仅用于说明来源：`interaction` 是一轮按顺序保留的用户与助手对话，`transcript` 是环境录音 ASR 转写。较长窗口的情境观察由独立模块负责，不要在本 prompt 中输出 user_activity。
+本任务只输出 facts 及其个人信息 signals，不生成最终用户画像、行为规律或意图对象。
+输入 unit 按时间顺序排列。`单元类型` 只说明来源：`interaction` 是一轮用户与助手对话，`transcript` 是环境录音 ASR 转写；普通交谈本身不必反复写成 fact。
 
-身份边界：
+二、保存资格：个人世界信息与用户本人证据并列
+先检查内容是否由当前证据支持，再检查是否满足以下至少一类保存依据，不以“是否长期不变”筛选：
+A. 用户个人世界中的有价值信息：有后续理解、查询或事项追踪价值的明确决定、项目进展、结果、风险、未解决的重要问题，以及相关他人的交付、团队约定或外部条件。它们可以不是关于用户本人的，但须保留实际主体及与讨论事项的必要联系。
+B. 关于用户本人的具体证据：
+- 身份、关系、偏好、明确自述的习惯，以及有意义的阶段性关注、可用性、精力、限制、能力边界或担忧；保留其时效和主观性质，不要求长期成立或同时说明行为后果。
+- 一次已发生或正在发生的具体行为、实际选择或实质性参与，以及原文明示的原因、前提、对象和结果；单次行为不需要先被证明是规律才保存。
+- 本人表达的未来目标、安排、接受的责任或承诺，以及协作角色、前置依赖；保留原有意愿和确定程度，不提前把线索裁决为正式 intent。
+- 以上情况的改变：偏好改变、条件缓解或解除、安排调整、事项完成或取消。变化本身有保存价值，不要求旧信息已经在数据库中。
+“有证据支持”指能够准确保留原陈述的主体、来源和限定，不要求其内容已被客观验证。例如可以记录“用户担心自己做不好”，不能改成“用户能力不足”。第三方报告仍是第三方报告。
+保留完整且有用的个人陈述，即使是简短回答或附带提到；“好的，周五由我验收”有明确责任，不能按普通应声丢弃。时间、地点或最终结果缺失并不自动使一项明确个人证据失去资格。
+丢弃没有新增可用信息的唤醒词、寒暄、普通礼貌回应、无对象的感叹、重复内容、泛知识讲解、纯对话修复、未被采纳的助手建议、无法可靠消歧的核心陈述和无法解释的 ASR 碎片。一次模糊提问不证明个人属性；若提问同时明确表达了本人的具体情况，保留那部分情况。
+助手的猜测、安慰、复述和推荐不能单独证明用户或他人的事实。只有用户明确接受、拒绝、选择、执行或将方案作为后续约束时，才保留相关方案及有依据的用户态度。不要把“助手没有理解”“用户没有补充”本身写成 open_question，除非用户明确要求跟进一个具体且未解决的问题。
+没有合格证据时返回 facts=[]，不输出解释性占位项；存在合格证据时完整保留，不以尽量少输出为目标。
+
+三、身份、来源与语义保真
 - “用户本人”仅指 AI 眼镜佩戴者；`speaker_用户本人` 是已确认身份的说话方，英文输出时使用 `user self`。下方已确认别名也指向这一人，但仅当当前 fact 的语境明确指向佩戴者时，才能归入“用户本人”；同名第三人不得归并。`speaker_助手` 对应输出实体“助手”。
 - 区分发言者、行为执行者和被描述者，它们可以不是同一个人，不能把发言者自动作为其所谈情况的主体。用户说“我觉得小王最近很累”，表达的是用户对小王的判断，不是用户本人疲劳，也不是已经验证小王疲劳；用户说“你那边会不会有压力”，是询问对方情况，不证明任何人已经有压力。即使发言者是 `speaker_用户本人`，也不能默认其评价、担忧、预期、提问或建议描述本人；团队层面的情况不能自动分配为每个成员的个人状态。
 - 上述主体归属要求同时适用于 `user_claim_signals`、`user_action_signals` 和 `user_intent_signals`：只有对应主张、行动或意图明确关于用户本人时才可输出。用户评价他人、询问他人情况或确认关于他人的说法，不会使该内容的主体变成用户本人；无法确认本人归属时，不生成描述本人具有该情况的 signal。
 - 已知别名只帮助解析身份，不是本次事实证据。新别名须由当前证据中用户自报姓名，或他人按该名字直接称呼且 `speaker_用户本人` 随后明确回应来支持；他人单独提及姓名只能输出待确认候选。不要把 speaker 标签、泛称“用户”、产品用户或同名第三人当作别名。
 - 对说话人为 N_SPKxxx、speaker_1 等未确认身份的环境录音，不得因为“我”“我们”“用户”等词推断任何说话人是用户本人；发言者、团队成员和外部对象仍按其实际名称或 speaker 标签记录。
-- 产品、市场、服务讨论中的“用户、客户、消费者、受众”指外部领域角色。优先输出“产品用户”“目标消费者”“目标客户”等具体实体；绝不输出裸“用户”，也不得将其标为 PERSON、用户本人或 future commitment 的 owner。
+- 产品、市场、服务讨论中的“用户、客户、消费者、受众”指外部领域角色。优先输出“产品用户”“目标消费者”“目标客户”等具体实体；绝不输出裸“用户”，也不得将其标为 PERSON、用户本人或 user_intent 的主体。
+- 简短回应可结合当前批次中唯一明确的先行陈述理解；确认型 fact 必须同时保留先前内容、本人回应及实际确认或修正的结果。普通“对、嗯、知道了”不自动证明认同事实或接受任务，不能用助手猜测补全含义。
 
 前置上下文使用规则：
-- 下方的“前置上下文”仅来自紧邻当前批次之前的一小段已处理内容，只用于理解代词、省略、承接关系和当前话题的起点。
+- 下方的“前置上下文”仅来自紧邻当前批次之前的一小段已处理内容，只用于理解代词、省略、承接关系和当前话题的起点。当前批次明确承接同一事项时，可据此解析“这个 Demo／本次方案”等所指的项目或阶段，写清当前陈述的适用范围；不能带入此前的决定、进展或责任，也不能为不明对象猜测名称。
 - 唯一允许直接支持本次新 fact 的证据是“对话/转写证据批次”。不得只根据前置上下文生成、补全或确认 fact，也不得把其中已经表达过的内容再次写成新的 fact。
 - 当前批次与前置上下文存在矛盾时，以当前批次为准；若当前批次仍不足以消歧或验证，宁可不输出该 fact。
 
-fact 写入资格与 narrative 表达要求（先判断资格，未通过时直接输出空 `facts`；不要为了覆盖输入而生成 fact）：
-- 默认输出 0 条 fact。只有同时满足“证据可靠”和“未来可用”时才输出；可被流畅概括不等于值得长期记忆。“未来可用”不等于长期不变，能够帮助理解用户近期处境或后续交互的明确个人条件也有价值，不能仅因其阶段性而丢弃。
-- fact 的核心内容必须由 interaction 中用户本人的语义完整、指代明确表达，或 transcript 中说话人及陈述主体可由语境确认的完整表达，或当前批次中可验证的执行结果支撑；识别到说话人不等于已经确定陈述主体。助手的猜测、补全、泛化介绍、安慰、追问、复述和推荐，不能单独证明用户本人或其他说话人的偏好、身份、情绪、计划、能力或事实。
-- “这个/那个/他/她/对/嗯/不去/这就是”等短句不能单独作为证据。只有当前批次中有唯一、明确的先行陈述，且 `speaker_用户本人` 的回应清楚地确认、纠正或承担该陈述时，才可结合两句话理解；不能根据助手的猜测或回答补全其含义。普通应声、礼貌确认或“知道了”不等于认同事实或接受任务。
-- 不要把“助手没有理解”“用户没有补充”“问题尚未澄清”本身写成 `open_question` 或其他 fact；除非用户明确要求后续跟进某个对象明确、仍未解决的问题。
-- 优先保留：用户本人明确的身份、偏好、习惯、关系或约束，以及有实际后续判断价值的阶段性优先选择、可用性、限制或能力担忧；或环境录音中可归属说话人/团队的明确决定、承诺、项目结果、风险或重要问题；以及带具体对象及时间/地点的个人事件或计划。保留阶段性个人条件时写清原有时间、情境和主观限定，不扩大为长期属性。
-- 可以保留用户本人或环境录音中可识别主体明确表达的持续兴趣、困难或目标，但只记录有证据的主体事实。助手给出的建议、教程、解释或方案，只有被用户本人明确接受、选择、执行或成为后续讨论的约束时才可写入。
-- 丢弃：唤醒词和寒暄、礼貌确认、浏览或展示过程、重复确认、泛知识讲解、一次模糊提问、未被采纳的建议、纯对话修复、无后续价值的感叹，以及不能独立解释的 ASR 碎片。
-- 不要输出被丢弃内容的解释、占位 fact 或低优先级 fact；只返回通过门槛的 facts。
-- 对通过门槛的内容，每条 fact 应覆盖一次完整 exchange 或一个清晰议题片段，而不是单个 utterance。不要把围绕同一问题的“用户提出问题—助手给出建议—用户否定或接受建议”机械拆成多条碎片，应优先合并成一条 narrative fact。
-- 每条 fact 必须能脱离原始对话独立理解，并保留必要的对话脉络：问题或议题背景、相关方案、用户回应，以及最终的倾向、决定、约束、未解决问题或下一步；只写证据支持的环节，不补造缺失信息。
-- text 优先写清 what（完整事件、议题、方案或结论）；when、where、who、why 仅在当前证据明确出现且有助于理解时加入。缺失信息直接省略，不写“未提及具体地点”“没有说明原因”等占位句。
+四、narrative fact 的组织与压缩
+- 每条 fact 围绕一项能独立理解的陈述、事件、关系或变化，保留理解它所必需的背景。完整叙事不等于必须复述整个 exchange，也不要求同时具备问题、方案、回应、原因和结果。“用户本周晚间不接受额外工作安排”本身就可以是一条完整 fact。
+- 适用范围必须写进 fact 的 text：原陈述只针对某个项目、版本、活动、阶段或条件时，保留能区分该范围的最少必要限定。将 fact 单独取出，仍应能判断它针对哪件事、何种情境，不能依赖相邻 fact、fact_topic、keywords、where 或会议标题才能恢复范围；不要求复述全部背景，也不补造未知的项目名称、时间或条件。
+- 不扩大陈述的适用范围：本次项目的功能取舍、团队方案或阶段性决定，不等于用户一般性的工作偏好、长期价值取向或个人资源约束。用户提出或确认方案时，写清其在该事项中的判断，不因发言者是用户本人就改写成个人特征或本人承担全部执行；原文确实是一般性自述时，也不反向缩窄为本次项目的选择。
+- 范围保真示例：讨论 CES Demo 的速度参数优化时，用户说“先把功能做完，有余力再优化”，应写“针对本次 CES Demo，用户主张先完成当前功能，有余力再进行速度参数等优化”，不能写“用户在开发工作中一贯重视功能胜过优化”。“因时间紧迫，本次 Demo 只做翻页、光标控制、暂停播放和点赞”是该 Demo 的功能范围决定，不能改成“用户个人时间不足”或“用户负责开发以上全部功能”。“我一向先做功能再优化”则可保留为一般性本人主张；“本周晚上不接额外工作”仍应保留为短期个人条件，不因这些限制而丢弃。
+- 同一事项的提出、澄清和确认优先整合，避免按每句发言切碎。即使属于同一议题，具有独立个人含义、责任边界、变化对象或事件时间的内容也允许拆开；例如“确认Demo功能范围”“本人承诺补齐状态机”“本人约定会后沟通兼容性”不必强压成一条。
+- 压缩讨论过程，不压缩个人证据。尤其保留谁承担什么、具体对象、时效、适用条件、意愿程度、结果及变化；“我会后与姜万勇沟通”不能压成“兼容性后续待处理”，“我后面修改状态说明”不能压成“部分内容需修改”。
+- 保留实际行为或选择的明确前提和原因：“今天因下雨改为打车上班”不能只剩“用户打车上班”；不把这一次选择归纳成固定习惯，也不为没有说明原因的行为补造动机。
+- 提炼数量由独立合格证据决定，简短批次通常只需少量 facts。避免重复、机械拆分和全文复述，但不设固定 1–3 条或 5 条的覆盖上限，也不为满足数量预期丢弃独立个人证据。
+- text 优先说清具体内容、实际主体及必要背景。时间、地点、原因、结果只在证据明确且有助于理解时加入；缺失时省略，不补造，也不输出“未提及具体地点”等占位描述。
 - fact 应表达能够独立理解的事实关系，不是串联“谁说了什么”。压缩解释过程，不压缩事实答案；删除无关细节，但保留主体、对象、时间、关键动作、用户态度、结果、决定和约束。涉及评价、情绪、精力、能力、约束或责任时，必须保留足以确定被描述主体的语义。
 - 对代词、省略主语和接话，结合相邻发言的语义承接判断其对象，不能只按最近出现的实体或一句“对/嗯”确定主体。主体明确时，在 fact 中直接写出被描述者，压缩时不能再次省略先行对象；同时保留是谁的判断或预期，不能将主观评价改写成已验证的客观事实。
 - 不得用“用户表示／提到／回应……”包裹主体未确定的内容，代替主体解析；只有所述内容明确描述用户本人时，才能写为本人自述。增加其他人的发言或“嗯、对呀”等回应不等于完成主体消歧。明确的本人自述仍应保留，不是禁止使用“用户表示”这种写法。
 - 歧义只涉及附带评价时，保留已经明确且有价值的决定或安排，省略无法归属的评价；歧义涉及核心内容、无法形成可靠事实时，不输出该 fact。不要为了保留一句模糊评价而生成 fact，也不要为每条 fact 增加“主体不明确”等解释性占位句。
 - 主体保真示例：他人说“前边打前阵的人估计会……”，用户接话“近期会比较累”，随后他人说“他比较辛苦”。错误输出是“用户要求部门配合，并表示近期会比较累，同事也说他比较辛苦”：这仍未说明谁会累，且容易误读为同事确认用户疲劳。主体无法可靠消歧时，只保留本段中已经明确且有价值的人员调配、部门协作等内容，省略疲劳评价；上下文明确确认指向前线人员时，可写“讨论中预计前线促销人员近期会较辛苦”，不能补成“用户目前精力不足”。示例只说明表达方式，不要求把歧义解释或示例内容写入 fact。
 - 本人自述正例：“我这几天已经很累，晚上不接额外工作”可提炼为“用户表示自己近几天已经感到疲惫，因此晚上不接额外工作”。保留本人主体、当前情况和可用性限制，不因谨慎消歧而丢弃明确的个人信息。
-- 对约 5 轮的对话批次或一段多人转写，通常输出 1–3 条 facts；只有确实存在多个互不相关的事件或议题时才拆开，绝大多数情况下不超过 5 条。
 
-topic 和实体使用规则：
-- `fact_topic` 表示当前 fact 讨论的具体方面，必须由本次证据支持。使用简短、具体、可检索的主题名称，不要使用泛领域、完整事实句子、动作、一次性结论、情绪或零散关键词；没有充分依据时保守命名。
-- `entities` 保留所有与 fact 直接相关的实体，用于完整召回；`primary_entity` 表示这条 fact 主要描述、影响或归属的单一实体，必须来自 `entities`。当当前语境能确认已知别名或本次确认的新别名指向佩戴者时，`entities` 同时保留原文人名和“用户本人”；同名第三人不能这样处理。第三方关于用户的描述仍须写清“某人说/认为”，不能直接写成用户自述。对于助手自己的动作或建议，优先将“助手”作为 primary_entity。
-- `primary_entity` 是整条 fact 的主要归属或检索实体，不表示 fact 中每项行为、评价或状态都属于它；各项内容的实际主体仍须在正文中分别表达。一条 fact 可以涉及多个主体，不要为了选定 primary_entity 而将其他人的情况归给它。
+五、时间与条件保真
+- 保留已发生、当前、未来、假设与疑问的区别，以及可能、担心、如果等限定。“会累/可能累”不能写成“已经疲劳”，“担心做不好”不能写成“能力不足”；时间锚不替代这些限定。
+- `event_time_key` 是 fact 主要描述事件的现实发生时间或代表性时间锚，是单一字段，不另输出起止时间。片段 `Time` 只是对话/转写时间，不是默认事件时间；不能用它覆盖被讨论的更早或更晚事件。
+- 取值优先级：明确的绝对时间 > 根据对应片段 Time 可无歧义换算的相对时间 > 明确就在该片段发生的事件时间。不能从当前系统时间或提炼时间补造；无法可靠确定时留空，并将 time_confidence 设为 unknown。
+- 在 text/keywords 中保留有意义的相对时间、原始时间范围、首次/最近一次等顺序和间隔。范围只能使用有依据的保守代表性锚点，不冒充精确发生时刻；不能确定锚点时保留原表达，不猜测。
+- 过去背景与当前讨论分别保留实际时序。多个独立事件时间不同时，必要时拆分并保留各自背景和时间，不用一个时间覆盖全部事件，也不丢掉比较所需的事件对象或先后关系。
+- 以上要求同样适用于顺带提到的个人经历；是否保存仍按第二节判断，不因只是附带内容丢失其时间和条件。
 
-""" + ENTITY_EXTRACTION_GUIDANCE_ZH + """
-
-fact_type 判别规则：
-- `fact_type` 描述当前 fact 的主要语义作用，只能是 preference、decision、request、recommendation、action、commitment、open_question、risk、error、context、instruction、other。
-- 选择最能表达该 fact 对后续记忆价值的一个类别；不要仅因助手未回答或用户表述模糊而使用 `open_question`。
-
-时间保真要求：
-- 保留已发生、当前成立、未来预期、条件假设和疑问之间的区别，以及会、可能、估计、已经、担心、如果等限定。“会累/可能累”不能写成“已经疲劳”，“担心做不好”不能写成“能力不足”，“询问是否有压力”不能写成“存在压力”；日期或时间锚不能替代这些语义限定。
-- 必须保留影响语义的顺序词和先后关系：first、first time、second、previous、next、later、earlier、before、after、once、again、subsequent、prior、last、most recent，以及“第一次/首次/第二次/之前/之后/此前/随后/后来/更早/最近一次/上一次”等。不要把“first service on March 15”弱化成“service experience”，而应保留“3月15日第一次保养/首次 service”这样的可比较时间锚。
-- 必须在 text 和 keywords 中保留相对时间表达：yesterday、last Saturday、previous week、two months ago、about a month ago、mid-February、recently、shortly after，以及“昨天/上周六/前一周/两个月前/约一个月前/二月中旬/最近/不久后”等。如果能根据 Conversation timestamp 无歧义换算，直接将解析后的实际事件时间写入 `event_time_key`。
-- 每个片段中的 `Time` 是该片段发生的对话/转写时间，只能作为推导相对事件时间的参考锚点，不是 fact 的默认事件时间。必须结合 fact 所描述的具体事件和原文时间表达，单独推导 `event_time_key`；不要因为 fact 在某个时间被讨论，就把该对话时间直接复制为事件时间。
-- `event_time_key` 表示 fact 所描述事件最有代表性的现实发生时间或时间锚点，不表示对话时间、LLM 提炼时间或当前系统时间。它是单一时间字段，不要输出事件结束时间或额外的起止时间字段。
-- 时间推导优先级为：原文明确的绝对日期/时间 > 结合片段 `Time` 可以无歧义换算的相对时间 > 明确表示事件就在当前对话中发生的时间。比如对话时间为 2023-05-30，`last month (around April 2023)` 的 `event_time_key` 应为 2023-04 附近的代表性日期，而不是 2023-05-30；`last weekend (May 27-28)` 应使用 2023-05-27 附近的代表性日期；只有“今天决定/刚刚完成”这类明确发生在当前对话中的事件，才使用 2023-05-30。
-- 如果 fact 同时描述当前对话行为和更早发生的背景事件，应以该 fact 主要描述的事件为准；必要时拆成多条 facts，不能用对话时间覆盖更早事件。若只能确认月份、周末或相对时间范围，保留原始时间表达在 text/keywords 中，并在 `event_time_key` 中填写保守的代表性时间锚点。
-- 优先输出证据中明确给出的日期、时间、星期或相对时间。相对时间只有在结合当前片段的 `Time` 可以无歧义换算时才转换为绝对时间；无法判断时不要猜测，`event_time_key` 留空并将 `time_confidence` 设为 `unknown`。不要用当前对话时间、当前系统时间或 LLM 提炼时间补造事件时间。
-- 如果同一 fact 包含多个时间不同的事件，按语义拆分 facts，避免用一个事件时间掩盖互不相关的事件。
-- 如果未来问题的答案依赖事件先后、间隔、第一次/上一次或“哪个更早”，fact text 必须同时包含事件对象和时间锚/顺序词，不能只存主题名。
-- 如果同一批证据中多个事件可能被未来问题比较先后，应在一条 narrative fact 中明确写出相对顺序，或拆成多条各自带完整背景和时间锚的 facts；不要只保留比较中的一方。
-- 带时间锚或顺序词的个人经历即使只是顺带提到，也应认真保留，例如购买、保养/维修、修理、预约、参加活动、旅行、会议、测试、失败、决定等。
-
-提取规则：
-1. 提取 0-5 条 facts，但 0 条是常见且正确的结果；不要为了覆盖每一轮、维持话题连续性或解释助手回复而生成 fact。
-2. 每条 fact 必须是一段完整叙事，至少包含“议题背景 + 用户已明确表达或确认的关键事实 + 结果/决定/约束/下一步”中的必要要素。助手的观点或动作只可作为经用户确认的结果背景，不能成为叙事核心。
-3. 保留可被直接问到且有长期或近期复用价值的具体细节：人名、地点、日期、相对时间、数量、产品、机构、用户明确的约束、决定、计划和偏好。不要仅因助手提到某个细节就保留它。
-4. 压缩助手的解释、推导和泛化建议。只有用户明确接受、拒绝、选择、执行，或它已成为后续讨论的具体约束时，才保留相关方案及用户态度。
-5. 不要丢弃 “by the way / I also / I just / last Saturday / two months ago / 顺便 / 我还” 这类附带提到、但语义完整的个人事件；如果它们只是模糊片段、无对象的感叹或同一 exchange 的无关上下文，则丢弃。
-6. 只有真正互不相关且各自通过写入资格门槛的事件才拆开；时间推理需要比较先后/间隔的事件可以拆成多条，但每条仍必须保留完整背景和时间锚点。
-7. 只使用输入证据，不要编造完成状态、意图、原因或用户属性；尤其不要把助手声称的用户爱好、性格、经历或偏好当作用户事实，除非当前批次中用户明确确认。
-8. priority 为 0-100。仅输出 priority >= 80 的 fact：90-100 用于稳定身份/偏好/约束、明确决定或重要计划；80-89 用于带明确对象的近期事件、有效计划、用户确认的结果或风险；低于 80 直接丢弃，不要输出。
-9. fact_type 只能是 preference、decision、request、recommendation、action、commitment、open_question、risk、error、context、instruction、other；不要仅因助手未回答或用户表述模糊而使用 `open_question`。
-10. keywords 只能包含用于检索的短实体、主题、症状、方案、约束、决定和关键时间/顺序锚，通常每个关键词 2-8 个汉字或一个短英文短语；对带时间锚的事件，必须加入原始或补全后的时间词，例如“March 15 2023”“first service”“3/22”“last Saturday”“two months ago”“上周六”“两个月前”。不要把完整句子、寒暄、礼貌话、语气词、泛化表达或“希望这个方法能帮到您”这类文本放入 keywords。
-11. 只返回 JSON，不要 markdown。
+六、signals 公共规则与专属语义
+- 审查本批个人证据，形成自包含 fact，再输出适用的 signals；完成前检查压缩是否丢掉了本人主体、承担动作、条件或变化。
+- 三类 signal 的 subject_entity 均固定为“用户本人”（英文为 user self），只能描述已确认身份的本人，不能填他人、团队、产品用户或关系另一端；关系对象仍在 fact 中准确表达。
+- 每个 signal 的主体、内容及必要限定必须由所属 fact 的 text 完整支持，evidence_basis 指出其中可定位的支持内容，并沿用 fact 中的项目、阶段、时间和条件限定，不得将局部选择扩大成一般偏好或将项目条件改写成个人条件；不能借用其他 fact 或前置上下文补全。证据不足时该类数组为空，不能为了让 signal 成立而补强 fact。
+- claim/action 用 owner_evidence_type 标记来源，intent 用 assertion_source。普通来源按以下规则填写，原话必须逐字来自当前批次，不得编造：
+  - self_statement：本人直接陈述关于自己的内容；owner_evidence_text 摘取本人原话，other_evidence_text 为空。
+  - confirmed_response：本人明确确认、纠正或接受先前关于自己的具体内容；两项原话分别摘取本人回应和先前他人发言。同一 fact 必须保留双方内容及最终确认结果，普通应声不构成确认。
+  - third_party_report：他人通过已确认别名明确描述本人；owner_evidence_text 为空，other_evidence_text 摘取包含别名的第三方原话。fact 和 signal 必须保留报告来源，不冒充本人自述，不将对方指派、建议或猜测写成本人承诺。
+- intent 额外允许 observed_event，仅用于所属 fact 明确记录的客观事件，两项原话均为空；claim/action 不使用该来源。
+- confidence 为 0-1 的证据支持程度，不代表承诺强度，不替代主体归属、原话和事实依据。保留时间、条件、主观性及不确定性，不把可能、担忧或第三方判断改为已证实事实。
+- 没有 signal 不等于没有 fact 保存价值；难以归入现有 signal 类型的明确个人证据仍可保存。三类 signal 分别判断，不要求每条个人 fact 都有 signal，更不要求三类同时非空。
+- signals 仅为待核验线索，不在此生成最终个人主张、行为规律、意图对象或状态。
 
 user_claim_signals 输出规则：
-- `user_claim_signals` 为后续显式 user_claim 提炼提供待核验的个人主张线索，包括长期特征和有价值的阶段性个人条件；不要求在此证明主张长期有效或重复出现多次。它不是最终 claim，不决定与已有 claim 的关系或应生成哪类 user_state，也不用于生成 `user_observed_pattern`。其他人、组织、产品用户或未确认身份的环境录音 speaker 关于其自身的主张不能进入该字段；关于用户本人的证据仍须满足下述身份与来源要求。
-- 仅当存在以下证据之一时输出：① `speaker_用户本人` 直接陈述明确关于自身的主张；② 其他人先提出明确关于用户本人的主张，用户本人随后明确确认或纠正；③ 第三方明确谈到已确认别名所指向的佩戴者。前两种都必须确认陈述主体是用户本人，而不只是发言者是用户本人；第三种只能作为 `third_party_report` 证据，不能冒充用户本人自述；同名对象、模糊应声或礼貌回应不能生成 signal。
-- 第二种情形必须在同一条 fact 的 `text` 中写清其他人提出了什么、用户如何回应以及最终由用户确认或纠正的具体内容；signal 只表达用户最终认可或修正后的主张，不照搬对方未获确认的说法。
-- `owner_evidence_type` 为 `self_statement|confirmed_response|third_party_report`。前两种在 `owner_evidence_text` 中逐字摘取用户本人原话；回应型还须在 `other_evidence_text` 中摘取先前对方原话。第三方报告将 `owner_evidence_text` 置空，`other_evidence_text` 填包含已确认别名的第三方原话。不要引用前置上下文或编造原话。
-- `subject_entity` 必须固定填写“用户本人”，不得填写关系对象。用户与他人、组织或项目之间的关系仍可作为用户本人的关系主张；关系另一端应在 fact/entities 及后续 claim 的 object_entity 中表达。
+- 提示关于本人的明确个人主张，包括长期特征和有价值的阶段性条件；不要求长期有效或重复出现，不从离散行为归纳规律。关系主张也可保留，但主体仍是本人。
 - 当前 fact 明确表达或清晰确认了关于用户本人的有价值主张时输出 `user_claim_signals`。除了稳定属性，也应捕捉有时间或情境限定的优先选择、工作/社交可用性、时间或资源限制、能力边界及相关担忧，以及这些个人条件的缓解、解除或改变。例如“这周先处理家里的事”“本周晚上不接额外工作”“练树式时觉得平衡能力还不够”“不再担心协调性跟不上”均可提供候选线索，不因只陈述一次或尚不确定能否生成最终 claim 而直接丢弃。
 - `claim_type_hint` 仍只能是 identity_profile、affiliation、relationship、preference、constraint、behavior_pattern。preference 可提示本人明确的阶段性优先选择，constraint 可提示本人明确的阶段性限制、能力边界或相关担忧，须保留其主观性质，不把所有情绪强塞为约束。`behavior_pattern` 仅用于本人明确自述或确认的规律/惯例，例如“我每周三都跑步”；“最近在学习摄影”本身不等于惯例、固定频率或摄影优先级，不得据此输出 behavior_pattern，也不得从离散行为观察中推断规律。
 - `claim_anchor` 是供显式 claim 提炼识别主张主题的简短标签，例如“安静旅行偏好”“每周三跑步惯例”“晚间工作可用性”。它不是行为样本分组键、完整句子或最终 user_claim；具体时间、条件和担忧程度须保留在 fact 的 text 和 evidence_basis 中。
 - 阶段性个人主张不等于普通一次性背景；但单次行动、未来安排和事项进度也不自动构成个人主张。“昨天去了健身房”主要由 user_action_signals 表达，“明天去黄山”主要由 user_intent_signals 表达，“编排完成七成”只是事项进度；若同一 fact 另有“因此本周无法接额外安排”等明确个人条件，可以为这部分内容另输出 claim signal，不重复复制行动、意图或事项进度。
 - 普通一次性背景、关于第三方自身的主张、临时建议、助手猜测、供跨事件归纳的行为线索、寒暄和无后续价值的感叹输出空数组。不要把“感觉真棒”等零散感叹自动变为个人状态，也不硬性要求用户同时说明具体行为后果才保留一项语义完整、具有实际判断价值的个人条件。
 - 严格保留“担心、可能、最近、本周、仅在某情境下”等判断强度与适用范围：“担心协调性跟不上”不能改成“协调性不足”，“训练进展缓慢”不能改成“长期身体缺陷”。明确条件已缓解或结束时也须如实保留，不沿用先前尚未缓解的说法。
-- 信号与 fact 必须严格一致：signal 的主体、主张及其必要限定信息必须由同一 fact 的 `text` 完整支持。回应型的提议和回应都必须写入该 fact；第三方报告必须保留说话人及被报告内容。不得从其他 fact 或前置上下文借用未写入该 fact 的信息；`evidence_basis` 应写清证据来源。
-- 每条 fact 最多输出 3 个 signal。同一 fact 中独立成立的偏好和阶段性个人条件可分别提示，不因已有偏好 signal 就忽略后者；不为凑数量生成信号。每个 signal 必须包含 subject_entity、claim_type_hint、claim_anchor、owner_evidence_type、owner_evidence_text、other_evidence_text、evidence_basis、confidence；其中 evidence_basis 必须引用当前 fact `text` 中可直接定位的具体证据。
+- 每条 fact 最多 3 个。同一 fact 中独立成立的偏好和阶段性条件可分别提示，不因已有偏好就忽略后者，也不为凑数量生成信号。字段见输出结构。
 
 user_action_signals 输出规则：
-- `user_action_signals` 只提示当前 fact 中用户本人一次具体的已发生或正在发生的行为、选择或实质性参与；不是习惯、偏好或归纳结论。它与本次采集期间“用户与助手交谈”的 user_activity 不同：谈论某项行为不等于执行该行为。
-- `subject_entity` 固定为“用户本人”，且必须出现在同一 fact 的 `entities` 中；不能把产品用户、其他人或未经确认的环境录音 speaker 当作本人。
-- `action_kind` 只能是 `action|choice|participation`，分别表示具体执行、在真实选项中作出选择、实际参加会议/活动等。`action_text` 应写清具体做了什么及已知时间/对象，且必须由同一 fact 的 `text` 直接支持；不得从别的 fact、前置上下文或常识补全。
-- 用户本人自述已发生行为、明确确认自己做过的行为，或第三方用已确认别名明确报告本人的已发生行为，可以输出。`owner_evidence_type` 使用 `self_statement|confirmed_response|third_party_report`，原话字段与 user_claim_signals 相同；第三方报告不能改写成本人自述。
+- 提示一次具体已发生或正在发生的行为、实际选择或实质性参与，不是习惯、偏好或归纳结论；谈论某项行为不等于执行该行为。本人必须出现在同一 fact 的 entities 中。
+- action_kind 只能是 action|choice|participation，分别表示具体执行、在真实选项中作出选择、实际参加会议/活动。action_text 写清做了什么及已知时间、对象。
 - 对未来计划/建议/假设、单纯提问或谈论、助手或第三方自己的行为输出空数组。“我每周三都跑步”是规律自述，不得拆成多次行为；只有文本另外明确描述一次具体发生的跑步时才可为该次事件输出 signal。普通用户—助手对话本身不要输出 action signal。
-- 每条 fact 最多输出 3 个 signal。每个 signal 都包含 subject_entity、action_kind、action_text、owner_evidence_type、owner_evidence_text、other_evidence_text、evidence_basis、confidence；evidence_basis 必须指出同一 fact 中支撑该行为的具体内容。事件时间沿用 fact 的 event_time_key，不在 signal 中重复输出。
+- 每条 fact 最多 3 个，字段见输出结构；事件时间沿用 fact 的 event_time_key，不在 signal 中重复输出。
 
 user_intent_signals 输出规则：
-- `user_intent_signals` 是当前 fact 对用户未来意图及其后续进展的证据提示，不是最终 goal、plan 或 work_item，也不能直接决定创建、更新或覆盖已有对象。
-- 只记录“用户本人”的未来目标、安排、责任，以及这些既有意图后来发生的变化：`subject_entity` 必须固定填写“用户本人”（英文输出填写 `user self`），不得填写任何其他人、团队、组织、产品用户或环境录音 speaker。
-- 当用户本人直接表达未来目标、安排、责任，或明确接受、承诺、确认或修正他人提出的事项时，可输出 signal。若同一 fact 明确指出用户本人先前的目标已实现、原定安排已发生、承诺事项已完成，或既有目标、安排、责任已取消，也必须输出 `signal_purpose=lifecycle_update` 的 signal；不要因为事件已过去或事项已结束而漏掉。第三方明确谈到已确认别名所指向佩戴者的未来安排、责任或既有意图的后续结果时，也可输出 `third_party_report` signal，但不得把对方指派、猜测或建议写成用户本人承诺；同一 fact 的 `text` 必须保留说话人与具体内容。
-- `assertion_source` 同时标明证据来源：`self_statement|confirmed_response|third_party_report|observed_event`。本人自述与确认回应在 `owner_evidence_text` 中摘取用户本人原话；确认回应还要在 `other_evidence_text` 中摘取先前对方原话。第三方报告的 `owner_evidence_text` 为空，`other_evidence_text` 是包含已确认别名的第三方原话；不得编造用户回应。`observed_event` 仅用于同一 fact 明确记录的客观事件，两项原话字段留空。
+- 提示本人的未来目标、安排、责任，或既有意图的后续进展，不直接决定对象的创建、更新、覆盖或最终状态。
+- 本人表达或明确接受、承诺、确认、修正的未来事项可输出 future_intent 信号；既有目标实现、安排发生、责任完成、取消等进展也须保留为 lifecycle_update，不能因事项已结束而漏掉。已确认别名的第三方报告同样可作为线索，但不能据此认定本人已接受责任。
 - `signal_purpose` 只区分 signal 的处理用途：`future_intent` 表示仍面向未来的目标、安排或责任，`lifecycle_update` 表示可识别的先前意图后来得到确认、调整、受阻、实现、发生、完成或取消；不要在此字段中填写 goal、plan 或 responsibility。`candidate_object_types` 必须非空，只能包含 goal、plan、work_item，用它表示对象可能的类型；第三方关于目标或责任的报告只是线索，不能单独证明用户已设定目标或承担承诺。
-- `user_role` 只能是 owner、participant、responsible，表示用户本人分别是目标拥有者、安排参与者或责任承担者。产品用户、客户、消费者或环境录音中的未知说话人只是被顺带提及时不得输出 signal。
-- 对方提出事项而用户明确接受时填写 `assertion_source=confirmed_response`。助手建议、开放假设、条件讨论和推测本身不得输出 signal。来源明确不等于意图已经确定；fact 的 `text` 和 `evidence_basis` 必须保留“可能、考虑、尚未决定”等意愿与承诺程度的限定，不能把这些表达改写为已落实安排或明确承诺。
+- user_role 只能是 owner、participant、responsible，分别表示目标拥有者、安排参与者或责任承担者。
+- 助手建议、开放假设、条件讨论和推测本身不得输出 signal；保留“可能、考虑、尚未决定”等意愿限定，不升级为已落实安排或明确承诺。
 - `user_intent_anchor` 是简短、稳定的事件/事项/目标聚合标签，例如“天津客户会议”“半马训练目标”“客户报告交付”；它不是完整句子，也不是最终对象描述。
-- 信号与 fact 必须严格一致：未来目标、安排、责任或既有意图的后续结果本身必须明确写在同一 fact 的 `text` 中。不得因为原始 unit 批次中存在相关内容，就把它挂到未保留该内容的 fact 上；无法由该 fact `text` 独立支撑时输出空数组。
-- 每条 fact 最多输出 2 个 signal。每个 signal 必须包含 subject_entity、signal_purpose、candidate_object_types、user_role、user_intent_anchor、assertion_source、owner_evidence_text、other_evidence_text、evidence_basis、confidence；其中 evidence_basis 必须是当前 fact `text` 中可直接定位的内容。
+- 每条 fact 最多 2 个，字段见输出结构。
 
-输出格式：
+七、实体、主题与输出字段
+- `fact_topic` 表示当前 fact 讨论的具体方面，必须由本次证据支持。使用简短、具体、可检索的主题名称，不要使用泛领域、完整事实句子、动作、一次性结论、情绪或零散关键词；没有充分依据时保守命名。
+- `entities` 保留所有与 fact 直接相关的实体，用于完整召回；`primary_entity` 表示这条 fact 主要描述、影响或归属的单一实体，必须来自 `entities`。当语境能确认已知别名或本次确认的新别名指向佩戴者时，同时保留原文人名和“用户本人”；同名第三人不能归并。第三方报告仍须保留来源，不能改写为本人自述。
+- `primary_entity` 是主要归属或检索实体，不代表 fact 中每项行为、评价或状态都属于它；多主体内容须分别表达实际主体，不能因为选定一个 primary_entity 就转移其他人的情况。
+- `fact_type` 只标记主要语义作用：preference、decision、request、recommendation、action、commitment、open_question、risk、error、context、instruction、other；它不是个人信息的保存资格，也不决定 signal 是否输出。
+- `priority` 为 0-100，只描述重要程度，不代表真实性、长期稳定性或保存资格。先按第二节判断是否值得保存，再评分；本 prompt 不用固定分数门槛删除已经合格的个人证据，不为通过筛选人为抬高分数。
+- `keywords` 是简短检索词，保留具体实体、主题、行为、约束及关键时间/顺序锚，通常每个词为 2-8 个汉字或短英文短语。不要使用完整句子、寒暄或泛化鼓励语。
+下列实体规则只用于选择已保留 fact 的语义锚点，不是额外的长期价值筛选门槛：
+
+""" + ENTITY_EXTRACTION_GUIDANCE_ZH + """
+
+输出 JSON，不要 markdown 或额外解释；保持以下字段结构：
 {
   "facts": [
     {
-      "text": "覆盖完整 exchange 的自包含 narrative fact；优先写清 what，when/where/who/why 仅在证据明确且有助于理解时写入，缺失信息直接省略",
+      "text": "自包含的事实陈述或叙事；保留实际主体、具体内容及必要背景、时间、条件与变化，不强制复述整个exchange，不补造缺失环节",
       "keywords": ["关键词1", "关键词2"],
       "entities": [{"name": "实体名", "type": "PERSON|ORGANIZATION|LOCATION|PRODUCT|PROJECT|TECHNOLOGY|CONCEPT|TOPIC|PREFERENCE|OTHER"}],
       "primary_entity": {"name": "这条 fact 主要描述、影响或归属的单一实体", "type": "PERSON|ORGANIZATION|LOCATION|PRODUCT|PROJECT|TECHNOLOGY|CONCEPT|TOPIC|PREFERENCE|OTHER"},
@@ -401,7 +395,7 @@ INTENT_EXTRACTION_PROMPT_ZH = """你是个人世界模型的显式 user_intent �
 `user_intent` 是用户未来导向的目标、安排或责任，不是对 fact 的逐字复述。fact 保存发生过的陈述和情境，future intent candidate 提取其中可追踪、可更新的未来对象。只允许三类：
 - `goal`：用户明确追求、跨越多个动作的持续性期望结果；一次性愿望或单次动作不是 goal。
 - `plan`：用户将参与的明确未来安排、行程、会议、活动或事件；必须有时间/时间窗口，或“已约定、已报名、已安排”等安排性证据；它不是待办。
-- `work_item`：用户本人负责的有界事项；除具体动作外，必须有交付物、截止时间、明确承诺或用户本人明确接受的分配中的至少一项完成锚点。它可以是 personal_action、commitment、assigned 或 external_commitment。
+- `work_item`：用户本人明确承担的有界事项。必须先确认该具体责任确实由用户本人承担，再判断是否有交付物、截止时间、明确承诺或用户本人明确接受的分配中的至少一项完成锚点；项目有交付物或 deadline 本身不能证明用户本人负责执行。它可以是 personal_action、commitment、assigned 或 external_commitment。
 goal 或 plan 不得自动拆出 work_item；只有 fact 明确提供下一步动作、交付、承诺或分配的独立证据时，才可由对应 signal 提炼 work_item。
 
 三、intent_lifecycle_observation 的含义
@@ -409,6 +403,20 @@ goal 或 plan 不得自动拆出 work_item；只有 fact 明确提供下一步�
 
 四、输入 user_intent_signal 的含义
 每个条目包含独立的 `signal_id`、一条 `user_intent_signal` 及其所属 fact。同一 fact 可能因多个 signal 重复出现，但仍是同一份证据。signal 是 fact 提炼阶段给出的待核验线索，不是已经成立的 user_intent，也不是 fact 之外的新证据：`signal_purpose` 决定处理未来意图还是先前意图的后续变化；`candidate_object_types` 限定可输出的 goal、plan 或 work_item 类型；`subject_entity` 与 `user_role` 提示用户在其中的身份，`user_intent_anchor` 帮助定位事项，`assertion_source` 与 `evidence_basis` 帮助审查来源。signal 的 `confidence` 只是前一阶段的估计。必须用当前条目的 fact `summary` 核验 signal，不得照搬 signal 的结论、借用其他条目的事实，或把重复 fact 当作多次独立证据。时间信息只用于理解 fact 中已有的表达，不是安排、截止日期或完成情况的独立证据。来源明确不等于意图已经确定；必须保留 fact 中的意愿和承诺程度限定，不能仅因是本人自述就认定安排已落实或责任已承担，也不能把 confidence 当作承诺程度。
+
+个人责任归属审查：
+- signal 可以正确地提示一项与用户有关的未来事项，但不意味着必须生成 intent item。即使 user_role=responsible、subject_entity=用户本人，或 anchor 提到“实现/开发”，仍须依据 fact 判断用户究竟承担了哪一项具体动作，不能把路由提示当作执行责任的证明。
+- 区分“确认需求或功能范围”“安排他人执行”“本人承担执行/协调/审核责任”。用户主持会议、讲解方案、决定 P0/P1、同意技术方向或使用“我们”，均不自动表示本人负责实现全部功能。产品要支持的行为不是用户本人将执行的任务。
+- 用户让梓豪开发，不等于用户自己开发；不能仅把梓豪放入 collaborator_entities 后，将开发任务的 subject_entity 改成用户本人。只有 fact 另有本人明确承诺的安排、跟进、协调或验收动作时，才可提炼该动作，不能自行补出管理责任。
+- 本人责任不限于亲自编码或制作。明确的“我来安排并跟进结果”“完成后由我验收”“我会后和姜万勇沟通”同样可以构成 work_item，但 action_text、summary 和 deliverable 必须保留实际责任边界，不升级为本人实现或解决整个技术问题。
+- responsibility_type=assigned 仅表示用户本人明确接受分配给自己的事项，不表示用户向别人分配工作。填写责任类型、较低 confidence 或引用 fact ID，都不能弥补缺失的个人承担证据。
+- 当前条目只支持功能范围或业务决定，而不支持候选类型所要求的个人未来意图时，future_intent_candidate 返回 null；保留 signal_id，intent_lifecycle_observation 仍为 null。不要修改输入 fact/signal，不为避免空结果而改造为 goal、plan 或编造下一步。
+
+责任边界示例（均以对应 fact 为准，不额外假定未提供的职责）：
+- “用户确认 CES Demo 的 P0 为返回防误触、移出5秒关闭、翻页，UI 为 P1”：即使 signal 提示 work_item/responsible，也不能生成“用户负责实现 CES P0 功能”；未说明本人后续动作时 candidate=null。
+- “用户说明刷抖音 Demo 只做 Flip 单页翻页、光标控制、暂停播放和点赞”：这是功能范围说明，不能生成“用户负责开发刷抖音功能”，candidate=null。
+- “用户让梓豪尝试延迟发信号来抑制误触”：不能生成用户亲自实现该策略的任务；若没有另外明确承诺安排或跟进动作，不凭这句话创造用户的管理待办。
+- “用户承诺这两天补齐状态机”：可以提炼本人补齐状态机的 work_item；“用户承诺安排梓豪测试并跟进结果”只能提炼本人的安排与跟进，不是本人执行测试。
 
 五、输出规则
 1. 每个输入 `signal_id` 恰好返回一条结果，必须同时包含 `future_intent_candidate` 和 `intent_lifecycle_observation`。`future_intent` signal 只能将前者设为对象，后者必须为 null；`lifecycle_update` signal 只能将后者设为对象，前者必须为 null。最多一个字段非空。signal 与 fact 不符或证据不足时两个字段都为 null，不得跨分支改写 signal，也不得省略该 signal。非空结果的 `object_type` 必须属于当前 signal 的 `candidate_object_types`。
@@ -495,6 +503,9 @@ save_new_intent 是布尔值，只决定是否在 memory_user_intent_items 中�
 - false：候选只是对旧事项的再次确认、细节补充或安排调整；候选不成立或证据不足；或者新旧同一性存在歧义，尚不足以安全新增独立事项。
 - 同一事项的再次确认或补充通常直接作用于旧对象，不另建一条重复 intent。save_new_intent=false 仍可以输出关系与旧对象更新。
 - 助手建议未被用户接受、开放假设、推测、含糊应声，以及不足以成立的候选，不得仅因已经被前一步提炼就判定需要保存。
+- 保存 work_item 前，必须用随附 fact 复核 candidate 中用户承担的具体责任，不能只相信 candidate 的 summary、responsibility_type 或前一步 signal 的 user_role。用户确认需求、界定功能范围、确定 P0/P1、安排别人做事，不自动证明本人负责实现；有交付物或截止时间，也不能替代责任归属证据。
+- 用户明确承担协调、安排、跟进或验收时，只能认可 fact 支持的相应责任；不得扩写成亲自开发或完成他人交付。assigned 指用户本人接受的分配，不是用户给别人的分配，collaborator_entities 也不能把他人责任转成用户责任。
+- 候选把“确认 CES P0 范围”或“说明刷抖音 Demo 功能”升级为“用户负责实现全部功能”时，应判定 save_new_intent=false，并在 reason 中说明 fact 只支持范围决定、缺少该个人执行责任。不能为了保留候选而自行补出协调工作、改换类型或改写新候选；若也没有独立支持旧事项变化的证据，relations=[]、intent_updates=[]。单纯不再提及旧责任，不构成取消旧 intent 的证据。
 - 判定保存时沿用输入 candidate 的内容，不在这里重新生成或扩写整条新 intent；新对象的初始状态由其类型确定为 active、planned、open。
 
 四、判断新旧关系
@@ -700,24 +711,31 @@ EXPLICIT_USER_CLAIM_EXTRACTION_PROMPT_ZH = """你是个人世界模型的显式 
 二、user_claim 的含义
 `user_claim` 是用户本人明确陈述或明确确认的、语义完整且可追溯到 fact 的主张，用于表达用户的身份、所属关系、人与事物的关系、偏好、约束或本人自述的持续行为。它不是 fact 的同义复述：fact 保存原始事件和对话情境，claim 抽取其中可复用、可与以后证据比较的用户主张。一条 claim 只表达一个核心判断，须写清主体、属性或关系、具体内容及必要的对象、时间和条件；“可复用”不等于永远有效，不能把有条件或阶段性的说法泛化成永久属性。
 允许的 `claim_type` 为：
-- `identity_profile`：用户明确说明的身份、背景或角色；
+- `identity_profile`：用户明确说明的身份、背景或角色，包括某个具体项目中的角色；
 - `affiliation`：用户与组织、团队、项目或地点的所属关系；
-- `relationship`：用户与人、组织或项目的其他明确关系；
-- `preference`：用户明确表达的喜欢、厌恶或优先选择；
-- `constraint`：用户明确表达的限制、禁止、能力边界或持续条件；
+- `relationship`：用户与人、组织或项目的其他明确关系，包括有明确对象和范围的职责关系；
+- `preference`：用户明确表达的喜欢、厌恶或优先选择，可以只在某个项目、阶段或条件下成立；
+- `constraint`：用户明确表达的限制、禁止、能力边界或阶段性、持续性个人条件；
 - `behavior_pattern`：用户明确自述或确认的持续行为或惯例，例如“我每周三都跑步”。
-单次事件或行为不是持续行为主张；从多次行为观察归纳出的规律属于 `user_observed_pattern`。未来行程、计划、承诺和待办属于 fact / user_intent。助手的猜测、建议和未经用户确认的第三方说法都不是显式 user_claim。
+单次事件或行为不是持续行为主张；从多次行为观察归纳出的规律属于 `user_observed_pattern`。具体的未来行程、计划、交付承诺和待办属于 fact / user_intent，不因一次承诺就推断用户长期负责某类工作；这不排除 fact 另行明确陈述的项目角色或职责关系。助手的猜测、建议和未经用户确认的第三方说法都不是显式 user_claim。
+
+个人主张与适用范围审查：
+- 不要求 claim 跨项目、长期或普遍成立。只要 fact 确实表达用户本人的偏好、角色、职责边界或个人条件，就可保留只在特定项目、版本、阶段或情境下成立的 claim；不能因范围有限而一概丢弃，也不能为方便复用而删除范围。
+- 区分“用户对项目作出判断”与“关于用户本人的主张”。主持会议、讲解方案、确认团队决定或功能范围，本身不证明个人偏好、个人时间不足或本人承担全部执行。项目期限紧、资源不足等条件不能直接转移为用户个人约束；但明确的项目内个人选择倾向或职责关系可以提炼。
+- claim 的断言不得超出 fact 支持的范围：保留具体对象、项目、阶段、时间、前提、否定和主观程度，不自行加入“一贯、通常、长期、跨项目”等概括。原文确实是一般性本人自述时，也不反向缩窄成当前项目的选择。
+- 正例：“在本次 CES Demo 中，用户更倾向于保证交互稳定性，而不是增加手势种类”可形成保留“本次 CES Demo”限定的 preference；“在 CES Demo 项目中，用户负责交互方案设计，不负责算法实现”可形成项目限定的角色或职责关系，不能扩大为用户所有项目的职责。
+- 反例：“用户确认本次 CES Demo 先做功能、有余力再优化”仅说明项目取舍，若未明确表达个人偏好，不生成“用户在开发工作中偏好功能优先”；“本次 Demo 因时间紧缩减范围”不能生成“用户本人时间不足”。只有这些信息时返回空 claims。明确的“我一向先保证功能再优化”仍可形成一般性偏好，“本周晚上不接额外工作”仍可形成阶段性个人约束。
 
 三、输入 user_claim_signal 的含义
-每个输入条目有独立的 `signal_id`、一条 `user_claim_signal` 及其所属 fact。同一个 fact 可能因多个 signal 重复出现，但它仍是同一份事实证据。signal 是 fact 提炼阶段给出的候选线索，不是最终 claim，也不是 fact 之外的新证据：`claim_type_hint` 提示可能的类别，`claim_anchor` 标出待核验的主题，`evidence_basis` 帮助定位证据，signal 的 `confidence` 只表示前一阶段的估计。必须以当前条目的 fact `summary` 核验该 signal，不得照搬 signal 的判断、借用其他条目的事实，或把重复出现的 fact 当作多次独立证据。
+每个输入条目有独立的 `signal_id`、一条 `user_claim_signal` 及其所属 fact。同一个 fact 可能因多个 signal 重复出现，但它仍是同一份事实证据。signal 是 fact 提炼阶段给出的候选线索，不是最终 claim，也不是 fact 之外的新证据：`claim_type_hint` 提示可能的类别，`claim_anchor` 标出待核验的主题，`evidence_basis` 帮助定位证据，signal 的 `confidence` 只表示前一阶段的估计。必须以当前条目的 fact `summary` 核验该 signal，不得照搬 signal 的判断、借用其他条目的事实，或把重复出现的 fact 当作多次独立证据。hint 为 preference 或 constraint 不证明一定存在个人偏好或个人约束；高 confidence 也不能弥补缺失的个人主张或范围依据，降低 confidence 不能使过度泛化的 claim 合格。
 
 四、输出规则
 1. 对每个输入 `signal_id` 恰好返回一个结果；一条 signal 可以产生零条或多条不同的 claim。证据不足、signal 与 fact 不符，或当前 fact 不包含合格显式主张时，返回空 `claims`，不得省略该 signal。
 2. 显式主张须来自用户本人直接陈述，或用户对他人具体说法的明确确认、否认、纠正；回应型 fact 必须同时保留对方说法和用户最终立场。仅有第三方报告、模糊应声、单次行为或助手推测时，不能生成 claim。
 3. 每条 claim 的 `subject_entity` 必须等于当前 fact 中非空的 `world_owner_entity`（用户本人），不得以其他人、产品用户或环境 speaker 为主体。`object_entity` 若非空，必须来自同一 fact 的 `entities`；没有明确用户主体时返回空 `claims`。
 4. 每条 claim 必须由当前 fact 的 `summary` 直接支持，`evidence_fact_ids` 必须恰好为当前条目 fact 的 `[fact_id]`。不得引用其他 fact，即使它们内容相似。
-5. `claim_text` 必须是自包含的完整陈述，写明会影响语义的对象、范围、时间及条件；不要拼接无关主张。`predicate` 使用简短稳定的小写英文键，如 `has_role`、`member_of`、`prefers`、`dislikes`、`requires`、`cannot`、`has_routine`。否定语义同时体现在 predicate 和 claim_text 中，不输出独立正负字段。
-6. `primary_domain` 只能是 `general|health|work|life|information|finance|family|learning|social|interest|travel`，优先选最具体领域。仅当 fact 明确给出有效时间时填写 `valid_from`/`valid_to`，不得猜测。claim 的 `confidence` 应根据当前 fact 对最终主张的支持程度独立判断，不照搬 signal 的 confidence。
+5. `claim_text` 必须是自包含的完整陈述，写明会影响语义的对象、范围、时间及条件；必要限定必须写在正文中，不能仅依靠 object_entity、primary_domain 或有效期恢复含义。没有具体项目名称时保留 fact 中可确认的范围，不猜测名称，也不删除限定；不要拼接无关主张。`predicate` 使用简短稳定的小写英文键，如 `has_role`、`member_of`、`prefers`、`dislikes`、`requires`、`cannot`、`has_routine`。否定语义同时体现在 predicate 和 claim_text 中，不输出独立正负字段。
+6. `primary_domain` 只能是 `general|health|work|life|information|finance|family|learning|social|interest|travel`，优先选最具体领域。仅当 fact 明确给出有效时间时填写 `valid_from`/`valid_to`，不得猜测；有效期为空不代表永久成立，相对时间和情境限定仍保留在 claim_text 中。claim 的 `confidence` 应根据当前 fact 对最终主张的支持程度独立判断，不照搬 signal 的 confidence。
 7. 同一 fact 在多个条目中出现时仍逐条审查；相同主张可以由不同 signal 输出，系统后续去重。只返回 JSON，不要 markdown。
 
 输出：
@@ -856,7 +874,7 @@ DERIVED_USER_CLAIM_EXTRACTION_PROMPT_ZH = """你是个人世界模型中的推�
 2. 每个 candidate 的 premise_claim_ids 至少包含一个 `changed_explicit_claims` 中的 claim id，且所有 ID 都必须来自输入。
 3. 只允许 claim_type 为 affiliation、relationship 或 constraint；禁止输出 identity_profile、preference、behavior_pattern、目标、计划、待办、人格或风险判断。
 4. subject_entity_id 必须等于输入中用户本人的 entity ID；不得以第三方为 subject。object_entity_id（0 表示无 object）如有，必须来自输入中出现的实体 ID；不能创建新实体。
-5. predicate 使用简短、稳定的小写英文键；claim_text 必须是完整、自包含、面向阅读者的结论。
+5. predicate 使用简短、稳定的小写英文键；claim_text 必须是完整、自包含、面向阅读者的结论。结论必须继承所需前提中的项目、对象、阶段、时间和条件限定，并写入 claim_text；不能把项目内职责扩大为所有项目职责，也不能把项目条件转为个人约束。所需前提的适用时间或条件不相容时，不推导该结论；没有明确时间不表示永久成立，不以提高或降低 confidence 弥补逻辑或范围依据不足。
 6. 不要重复或改写某个 premise 本身；没有严格成立的新结论时返回空数组。
 7. `primary_domain` 必须为 `general|health|work|life|information|finance|family|learning|social|interest|travel` 之一，表示该推导结论主要涉及的用户生活领域；优先选择最具体领域，`general` 只用于真正跨领域的结论。
 8. confidence 表示“在给定 premise 下该结论成立”的把握，不表示 premise 本身的真实性。只返回 JSON。
@@ -959,13 +977,25 @@ user_claim 是关于用户本人的可追溯命题，记录用户明确表达的
 输入含义：`new_claim_cases` 每项以 `new_claim` 为主体，`related_claims` 将关系事件、对应旧 claim 及该旧 claim 关联的 `linked_state_ids` 放在一起；事件的语义关系已判定，无需重新分类。`state_contexts` 包含本领域现有 enduring_state、recurring_state 和 situational_state。`evidence_detail_available=true` 表示该 state 与关系事件中的旧 claim 有证据关联，展开其 `claim_evidence` 和 `pattern_evidence`；其他类型证据可能未展开，不能据此认定它们不存在。否则只提供 state 描述与两类支撑证据的数量，不代表它没有其他证据，也不代表这些支撑目前都有效。需要检查新 claim 是否与其中任一 state 表达同一状态。列表为空只表示没有这类历史信息，不表示不能创建 state。
 
 请按以下顺序思考，只输出 state 操作：
-1. **逐条评估新 claim。**先阅读每个 `new_claim_case.new_claim`，独立判断它是否支持值得在预测或服务决策中使用的长期倾向、重复规律，或当前阶段的个人条件；根据内容、时间和适用条件选择 state_type，不按 claim_type 或来源机械指定类型。再合并指向同一状态维度的新 claim，不要对同一 state 输出重复操作。即使没有 `related_claims` 且 `state_contexts=[]`，也必须完成评估；有充分证据就输出 `create`。一条直接、明确的 explicit claim 即可支持合格状态，不要求凑够多条：例如“我一向喜欢早上开会”可形成长期时间偏好，“本周晚上要陪家人，不接受额外工作安排”可形成阶段性可用性约束。不要为了聚合而混合互不相干的主题。state_text 应表达有证据支持的用户条件，而非粘贴 claim、记录单次事件或复述事项进展。
-2. **区分三种状态。**`enduring_state` 表示跨时间或情境大致有效的偏好、风格、价值取向或长期约束；明确表达的稳定偏好不因只有一次陈述就被视为一次性事件。`recurring_state` 表示有周期、频率、反复行为或明确条件—行为规则的模式，需要 claim 明确陈述习惯/规律；本模块不依据单次行为或喜好归纳重复规律。`situational_state` 表示在 reference_time 及其适用条件下成立的阶段性个人处境，重点包括当前优先级与注意力分配、时间或资源约束、可用性，以及有证据支持的精力、压力或社交状态；当前准备状态只表达个人准备条件，不复述项目进度或待办清单。其依据必须来自输入 claim，不能因为项目多、截止日期近就臆测压力，也不能把最近谈论的话题当作最高优先级。一次性的目标、计划、行程或“正在推进某项目”本身不自动生成 state；若 claim 同时明确表达其对用户当前个人条件的影响，只提炼这部分条件。阶段性的个人条件可以形成 situational_state，但不得升级成永久偏好或长期约束。
-3. **对齐旧 state。**检查所有 `state_contexts`。若同一 `state_domain`、`state_type`、`state_kind`、`state_topic` 的旧 state 已表达该状态，应根据新证据选择 `reinforce` 或 `revise`，不能重复 `create`。任何已有 state，包括只提供精简描述的 state，都允许 `reinforce|revise|weaken|expire`；对精简 state 作 `weaken|expire` 时，应说明新 claim 与其状态陈述、适用条件或有效时间的具体冲突，不得把未展开的证据当作不存在。对有完整证据的 state，应结合 `claim_evidence` 和 `pattern_evidence` 判断；一条支撑 claim 失效并不意味着整个 state 失效。仍有 observed pattern 支持的 recurring_state 不应仅因 claim 变化而削弱或失效。没有受影响的旧 state 时，也要保留第 1 步得出的新建结论。
+1. **逐条评估新 claim 及其范围。**先阅读每个 `new_claim_case.new_claim` 的完整 claim_text、valid_from/valid_to，识别它描述用户什么、针对哪个对象/项目/场景、在何种时间/阶段/前提下成立，以及否定、主观程度和不确定性。再独立判断它是否支持值得在预测或服务决策中使用的长期倾向、重复规律，或当前阶段的个人条件；根据含义、持续性和适用条件选择 state_type，不按 claim_type 或来源机械指定类型。合格 claim 也可以不产生 state：个人角色或职责关系本身不证明忙碌、压力或可用性；个人情况明确时也不要求额外说明行为后果，“我最近很累”本身即可支持相应当前状态。只合并表达同一状态且适用条件兼容的 claim，不要对同一 state 输出重复操作；多个局部 claim 不因数量增加就自动支持跨项目、跨情境结论，没有共同概括的依据时分别保留范围或不聚合。即使没有 `related_claims` 且 `state_contexts=[]`，也必须完成评估；有充分证据就输出 `create`。一条直接、明确的 explicit claim 即可支持合格状态，不要求凑够多条。state_text 应表达有证据支持的用户条件，而非粘贴 claim、记录单次事件或复述事项进展。
+2. **分别判断适用范围与持续性。**适用范围说明针对哪个对象/项目/场景及条件，持续性说明长期、重复还是当前阶段成立，两者不是同一维度。有情境限定不等于短期，也不自动归入 situational_state。`enduring_state` 表示在所述适用范围内相对稳定的偏好、风格、价值取向或长期约束，可以有明确场景条件；但一次项目取舍不能推成长期工作风格，必须有稳定性的依据。明确表达的稳定偏好不因只有一次陈述就被视为一次性事件。`recurring_state` 表示有周期、频率、反复行为或明确条件—行为规则的模式，需要 claim 明确陈述习惯/规律，并保留其条件；本模块不依据单次行为或喜好归纳重复规律。`situational_state` 表示在 reference_time 及其适用条件下成立的阶段性个人处境，包括当前优先级与注意力分配、时间或资源约束、可用性，以及有证据支持的精力、压力、社交或个人准备状态；不是不满足 enduring_state 的内容的兜底类型。其依据必须来自输入 claim，不能把项目期限紧转成个人时间不足，不能因为项目多就臆测压力，也不能把最近谈论的话题当作最高优先级。一次性的目标、计划、行程、功能清单、项目进度或“正在推进某项目”本身不自动生成 state；只有明确的个人条件才提炼。阶段性的个人条件不得升级成永久偏好或长期约束。
+3. **按含义和适用范围对齐旧 state。**检查所有 `state_contexts` 的 state_text、conditions 和有效期，主题相似不等于范围相同。已表达同一状态且范围相符时，使用原 `target_state_id` 选择 `reinforce` 或有依据的 `revise`，不能重复 `create`；同一项目、同一状态的新增支持不另建。不同项目/场景的选择可以并存，不能仅因结论不同就认定矛盾，也不能把项目内偏好用于强化或改写全局工作风格。局部例外不自动否定长期状态；对较宽范围旧 state 的判断，要说明新证据在其原适用范围内的具体影响，不能把局部变化当作整体失效。任何已有 state，包括只提供精简描述的 state，都允许 `reinforce|revise|weaken|expire`；对精简 state 作 `weaken|expire` 时，应说明新 claim 与其状态陈述、适用条件或有效时间的具体冲突，不得把未展开的证据当作不存在。对有完整证据的 state，应结合 `claim_evidence` 和 `pattern_evidence` 判断；一条支撑 claim 失效并不意味着整个 state 失效。仍有 observed pattern 支持的 recurring_state 不应仅因 claim 变化而削弱或失效。没有受影响的旧 state 时，也要保留第 1 步得出的新建结论。
 4. **处理旧 state 失效后的新状态。**如果决定对旧 state 输出 `expire`，必须继续检查新 claim 是否同时支持另一条有效的长期、重复或阶段性 state。若支持，且新旧 state 的具体主题身份不同，就在同一个 `operations` 列表中同时输出旧 state 的 `expire` 和新 state 的 `create`；例如“以后固定改为每周五跑步”可以终止“每周三跑步”并创建“每周五跑步”。如果新 claim 只表明旧状态结束、没有确立新状态，则只输出 `expire`。如果变化仍是同一 state 身份的延续，应输出 `revise`，而非对同一主题 `expire` 后重复 `create`。不得直接修改旧 state 的 state_type；确有类型变化时，分别判断旧状态是否应结束、新类型状态是否成立，不将短期例外当作长期规律消失。
-5. **检查证据和时效。**关系事件不自动决定旧 claim 或 state 的当前有效性。结合文本、来源、reference_time、claim 的 valid_from/valid_to 及条件判断新 claim 的影响；不同条件或时期可以并存，例如“本周晚上不接工作”不否定长期工作偏好。对 situational_state，只有证据支持在参考时点仍成立的个人条件时才 create/reinforce/revise；已经结束的历史状态或尚未开始的未来条件，不得写成当前 active 状态。优先沿用明确的有效时间；没有明确结束时间时，可在 conditions 保留证据支持的适用或结束条件，不编造到期时间，不把“本周”泛化为长期。当前限制已解除时可以 revise/expire 相关 state，但不代表过去的 claim 错误。缺少证据的候选可以省略，但不能因此放弃其他有根据的 state。
+5. **检查证据和时效。**关系事件不自动决定旧 claim 或 state 的当前有效性。结合文本、来源、reference_time、claim 的 valid_from/valid_to 及条件判断新 claim 的影响；有效期为空不代表永久或全场景有效，primary_domain=work 也不表示适用于所有工作项目。对 situational_state，只有证据支持在参考时点仍成立的个人条件时才 create/reinforce/revise；已经结束的历史状态或尚未开始的未来条件，不得写成当前 active 状态。优先沿用明确的有效时间；没有明确结束时间时，在 conditions 保留有依据的适用或结束条件，不编造到期时间，也不能自动用项目 deadline 代替个人状态结束时间。当前限制已解除时可以 revise/expire 相关 state，但不代表过去的 claim 错误。没有合格状态时输出 operations=[] 是正常结果，不需要为了消费 claim 而创建状态，也不表示该 claim 无效；仍须评估其他有根据的 claim。
 
-state 操作仅允许 `create|reinforce|revise|weaken|expire`。更新必须引用 `state_contexts` 中的 state id；create 的 target_state_id 为 0。state_kind 必须与 state_type 对应：enduring_state 为 `communication_style|decision_style|value_priority|risk_preference|privacy_preference|time_preference|work_style|lifestyle_preference|long_term_constraint`；recurring_state 为 `daily_routine|weekly_routine|work_routine|health_routine|social_routine|conditional_behavior`；situational_state 为 `current_focus|current_constraint|current_availability|current_energy|current_stress|current_social_engagement|current_preparation`。state_kind 表示类别，不是具体状态的唯一身份；同一类别可以有多条不同状态。创建时另输出简短、稳定、能区分具体主题的中文 state_topic，如 `工作日健身`、`晚间散步`、`晚间工作可用性`；时间段优先放入有效期或 conditions，不因每次日期变化就另造同义 topic。不得输出纯英文标识、拼音或英文蛇形命名；外文专有名词可保留，但主题含义仍须用中文表达。同义改写或新增证据若仍描述已有状态，应使用其 target_state_id。更新时保持目标 state_type、state_kind 和 state_topic，不得跨出本轮 state_domain。
+范围表达与输出前复核：
+- state_text 必须自包含地保留影响含义的对象、项目、阶段、时间、前提和判断强度，结论的适用范围不能超过支撑它的 claim；不能只在 conditions 或 state_topic 中写项目名，正文却变成全局判断。聚合不是扩大范围，不补造 claim 中没有的长期性、执行责任、压力或最高优先级；降低 confidence 不能使越界结论合格。
+- conditions 是正文适用条件的结构化补充，不是新证据，也不能补救泛化正文。依据证据填写简洁的 project、phase 或其他必要条件，无条件时允许 {}，不要凑字段。更新旧 state 时输出本次判断后的完整条件，保留仍有效的限定；只有新证据确实修改或解除时才改变，不能因为新 claim 没提到就删除，更不能无依据用 {} 清空旧范围。
+- reason 应简要说明哪些 claim 支持个人状态、为何选择此持续性及范围；更新时说明与旧状态是同范围延续、明确条件变化还是其他关系，不只写“新增证据”。这些判断均在现有调用中完成，不增加输出字段。
+
+边界示例（只说明判断，不把示例当成输入证据）：
+- “在本次 CES Demo 中，用户更偏好稳定交互而非增加手势”：若形成 state，仍只能描述本次 Demo 内的个人倾向；不能改成“用户一贯重视稳定性”，也不强制生成 situational_state。
+- “在 CES 项目中用户负责交互设计”：这是有价值的职责 claim，但单独不足以推出“用户当前很忙”或“不能接其他工作”，允许无 state 操作。
+- “本次 CES Demo 交付阶段，用户将主要精力投入交互稳定性，暂缓非必要功能扩展”：可支持项目及阶段限定的 current_focus，正文保留该范围，conditions 可写 {"project": "CES Demo", "phase": "本次交付阶段"}。
+- “需要专注编程时，用户一向偏好文字沟通”：可支持保留“专注编程时”条件的 enduring_state，而不是只因有条件就改成短期状态。“用户一向喜欢早上开会”可支持长期时间偏好，“用户每周三早上去健身房”可支持明确自述的 recurring_state，均不要求多次重复自述。
+- “用户本周晚上要陪家人，不接额外工作”：可支持本周晚间的 situational_state，不意味着长期不愿工作，也不自动终止已有长期工作偏好。
+
+state 操作仅允许 `create|reinforce|revise|weaken|expire`。更新必须引用 `state_contexts` 中的 state id；create 的 target_state_id 为 0。state_kind 必须与 state_type 对应：enduring_state 为 `communication_style|decision_style|value_priority|risk_preference|privacy_preference|time_preference|work_style|lifestyle_preference|long_term_constraint`；recurring_state 为 `daily_routine|weekly_routine|work_routine|health_routine|social_routine|conditional_behavior`；situational_state 为 `current_focus|current_constraint|current_availability|current_energy|current_stress|current_social_engagement|current_preparation`。state_kind 表示类别，不是具体状态的唯一身份；同一类别可以有多条不同状态。创建时另输出简短、稳定、能区分具体主题的中文 state_topic，如 `工作日健身`、`晚间散步`、`晚间工作可用性`；需要独立维护的不同项目状态可用 `CES Demo 工作重点`、`项目 B 工作重点` 区分，不能都命名为泛化的“工作重点”。同一事项仅日期推进或表述变化时复用原主题，时间段优先放入有效期或 conditions，不另造同义 topic，也不为每条 claim 各建一条 state。不得输出纯英文标识、拼音或英文蛇形命名；外文专有名词可保留，但主题含义仍须用中文表达。同义改写或新增证据若仍描述已有状态，应使用其 target_state_id。更新时保持目标 state_type、state_kind 和 state_topic，不得跨出本轮 state_domain。
 
 每条 state 操作的 evidence 只可引用输入 claim，格式为 `evidence_type=user_claim`、`evidence_id`、`role=change_trigger|support|counterexample|context`、`weight`。必须引用至少一条 `new_claim_cases.new_claim` 作为触发；只需列出本轮判断直接使用的 claim，无需复述未提供的旧证据，系统会保留它们。expire/weaken 可以引用反例，但不应把反例写成支持。每项都要给出简短理由、0-1 的 confidence。只有逐项评估后确实没有合格操作时，operations 才输出空数组。只返回 JSON：
 {
