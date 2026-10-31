@@ -145,6 +145,7 @@ personal_world_model:
     llm_base_url: https://api.deepseek.com
     llm_api_key: ${DEEPSEEK_API_KEY}
     llm_timeout: 120
+    llm_max_tokens: 8192
     llm_thinking: disabled
     llm_json_mode: true
   embedding_model:
@@ -169,10 +170,11 @@ personal_world_model:
       fact_extraction_trigger:
         # Semantic boundaries close chapters. Fact extraction waits until
         # multiple closed chapters provide a sufficiently complete context.
+        # Coalesce multiple chapters into a larger fact evidence window.
         min_sealed_chapters: 2
-        target_sealed_tokens: 1200
-        max_sealed_chapters: 5
-        max_sealed_tokens: 1800
+        target_sealed_tokens: 2000
+        max_sealed_chapters: 8
+        max_sealed_tokens: 3200
         # Tail of the last accepted fact window, used only to resolve the
         # following window's local discourse context.
         preceding_context_max_units: 3
@@ -181,7 +183,7 @@ personal_world_model:
         max_pending_units: 40
         max_pending_tokens: 1000
         min_pending_units: 4
-        min_pending_tokens: 200
+        min_pending_tokens: 400
         enforce_min_pending_tokens: true
         max_time_gap_seconds: 60.0
         min_boundary_scoring_incoming_tokens: 5

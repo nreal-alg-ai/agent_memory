@@ -90,6 +90,11 @@ class EmbeddingClient:
     def dimension(self) -> int:
         return self._dim
 
+    @property
+    def batch_size(self) -> int:
+        """Maximum inputs in one provider-side embedding request."""
+        return self._batch_size
+
     def embed_text(self, text: str) -> Optional[np.ndarray]:
         if self._provider == "openai" and self._api_key:
             remote = self._embed_openai(text)

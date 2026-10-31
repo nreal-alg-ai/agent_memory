@@ -1,7 +1,9 @@
 from dataclasses import dataclass, field
 from datetime import datetime
 from collections import deque
+import logging
 import re
+from time import perf_counter
 from typing import Any, Deque, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -13,6 +15,8 @@ from .memory_manager import (
     _compact_whitespace,
     _to_timestamp_text,
 )
+
+logger = logging.getLogger(__name__)
 
 INTERACTION_TOKEN_RE = re.compile(r"[\u4e00-\u9fff]|[A-Za-z0-9_.$'-]+|[^\s]")
 
@@ -647,9 +651,10 @@ class MemoryContextManager:
             return self._fact_task_decision_without_new_sealed_chapter(
                 chapter_boundary_decision,
             )
-        incoming_unit.embedding = _as_embedding_vector(
-            self.embedding_client.embed_text(incoming_unit.text),
-        )
+        if incoming_unit.embedding is None:
+            incoming_unit.embedding = _as_embedding_vector(
+                self.embedding_client.embed_text(incoming_unit.text),
+            )
         chapter_boundary_decision = self._evaluate_incoming_unit_for_chapter(
             incoming_unit,
         )
@@ -691,20 +696,49 @@ class MemoryContextManager:
         intentionally accepts the remaining ASR-delay risk rather than
         leaving an input unit unpersisted.
 
-        The iterator deliberately does not accumulate decisions. Its caller
-        can evaluate a newly sealed chapter while later waiting units are
-        still being embedded and scored.
+        Embed only one covered prefix of at most the client's batch_size at
+        a time, then yield decisions individually. The caller can submit and
+        clear sealed chapters before the next unit is evaluated. Unconsumed
+        units stay buffered, including their precomputed vectors.
         """
         while self._awaiting_ambient_unit_buffer:
-            unit = self._awaiting_ambient_unit_buffer[0]
-            if not force and not self._ambient_asr_covers_unit(unit):
+            batch_units: List[MemoryUnit] = []
+            for unit in self._awaiting_ambient_unit_buffer[:self.embedding_client.batch_size]:
+                if not force and not self._ambient_asr_covers_unit(unit):
+                    break
+                batch_units.append(unit)
+            if not batch_units:
                 break
-            self._awaiting_ambient_unit_buffer.pop(0)
-            decision = self.insert_incoming_unit(
-                unit,
-                ambient_recording_enabled=not force,
+            self._embed_memory_units_batch(batch_units)
+            for _ in batch_units:
+                unit = self._awaiting_ambient_unit_buffer.pop(0)
+                decision = self.insert_incoming_unit(
+                    unit,
+                    ambient_recording_enabled=not force,
+                )
+                yield unit, decision
+
+    def _embed_memory_units_batch(self, units: Sequence[MemoryUnit]) -> None:
+        """Precompute missing unit vectors; failed items retain single-call fallback."""
+        missing_units = [unit for unit in units if unit.embedding is None]
+        if not missing_units:
+            return
+        started_at = perf_counter()
+        vectors = self.embedding_client.embed_batch(unit.text for unit in missing_units)
+        for unit, vector in zip(missing_units, vectors):
+            unit.embedding = _as_embedding_vector(vector)
+        missing_count = sum(unit.embedding is None for unit in missing_units)
+        logger.info(
+            "memory input batch embedding units=%s requested=%s reused=%s "
+            "missing=%s elapsed_ms=%.3f",
+            len(units), len(missing_units), len(units) - len(missing_units),
+            missing_count, (perf_counter() - started_at) * 1000,
+        )
+        if missing_count:
+            logger.warning(
+                "memory input batch embedding missing=%s; using per-unit fallback",
+                missing_count,
             )
-            yield unit, decision
 
     def process_awaiting_ambient_units(
         self,
