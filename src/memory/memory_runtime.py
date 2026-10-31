@@ -636,7 +636,7 @@ class MemoryRuntime:
                 canonical_units,
             )
             self._memory_context_manager.record_preceding_context_units(
-                canonical_units,
+                sealed_chapters[-1].units,
             )
             self._logger.info(
                 "memory user activity source queued semantic_unit_count=%s "

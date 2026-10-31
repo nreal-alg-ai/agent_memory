@@ -127,41 +127,23 @@ Return JSON only, with each field on its own line:
 
 ENTITY_EXTRACTION_GUIDANCE_EN = """Entity extraction rules:
 
-Entities are not limited to traditional named entities. In this memory system, an entity is a semantic anchor that can be reused across facts for clustering, retrieval, and graph construction.
-Prefer nouns or short noun phrases with long-term memory value instead of only proper names.
+Select entities directly relevant to the current fact, using short, clear nouns or noun phrases. Besides proper names, retain concrete objects or concepts explicitly involved in the evidence and necessary to understand the fact. Do not add entities to meet a count, mechanically split a description into generic concepts, or invent objects through topic association. Entity extraction does not change fact retention eligibility.
 
 Allowed entity type values:
-- PERSON: specific people, names, roles, or speakers mentioned in the conversation
+- PERSON: names, titles, or roles identifying specific people
 - ORGANIZATION: companies, teams, institutions, or groups
 - LOCATION: geographic locations or venues
 - PRODUCT: products or services
-- PROJECT: projects, product names, or long-running work items
+- PROJECT: projects or ongoing work matters
 - TECHNOLOGY: technology stacks, frameworks, libraries, tools, APIs, or systems
-- CONCEPT: abstract concepts, methods, theories, or reusable ideas
-- TOPIC: discussed domains or subject areas
+- CONCEPT: explicitly involved concepts, methods, or theories
+- TOPIC: specific discussion subjects
 - PREFERENCE: user preferences, likes, habits, or dislikes
 - OTHER: explicitly mentioned entities that do not fit the above types
 
-Entities that should be extracted include:
-- Conversation subjects or roles, such as user self, assistant, speaker_1, speaker_2, spouse, child, team, or client. `user self` is a reserved identity for the verified source speaker `speaker_用户本人`; a speaker label is not the output entity name.
-- Users in a product, market, or service domain: use a specific label such as product user, target consumer, or target customer, never bare user. These are external domain roles, not the AI-glasses wearer, and normally use CONCEPT or OTHER rather than PERSON.
-- User-relevant domains, problems, tasks, states, or scenarios, such as health management, physical condition, work, business events, family education, communication, or fatigue
-- Reusable plans, methods, tools, activities, or objects, such as healthy eating, family meetings, shared rules, picnics, or yoga mats
-- Constraint objects or conditions that affect user choices, such as financial burden, fixed schedule, time shortage, or work pressure
-
-Do not extract ordinary time expressions as entities, such as today, yesterday, last week, the past three days, 2026-05-07, 10:30, or three months.
-Time should be stored as fact time metadata, not in the entity graph.
-Only named time concepts with semantic identity may be entities, such as Spring Festival, Q3 earnings season, or Sprint 42.
-
-Do not extract pure attributes, adjective-only phrases, isolated degree words, or generic labels as entities; keep them in fact text, keywords, topics, or states instead.
-For example: low venue dependence, low intensity, high priority, low cost, strong privacy, lightweight.
-If a phrase contains a reusable object or scenario, extract the core object or scenario:
-- "fatigue caused by long-term high-intensity work" may yield "work" and "fatigue"
-- "high-frequency business activities" may yield "business activities"
-- "the financial burden is too heavy" may yield "financial burden"
-
-Entities must come from explicit conversation content or be directly determined by a role/fact subject. Do not over-infer.
-Each retained memory fact should usually include a subject entity, such as user self/assistant/speaker, plus 1-4 core semantic anchors."""
+Follow the identity and alias rules above, distinguishing user self, other speakers, and product users. Never infer wearer identity from an unverified speaker label.
+Ordinary dates, clock times, relative times, and durations are not entities; handle them under the temporal rules. Named events or periods with a distinct identity, such as Spring Festival, may be retained.
+Pure attributes, adjective-only phrases, degree words, and generic evaluations are not entities; preserve their necessary meaning in the fact text instead. Entity names must be explicitly grounded in evidence or directly resolved from verified roles, without additional inference."""
 
 
 USER_ACTIVITY_EXTRACTION_PROMPT_EN = """You are the situational-observation module of a personal world model. Given chronological dialogue or ambient-transcript units and extracted facts, describe the user's activity or situation observable during the capture window. An activity is what the user was doing then, not what they reported doing earlier, usually do, or intend to do later.
@@ -216,12 +198,15 @@ Return facts=[] when no qualifying evidence exists, without explanatory placehol
 - Known aliases help identity resolution but are not evidence of a new fact. Propose a new alias only from the wearer's self-identification, a direct address followed by the wearer's clear response, or a third-party mention marked as an unconfirmed candidate. Never treat generic user, product users, or speaker labels as names.
 - For unverified ambient speaker labels such as N_SPKxxx or speaker_1, never infer that a speaker is user self from words such as I, we, or user. Keep speakers, team members, and external objects under their actual names or speaker labels.
 - In product, market, or service discussions, user, customer, consumer, and audience are external domain roles. Prefer product user, target consumer, or target customer; never emit bare user, and never classify it as PERSON, user self, or a user_intent subject.
-- A short reply from `speaker_用户本人` can confirm or correct another speaker's specific earlier statement in this same evidence batch. Preserve both the earlier statement and the wearer's actual response in the same fact. A mere acknowledgment such as "uh-huh" or "got it" does not establish agreement or responsibility.
+- Interpret a short reply against one unambiguous antecedent. If it crosses a batch boundary, preceding context may resolve the reply's object, but the current batch must contain explicit acceptance, commitment, choice, or correction. A confirmation fact retains the necessary earlier content, the wearer's response, and the actual result. A mere acknowledgment such as "uh-huh" or "got it" does not establish agreement or responsibility; never fill gaps with assistant guesses.
 
 Preceding-context rules:
-- The preceding context below is a short tail from the already processed batch immediately before the current batch. Use it only to resolve references, ellipsis, continuity, and the starting point of the current topic. When the current batch clearly continues the same matter, it may resolve which project or phase "this Demo/design" refers to so the current statement retains its scope. Do not import earlier decisions, progress, or responsibilities, or guess a name for an unresolved object.
-- Only the current dialogue/transcript evidence batch may directly support a new fact. Do not generate, complete, or confirm a fact from preceding context alone, and do not repeat a fact solely because it appeared there.
+- The preceding context is the last complete chapter from the immediately preceding submitted batch; not every statement there is guaranteed to have been saved as a fact. Use it only to resolve references, ellipsis, cross-batch sentence continuations, and topic background. When the current batch clearly continues the same matter, it may resolve what "this Demo/design" refers to so the current statement retains its scope. Never guess a name for an unresolved object.
+- Only the current dialogue/transcript evidence batch may directly support a new fact through a substantive contribution. For each fact, identify what statement, progress, result, condition, explicit confirmation, commitment, or correction the current batch adds, or what statement it continues and completes. Without such a contribution, omit the fact; rewording, continuing the same topic, or polite acknowledgment alone adds no new information.
+- A new fact may include the old background or before/after contrast necessary to understand the current contribution. Never separately re-extract old decisions, progress, responsibilities, or parameters from preceding context, or attach unrelated old details to construct a full narrative. A cross-batch sentence continuation may use preceding context to recover its complete meaning; do not discard the current continuation merely because the sentence began in the previous batch.
+- Do not judge duplication by text similarity: a distinct occurrence of a similar action, an informative renewed confirmation, or a choice under new conditions may still be retained. Preserve the time, conditions, and results that distinguish the event or change; never present an old event as newly occurring.
 - When the current batch conflicts with preceding context, prefer the current batch. If the current batch still cannot disambiguate or verify a statement, omit the fact.
+- Examples: preceding context says "measured about 200 ms, theoretical about 120 ms" and the current batch says "I can measure it again; I estimate it is still 150-200 ms": extract only the current remeasurement arrangement and estimate, not a separate copy of the old measurement. Preceding context says "review on Friday" and the current batch says "move it to Monday; I will review it": extract the rescheduling and personal responsibility, optionally retaining Friday as change context. If preceding context ends "while operating design two, it is easy to..." and the current batch continues "move the hand out of bounds; this needs separate handling", combine them into a complete new statement about design two. If the current batch only says "okay, thanks, goodbye", do not re-extract preceding content.
 
 4. Organizing and compressing narrative facts
 - Center each fact on an independently understandable statement, event, relationship, or change, retaining only the background needed to interpret it. A complete narrative need not retell an entire exchange or contain a problem, solution, response, reason, and outcome together. "The wearer is not taking extra evening work this week" can already be a complete fact.
@@ -292,7 +277,6 @@ user_intent_signals rules:
 - `entities` preserves all directly relevant entities for retrieval. `primary_entity` is one object, the single entity mainly described, affected, or associated with the fact, and must come from entities. When context confirms a known or newly confirmed alias as the wearer, include both the mentioned name and user self; never merge a namesake. Keep third-party reports attributed, not rewritten as self-statements.
 - `primary_entity` is the main affiliation or retrieval entity, not the owner of every action, evaluation, or condition in the fact. Explicitly preserve the actual subjects in multi-subject content rather than transferring their circumstances to the primary entity.
 - `fact_type` marks only the primary semantic role: preference, decision, request, recommendation, action, commitment, open_question, risk, error, context, instruction, or other. It neither determines personal-evidence retention nor whether a signal is emitted.
-- `priority` is 0-100 and describes importance, not truth, permanence, or retention eligibility. First apply section 2, then score. This prompt must not delete qualifying personal evidence through a fixed score cutoff or artificially inflate scores to pass a filter.
 - `keywords` are short retrieval terms for concrete entities, topics, actions, constraints, and key temporal/order anchors, typically short noun phrases or 2-8 Chinese characters. Do not use full sentences, pleasantries, or generic encouragement.
 The following entity guidance selects semantic anchors in already retained facts; it is not an additional long-term-value retention gate:
 
@@ -308,7 +292,6 @@ Return JSON only, without markdown or extra explanation. Keep this field structu
       "primary_entity": {"name": "the single primary entity of this fact", "type": "PERSON|ORGANIZATION|LOCATION|PRODUCT|PROJECT|TECHNOLOGY|CONCEPT|TOPIC|PREFERENCE|OTHER"},
       "fact_topic": "specific aspect discussed by this fact",
       "fact_type": "preference|decision|request|recommendation|action|commitment|open_question|risk|error|context|instruction|other",
-      "priority": 80,
       "event_time_key": "real-world event occurrence time or representative temporal anchor derived from the dialogue time anchor and fact content; empty when it cannot be determined",
       "time_confidence": "explicit|inferred_from_turn|unknown; explicit evidence, resolved from the segment Time and a relative expression, or undetermined",
       "where": "",
@@ -364,10 +347,10 @@ Return JSON only, without markdown or extra explanation. Keep this field structu
 Confirmed user-self aliases (identity resolution only, not current fact evidence):
 {known_world_owner_aliases}
 
-Preceding context (understanding aid only; not independent evidence for this fact task):
+Preceding context (last complete chapter of the previous submitted batch, for understanding only; never separately re-extract its old content):
 {preceding_context}
 
-Dialogue/transcript evidence batch:
+Current dialogue/transcript evidence batch (each new fact requires a substantive contribution from this batch):
 {dialogue_batch}
 """
 

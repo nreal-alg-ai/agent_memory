@@ -175,11 +175,6 @@ personal_world_model:
         target_sealed_tokens: 2000
         max_sealed_chapters: 8
         max_sealed_tokens: 3200
-        # Tail of the last accepted fact window, used only to resolve the
-        # following window's local discourse context.
-        preceding_context_max_units: 3
-        preceding_context_max_tokens: 400
-
         max_pending_units: 40
         max_pending_tokens: 1000
         min_pending_units: 4

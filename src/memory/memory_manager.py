@@ -1074,7 +1074,6 @@ class MemoryNodeManager:
             index: int,
             raw_fact: Any,
             result: str,
-            priority: Optional[int] = None,
         ) -> None:
             if len(candidate_diagnostics) >= 12:
                 return
@@ -1082,7 +1081,6 @@ class MemoryNodeManager:
             candidate_diagnostics.append({
                 "index": index,
                 "result": result,
-                "priority": priority,
                 "text": self._format_log_text(
                     raw_payload.get("text") or raw_payload.get("summary") or "",
                     limit=300,
@@ -1110,16 +1108,6 @@ class MemoryNodeManager:
                     index=index,
                     raw_fact=raw_fact,
                     result="dropped_missing_text",
-                )
-                continue
-            priority = self._normalize_priority(raw_fact.get("priority", 70))
-            if priority < 60:
-                record_drop("priority_below_runtime_minimum")
-                record_candidate(
-                    index=index,
-                    raw_fact=raw_fact,
-                    result="dropped_priority_below_runtime_minimum",
-                    priority=priority,
                 )
                 continue
             keywords = self._normalize_string_list(raw_fact.get("keywords"), limit=18)
@@ -1203,17 +1191,6 @@ class MemoryNodeManager:
                     index=index,
                     raw_fact=raw_fact,
                     result="dropped_low_value_assistant_closing",
-                    priority=priority,
-                )
-                continue
-            if self._is_world_owner_entity_reference(primary_entity_name) \
-                    and self._is_low_value_user_acknowledgement(text):
-                record_drop("low_value_user_acknowledgement")
-                record_candidate(
-                    index=index,
-                    raw_fact=raw_fact,
-                    result="dropped_low_value_user_acknowledgement",
-                    priority=priority,
                 )
                 continue
             fact_topic_fallback = " ".join(keywords[:3]) if keywords else "general"
@@ -1258,11 +1235,10 @@ class MemoryNodeManager:
                 "world_owner_alias_candidates": alias_candidates,
                 "resolved_world_owner_aliases": confirmed_aliases,
                 "fact_topic": fact_topic,
-                "importance": max(0.6, min(1.0, priority / 100.0)),
+                "importance": 0.5,
                 "confidence": 0.9,
                 "metadata": {
                     "extractor": "llm",
-                    "priority": priority,
                     "time_confidence": _compact_whitespace(raw_fact.get("time_confidence") or "unknown"),
                     "where": _compact_whitespace(raw_fact.get("where") or ""),
                     "has_world_owner_speaker": (
@@ -1297,7 +1273,6 @@ class MemoryNodeManager:
                 index=index,
                 raw_fact=raw_fact,
                 result="accepted",
-                priority=priority,
             )
         diagnostics.update({
             "normalization_status": "ok",
@@ -2148,22 +2123,6 @@ class MemoryNodeManager:
             )
             return not has_specific_action
         return False
-
-    @staticmethod
-    def _is_low_value_user_acknowledgement(text: str) -> bool:
-        clean = _compact_whitespace(text)
-        if not clean:
-            return True
-        lower = clean.lower()
-        if len(clean) > 48:
-            return False
-        if any(marker in lower for marker in ("?", "？", "帮我", "需要", "想要", "计划", "决定", "安排", "提醒", "购买", "预约", "need", "want", "plan", "decide", "remind")):
-            return False
-        acknowledgement_markers = (
-            "好的", "可以", "行", "嗯", "谢谢", "试一试", "听起来", "明白",
-            "ok", "okay", "thanks", "thank you", "sounds good", "i'll try",
-        )
-        return any(marker in lower for marker in acknowledgement_markers)
 
     def _store_extracted_memory_facts_into_db(
         self,
@@ -10349,13 +10308,6 @@ class MemoryNodeManager:
         topics.append(keywords[0])
         return list(dict.fromkeys(topics))[:3]
     
-    @staticmethod
-    def _normalize_priority(value: Any) -> int:
-        try:
-            return max(0, min(100, int(round(float(value)))))
-        except (TypeError, ValueError):
-            return 70
-
     @staticmethod
     def _normalize_fact_type(value: Any) -> str:
         text = str(value or "context").strip().lower()

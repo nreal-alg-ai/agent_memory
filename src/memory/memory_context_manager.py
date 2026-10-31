@@ -73,8 +73,6 @@ class FactExtractionWindowConfig:
     target_sealed_tokens: int = 1200
     max_sealed_chapters: int = 5
     max_sealed_tokens: int = 1800
-    preceding_context_max_units: int = 3
-    preceding_context_max_tokens: int = 400
 
 
 @dataclass
@@ -243,14 +241,6 @@ def _build_fact_extraction_window_config(
         target_tokens,
         int(extraction_config.get("max_sealed_tokens", 1800)),
     )
-    preceding_context_max_units = max(
-        0,
-        int(extraction_config.get("preceding_context_max_units", 3)),
-    )
-    preceding_context_max_tokens = max(
-        0,
-        int(extraction_config.get("preceding_context_max_tokens", 400)),
-    )
     return FactExtractionWindowConfig(
         threshold=float(extraction_config.get("threshold", 0.60)),
         bias=float(extraction_config.get("bias", -1.10)),
@@ -310,8 +300,6 @@ def _build_fact_extraction_window_config(
         target_sealed_tokens=target_tokens,
         max_sealed_chapters=max_chapters,
         max_sealed_tokens=max_tokens,
-        preceding_context_max_units=preceding_context_max_units,
-        preceding_context_max_tokens=preceding_context_max_tokens,
     )
 
 
@@ -798,43 +786,20 @@ class MemoryContextManager:
         self._sealed_chapter_buffers.clear()
 
     def preceding_context_units_snapshot(self) -> List[MemoryUnit]:
-        """Return the prior fact task's bounded trailing task units."""
+        """Return the last complete chapter from the previous submitted batch."""
         return list(self._preceding_context_units)
 
     def record_preceding_context_units(
         self,
         units: Sequence[MemoryUnit],
     ) -> None:
-        """Replace the next task's auxiliary context with this batch's tail.
+        """Replace auxiliary context with all units of the submitted last chapter.
 
-        The context is deliberately non-accumulating: it provides only the
-        immediately preceding local discourse, rather than becoming a second
-        history buffer.  Units are selected from newest to oldest under both
-        configured bounds, then restored to chronological order.
+        The caller supplies only the last chapter after its batch is accepted.
+        Preserve its order and completeness without unit/token truncation or
+        accumulation across batches.
         """
-        config = self.config.fact_extraction
-        max_units = max(0, int(config.preceding_context_max_units))
-        max_tokens = max(0, int(config.preceding_context_max_tokens))
-        if max_units <= 0 or max_tokens <= 0:
-            self._preceding_context_units.clear()
-            return
-
-        selected_reversed: List[MemoryUnit] = []
-        selected_tokens = 0
-        for unit in reversed(list(units or [])):
-            if len(selected_reversed) >= max_units:
-                break
-            token_count = max(0, unit.token_count)
-            if selected_reversed and selected_tokens + token_count > max_tokens:
-                break
-            if not selected_reversed and token_count > max_tokens:
-                # Preserve one complete trailing unit rather than splitting a
-                # semantic unit solely to satisfy an approximate token count.
-                selected_reversed.append(unit)
-                break
-            selected_reversed.append(unit)
-            selected_tokens += token_count
-        self._preceding_context_units = list(reversed(selected_reversed))
+        self._preceding_context_units = list(units)
 
     def _sealed_buffer_statistics(self) -> Tuple[int, int]:
         """Return the current sealed chapter count and token count."""
