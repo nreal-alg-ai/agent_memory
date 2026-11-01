@@ -19,6 +19,7 @@ import json
 import logging
 import math
 import re
+import sqlite3
 import time
 from collections import Counter
 from datetime import datetime, timedelta, timezone
@@ -651,20 +652,23 @@ class MemoryNodeManager:
         tags: List[str],
     ) -> Dict[str, Any]:
         store_started_at = time.monotonic()
+        units = self._valid_memory_units(units)
         preceding_units = list(preceding_context_units or [])
         if not units:
             elapsed_ms = round((time.monotonic() - store_started_at) * 1000, 2)
-            self._log_info("memory_fact_extraction", "finish", {
-                "status": "skipped",
+            report = {
+                "status": "empty",
                 "reason": "no_units",
-                "total_elapsed_ms": elapsed_ms,
-            })
-            return {
-                "status": "skipped",
-                "reason": "no_units",
+                "attempt_count": 0,
                 "new_fact_count": 0,
+                "fact_ids": [],
+                "source_unit_row_ids": [],
+                "source_unit_count": 0,
+                "source_unit_row_count": 0,
                 "total_elapsed_ms": elapsed_ms,
             }
+            self._log_info("memory_fact_extraction", "finish", report)
+            return report
         with self._db.transaction():
             source_unit_row_ids = self._db.insert_memory_source_segments(
                 units=units,
@@ -673,6 +677,22 @@ class MemoryNodeManager:
             units,
             preceding_context_units=preceding_units,
         )
+        if fact_info["status"] != "ok":
+            report = {
+                "status": fact_info["status"],
+                "reason": fact_info["reason"],
+                "attempt_count": fact_info["attempt_count"],
+                "new_fact_count": 0,
+                "fact_ids": [],
+                "source_unit_row_ids": source_unit_row_ids,
+                "source_unit_count": len(units),
+                "source_unit_row_count": len(source_unit_row_ids),
+                "total_elapsed_ms": round((time.monotonic() - store_started_at) * 1000, 2),
+            }
+            if fact_info.get("error_type"):
+                report["error_type"] = fact_info["error_type"]
+            self._log_info("memory_fact_extraction", "finish", report)
+            return report
         facts = list(fact_info.get("facts") or [])
         self._log_extracted_fact_info(facts=facts)
         with self._db.transaction():
@@ -688,7 +708,9 @@ class MemoryNodeManager:
                 save_fact_info.get("topic_item_updates") or []
             )
         report = {
-            "status": "ok",
+            "status": fact_info["status"],
+            "reason": fact_info["reason"],
+            "attempt_count": fact_info["attempt_count"],
             "new_fact_count": len(list(save_fact_info.get("fact_ids") or [])),
             "fact_ids": list(save_fact_info.get("fact_ids") or []),
             "user_claim_signal_fact_count": int(
@@ -853,8 +875,10 @@ class MemoryNodeManager:
         *,
         preceding_context_units: Optional[Sequence[MemoryUnit]] = None,
     ) -> Dict[str, Any]:
-        """Extract narrative facts with the unified fact prompt."""
+        """Return ok/empty/failed, facts, a reason and the extraction attempt count."""
         current_units = self._valid_memory_units(units)
+        if not current_units:
+            return {"status": "empty", "facts": [], "reason": "no_units", "attempt_count": 0}
         preceding_units = self._valid_memory_units(preceding_context_units or [])
         prompt_language = self._resolve_prompt_language_from_memory_units(
             [*current_units, *preceding_units],
@@ -905,11 +929,27 @@ class MemoryNodeManager:
                 ) or ("(none)" if prompt_language == "en" else "（无）"),
             )
         )
+        failure_info: Dict[str, Any] = {}
         for attempt in range(2):
-            result = self._llm_client.call_llm(prompt)
+            try:
+                result = self._llm_client.call_llm(prompt)
+            except Exception as exc:
+                failure_info = {"reason": "llm_request_error", "error_type": type(exc).__name__}
+                self._logger.exception("Unified memory LLM request failed attempt=%s", attempt + 1)
+                self._log_info("memory_fact_extraction", "llm_output_diagnostics", {
+                    "attempt": attempt + 1,
+                    "parse_status": "request_error",
+                    "error_type": type(exc).__name__,
+                    "response_chars": 0,
+                    "raw_fact_count": None,
+                    "normalized_fact_count": 0,
+                    "dropped_fact_counts": {},
+                })
+                continue
             response_text = str(result or "")
             response_chars = len(response_text)
             if not response_text.strip():
+                failure_info = {"reason": "empty_llm_response"}
                 self._log_info("memory_fact_extraction", "llm_output_diagnostics", {
                     "attempt": attempt + 1,
                     "parse_status": "empty_response",
@@ -923,6 +963,7 @@ class MemoryNodeManager:
                 continue
             parsed = self._llm_client.parse_json_object_from_llm_text(result or "")
             if parsed is None:
+                failure_info = {"reason": "invalid_llm_json_object"}
                 self._log_info("memory_fact_extraction", "llm_output_diagnostics", {
                     "attempt": attempt + 1,
                     "parse_status": "invalid_json_object",
@@ -948,10 +989,22 @@ class MemoryNodeManager:
                     **normalization_diagnostics,
                 })
                 if normalized is not None:
-                    return normalized
+                    facts = normalized["facts"]
+                    return {
+                        "status": "ok" if facts else "empty",
+                        "facts": facts,
+                        "reason": (
+                            "" if facts else "no_retained_facts" if parsed["facts"] else "no_facts"
+                        ),
+                        "attempt_count": attempt + 1,
+                    }
+                failure_info = {
+                    "reason": normalization_diagnostics.get("normalization_status")
+                    or "invalid_llm_fact_response",
+                }
             if attempt == 0:
                 self._logger.debug("Unified memory LLM extraction failed, retrying")
-        return {"facts": []}
+        return {"status": "failed", "facts": [], "attempt_count": 2, **failure_info}
 
     def _extract_user_activity_from_source_units(
         self,
@@ -2346,13 +2399,12 @@ class MemoryNodeManager:
             "timestamp": reference_timestamp,
             "user_claim_signal_count": len(selected_signal_ids),
         })
-        with self._db.transaction():
-            claim_report = self._update_memory_user_claims(
-                signal_ids=selected_signal_ids,
-                reference_timestamp=reference_timestamp,
-            )
-            new_claim_ids = list(claim_report.get("new_claim_ids") or [])
-            claim_relations = list(claim_report.get("claim_relations") or [])
+        claim_report = self._update_memory_user_claims(
+            signal_ids=selected_signal_ids,
+            reference_timestamp=reference_timestamp,
+        )
+        new_claim_ids = list(claim_report.get("new_claim_ids") or [])
+        claim_relations = list(claim_report.get("claim_relations") or [])
         self._log_info("memory_user_claim", "user_claim_update_finish", claim_report)
         explicit_failed_count = int(
             claim_report.get("explicit", {}).get("failed_signal_count") or 0
@@ -2360,12 +2412,19 @@ class MemoryNodeManager:
         completed_signal_count = len(
             claim_report.get("_completed_signal_ids") or []
         )
+        failed_derived_seed_claim_ids = list(
+            claim_report.get("derived", {}).get("failed_seed_claim_ids") or []
+        )
+        has_failures = explicit_failed_count > 0 or bool(failed_derived_seed_claim_ids)
         report = {
             "status": (
-                "partial" if explicit_failed_count and completed_signal_count
-                else "error" if explicit_failed_count or claim_report.get("derived", {}).get("error")
+                "partial" if has_failures and completed_signal_count
+                else "failed" if has_failures
                 else "ok" if completed_signal_count else "empty"
             ),
+            "explicit_failed_signal_count": explicit_failed_count,
+            "failed_derived_seed_claim_ids": failed_derived_seed_claim_ids,
+            "derived_failures": list(claim_report.get("derived", {}).get("failures") or []),
             "explicit_claims_updated": int(
                 claim_report.get("explicit", {}).get("updated", 0) or 0
             ),
@@ -2392,7 +2451,7 @@ class MemoryNodeManager:
         reference_timestamp: Optional[Any] = None,
         signal_ids: Optional[Sequence[int]] = None,
     ) -> Dict[str, Any]:
-        """Save intent updates in batches and return their committed change events."""
+        """Process independent signal batches and return only committed change events."""
         reference_timestamp = reference_timestamp or _now_text()
         selected_signal_ids = list(dict.fromkeys(
             int(value) for value in signal_ids or [] if int(value) > 0
@@ -2428,7 +2487,17 @@ class MemoryNodeManager:
                 "signal": signal,
             })
         self._log_user_intent_signals_loaded(signal_items, reference_timestamp)
+        available_signal_ids = {item["signal_id"] for item in signal_items}
+        report["failed_signal_ids"] = sorted(set(selected_signal_ids) - available_signal_ids)
+        if report["failed_signal_ids"]:
+            self._log_info("memory_user_intent_update", "batch_error", {
+                "phase": "input_validation",
+                "signal_ids": report["failed_signal_ids"],
+                "error": "missing_signal_or_supporting_fact",
+            })
         if not signal_items:
+            if report["failed_signal_ids"]:
+                report["status"] = "failed"
             self._log_info("memory_user_intent_update", "finish", report)
             return report
 
@@ -2466,34 +2535,40 @@ class MemoryNodeManager:
                 self._log_info("memory_user_intent_update", "batch_error", {
                     "batch_index": batch_index,
                     "signal_ids": [item["signal_id"] for item in batch],
+                    "phase": "extraction",
                     "error": batch_error or "invalid_llm_user_intent_extraction_response",
                 })
                 continue
 
-            normalized = self._normalize_intent_candidates(
-                parsed["results"],
-                signal_items=batch,
-                world_owner_id=world_owner_id,
-            )
+            try:
+                normalized = self._normalize_intent_candidates(
+                    parsed["results"],
+                    signal_items=batch,
+                    world_owner_id=world_owner_id,
+                )
+            except sqlite3.Error:
+                raise
+            except Exception as exc:
+                report["failed_signal_ids"].extend(item["signal_id"] for item in batch)
+                self._log_info("memory_user_intent_update", "batch_error", {
+                    "batch_index": batch_index,
+                    "signal_ids": [item["signal_id"] for item in batch],
+                    "phase": "normalization",
+                    "error_type": type(exc).__name__, "error": str(exc),
+                })
+                continue
             candidates = normalized["future_intent_candidates"]
             observations = normalized["intent_lifecycle_observations"]
             report["_completed_signal_ids"].extend(normalized["empty_signal_ids"])
             report["failed_signal_ids"].extend(normalized["failed_signal_ids"])
+            phase = "future_intent_reconciliation"
             try:
                 decisions = self._reconcile_future_intent_candidates(
                     candidates,
                     world_owner_id=world_owner_id,
                     prompt_language=language,
                 )
-            except Exception as exc:
-                report["failed_signal_ids"].extend(candidate["signal_id"] for candidate in candidates)
-                self._log_info("memory_user_intent_update", "batch_error", {
-                    "batch_index": batch_index,
-                    "signal_ids": [candidate["signal_id"] for candidate in candidates],
-                    "error": str(exc),
-                    "phase": "reconciliation",
-                })
-            else:
+                phase = "future_intent_save"
                 applied = self._save_future_intent_candidates(
                     candidates,
                     decisions,
@@ -2503,22 +2578,44 @@ class MemoryNodeManager:
                 report["_completed_signal_ids"].extend(applied["completed_signal_ids"])
                 report["failed_signal_ids"].extend(applied["failed_signal_ids"])
                 report["intent_event_ids"].extend(applied["intent_event_ids"])
+            except sqlite3.Error:
+                raise
+            except Exception as exc:
+                report["failed_signal_ids"].extend(candidate["signal_id"] for candidate in candidates)
+                self._log_info("memory_user_intent_update", "batch_error", {
+                    "batch_index": batch_index,
+                    "signal_ids": [candidate["signal_id"] for candidate in candidates],
+                    "error_type": type(exc).__name__, "error": str(exc),
+                    "phase": phase,
+                })
 
             # Match after saving future candidates so this batch's newly stored
             # intents are visible too. A failure in either branch is independent.
+            phase = "lifecycle_reconciliation"
             try:
                 lifecycle_decisions = self._reconcile_intent_lifecycle_observations(
                     observations, facts_by_id=facts_by_id,
                     world_owner_id=world_owner_id, prompt_language=language,
                 )
+                phase = "lifecycle_save"
+                saved = self._save_intent_lifecycle_observations(
+                    observations, lifecycle_decisions, world_owner_id=world_owner_id,
+                )
+            except sqlite3.Error:
+                raise
             except Exception as exc:
-                lifecycle_decisions = {}
-                self._log_info("memory_user_intent_update", "lifecycle_match_error", {
-                    "signal_ids": [item["signal_id"] for item in observations], "error": str(exc),
+                saved = {
+                    "completed_signal_ids": [],
+                    "failed_signal_ids": [item["signal_id"] for item in observations],
+                    "intent_event_ids": [], "intent_lifecycle_observation_ids": [],
+                    "unmatched_observation_ids": [],
+                }
+                self._log_info("memory_user_intent_update", "batch_error", {
+                    "batch_index": batch_index,
+                    "signal_ids": saved["failed_signal_ids"],
+                    "phase": phase,
+                    "error_type": type(exc).__name__, "error": str(exc),
                 })
-            saved = self._save_intent_lifecycle_observations(
-                observations, lifecycle_decisions, world_owner_id=world_owner_id,
-            )
             report["_completed_signal_ids"].extend(saved["completed_signal_ids"])
             report["failed_signal_ids"].extend(saved["failed_signal_ids"])
             report["intent_event_ids"].extend(saved["intent_event_ids"])
@@ -2536,9 +2633,15 @@ class MemoryNodeManager:
             })
 
         report["intent_event_ids"] = sorted(set(report["intent_event_ids"]))
+        report["_completed_signal_ids"] = sorted(set(report["_completed_signal_ids"]))
+        # Never silently lose an input that received no terminal handler result.
+        report["failed_signal_ids"] = sorted(
+            set(report["failed_signal_ids"])
+            | (set(selected_signal_ids) - set(report["_completed_signal_ids"]))
+        )
         report["status"] = (
             "partial" if report["failed_signal_ids"] and report["_completed_signal_ids"]
-            else "error" if report["failed_signal_ids"] else "ok"
+            else "failed" if report["failed_signal_ids"] else "ok"
         )
         self._log_info("memory_user_intent_update", "finish", report)
         return report
@@ -3826,7 +3929,10 @@ class MemoryNodeManager:
             if int(row["fact_id"]) in facts_by_id
             and int(row["signal_id"]) in signals_by_id
         ]
-        explicit_report = self._update_explicit_user_claims_from_signals(signal_items)
+        # Commit explicit results independently: a later derivation failure must
+        # neither roll them back nor make their source signals pending again.
+        with self._db.transaction():
+            explicit_report = self._update_explicit_user_claims_from_signals(signal_items)
         missing_signal_count = len(signals) - len(signal_items)
         if missing_signal_count:
             explicit_report["failed_signal_count"] += missing_signal_count
@@ -3837,23 +3943,15 @@ class MemoryNodeManager:
         derived_report = self._update_derived_user_claims_from_explicit_claims(
             new_explicit_claim_ids=new_claim_ids,
         )
-        derived_completed = bool(derived_report.pop("completed", False))
-        # Only acknowledge signals that received a validated result and whose
-        # follow-up derivation completed. Other signal IDs remain pending.
-        completed_signal_ids = (
-            processed_signal_ids if derived_completed else []
-        )
-
-        all_new_claim_ids = (
-            sorted(set(new_claim_ids) | set(derived_report.get("new_claim_ids") or []))
-            if derived_completed else []
+        all_new_claim_ids = sorted(
+            set(new_claim_ids) | set(derived_report.get("new_claim_ids") or [])
         )
         all_claim_relations = {
             int(relation["relation_event_id"]): relation
             for source_report in (explicit_report, derived_report)
             for relation in source_report.get("claim_relations") or []
             if int(relation.get("relation_event_id") or 0) > 0
-        } if derived_completed else {}
+        }
         return {
             "explicit": explicit_report,
             "derived": derived_report,
@@ -3861,7 +3959,7 @@ class MemoryNodeManager:
             "claim_relations": [
                 all_claim_relations[event_id] for event_id in sorted(all_claim_relations)
             ],
-            "_completed_signal_ids": completed_signal_ids,
+            "_completed_signal_ids": processed_signal_ids,
         }
 
     def _explicit_claim_fact_prompt_view(self, fact: Dict[str, Any]) -> Dict[str, Any]:
@@ -4649,6 +4747,7 @@ class MemoryNodeManager:
             "input_explicit_claim_count": len(explicit_claim_ids),
             "seed_claim_count": 0,
             "processed_seed_claim_count": 0,
+            "successful_seed_claim_count": 0,
             "input_claim_count": 0,
             "candidate_count": 0,
             "updated": 0,
@@ -4656,6 +4755,8 @@ class MemoryNodeManager:
             "suppressed": 0,
             "new_claim_ids": [],
             "claim_relations": [],
+            "failed_seed_claim_ids": [],
+            "failures": [],
             "completed": True,
         }
         if not explicit_claim_ids:
@@ -4683,27 +4784,44 @@ class MemoryNodeManager:
             )
             report["processed_seed_claim_count"] += 1
             report["input_claim_count"] += 1 + len(related_claims)
-            outcome = self._extract_derived_user_claims(
-                changed_claims=[seed_claim],
-                related_claims=related_claims,
-            )
-            if outcome is None:
+            failure: Dict[str, Any] = {}
+            claim_report: Dict[str, Any] = {}
+            try:
+                outcome = self._extract_derived_user_claims(
+                    changed_claims=[seed_claim],
+                    related_claims=related_claims,
+                )
+                if outcome is None:
+                    failure = {"reason": "invalid_llm_derived_claim_response"}
+                elif outcome:
+                    with self._db.transaction():
+                        claim_report = self._apply_derived_user_claim_candidates(
+                            raw_candidates=outcome,
+                            changed_claims=[seed_claim],
+                            related_claims=related_claims,
+                        )
+            except sqlite3.Error:
+                # Storage/infrastructure failures are not invalid LLM outputs.
+                raise
+            except Exception as exc:
+                failure = {
+                    "reason": "derived_claim_processing_error",
+                    "error_type": type(exc).__name__,
+                }
+                self._logger.exception(
+                    "Derived user claim processing failed seed_claim_id=%s", seed_claim["id"],
+                )
+            if failure:
                 report["completed"] = False
-                report["error"] = "invalid_llm_derived_claim_response"
-                report["failed_claim_id"] = int(seed_claim["id"])
-                report["new_claim_ids"] = sorted(new_derived_claim_ids)
-                report["claim_relations"] = [
-                    claim_relations[key] for key in sorted(claim_relations)
-                ]
-                return report
+                report["failed_seed_claim_ids"].append(int(seed_claim["id"]))
+                failure["seed_claim_id"] = int(seed_claim["id"])
+                report["failures"].append(failure)
+                self._log_info("memory_user_claim", "derived_seed_failed", failure)
+                continue
+            report["successful_seed_claim_count"] += 1
             report["candidate_count"] += len(outcome)
             if not outcome:
                 continue
-            claim_report = self._apply_derived_user_claim_candidates(
-                raw_candidates=outcome,
-                changed_claims=[seed_claim],
-                related_claims=related_claims,
-            )
             for key in ("updated", "created", "suppressed"):
                 report[key] += int(claim_report[key])
             new_derived_claim_ids.update(
