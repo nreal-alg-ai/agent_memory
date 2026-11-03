@@ -173,6 +173,8 @@ personal_world_model:
         target_pending_tokens: 2000
         max_pending_tokens: 3200
         max_pending_units: 128
+        # Trigger short conversations independently of the token thresholds.
+        max_pending_interaction_units: 6
         max_time_gap_seconds: 60.0
         # Soft budget: retain whole units from the last submitted batch's tail.
         preceding_context_max_tokens: 500

@@ -19,6 +19,7 @@ class FactExtractionWindowConfig:
     target_pending_tokens: int = 2000
     max_pending_tokens: int = 3200
     max_pending_units: int = 128
+    max_pending_interaction_units: int = 6
     max_time_gap_seconds: float = -1.0
     preceding_context_max_tokens: int = 500
 
@@ -120,6 +121,7 @@ def _build_fact_extraction_window_config(
         target_pending_tokens=target_tokens,
         max_pending_tokens=max(target_tokens, config_int("max_pending_tokens", 3200)),
         max_pending_units=max(1, config_int("max_pending_units", 128)),
+        max_pending_interaction_units=max(0, config_int("max_pending_interaction_units", 6)),
         max_time_gap_seconds=float(-1.0 if max_gap in (None, "") else max_gap),
         preceding_context_max_tokens=max(0, config_int("preceding_context_max_tokens", 500)),
     )
@@ -617,6 +619,9 @@ class MemoryContextManager:
         decision.time_gap_seconds = self.unit_time_gap_seconds(
             pending_units[-1], incoming_unit,
         )
+        pending_interaction_count = sum(
+            unit.unit_type == "interaction" for unit in pending_units
+        )
         if (config.max_time_gap_seconds >= 0
                 and decision.time_gap_seconds is not None
                 and decision.time_gap_seconds > config.max_time_gap_seconds):
@@ -625,6 +630,10 @@ class MemoryContextManager:
         elif config.max_pending_units > 0 and len(pending_units) >= config.max_pending_units:
             decision.should_trigger = True
             decision.reason = "pending_unit_limit"
+        elif (config.max_pending_interaction_units > 0
+              and pending_interaction_count >= config.max_pending_interaction_units):
+            decision.should_trigger = True
+            decision.reason = "pending_interaction_unit_limit"
         elif (config.max_pending_tokens > 0
               and decision.batch_token_count + incoming_unit.token_count > config.max_pending_tokens):
             decision.should_trigger = True
