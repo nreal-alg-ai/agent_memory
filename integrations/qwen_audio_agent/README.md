@@ -11,12 +11,27 @@
 ```dotenv
 QWEN_AUDIO_MEMORY_PROVIDER=agent-memory
 AGENT_MEMORY_PYTHON=/absolute/path/to/python
-AGENT_MEMORY_SIDECAR=/absolute/path/to/agent_memory/integrations/qwen_audio_agent/agent_memory_sidecar.py
-AGENT_MEMORY_CONFIG=/absolute/path/to/agent_memory/config.yaml
-AGENT_MEMORY_STATE_DIR=/absolute/path/to/persistent/agent-memory-state
+AGENT_MEMORY_SIDECAR=auto
+AGENT_MEMORY_CONFIG=auto
+AGENT_MEMORY_STATE_DIR=auto
 ```
 
+路径留空或设为 `auto` 时，开发版使用当前工程 `memory/`，安装版使用应用资源
+`Contents/Resources/runtime/memory/`；Python 代码与默认 YAML 随安装包发布，
+不依赖打包机器或源码目录。状态目录默认是 `QWAUDIO_DATA_DIR/memory/agent-memory`
+（未覆盖时为 `~/.config/qwaudio/data/memory/agent-memory`），录音也保存在此目录下。
+
+启动时会将当前工程的默认代码路径，以及指向已删除工程的旧标准路径，自动改为
+`auto`；修改配置前保留 `config.env.before-agent-memory-auto` 备份。
+有效的外部代码路径、自定义 YAML 和已有状态目录保留，缺失的自定义文件仍会报错。
+旧工程连同 `tmp/qwen_audio_agent_online` 已被删除时，改用持久数据目录，无法恢复
+已删除的记忆或录音。已有状态目录不会自动搬迁；如要迁移数据库，应先退出应用。
+Shell 中显式传入的路径只对当前进程解析，不会写回覆盖 `config.env`。
+`AGENT_MEMORY_PREWAKE_CONTEXT_SIDECAR` 和 `AGENT_MEMORY_AMBIENT_RECORDING_SIDECAR`
+默认跟随主 sidecar，显式设为 `auto` 也遵循同一规则。
+
 `AGENT_MEMORY_PYTHON` 必须是安装了本工程 `requirements.txt` 依赖的解释器。
+解释器路径保留用户配置，不随工程路径自动替换。
 Sidecar 会按 Qwen Gateway 的 `ownerId` 进行 SHA-256 分区；每个用户拥有独立的
 `memory.db`、去重索引和 `MemoryRuntime` worker。
 
@@ -63,3 +78,109 @@ PWM 启动、worker 空闲和普通任务完成都不会自动触发周期检查
 `drain_pending_user_state_claims()`，然后等待状态更新任务完成。
 在线周期信号使用 `trigger_user_state_update()`，离线完整处理使用
 `drain_pending_user_state_claims()`，两者均不在 PWM 内部计时。
+
+## 我的活动只读查看
+
+“我的记忆”中的“我的活动”读取当前用户 `memory.db` 的
+`memory_user_activity_items`，复用认证后的 `inspect` 路径，不启动提炼任务。
+
+- 列表：`GET /api/pwm/activities?page=1&pageSize=20`。
+- 详情：`GET /api/pwm/activities/{id}?evidencePage=1&sourcePage=1`。
+- `role` 可选 `actor`、`participant`、`contextual`；空值表示全部角色。
+- `from`、`to` 使用带时区的 ISO 时间，查询观察窗口与 `[from, to)` 重叠的记录。
+  界面日期按用户本地整天转换，结束日期包含当天。
+- 关联事实每页最多 20 条，来源窗口每页最多 6 段；来源不可用时保留缺失提示。
+
+活动表示采集当时观察到的行为、交谈或环境情境。观察时间来自整个来源窗口，
+不表示精确活动时长；来源窗口也可能包含其他话题。活动列表不套用意图和状态的
+领域、状态或当前/历史筛选。
+
+### 桌面 PWM 模型设置
+
+设置页按“语音前台 → PWM → 后台 Agent → 应用程序”排列。PWM（PersonalWorldModel）
+分别配置语言模型 `llm_client` 和向量模型 `embedding_client`，高级参数默认折叠。
+服务预设仅填充地址与模型名；Embedding 使用 OpenAI 兼容协议。
+
+本地设置保存在 Gateway 的 `config.env` 中，优先于 `config.yaml` 的
+`personal_world_model.llm_model` / `embedding_model`。没有桌面覆盖项时继续沿用 YAML，
+包括其中引用的环境变量密钥。对应覆盖项如下：
+
+| 客户端 | 环境变量（前缀均为 `QWEN_AUDIO_PWM_`） |
+| --- | --- |
+| 语言模型 | `LLM_BASE_URL`、`LLM_MODEL`、`LLM_API_KEY`、`LLM_TIMEOUT`、`LLM_MAX_TOKENS`、`LLM_THINKING`、`LLM_JSON_MODE` |
+| Embedding | `EMBEDDING_BASE_URL`、`EMBEDDING_MODEL`、`EMBEDDING_API_KEY`、`EMBEDDING_TIMEOUT`、`EMBEDDING_DIMENSIONS`、`EMBEDDING_BATCH_SIZE`、`EMBEDDING_NORMALIZE` |
+
+密钥分别保存，页面只接收“已配置”状态，留空保留原密钥。连接测试由桌面主进程发送固定测试文本，
+不会发送记忆内容、保存草稿或重启运行时。远端 Gateway 模式下，PWM 设置由远端主机管理。
+点击“应用”后，本地托管的 Gateway / PWM Sidecar 自动重新加载；其他进程管理的本地 Gateway
+需要先停止，再应用 PWM 设置。
+
+Embedding 的模型、请求地址、维度或归一化策略改变后，仅失效可再生成的向量缓存，保留事实、
+活动、意图、状态及原文。旧版本没有模型标记的向量也会在升级后重建一次。召回文档向量在共享
+工作队列中后台补齐，行动信号向量在后续模式更新时按需补齐；服务暂不可用的缓存会在下次启动时
+继续尝试。向量维度必须与服务真实输出一致，不会再补零或截断；重建期间仍可使用词法召回。
+
+## 桌面双路环境录音
+
+设置 → 应用程序 → 环境录音来源，可选择“麦克风 + 系统音频”（默认）或“仅麦克风”。
+此桌面偏好保存在客户端 `settings.env`，对应 `QWEN_AUDIO_AMBIENT_RECORDING_SOURCE`，
+值分别为 `microphone-system` / `microphone`；下次开始环境录音时生效。
+
+- 麦克风保持原有采集链路，继续用于唤醒、语音交互和环境录音。
+- macOS 14.2+ 使用随应用打包的 Swift / Core Audio Process Tap 辅助程序，直接采集系统播放音频，
+  不调用 `getDisplayMedia`、不打开屏幕共享选择器、不创建视频轨。主进程将系统 PCM 直接送入录音
+  Sidecar，网页仅控制生命周期和接收进度，不接收系统 PCM；唤醒、实时语音、前唤醒上下文与本人
+  声音采集继续仅使用麦克风。Windows 继续使用 Electron loopback；Linux 暂需选择“仅麦克风”。
+- 原生辅助程序及主应用均声明 `NSAudioCaptureUsageDescription`。首次使用需授予系统音频录制权限；
+  拒绝后可在系统设置的“隐私与安全性”中开启相应的系统音频录制权限。输出设备切换时会停止本次
+  录音并提示重新开始，避免将变化后的格式写入旧 WAV。
+- `desktop/native/build-system-audio.mjs` 构建辅助程序。开发启动前自动构建当前架构；打包 hook
+  分别构建 arm64 / x64，Universal 打包时随应用合并。二进制放在 `.asar` 外的
+  `Contents/Resources/native/qwen-system-audio`，由打包签名流程签名。用户运行安装版无需 Swift 工具链。
+- 停止时先等待原生程序输出尾段并确认落盘，再请求网页刷新麦克风尾段，最后封存两路文件；
+  主进程主动停止、辅助程序异常和退出应用均使用相同的尾段处理。
+- 授权取消、缺少有效系统音轨或采集中断均明确报错，不自动降级为麦克风录音。任一来源连续
+  10 秒没有交付 PCM 时停止本次环境录音并提示；静音 PCM 不算断流。
+- 两路分别保存单声道 PCM16 WAV，文件名包含 `microphone` / `system`，各自保留采样率与时间。
+  设备采样率变化或明显时间间断时封存当前文件，避免 WAV 格式错误或压缩时间空隙。
+- 两路共用 recordingId，转写证据的 `metadata.audio_source` 标记来源。ASR 使用同一串行 worker，
+  转写按采集时间整合后送入唯一的 PWM writer；提交也在 worker 中执行，避免阻塞 PCM 落盘。
+  只有两路均处理完成的时间范围才推进覆盖水位；静音批次也通过 `processedThrough` 推进。
+  录音停止后提交剩余转写并统一 finalize；失败批次保留 WAV，界面提示转写未完成。
+- 本阶段没有增加额外回声消除、混音或跨音轨文本去重。外放可能在两个来源中产生重复内容，
+  两路相同文本均保留；不依据录音来源直接认定说话人身份。麦克风原有浏览器音频处理保持沿用。
+
+### 麦克风 AEC 诊断与外放对照
+
+桌面应用固定优先使用系统级 all，通过 `{ exact: "all" }` 请求麦克风回声消除，且只有
+`track.getSettings().echoCancellation === "all"` 才确认生效。设置页不再提供模式选择，
+旧的 `QWEN_AUDIO_MICROPHONE_ECHO_CANCELLATION` 配置及页面模式参数不再生效。
+普通网页仍沿用 `echoCancellation: true`；独立对照工具继续支持 default/all 两种模式。
+不支持 all、实际返回未确认，或严格模式启动后 3 秒内没有音频帧时，释放尝试的音轨并
+回退默认模式。静音帧也算有效帧，不会因为环境安静而回退；权限与设备错误仍正常报错。
+
+`desktop.log` 的 `desktop.microphone.capture` 记录实际设备名称、请求/应用模式、
+all 能力状态、回退原因、采样率、声道数、NS/AGC 及能力范围。不会记录音频、正文、
+原始 deviceId/groupId。每次环境录音还会保存 `<recordingId>.microphone.json`，
+与原有录音清单的 `recording_id` 对应；设备切换后的诊断也会追加，最多保留 20 条。
+`advertised` 只表示能力列表包含 all，`confirmed` 表示实际设置返回 all；
+`rejected`/`unconfirmed`/`no-pcm` 不能当作 all 测试成功。
+`allPcmFlow` 记录 all 的音频帧验证结果，`allNegotiatedEchoCancellation` 保留尝试时的实际设置。
+
+macOS 可在工程根目录运行独立对照工具：
+
+```bash
+node scripts/compare-microphone-aec.mjs --audio /absolute/path/to/playback.wav
+```
+
+工具请求真实麦克风权限，使用外部 `afplay` 重放同一素材，分别采集 default/all。
+保持外放音量、输出设备、麦克风位置不变，并在纯回声测试期间保持安静。
+两次采集固定同一输入设备、NS/AGC 参数；all 不可确认时跳过第二次播放并明确标记。
+工具不连接 Gateway、ASR 或 PWM，不会把测试内容写入实际记忆。
+默认输出到 `tmp/microphone-aec-comparison/<timestamp>/`，可用 `--output` 指定目录。
+报告包括实际模式、能力、运行时版本、素材 SHA-256 和 WAV；支持 all 只代表模式
+协商成功，是否消除了外放仍应听取录音并做同条件比较，不能仅靠该标记判断。
+
+独立工具支持 `--probe-only`：只验证两种模式的音频帧与回退，不播放素材。
+没有采集到 PCM 的测试标记为 `no-pcm`/`inconclusive`，不会当作 AEC 消除了所有声音。
+macOS 可能把从终端或 Codex 启动的进程归到启动器的麦克风权限；以系统实际授权提示为准。

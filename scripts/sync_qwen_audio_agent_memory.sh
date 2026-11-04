@@ -9,7 +9,7 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 SOURCE_ROOT=$(cd "${SCRIPT_DIR}/.." && pwd)
-DEFAULT_TARGET="${SOURCE_ROOT}/../voice_agent/qwen-audio-agent/memory"
+DEFAULT_TARGET="${SOURCE_ROOT}/../voice_agent/Qwen_Voice/memory"
 TARGET_ROOT="${DEFAULT_TARGET}"
 DRY_RUN=0
 
