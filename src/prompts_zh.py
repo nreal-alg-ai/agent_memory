@@ -312,8 +312,8 @@ user_intent_signals 输出规则：
 
 七、实体、主题与输出字段
 - `fact_topic` 表示当前 fact 讨论的具体方面，必须由本次证据支持。使用简短、具体、可检索的主题名称，不要使用泛领域、完整事实句子、动作、一次性结论、情绪或零散关键词；没有充分依据时保守命名。
-- `entities` 保留所有与 fact 直接相关的实体，用于完整召回；`primary_entity` 表示这条 fact 主要描述、影响或归属的单一实体，必须来自 `entities`。当语境能确认已知别名或本次确认的新别名指向佩戴者时，同时保留原文人名和“用户本人”；同名第三人不能归并。第三方报告仍须保留来源，不能改写为本人自述。
-- `primary_entity` 是主要归属或检索实体，不代表 fact 中每项行为、评价或状态都属于它；多主体内容须分别表达实际主体，不能因为选定一个 primary_entity 就转移其他人的情况。
+- `entities` 保留所有与 fact 直接相关的实体，用于完整召回。当语境能确认已知别名或本次确认的新别名指向佩戴者时，同时保留原文人名和“用户本人”；同名第三人不能归并。第三方报告仍须保留来源，不能改写为本人自述。
+- 多主体内容须在 fact 正文中分别表达每项行为、评价或状态的实际主体，不能因为某人发言或参与讨论，就将其他人的情况归到其身上。
 - `fact_type` 只标记主要语义作用：preference、decision、request、recommendation、action、commitment、open_question、risk、error、context、instruction、other；它不是个人信息的保存资格，也不决定 signal 是否输出。
 - `keywords` 是简短检索词，保留具体实体、主题、行为、约束及关键时间/顺序锚，通常每个词为 2-8 个汉字或短英文短语。不要使用完整句子、寒暄或泛化鼓励语。
 下列实体规则只用于选择已保留 fact 的语义锚点，不是额外的长期价值筛选门槛：
@@ -330,7 +330,6 @@ user_intent_signals 输出规则：
       "text": "围绕同一具体问题、决定或事件组织的自包含事实叙事，而非逐句摘录；保留实际主体、具体内容及必要背景、时间、条件与变化，不强制复述整个exchange，不补造缺失环节",
       "keywords": ["关键词1", "关键词2"],
       "entities": [{"name": "实体名", "type": "PERSON|ORGANIZATION|LOCATION|PRODUCT|PROJECT|TECHNOLOGY|CONCEPT|TOPIC|PREFERENCE|OTHER"}],
-      "primary_entity": {"name": "这条 fact 主要描述、影响或归属的单一实体", "type": "PERSON|ORGANIZATION|LOCATION|PRODUCT|PROJECT|TECHNOLOGY|CONCEPT|TOPIC|PREFERENCE|OTHER"},
       "fact_topic": "当前 fact 讨论的具体方面",
       "fact_type": "preference|decision|request|recommendation|action|commitment|open_question|risk|error|context|instruction|other",
       "event_time_key": "根据对话时间锚点和 fact 内容推导出的事件实际发生时间或代表性时间锚点；无法判断时为空字符串",

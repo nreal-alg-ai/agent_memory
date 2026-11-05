@@ -64,7 +64,7 @@ class UserThreadUpdater:
         for activity in activities:
             facts = self._db.get_memory_facts_by_ids(activity['evidence_fact_ids'])
             fact_views = [{key: fact.get(key) for key in (
-                'id', 'summary', 'fact_topic', 'entities', 'keywords',
+                'id', 'summary',
                 'dialogue_time_key', 'event_time_key',
             )} for fact in facts]
             search_text = '\n'.join([

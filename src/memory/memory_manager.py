@@ -570,7 +570,6 @@ class MemoryNodeManager:
     def set_logger(self, logger: Optional[logging.Logger]) -> None:
         """Set the logger used by memory store, entity-claim, and recall operations."""
         self._logger = logger or logging.getLogger(__name__)
-        self._llm_client.set_logger(self._logger)
 
     def set_embedding_client(self, embedding_client: Optional[EmbeddingClient]) -> None:
         """Share a pre-initialized embedding client with memory runtime callers."""
@@ -892,7 +891,6 @@ class MemoryNodeManager:
                     "dialogue_time_key": fact.get("dialogue_time_key") or "",
                     "keywords": fact.get("keywords") or "",
                     "entities": fact.get("entities") or [],
-                    "primary_entity": fact.get("primary_entity"),
                     "fact_topic": fact.get("fact_topic") or "",
                     "user_claim_signals": fact.get("user_claim_signals") or [],
                     "user_action_signals": fact.get("user_action_signals") or [],
@@ -1205,45 +1203,6 @@ class MemoryNodeManager:
                     allows_world_owner_reference=allows_world_owner_reference,
                 )
                 entities = [item["name"] for item in entity_descriptors]
-            primary_candidates = self._normalize_fact_entity_descriptors(
-                raw_fact.get("primary_entity"),
-                allows_world_owner_reference=allows_world_owner_reference,
-            )
-            if primary_candidates and not any(
-                descriptor["name"] == primary_candidates[0]["name"]
-                for descriptor in entity_descriptors
-            ):
-                self._merge_entity_descriptor(
-                    entity_descriptors,
-                    primary_candidates[0],
-                )
-                entities = [item["name"] for item in entity_descriptors]
-            primary_entity = (
-                primary_candidates[0]
-                if primary_candidates
-                else (entity_descriptors[0] if entity_descriptors else None)
-            )
-            if primary_entity is not None:
-                primary_entity = next(
-                    (
-                        descriptor
-                        for descriptor in entity_descriptors
-                        if descriptor["name"] == primary_entity["name"]
-                    ),
-                    primary_entity,
-                )
-            primary_entity_name = _compact_whitespace(
-                (primary_entity or {}).get("name") or ""
-            ).lower()
-            if primary_entity_name in {"assistant", "agent", "the assistant", "助手"} \
-                    and self._is_low_value_assistant_closing(text):
-                record_drop("low_value_assistant_closing")
-                record_candidate(
-                    index=index,
-                    raw_fact=raw_fact,
-                    result="dropped_low_value_assistant_closing",
-                )
-                continue
             fact_topic_fallback = " ".join(keywords[:3]) if keywords else "general"
             fact_topic = (
                 self._normalize_topic_name(raw_fact.get("fact_topic"))
@@ -1265,7 +1224,6 @@ class MemoryNodeManager:
             )
             user_intent_signals = self._normalize_user_intent_signals(
                 raw_fact.get("user_intent_signals"),
-                fallback_entity=primary_entity,
                 allows_world_owner_reference=allows_world_owner_reference,
                 source_units=units,
                 owner_aliases=confirmed_aliases,
@@ -1279,7 +1237,6 @@ class MemoryNodeManager:
                 "keywords": keywords,
                 "entities": entities,
                 "entity_descriptors": entity_descriptors,
-                "primary_entity": primary_entity,
                 "user_claim_signals": user_claim_signals,
                 "user_action_signals": user_action_signals,
                 "user_intent_signals": user_intent_signals,
@@ -1495,7 +1452,6 @@ class MemoryNodeManager:
         self,
         value: Any,
         *,
-        fallback_entity: Optional[Dict[str, str]] = None,
         limit: Optional[int] = None,
         allows_world_owner_reference: bool = False,
         source_units: Optional[Sequence[MemoryUnit]] = None,
@@ -1544,7 +1500,7 @@ class MemoryNodeManager:
                 "observed_event",
             }:
                 continue
-            subject = raw.get("subject_entity") or raw.get("subject") or fallback_entity
+            subject = raw.get("subject_entity") or raw.get("subject")
             if isinstance(subject, dict):
                 subject_name = _compact_whitespace(
                     subject.get("name") or subject.get("text") or ""
@@ -1947,14 +1903,6 @@ class MemoryNodeManager:
                 descriptors,
                 {"name": name, "type": "OTHER"},
             )
-        primary = fact.get("primary_entity")
-        if isinstance(primary, dict):
-            cls._merge_entity_descriptor(descriptors, primary)
-        elif primary:
-            cls._merge_entity_descriptor(
-                descriptors,
-                {"name": primary, "type": "OTHER"},
-            )
         return descriptors
 
     @staticmethod
@@ -2031,6 +1979,7 @@ class MemoryNodeManager:
         *,
         prompt_language: str,
     ) -> str:
+        """Keep each complete unit on one line, escaping embedded line breaks."""
         is_en = prompt_language == "en"
         time_label = "Time" if is_en else "时间"
         unit_type_label = "Unit type" if is_en else "单元类型"
@@ -2060,17 +2009,17 @@ class MemoryNodeManager:
                     if entry_index <= len(unit.speakers)
                     else ""
                 )
-                entry_blocks.append("\n".join([
+                entry_blocks.append(" | ".join([
                     f"{time_label}: {time_text}",
                     f"{speaker_label}: {speaker}",
                     f"{text_label}: {text}",
                 ]))
-            blocks.append("\n".join([
+            blocks.append(" | ".join([
                 f"[Unit {index}]",
                 f"{unit_type_label}: {unit.unit_type or 'transcript'}",
                 *entry_blocks,
-            ]))
-        return "\n\n".join(blocks)
+            ]).replace("\r", "\\r").replace("\n", "\\n"))
+        return "\n".join(blocks)
 
     def _is_indexable_memory_topic(self, value: Any) -> bool:
         """Reject fallback labels that must not become reusable topic names."""
@@ -2226,22 +2175,6 @@ class MemoryNodeManager:
             if isinstance(unit, MemoryUnit)
         )
         return self._resolve_prompt_language_from_text(text)
-
-    def _is_low_value_assistant_closing(self, text: str) -> bool:
-        clean = _compact_whitespace(text)
-        if not clean:
-            return True
-        lower = clean.lower()
-        if any(pattern in lower for pattern in _COURTESY_PATTERNS):
-            has_specific_action = any(
-                marker in lower
-                for marker in (
-                    "建议", "需要", "决定", "计划", "截止", "预约", "购买",
-                    "recommend", "suggest", "need to", "decide", "plan", "deadline",
-                )
-            )
-            return not has_specific_action
-        return False
 
     def _store_extracted_memory_facts_into_db(
         self,
@@ -2871,12 +2804,8 @@ class MemoryNodeManager:
         return {
             "id": fact.get("id"), "summary": fact.get("summary") or "",
             "fact_type": fact.get("fact_type") or "",
-            "entities": fact.get("entities") or [],
-            "primary_entity": fact.get("primary_entity") or {},
             "event_time": fact.get("event_time_key") or "",
             "dialogue_time": fact.get("dialogue_time_key") or "",
-            "keywords": fact.get("keywords") or [],
-            "topics": [fact.get("fact_topic") or ""],
         }
 
     def _normalize_intent_candidates(
@@ -4043,12 +3972,9 @@ class MemoryNodeManager:
             "fact_id": fact.get("id"),
             "summary": fact.get("summary") or "",
             "fact_type": fact.get("fact_type") or "",
-            "entities": entities,
             "world_owner_entity": (
                 self._world_owner_entity_name if has_world_owner else ""
             ),
-            "primary_entity": fact.get("primary_entity") or metadata.get("primary_entity"),
-            "keywords": fact.get("keywords") or [],
             "event_time": fact.get("event_time_key") or "",
             "dialogue_time": fact.get("dialogue_time_key") or "",
         }
@@ -5758,7 +5684,6 @@ class MemoryNodeManager:
         updates: List[Dict[str, Any]] = []
         raw_signals = self._normalize_user_intent_signals(
             fact.get("user_intent_signals"),
-            fallback_entity=fact.get("primary_entity"),
             allows_world_owner_reference=(
                 isinstance(fact.get("metadata"), dict)
                 and bool(fact["metadata"].get("has_world_owner_speaker")

@@ -287,8 +287,8 @@ user_intent_signals rules:
 
 7. Entities, topics, and output fields
 - `fact_topic` names the specific aspect discussed by this fact and must be grounded in current evidence. Use a short, specific, searchable topic, not a broad domain, full factual sentence, action, one-off conclusion, emotion, or isolated keyword. Name it conservatively when evidence is limited.
-- `entities` preserves all directly relevant entities for retrieval. `primary_entity` is one object, the single entity mainly described, affected, or associated with the fact, and must come from entities. When context confirms a known or newly confirmed alias as the wearer, include both the mentioned name and user self; never merge a namesake. Keep third-party reports attributed, not rewritten as self-statements.
-- `primary_entity` is the main affiliation or retrieval entity, not the owner of every action, evaluation, or condition in the fact. Explicitly preserve the actual subjects in multi-subject content rather than transferring their circumstances to the primary entity.
+- `entities` preserves all directly relevant entities for retrieval. When context confirms a known or newly confirmed alias as the wearer, include both the mentioned name and user self; never merge a namesake. Keep third-party reports attributed, not rewritten as self-statements.
+- In multi-subject facts, explicitly identify the actual subject of each action, evaluation, or condition in the fact text. Speaking or participating in a discussion does not make someone the subject of other people's circumstances.
 - `fact_type` marks only the primary semantic role: preference, decision, request, recommendation, action, commitment, open_question, risk, error, context, instruction, or other. It neither determines personal-evidence retention nor whether a signal is emitted.
 - `keywords` are short retrieval terms for concrete entities, topics, actions, constraints, and key temporal/order anchors, typically short noun phrases or 2-8 Chinese characters. Do not use full sentences, pleasantries, or generic encouragement.
 The following entity guidance selects semantic anchors in already retained facts; it is not an additional long-term-value retention gate:
@@ -305,7 +305,6 @@ Return JSON only, without markdown or extra explanation. Keep this field structu
       "text": "self-contained factual narrative organized around one concrete issue, decision, or event rather than individual sentence excerpts, preserving actual subjects, content, and necessary background, time, conditions, and changes; no mandatory full-exchange retelling or invented missing elements",
       "keywords": ["keyword1", "keyword2"],
       "entities": [{"name": "entity name", "type": "PERSON|ORGANIZATION|LOCATION|PRODUCT|PROJECT|TECHNOLOGY|CONCEPT|TOPIC|PREFERENCE|OTHER"}],
-      "primary_entity": {"name": "the single primary entity of this fact", "type": "PERSON|ORGANIZATION|LOCATION|PRODUCT|PROJECT|TECHNOLOGY|CONCEPT|TOPIC|PREFERENCE|OTHER"},
       "fact_topic": "specific aspect discussed by this fact",
       "fact_type": "preference|decision|request|recommendation|action|commitment|open_question|risk|error|context|instruction|other",
       "event_time_key": "real-world event occurrence time or representative temporal anchor derived from the dialogue time anchor and fact content; empty when it cannot be determined",
