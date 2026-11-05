@@ -2517,13 +2517,18 @@ class MemoryNodeManager:
             )
             batch_error = ""
             try:
-                raw = self._llm_client.call_llm(
+                prompt = (
                     prompt_template.replace("{reference_timestamp}", str(reference_timestamp))
-                    .replace("{signal_items}", json.dumps(
-                        [self._user_intent_signal_prompt_view(item) for item in batch],
-                        ensure_ascii=False,
-                        indent=2,
-                    )), stage_name='memory_user_intent_extraction'
+                    .replace("{signal_items}", "[\n" + ",\n".join(
+                        json.dumps(
+                            self._user_intent_signal_prompt_view(item),
+                            ensure_ascii=False, separators=(",", ":"),
+                        )
+                        for item in batch
+                    ) + "\n]")
+                )
+                raw = self._llm_client.call_llm(
+                    prompt, stage_name='memory_user_intent_extraction',
                 )
                 parsed = self._llm_client.parse_json_object_from_llm_text(raw or "", stage_name='memory_user_intent_extraction')
             except Exception as exc:
@@ -2652,7 +2657,6 @@ class MemoryNodeManager:
         signal = item["signal"]
         return {
             "signal_id": item["signal_id"],
-            "fact": self._intent_fact_prompt_view(item["fact"]),
             "user_intent_signal": {
                 key: signal.get(key)
                 for key in (
@@ -2661,6 +2665,7 @@ class MemoryNodeManager:
                     "evidence_basis", "confidence",
                 )
             },
+            "fact": self._intent_fact_prompt_view(item["fact"]),
         }
 
     def _retrieve_user_intent_related_intent_objects(
@@ -4547,12 +4552,18 @@ class MemoryNodeManager:
                 if prompt_language == "en" else EXPLICIT_USER_CLAIM_EXTRACTION_PROMPT_ZH
             )
             try:
-                raw = self._llm_client.call_llm(prompt_template.replace(
-                    "{signal_items}", json.dumps(
-                        [self._explicit_claim_signal_prompt_view(item) for item in batch_signal_items],
-                        ensure_ascii=False, indent=2,
-                    ),
-                ), stage_name='memory_explicit_user_claim_extraction')
+                prompt = prompt_template.replace(
+                    "{signal_items}", "[\n" + ",\n".join(
+                        json.dumps(
+                            self._explicit_claim_signal_prompt_view(item),
+                            ensure_ascii=False, separators=(",", ":"),
+                        )
+                        for item in batch_signal_items
+                    ) + "\n]",
+                )
+                raw = self._llm_client.call_llm(
+                    prompt, stage_name='memory_explicit_user_claim_extraction',
+                )
                 parsed = self._llm_client.parse_json_object_from_llm_text(raw or "", stage_name='memory_explicit_user_claim_extraction')
             except Exception as exc:
                 parsed = None
