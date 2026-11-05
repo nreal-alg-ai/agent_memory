@@ -36,6 +36,7 @@ from config import split_memory_config
 from memory.memory_inspector import MemoryInspector
 from pwm_manager import PersonWorldModel
 from memory.feishu_import import FeishuMeetingImports
+from memory.reset import MemoryResets
 from task_scheduler import TaskOperationReporter
 
 
@@ -158,24 +159,37 @@ class AgentMemoryRuntime:
                                               self._owners[_owner_key(owner)].active_ambient_recording_ids),
             logger=self._logger)
 
+        self._resets = MemoryResets(root=self._state_dir, owner_key=_owner_key,
+            operation_lock=self._operation_lock, owners=self._owners, get_owner=self._owner_runtime,
+            imports=self._meeting_imports, logger=self._logger)
 
     def dispatch(self, method: str, params: Dict[str, Any]) -> Dict[str, Any]:
         """Serialize stdio and local-IPC mutations through the memory service."""
         # Reads use independent committed snapshots and never initialize an owner
         # runtime or wait for its worker's long-running model calls.
+        if method in {"memory_generation", "memory_reset_status"}:
+            return self._resets.status(_clean(params.get("ownerId"), 240))
         if method == "inspect":
             owner = _clean(params.get("ownerId"), 240)
             if not owner:
                 raise ValueError("ownerId must be non-empty")
-            owner_dir = self._owner_dir / _owner_key(owner)
-            return MemoryInspector(
-                owner_dir / "memory.db", owner_dir / "user_model.db",
-                owner_name=str(self._manager_config.get("world_owner_entity_name") or "用户本人"),
-            ).inspect(params)
+            # Independent snapshot readers must not cross a database rebuild.
+            with self._resets.lock:
+                if self._resets.blocked(owner):
+                    return {"supported": True, "available": False, "reason": "memory_resetting"}
+                owner_dir = self._owner_dir / _owner_key(owner)
+                return MemoryInspector(
+                    owner_dir / "memory.db", owner_dir / "user_model.db",
+                    owner_name=str(self._manager_config.get("world_owner_entity_name") or "用户本人"),
+                ).inspect(params)
         if method == "preview_feishu_meeting":
             return self._meeting_imports.preview(params)
         if method == "feishu_import_status":
-            return self._meeting_imports.status(_clean(params.get("ownerId"), 240), params.get("id"))
+            owner = _clean(params.get("ownerId"), 240)
+            with self._resets.lock:
+                if self._resets.blocked(owner):
+                    return {"ok": False, "code": "feishu_import_not_found"}
+                return self._meeting_imports.status(owner, params.get("id"))
         if method == "close":
             return self.close(params)
         if self._meeting_imports.closed and method != "health":
@@ -184,8 +198,11 @@ class AgentMemoryRuntime:
             "observe", "observe_transcript_segments", "set_ambient_recording_state", "finalize",
             "finalize_transcript_recording", "trigger_periodic_task",
         }:
+            if method == "trigger_periodic_task":
+                return self._skip_periodic_task(params, reason="meeting_import_running")
             raise RuntimeError("Meeting import is running; retry after it completes")
         handlers = {
+            "reset_memory": lambda value: self._resets.start(_clean(value.get("ownerId"), 240)),
             "import_feishu_meeting": lambda value: self._meeting_imports.start(_clean(value.get("ownerId"), 240), value),
             "trigger_periodic_task": self.trigger_periodic_task,
             "observe": self.observe,
@@ -201,9 +218,17 @@ class AgentMemoryRuntime:
         if handler is None:
             raise ValueError(f"unsupported method: {method}")
         with self._operation_lock:
+            owner = _clean(params.get("ownerId"), 240)
+            if method not in {"reset_memory", "health"}:
+                if self._resets.closed or self._resets.blocked(owner):
+                    return {"ok": False, "observed": False, "reason": "memory_resetting", "code": "memory_resetting"}
+                if not self._resets.accepts(owner, params.get("memoryGeneration")):
+                    return {"ok": False, "observed": False, "reason": "stale_memory_generation", "code": "stale_memory_generation"}
             if self._meeting_imports.busy(_clean(params.get("ownerId"), 240)) and method not in {
-                "import_feishu_meeting", "health", "recall",
+                "reset_memory", "import_feishu_meeting", "health", "recall",
             }:
+                if method == "trigger_periodic_task":
+                    return self._skip_periodic_task(params, reason="meeting_import_running")
                 raise RuntimeError("Meeting import is running; retry after it completes")
             return handler(params)
 
@@ -582,6 +607,18 @@ class AgentMemoryRuntime:
         )
         return result
 
+    def _skip_periodic_task(self, params: Dict[str, Any], *, reason: str) -> Dict[str, Any]:
+        task_id = _clean(params.get("taskId"), 80)
+        owner_id = _clean(params.get("ownerId"), 240)
+        if task_id != "user_state_from_claims":
+            raise ValueError(f"unsupported periodic task: {task_id}")
+        if not owner_id:
+            raise ValueError("ownerId must be non-empty")
+        self._logger.info("periodic task signal owner=%s task=%s queued=False reason=%s",
+                          _owner_key(owner_id)[:12], task_id, reason)
+        return {"supported": True, "taskId": task_id, "queued": False,
+                "status": "skipped", "reason": reason}
+
     def trigger_periodic_task(self, params: Dict[str, Any]) -> Dict[str, Any]:
         task_id = _clean(params.get("taskId"), 80)
         if task_id != "user_state_from_claims":
@@ -602,6 +639,7 @@ class AgentMemoryRuntime:
         return {"ok": True, "activeOwners": len(self._owners)}
 
     def close(self, _params: Dict[str, Any]) -> Dict[str, Any]:
+        self._resets.close()
         self._meeting_imports.close()
         with self._operation_lock:
             return self._close_owners()
@@ -629,6 +667,7 @@ class _LocalTranscriptIpcServer:
     """
 
     _ALLOWED_METHODS = {
+        "memory_generation",
         "set_ambient_recording_state",
         "observe_transcript_segments",
         "finalize_transcript_recording",
