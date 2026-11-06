@@ -470,9 +470,10 @@ Express these decisions through save_new_intent, relations, and intent_updates, 
 Only propose evidence-supported decisions. Do not write to the database, predict user behavior, or generate user_state.
 
 2. Meaning of the inputs
-- candidates: the current batch of future_intent_candidates, indexed in their original order. Each candidate is a future goal, arrangement, or bounded responsibility extracted from a new fact. It is an unverified candidate, not an established intention or a mandatory new record; summary and details describe that future object.
+- candidates: the current batch of future_intent_candidates; candidate_index is its original zero-based position. subject_entity preserves the candidate's attributed subject name. Each candidate is a future goal, arrangement, or bounded responsibility extracted from a new fact. It is an unverified candidate, not an established intention or a mandatory new record; summary and details describe that future object.
 - existing_objects: existing intents retrieved for the same user. These are potentially related objects, not confirmed matches, and may be ongoing, blocked, completed, occurred, or cancelled.
-- Use only the candidates, existing objects, and accompanying source evidence actually provided. IDs such as evidence_fact_ids do not supply the contents of missing facts; do not reconstruct or invent facts from IDs.
+- Both new and existing objects use time_start and time_end; for a goal, time_end is its target time, and for a work_item it is the deadline. Type-specific business information appears only in details; plan locations use details.location_text. Omitted optional information means unknown or not provided, not cancelled or cleared.
+- Each candidate's facts retain the source id, summary, event_time, and dialogue_time. Use only the supplied candidates, existing objects, and accompanying evidence; do not reconstruct missing facts from IDs. event_time is when the event occurs; dialogue_time is when the statement was made. Do not confuse them.
 
 user_intent includes only three object types:
 - goal: a desired outcome the user continues to pursue, not a single action or vague wish.
@@ -498,7 +499,7 @@ relations is a list. Return [] when no reliable relationship exists; otherwise r
 - conflicts: new information conflicts with an identifiable existing intent, but replacement or current validity cannot be established. Return intent_updates=[] when there is insufficient evidence to adjudicate the conflict.
 
 Identity and relationship rules:
-1. Similar canonical_key values, topics, places, people, or keywords only help locate potential matches; they do not establish identity or replacement by themselves.
+1. Similar topics, places, people, or keywords only help locate potential matches; they do not establish identity or replacement by themselves.
 2. goal: the core subject and desired_outcome must be compatible and refer to the same ongoing desired result.
 3. plan: the core participants and event_or_activity must be compatible. Similar activities on different dates are normally separate arrangements. Relate them only when evidence explicitly describes rescheduling, supplementation, or adjustment of the original arrangement.
 4. work_item: the responsible person, core action_text, and deliverable must be compatible. Similar actions with different deliverables, responsibilities, or independent instances must not be merged.

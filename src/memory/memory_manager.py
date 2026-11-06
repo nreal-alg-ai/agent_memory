@@ -2521,7 +2521,7 @@ class MemoryNodeManager:
                     prompt_template.replace("{reference_timestamp}", str(reference_timestamp))
                     .replace("{signal_items}", "[\n" + ",\n".join(
                         json.dumps(
-                            self._user_intent_signal_prompt_view(item),
+                            self._format_signal_view_for_user_intent_prompt(item),
                             ensure_ascii=False, separators=(",", ":"),
                         )
                         for item in batch
@@ -2650,7 +2650,7 @@ class MemoryNodeManager:
         self._log_info("memory_user_intent_update", "finish", report)
         return report
 
-    def _user_intent_signal_prompt_view(
+    def _format_signal_view_for_user_intent_prompt(
         self,
         item: Dict[str, Any],
     ) -> Dict[str, Any]:
@@ -2665,7 +2665,7 @@ class MemoryNodeManager:
                     "evidence_basis", "confidence",
                 )
             },
-            "fact": self._intent_fact_prompt_view(item["fact"]),
+            "fact": self._format_fact_view_for_user_intent_prompt(item["fact"]),
         }
 
     def _retrieve_user_intent_related_intent_objects(
@@ -2805,7 +2805,7 @@ class MemoryNodeManager:
         mapping = self._db.add_entity_names([self._world_owner_entity_name])
         return int(mapping[self._world_owner_entity_name])
 
-    def _intent_fact_prompt_view(self, fact: Dict[str, Any]) -> Dict[str, Any]:
+    def _format_fact_view_for_user_intent_prompt(self, fact: Dict[str, Any]) -> Dict[str, Any]:
         return {
             "id": fact.get("id"), "summary": fact.get("summary") or "",
             "fact_type": fact.get("fact_type") or "",
@@ -3127,6 +3127,39 @@ class MemoryNodeManager:
                 })
         return candidate
 
+    @staticmethod
+    def _future_intent_reconciliation_prompt_view(
+        object_type: str, item: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Project business semantics without storage fields or duplicate aliases."""
+        detail_fields = {
+            "goal": ("desired_outcome", "success_criteria"),
+            "plan": ("event_or_activity", "time_precision", "location_text", "participants"),
+            "work_item": (
+                "action_text", "deliverable", "responsibility_type", "priority",
+                "beneficiary_entities", "delegator_entities", "collaborator_entities", "completed_at",
+            ),
+        }[object_type]
+        source_details = item.get("details")
+        source_details = source_details if isinstance(source_details, dict) else {}
+        details: Dict[str, Any] = {}
+        for key in detail_fields:
+            value = source_details.get(key)
+            if key == "location_text" and not value:
+                value = source_details.get("location")
+            if value in (None, "", [], {}):
+                value = item.get(key)
+            if value not in (None, "", [], {}):
+                details[key] = value
+        end_field = {"goal": "target_at", "plan": "end_at", "work_item": "due_at"}[object_type]
+        return {
+            "object_type": object_type,
+            "summary": item.get("summary") or "",
+            "time_start": item.get("time_start") or item.get("start_at") or "",
+            "time_end": item.get("time_end") or item.get(end_field) or "",
+            "details": details,
+        }
+
     def _reconcile_future_intent_candidates(
         self,
         candidates: Sequence[Dict[str, Any]],
@@ -3154,10 +3187,9 @@ class MemoryNodeManager:
         decisions: Dict[int, Dict[str, Any]] = {}
         existing = [
             {
-                **self._intent_object_prompt_view(object_type, item),
-                "time_start": item.get("time_start") or "",
-                "time_end": item.get("time_end") or "",
-                "details": item.get("details") or {},
+                "id": item["id"],
+                **self._future_intent_reconciliation_prompt_view(object_type, item),
+                "status": item.get("status") or "",
             }
             for object_type, items in existing_by_type.items() for item in items
         ]
@@ -3169,20 +3201,40 @@ class MemoryNodeManager:
             }))
         }
         candidate_inputs = [{
-            **candidate,
+            "candidate_index": index,
+            **self._future_intent_reconciliation_prompt_view(candidate["object_type"], candidate),
+            "subject_entity": candidate.get({
+                "goal": "owner_name", "plan": "actor_name", "work_item": "responsible_name",
+            }[candidate["object_type"]]) or candidate.get("subject_entity") or "",
             "facts": [
-                self._intent_fact_prompt_view(facts_by_id[fact_id])
+                {
+                    "id": fact_id,
+                    "summary": facts_by_id[fact_id].get("summary") or "",
+                    "event_time": facts_by_id[fact_id].get("event_time_key") or "",
+                    "dialogue_time": facts_by_id[fact_id].get("dialogue_time_key") or "",
+                }
                 for fact_id in candidate["evidence_fact_ids"] if fact_id in facts_by_id
             ],
-        } for candidate in candidates]
+        } for index, candidate in enumerate(candidates)]
         prompt_template = (
             INTENT_RECONCILIATION_PROMPT_EN
             if prompt_language == "en" else INTENT_RECONCILIATION_PROMPT_ZH
         )
         try:
+            candidate_text = "[\n" + ",\n".join(
+                json.dumps(item, ensure_ascii=False, separators=(",", ":"))
+                for item in candidate_inputs
+            ) + "\n]"
+            existing_text = "[\n" + ",\n".join(
+                json.dumps(item, ensure_ascii=False, separators=(",", ":"))
+                for item in existing
+            ) + "\n]" if existing else "[]"
+            prompt = (
+                prompt_template.replace("{candidates}", candidate_text)
+                .replace("{existing_objects}", existing_text)
+            )
             raw = self._llm_client.call_llm(
-                prompt_template.replace("{candidates}", json.dumps(candidate_inputs, ensure_ascii=False, indent=2))
-                .replace("{existing_objects}", json.dumps(existing, ensure_ascii=False, indent=2)), stage_name='memory_future_intent_reconciliation'
+                prompt, stage_name='memory_future_intent_reconciliation',
             )
             parsed = self._llm_client.parse_json_object_from_llm_text(raw or "", stage_name='memory_future_intent_reconciliation')
             if not isinstance(parsed, dict) or not isinstance(parsed.get("decisions"), list):
@@ -3445,7 +3497,7 @@ class MemoryNodeManager:
                         "lifecycle_evidence", "effective_at", "confidence", "details",
                     )
                 },
-                "fact": self._intent_fact_prompt_view(
+                "fact": self._format_fact_view_for_user_intent_prompt(
                     facts_by_id[observation["evidence_fact_ids"][0]],
                 ),
                 "existing_intents": [
@@ -3962,7 +4014,7 @@ class MemoryNodeManager:
             "_completed_signal_ids": processed_signal_ids,
         }
 
-    def _explicit_claim_fact_prompt_view(self, fact: Dict[str, Any]) -> Dict[str, Any]:
+    def _format_fact_view_for_explicit_claim_prompt(self, fact: Dict[str, Any]) -> Dict[str, Any]:
         metadata = fact.get("metadata") if isinstance(fact.get("metadata"), dict) else {}
         entities = list(fact.get("entities") or [])
         has_world_owner = bool(
@@ -3985,7 +4037,7 @@ class MemoryNodeManager:
         }
         return prompt_view
 
-    def _explicit_claim_signal_prompt_view(self, item: Dict[str, Any]) -> Dict[str, Any]:
+    def _format_signal_view_for_explicit_claim_prompt(self, item: Dict[str, Any]) -> Dict[str, Any]:
         signal = item["signal"]
         return {
             "signal_id": item["signal_id"],
@@ -3996,7 +4048,7 @@ class MemoryNodeManager:
                 "evidence_basis": str(signal.get("evidence_basis") or ""),
                 "confidence": float(signal.get("confidence") or 0.0),
             },
-            "fact": self._explicit_claim_fact_prompt_view(item["fact"]),
+            "fact": self._format_fact_view_for_explicit_claim_prompt(item["fact"]),
         }
 
     def _sync_user_claim_recall_documents(
@@ -4555,7 +4607,7 @@ class MemoryNodeManager:
                 prompt = prompt_template.replace(
                     "{signal_items}", "[\n" + ",\n".join(
                         json.dumps(
-                            self._explicit_claim_signal_prompt_view(item),
+                            self._format_signal_view_for_explicit_claim_prompt(item),
                             ensure_ascii=False, separators=(",", ":"),
                         )
                         for item in batch_signal_items
@@ -6054,7 +6106,7 @@ class MemoryNodeManager:
             "signal_ids": [item["signal_id"] for item in signal_items],
             "reference_timestamp": reference_timestamp,
             "signal_items": [
-                self._user_intent_signal_prompt_view(item) for item in signal_items
+                self._format_signal_view_for_user_intent_prompt(item) for item in signal_items
             ],
         })
 
