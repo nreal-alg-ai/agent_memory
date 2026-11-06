@@ -946,14 +946,14 @@ class MemoryNodeManager:
             )
             .replace(
                 "{dialogue_batch}",
-                self._build_memory_units_for_prompt(
+                self._format_memory_units_view_for_fact_prompt(
                     current_units,
                     prompt_language=prompt_language,
                 ),
             )
             .replace(
                 "{preceding_context}",
-                self._build_memory_units_for_prompt(
+                self._format_memory_units_view_for_fact_prompt(
                     preceding_units,
                     prompt_language=prompt_language,
                 ) or ("(none)" if prompt_language == "en" else "（无）"),
@@ -1024,15 +1024,6 @@ class MemoryNodeManager:
             if isinstance(item, dict)
             and _compact_whitespace(item.get("summary") or item.get("text") or "")
         ]
-        fact_payload = [
-            {
-                "id": item.get("id"),
-                "summary": _compact_whitespace(item.get("summary") or item.get("text") or ""),
-                "dialogue_time_key": item.get("dialogue_time_key") or "",
-                "event_time_key": item.get("event_time_key") or "",
-            }
-            for item in fact_list
-        ]
         source_text = self._build_user_activity_units_for_prompt(
             unit_list,
             prompt_language=prompt_language,
@@ -1045,9 +1036,10 @@ class MemoryNodeManager:
         prompt = (
             prompt_template
             .replace("{source_units}", source_text)
-            .replace("{evidence_facts}", json.dumps(
-                fact_payload, ensure_ascii=False, separators=(",", ":"),
-            ))
+            .replace(
+                "{evidence_facts}",
+                self._format_facts_view_for_user_activity_prompt(fact_list),
+            )
         )
         allowed_fact_ids = {
             int(item["id"]) for item in fact_list
@@ -1089,6 +1081,23 @@ class MemoryNodeManager:
                 })
             return activities
         return None
+
+    @staticmethod
+    def _format_facts_view_for_user_activity_prompt(
+        facts: Sequence[Dict[str, Any]],
+    ) -> str:
+        """Render evidence facts as a JSON array with one complete fact per line."""
+        if not facts:
+            return "[]"
+        return "[\n" + ",\n".join(
+            json.dumps({
+                "id": item.get("id"),
+                "summary": _compact_whitespace(item.get("summary") or item.get("text") or ""),
+                "dialogue_time_key": item.get("dialogue_time_key") or "",
+                "event_time_key": item.get("event_time_key") or "",
+            }, ensure_ascii=False, separators=(",", ":"))
+            for item in facts
+        ) + "\n]"
 
     def _normalize_memory_fact_extraction_llm_output(
         self,
@@ -1973,7 +1982,7 @@ class MemoryNodeManager:
             lines.append(f"[U{index} {unit.unit_type}] " + " | ".join(entry_texts))
         return "\n".join(lines)
 
-    def _build_memory_units_for_prompt(
+    def _format_memory_units_view_for_fact_prompt(
         self,
         units: Sequence[MemoryUnit],
         *,
@@ -2519,13 +2528,10 @@ class MemoryNodeManager:
             try:
                 prompt = (
                     prompt_template.replace("{reference_timestamp}", str(reference_timestamp))
-                    .replace("{signal_items}", "[\n" + ",\n".join(
-                        json.dumps(
-                            self._format_signal_view_for_user_intent_prompt(item),
-                            ensure_ascii=False, separators=(",", ":"),
-                        )
-                        for item in batch
-                    ) + "\n]")
+                    .replace(
+                        "{signal_items}",
+                        self._format_signal_view_for_user_intent_prompt(batch),
+                    )
                 )
                 raw = self._llm_client.call_llm(
                     prompt, stage_name='memory_user_intent_extraction',
@@ -2652,35 +2658,41 @@ class MemoryNodeManager:
 
     def _format_signal_view_for_user_intent_prompt(
         self,
-        item: Dict[str, Any],
-    ) -> Dict[str, Any]:
-        signal = item["signal"]
-        return {
-            "signal_id": item["signal_id"],
-            "user_intent_signal": {
-                key: signal.get(key)
-                for key in (
-                    "signal_purpose", "candidate_object_types", "subject_entity",
-                    "user_role", "user_intent_anchor", "assertion_source",
-                    "evidence_basis", "confidence",
-                )
-            },
-            "fact": self._format_fact_view_for_user_intent_prompt(item["fact"]),
-        }
+        signal_items: Sequence[Dict[str, Any]],
+    ) -> str:
+        """Render a signal batch as a JSON array with one complete item per line."""
+        if not signal_items:
+            return "[]"
+        lines = []
+        for item in signal_items:
+            signal = item["signal"]
+            lines.append(json.dumps({
+                "signal_id": item["signal_id"],
+                "user_intent_signal": {
+                    key: signal.get(key)
+                    for key in (
+                        "signal_purpose", "candidate_object_types", "subject_entity",
+                        "user_role", "user_intent_anchor", "assertion_source",
+                        "evidence_basis", "confidence",
+                    )
+                },
+                "fact": self._format_fact_view_for_user_intent_prompt(item["fact"]),
+            }, ensure_ascii=False, separators=(",", ":")))
+        return "[\n" + ",\n".join(lines) + "\n]"
 
     def _retrieve_user_intent_related_intent_objects(
         self,
         candidates: Sequence[Dict[str, Any]],
         *,
         world_owner_id: int,
-    ) -> Dict[str, List[Dict[str, Any]]]:
+    ) -> List[Dict[str, Any]]:
         """Retrieve candidate-ranked existing objects for reconciliation.
 
         ``canonical_key`` is deliberately only one high-precision feature. It
         cannot be a retrieval gate because separately extracted descriptions
         of the same future-facing object rarely use identical keys.
         """
-        related_by_type: Dict[str, List[Dict[str, Any]]] = {}
+        related_objects: List[Dict[str, Any]] = []
         for object_type in ("goal", "plan", "work_item"):
             existing = self._db.get_intent_objects(
                 object_type=object_type,
@@ -2716,8 +2728,8 @@ class MemoryNodeManager:
                     object_id = int(item.get("id") or 0)
                     if object_id > 0:
                         selected_by_id[object_id] = item
-            related_by_type[object_type] = list(selected_by_id.values())
-        return related_by_type
+            related_objects.extend(selected_by_id.values())
+        return related_objects
 
     def _build_intent_object_match_profile(
         self,
@@ -3160,39 +3172,13 @@ class MemoryNodeManager:
             "details": details,
         }
 
-    def _reconcile_future_intent_candidates(
+    def _format_intent_candidates_view_for_future_intent_reconciliation_prompt(
         self,
         candidates: Sequence[Dict[str, Any]],
-        *,
-        world_owner_id: int,
-        prompt_language: str,
-        existing_by_type: Optional[Dict[str, List[Dict[str, Any]]]] = None,
-    ) -> Dict[int, Dict[str, Any]]:
-        """Adjudicate candidate persistence, relationships, and existing-intent changes."""
+    ) -> str:
+        """Load direct facts and render candidates with one candidate per line."""
         if not candidates:
-            return {}
-        if existing_by_type is None:
-            existing_by_type = self._retrieve_user_intent_related_intent_objects(
-                candidates,
-                world_owner_id=world_owner_id,
-            )
-        existing_by_type = {
-            object_type: [
-                item for item in existing_by_type.get(object_type) or []
-                if int(item.get("world_owner_entity_id") or 0) == world_owner_id
-                and int(item.get("id") or 0) > 0
-            ]
-            for object_type in ("goal", "plan", "work_item")
-        }
-        decisions: Dict[int, Dict[str, Any]] = {}
-        existing = [
-            {
-                "id": item["id"],
-                **self._future_intent_reconciliation_prompt_view(object_type, item),
-                "status": item.get("status") or "",
-            }
-            for object_type, items in existing_by_type.items() for item in items
-        ]
+            return "[]"
         facts_by_id = {
             int(fact["id"]): fact
             for fact in self._db.get_memory_facts_by_ids(sorted({
@@ -3200,38 +3186,74 @@ class MemoryNodeManager:
                 for fact_id in candidate["evidence_fact_ids"]
             }))
         }
-        candidate_inputs = [{
-            "candidate_index": index,
-            **self._future_intent_reconciliation_prompt_view(candidate["object_type"], candidate),
-            "subject_entity": candidate.get({
-                "goal": "owner_name", "plan": "actor_name", "work_item": "responsible_name",
-            }[candidate["object_type"]]) or candidate.get("subject_entity") or "",
-            "facts": [
-                {
-                    "id": fact_id,
-                    "summary": facts_by_id[fact_id].get("summary") or "",
-                    "event_time": facts_by_id[fact_id].get("event_time_key") or "",
-                    "dialogue_time": facts_by_id[fact_id].get("dialogue_time_key") or "",
-                }
-                for fact_id in candidate["evidence_fact_ids"] if fact_id in facts_by_id
-            ],
-        } for index, candidate in enumerate(candidates)]
+        return "[\n" + ",\n".join(
+            json.dumps({
+                "candidate_index": index,
+                **self._future_intent_reconciliation_prompt_view(candidate["object_type"], candidate),
+                "subject_entity": candidate.get({
+                    "goal": "owner_name", "plan": "actor_name", "work_item": "responsible_name",
+                }[candidate["object_type"]]) or candidate.get("subject_entity") or "",
+                "facts": [
+                    {
+                        "id": fact_id,
+                        "summary": facts_by_id[fact_id].get("summary") or "",
+                        "event_time": facts_by_id[fact_id].get("event_time_key") or "",
+                        "dialogue_time": facts_by_id[fact_id].get("dialogue_time_key") or "",
+                    }
+                    for fact_id in candidate["evidence_fact_ids"] if fact_id in facts_by_id
+                ],
+            }, ensure_ascii=False, separators=(",", ":"))
+            for index, candidate in enumerate(candidates)
+        ) + "\n]"
+
+    def _format_intent_object_view_for_future_intent_reconciliation_prompt(
+        self,
+        existing_objects: Sequence[Dict[str, Any]],
+    ) -> str:
+        """Render existing intent objects with one complete object per line."""
+        lines = [
+            json.dumps({
+                "id": item["id"],
+                **self._future_intent_reconciliation_prompt_view(item["object_type"], item),
+                "status": item.get("status") or "",
+            }, ensure_ascii=False, separators=(",", ":"))
+            for item in existing_objects
+        ]
+        return "[\n" + ",\n".join(lines) + "\n]" if lines else "[]"
+
+    def _reconcile_future_intent_candidates(
+        self,
+        candidates: Sequence[Dict[str, Any]],
+        *,
+        world_owner_id: int,
+        prompt_language: str,
+    ) -> Dict[int, Dict[str, Any]]:
+        """Adjudicate candidate persistence, relationships, and existing-intent changes."""
+        if not candidates:
+            return {}
+        existing_objects = self._retrieve_user_intent_related_intent_objects(
+            candidates,
+            world_owner_id=world_owner_id,
+        )
+        decisions: Dict[int, Dict[str, Any]] = {}
         prompt_template = (
             INTENT_RECONCILIATION_PROMPT_EN
             if prompt_language == "en" else INTENT_RECONCILIATION_PROMPT_ZH
         )
         try:
-            candidate_text = "[\n" + ",\n".join(
-                json.dumps(item, ensure_ascii=False, separators=(",", ":"))
-                for item in candidate_inputs
-            ) + "\n]"
-            existing_text = "[\n" + ",\n".join(
-                json.dumps(item, ensure_ascii=False, separators=(",", ":"))
-                for item in existing
-            ) + "\n]" if existing else "[]"
             prompt = (
-                prompt_template.replace("{candidates}", candidate_text)
-                .replace("{existing_objects}", existing_text)
+                prompt_template.replace(
+                    "{candidates}",
+                    self._format_intent_candidates_view_for_future_intent_reconciliation_prompt(
+                        candidates,
+                    ),
+                )
+                .replace(
+                    "{existing_objects}",
+                    self._format_intent_object_view_for_future_intent_reconciliation_prompt(
+                        existing_objects,
+                    ),
+                )
             )
             raw = self._llm_client.call_llm(
                 prompt, stage_name='memory_future_intent_reconciliation',
@@ -3239,6 +3261,8 @@ class MemoryNodeManager:
             parsed = self._llm_client.parse_json_object_from_llm_text(raw or "", stage_name='memory_future_intent_reconciliation')
             if not isinstance(parsed, dict) or not isinstance(parsed.get("decisions"), list):
                 raise ValueError("invalid_future_intent_reconciliation_response")
+        except sqlite3.Error:
+            raise
         except Exception as exc:
             self._log_info("memory_user_intent_update", "batch_error", {
                 "candidate_indices": list(range(len(candidates))),
@@ -3246,8 +3270,7 @@ class MemoryNodeManager:
             })
             return decisions
         existing_by_id = {
-            (object_type, int(item["id"])): item
-            for object_type, items in existing_by_type.items() for item in items
+            int(item["id"]): item for item in existing_objects
         }
         allowed_statuses = {
             "goal": {"active", "blocked", "completed", "cancelled"},
@@ -3294,7 +3317,8 @@ class MemoryNodeManager:
                         raise ValueError("invalid_future_intent_relation")
                     target_id = relation.get("target_intent_id")
                     if (type(target_id) is not int
-                            or (object_type, target_id) not in existing_by_id
+                            or target_id not in existing_by_id
+                            or existing_by_id[target_id]["object_type"] != object_type
                             or relation.get("relation") not in {"same_intent", "supersedes", "conflicts"}):
                         raise ValueError("invalid_future_intent_target_or_relation")
                     normalized_relations.append({
@@ -4037,19 +4061,28 @@ class MemoryNodeManager:
         }
         return prompt_view
 
-    def _format_signal_view_for_explicit_claim_prompt(self, item: Dict[str, Any]) -> Dict[str, Any]:
-        signal = item["signal"]
-        return {
-            "signal_id": item["signal_id"],
-            "user_claim_signal": {
-                "subject_entity": _compact_whitespace(signal.get("subject") or ""),
-                "claim_type_hint": str(signal.get("claim_type_hint") or ""),
-                "claim_anchor": str(signal.get("claim_anchor") or ""),
-                "evidence_basis": str(signal.get("evidence_basis") or ""),
-                "confidence": float(signal.get("confidence") or 0.0),
-            },
-            "fact": self._format_fact_view_for_explicit_claim_prompt(item["fact"]),
-        }
+    def _format_signal_view_for_explicit_claim_prompt(
+        self,
+        signal_items: Sequence[Dict[str, Any]],
+    ) -> str:
+        """Render a signal batch as a JSON array with one complete item per line."""
+        if not signal_items:
+            return "[]"
+        lines = []
+        for item in signal_items:
+            signal = item["signal"]
+            lines.append(json.dumps({
+                "signal_id": item["signal_id"],
+                "user_claim_signal": {
+                    "subject_entity": _compact_whitespace(signal.get("subject") or ""),
+                    "claim_type_hint": str(signal.get("claim_type_hint") or ""),
+                    "claim_anchor": str(signal.get("claim_anchor") or ""),
+                    "evidence_basis": str(signal.get("evidence_basis") or ""),
+                    "confidence": float(signal.get("confidence") or 0.0),
+                },
+                "fact": self._format_fact_view_for_explicit_claim_prompt(item["fact"]),
+            }, ensure_ascii=False, separators=(",", ":")))
+        return "[\n" + ",\n".join(lines) + "\n]"
 
     def _sync_user_claim_recall_documents(
         self,
@@ -4605,13 +4638,8 @@ class MemoryNodeManager:
             )
             try:
                 prompt = prompt_template.replace(
-                    "{signal_items}", "[\n" + ",\n".join(
-                        json.dumps(
-                            self._format_signal_view_for_explicit_claim_prompt(item),
-                            ensure_ascii=False, separators=(",", ":"),
-                        )
-                        for item in batch_signal_items
-                    ) + "\n]",
+                    "{signal_items}",
+                    self._format_signal_view_for_explicit_claim_prompt(batch_signal_items),
                 )
                 raw = self._llm_client.call_llm(
                     prompt, stage_name='memory_explicit_user_claim_extraction',
@@ -5074,28 +5102,34 @@ class MemoryNodeManager:
         report["new_claim_ids"] = sorted(set(report["new_claim_ids"]))
         return report
 
-    def _derived_claim_prompt_view(
+    def _format_claims_view_for_derived_user_claim_prompt(
         self,
-        claim: Dict[str, Any],
+        claims: Sequence[Dict[str, Any]],
         *,
         entity_names: Dict[int, str],
-    ) -> Dict[str, Any]:
-        subject_id = int(claim.get("subject_entity_id") or 0)
-        object_id = int(claim.get("object_entity_id") or 0)
-        return {
-            "id": int(claim["id"]),
-            "subject_entity_id": subject_id,
-            "subject_entity": entity_names.get(subject_id, ""),
-            "predicate": claim.get("predicate") or "",
-            "object_entity_id": object_id,
-            "object_entity": entity_names.get(object_id, ""),
-            "claim_type": claim.get("claim_type") or "",
-            "primary_domain": claim.get("primary_domain") or "",
-            "claim_text": claim.get("claim_text") or "",
-            "valid_from": claim.get("valid_from") or "",
-            "valid_to": claim.get("valid_to") or "",
-            "confidence": float(claim.get("confidence") or 0.0),
-        }
+    ) -> str:
+        """Render premise claims as a JSON array with one complete claim per line."""
+        if not claims:
+            return "[]"
+        lines = []
+        for claim in claims:
+            subject_id = int(claim.get("subject_entity_id") or 0)
+            object_id = int(claim.get("object_entity_id") or 0)
+            lines.append(json.dumps({
+                "id": int(claim["id"]),
+                "subject_entity_id": subject_id,
+                "subject_entity": entity_names.get(subject_id, ""),
+                "predicate": claim.get("predicate") or "",
+                "object_entity_id": object_id,
+                "object_entity": entity_names.get(object_id, ""),
+                "claim_type": claim.get("claim_type") or "",
+                "primary_domain": claim.get("primary_domain") or "",
+                "claim_text": claim.get("claim_text") or "",
+                "valid_from": claim.get("valid_from") or "",
+                "valid_to": claim.get("valid_to") or "",
+                "confidence": float(claim.get("confidence") or 0.0),
+            }, ensure_ascii=False, separators=(",", ":")))
+        return "[\n" + ",\n".join(lines) + "\n]"
 
     def _extract_derived_user_claims(
         self,
@@ -5120,25 +5154,22 @@ class MemoryNodeManager:
             DERIVED_USER_CLAIM_EXTRACTION_PROMPT_EN
             if language == "en" else DERIVED_USER_CLAIM_EXTRACTION_PROMPT_ZH
         )
-        raw = self._llm_client.call_llm(prompt_template.replace(
+        prompt = prompt_template.replace(
             "{changed_claims}",
-            json.dumps([
-                self._derived_claim_prompt_view(
-                    claim,
-                    entity_names=entity_names,
-                )
-                for claim in changed_claims
-            ], ensure_ascii=False, indent=2),
+            self._format_claims_view_for_derived_user_claim_prompt(
+                changed_claims,
+                entity_names=entity_names,
+            ),
         ).replace(
             "{related_claims}",
-            json.dumps([
-                self._derived_claim_prompt_view(
-                    claim,
-                    entity_names=entity_names,
-                )
-                for claim in related_claims
-            ], ensure_ascii=False, indent=2),
-        ), stage_name='memory_derived_user_claim_extraction')
+            self._format_claims_view_for_derived_user_claim_prompt(
+                related_claims,
+                entity_names=entity_names,
+            ),
+        )
+        raw = self._llm_client.call_llm(
+            prompt, stage_name='memory_derived_user_claim_extraction',
+        )
         parsed = self._llm_client.parse_json_object_from_llm_text(raw or "", stage_name='memory_derived_user_claim_extraction')
         if parsed is None or not isinstance(parsed.get("claims"), list):
             return None
@@ -6101,14 +6132,14 @@ class MemoryNodeManager:
         reference_timestamp: Any,
     ) -> None:
         """Log each intent signal together with the fact supporting its extraction."""
-        self._log_info("memory_user_intent_update", "signals_loaded", {
-            "signal_count": len(signal_items),
-            "signal_ids": [item["signal_id"] for item in signal_items],
-            "reference_timestamp": reference_timestamp,
-            "signal_items": [
-                self._format_signal_view_for_user_intent_prompt(item) for item in signal_items
-            ],
-        })
+        self._logger.info(
+            "memory_user_intent_update signals_loaded signal_count=%s "
+            "signal_ids=%s reference_timestamp=%s\nsignal_items=%s",
+            len(signal_items),
+            [item["signal_id"] for item in signal_items],
+            reference_timestamp,
+            self._format_signal_view_for_user_intent_prompt(signal_items),
+        )
 
     @staticmethod
     def _generate_topic_name_key(value: Any) -> str:
