@@ -265,6 +265,45 @@ class UserStateResolver:
             "existing_states": states_by_id,
         }
 
+    @staticmethod
+    def _format_thread_cases_view_for_user_state_prompt(
+        thread_cases: Sequence[Mapping[str, Any]],
+    ) -> str:
+        """Render compact thread cases without changing validation snapshots."""
+        if not thread_cases:
+            return "[]"
+        lines = []
+        for case in thread_cases:
+            previous = case["previous_thread"]
+            previous_view = None if previous is None else {
+                key: previous[key]
+                for key in ("title", "identity_description", "current_summary", "status")
+                if key in previous and previous[key] != case["thread"].get(key)
+            }
+            lines.append(json.dumps({
+                "thread": case["thread"],
+                "previous_thread": previous_view,
+                "reference_time": case["reference_time"],
+                "change_events": [
+                    {key: value for key, value in event.items()
+                     if key != "thread_id" and not (
+                         key == "known_at" and value == case["reference_time"]
+                     )}
+                    for event in case["change_events"]
+                ],
+                "activity_cases": [
+                    {
+                        "activity": activity_case["activity"],
+                        "linked_facts": [
+                            {key: value for key, value in fact.items() if key != "fact_topic"}
+                            for fact in activity_case["linked_facts"]
+                        ],
+                    } for activity_case in case["activity_cases"]
+                ],
+                "linked_state_ids": case["linked_state_ids"],
+            }, ensure_ascii=False, separators=(",", ":")))
+        return "[\n" + ",\n".join(lines) + "\n]"
+
     def _normalize_user_thread_state_operations(
         self, raw_operations: Sequence[Any], *,
         update_input: Mapping[str, Any],
@@ -374,9 +413,16 @@ class UserStateResolver:
                     else USER_THREAD_STATE_UPDATE_PROMPT_ZH)
         prompt = template
         for key, value in update_input.items():
-            prompt = prompt.replace("{" + key + "}", json.dumps(
-                value, ensure_ascii=False, separators=(",", ":"),
-            ))
+            if key == "thread_cases":
+                text = self._format_thread_cases_view_for_user_state_prompt(value)
+            elif key == "state_contexts":
+                text = "[\n" + ",\n".join(
+                    json.dumps(context, ensure_ascii=False, separators=(",", ":"))
+                    for context in value
+                ) + "\n]" if value else "[]"
+            else:
+                text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+            prompt = prompt.replace("{" + key + "}", text)
         self._logger.info("\n%s", json.dumps({
             "scope": task_kind, "event": "input", "payload": update_input,
         }, ensure_ascii=False, indent=2, default=str))
@@ -826,7 +872,7 @@ class UserStateResolver:
             "domains": domains,
         }
 
-    def _build_user_update_inputs_using_claim(
+    def _build_user_state_update_inputs_using_claim(
         self, *, world_owner_entity_id: int, new_claim_ids: Sequence[int],
         claim_relations: Sequence[Mapping[str, Any]],
         reference_time: Optional[Any],
@@ -957,6 +1003,36 @@ class UserStateResolver:
             }
         return result
 
+    @staticmethod
+    def _format_claim_cases_view_for_user_state_prompt(
+        new_claim_cases: Sequence[Mapping[str, Any]],
+    ) -> str:
+        """Flatten claim relations for the prompt without changing internal events."""
+        if not new_claim_cases:
+            return "[]"
+        lines = []
+        for case in new_claim_cases:
+            related_claims = []
+            for related in case["related_claims"]:
+                event = related["relation_event"]
+                related_claims.append({
+                    **{key: value for key, value in related["existing_claim"].items()
+                       if key != "predicate"},
+                    "semantic_relation": event.get("semantic_relation"),
+                    "semantic_confidence": event.get("semantic_confidence"),
+                    "semantic_reason": event.get("semantic_reason"),
+                    "relation_effective_at": event.get("effective_at"),
+                    "linked_state_ids": related["linked_state_ids"],
+                })
+            lines.append(json.dumps({
+                "new_claim": {
+                    key: value for key, value in case["new_claim"].items()
+                    if key not in {"predicate", "primary_domain"}
+                },
+                "related_claims": related_claims,
+            }, ensure_ascii=False, separators=(",", ":")))
+        return "[\n" + ",\n".join(lines) + "\n]"
+
     def _build_state_context(
         self, state: Mapping[str, Any], *, detailed: bool,
         world_owner_entity_id: int,
@@ -996,9 +1072,12 @@ class UserStateResolver:
         }
         context["claim_evidence"] = [
             {
-                "claim": self._claim_prompt_view(claims[int(item["evidence_id"])]),
+                "claim": {
+                    key: value for key, value in self._claim_prompt_view(
+                        claims[int(item["evidence_id"])]
+                    ).items() if key != "predicate"
+                },
                 "role": str(item.get("role") or ""),
-                "weight": float(item.get("weight") or 0.0),
             }
             for item in evidence_items
             if item["evidence_type"] == "user_claim"
@@ -1012,23 +1091,22 @@ class UserStateResolver:
             int(pattern["id"]): pattern
             for pattern in self._user_memory_db.get_user_observed_patterns_by_ids(pattern_ids)
         }
-        context["pattern_evidence"] = [
-            {
-                "pattern_id": int(item["evidence_id"]),
-                "pattern": (
-                    {
-                        "id": int(pattern["id"]),
-                        "pattern_text": str(pattern.get("pattern_text") or ""),
-                        "condition_text": str(pattern.get("condition_text") or ""),
-                        "confidence": float(pattern.get("confidence") or 0.0),
-                    }
-                    if (pattern := patterns.get(int(item["evidence_id"]))) else None
-                ),
+        context["pattern_evidence"] = []
+        for item in evidence_items:
+            if item["evidence_type"] != "user_observed_pattern":
+                continue
+            evidence = {
+                "id": int(item["evidence_id"]),
                 "role": str(item.get("role") or ""),
             }
-            for item in evidence_items
-            if item["evidence_type"] == "user_observed_pattern"
-        ]
+            pattern = patterns.get(evidence["id"])
+            if pattern is not None:
+                evidence.update({
+                    "pattern_text": str(pattern.get("pattern_text") or ""),
+                    "condition_text": str(pattern.get("condition_text") or ""),
+                    "confidence": float(pattern.get("confidence") or 0.0),
+                })
+            context["pattern_evidence"].append(evidence)
         context["thread_evidence"] = []
         event_ids = [int(item["evidence_id"]) for item in evidence_items
                      if item["evidence_type"] == "user_thread_event"]
@@ -1039,19 +1117,27 @@ class UserStateResolver:
         for item in evidence_items:
             if item["evidence_type"] not in {"user_thread", "user_thread_event"}:
                 continue
-            details = item.get("details") or {}
-            if isinstance(details, str):
-                details = json.loads(details)
-            context["thread_evidence"].append({
+            evidence = {
                 "evidence_type": item["evidence_type"],
                 "evidence_id": int(item["evidence_id"]),
                 "role": item["role"],
-                "weight": float(item.get("weight") or 0.0),
-                "observed_at": item.get("observed_at"),
-                "thread_snapshot": details.get("thread_snapshot"),
-                "event": events_by_id.get(int(item["evidence_id"]))
-                if item["evidence_type"] == "user_thread_event" else None,
-            })
+            }
+            if item.get("observed_at"):
+                evidence["observed_at"] = item["observed_at"]
+            if item["evidence_type"] == "user_thread":
+                details = item.get("details") or {}
+                if isinstance(details, str):
+                    details = json.loads(details)
+                if details.get("thread_snapshot") is not None:
+                    evidence["thread_snapshot"] = details["thread_snapshot"]
+            else:
+                event = events_by_id.get(evidence["evidence_id"])
+                if event is not None:
+                    evidence["event"] = {key: event.get(key) for key in (
+                        "thread_id", "event_type", "summary", "occurred_at", "known_at",
+                        "evidence_activity_ids", "evidence_fact_ids",
+                    )}
+            context["thread_evidence"].append(evidence)
         return context
 
     def _normalize_user_claim_state_operations(
@@ -1304,7 +1390,7 @@ class UserStateResolver:
         world_owner_entity_id = int(self._user_memory_db.add_entity_names([self._world_owner_entity_name])[
             self._world_owner_entity_name
         ])
-        update_inputs = self._build_user_update_inputs_using_claim(
+        update_inputs = self._build_user_state_update_inputs_using_claim(
             world_owner_entity_id=world_owner_entity_id,
             new_claim_ids=new_claim_ids,
             claim_relations=list(claim_relations or []),
@@ -1340,7 +1426,9 @@ class UserStateResolver:
             prompt = template
             for key in ("reference_time", "state_domain", "new_claim_cases", "state_contexts"):
                 value = update_input[key]
-                if key in {"new_claim_cases", "state_contexts"}:
+                if key == "new_claim_cases":
+                    text = self._format_claim_cases_view_for_user_state_prompt(value)
+                elif key == "state_contexts":
                     text = "[\n" + ",\n".join(
                         json.dumps(item, ensure_ascii=False, separators=(",", ":"))
                         for item in value
