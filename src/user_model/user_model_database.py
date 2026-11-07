@@ -279,6 +279,18 @@ class UserModelDB:
                 deleted += cursor.rowcount
         return deleted
 
+    def delete_user_prediction_reassessment_schedule(
+        self, *, intent_id: int, assessment_key: str, user_entity_id: int,
+    ) -> int:
+        """Consume one assessment without clearing other behaviors of the intent."""
+        cursor = self._conn.execute(
+            "DELETE FROM user_prediction_reassessment_schedule "
+            "WHERE intent_id = ? AND assessment_key = ? AND user_entity_id = ?",
+            (int(intent_id), str(assessment_key), int(user_entity_id)),
+        )
+        self._commit_if_needed()
+        return cursor.rowcount
+
     def save_user_prediction(self, payload: Dict[str, Any]) -> Tuple[int, str]:
         """Atomically save a forecast and link its intent, retaining the basis snapshot."""
         owner_id = int(payload["user_entity_id"])

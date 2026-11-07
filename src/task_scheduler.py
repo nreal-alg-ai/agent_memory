@@ -249,6 +249,7 @@ class TaskOperationReporter:
             "user_state_update_from_user_threads",
             "user_state_update_from_user_observed_patterns",
             "user_prediction_update_from_intent_events",
+            "user_prediction_reassessment",
             "user_proactive_policy_evaluation",
         }:
             if not isinstance(result, dict):
@@ -357,6 +358,9 @@ class TaskScheduler:
             "user_prediction_update_from_intent_events": self._config_bool(
                 settings.get("enable_user_prediction"), True,
             ),
+            "user_prediction_reassessment": self._config_bool(
+                settings.get("enable_user_prediction"), True,
+            ),
             "user_proactive_policy_evaluation": self._config_bool(
                 settings.get("enable_user_proactive_policy_evaluation"), True,
             ),
@@ -366,6 +370,11 @@ class TaskScheduler:
         )
         self._prediction_lock = threading.RLock()
         self._prediction_events_inflight: set[int] = set()
+        self._prediction_reassessment_pending = False
+        self._prediction_reassessment_retry_at = 0.0
+        self._prediction_reassessment_retry_seconds = max(
+            1.0, float(settings.get("user_prediction_reassessment_retry_seconds", 300)),
+        )
         self._claim_state_database = claim_state_database
         self._task_execution_db: Optional[TaskExecutionDB] = None
         if claim_state_database is not None and hasattr(claim_state_database, "db_path"):
@@ -580,6 +589,8 @@ class TaskScheduler:
             }
             if self._queue.full():
                 return self._reject_locked(task_kind, task_id, "worker_queue_full")
+            if task_kind == "user_prediction_reassessment" and self._prediction_reassessment_pending:
+                return self._reject_locked(task_kind, task_id, "reassessment_already_pending")
             if task_kind == "memory_user_thread_update":
                 if self._task_execution_db is None:
                     return self._reject_locked(task_kind, task_id, "task_execution_database_unavailable")
@@ -635,6 +646,8 @@ class TaskScheduler:
                     )
             # Publish only after the reporter and task DB know the task. The
             # worker may take it immediately after put_nowait returns.
+            if task_kind == "user_prediction_reassessment":
+                self._prediction_reassessment_pending = True
             self._queue.put_nowait(task)
             self._logger.info(
                 "scheduled task queued task_kind=%s task_id=%s queue_depth=%s",
@@ -844,6 +857,31 @@ class TaskScheduler:
             task_kind, task_id, self._queue.qsize(),
         )
 
+    def trigger_user_prediction_time_tick(
+        self, *, reference_timestamp: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        """Queue due-defer maintenance, never a scan to forecast every active intent."""
+        reference = datetime.now().astimezone()
+        if reference_timestamp is not None:
+            reference = (reference_timestamp if isinstance(reference_timestamp, datetime)
+                         else datetime.fromisoformat(str(reference_timestamp).replace("Z", "+00:00")))
+            if reference.tzinfo is None:
+                reference = reference.replace(tzinfo=datetime.now().astimezone().tzinfo)
+        with self._prediction_lock:
+            if self._prediction_reassessment_pending:
+                return {"queued": False, "status": "skipped", "reason": "reassessment_already_pending"}
+            if reference.timestamp() < self._prediction_reassessment_retry_at:
+                return {"queued": False, "status": "skipped", "reason": "reassessment_retry_cooldown"}
+            # Keep None for real-time ticks: the handler resolves actual time when
+            # its FIFO slot executes. Explicit replay timestamps remain exact.
+            payload = {
+                "reference_timestamp": reference.isoformat() if reference_timestamp is not None else None,
+                "horizon_hours": self._user_prediction_horizon_hours,
+            }
+            report = self.submit("user_prediction_reassessment", payload)
+        self._logger.info("prediction time tick reference_timestamp=%s report=%s", reference.isoformat(), report)
+        return report
+
     def trigger_user_state_update(self, *, drain: bool = False) -> Dict[str, Any]:
         """Inspect persisted claims now and enqueue only the actual state update.
 
@@ -986,6 +1024,7 @@ class TaskScheduler:
                 self._postprocess_user_state_update_from_user_claims_task
             ),
             "user_prediction_update_from_intent_events": self._postprocess_user_prediction_task,
+            "user_prediction_reassessment": self._postprocess_prediction_reassessment_task,
         }
         completion: Dict[str, Any] = {"postprocessed": False}
         postprocess = postprocessors.get(task_kind)
@@ -1010,6 +1049,7 @@ class TaskScheduler:
                 self._schedule_after_user_state_update_from_user_claims_task
             ),
             "user_prediction_update_from_intent_events": self._schedule_after_user_prediction_task,
+            "user_prediction_reassessment": self._schedule_after_user_prediction_task,
         }
         schedule = schedulers.get(task_kind)
         if schedule is None:
@@ -1113,6 +1153,27 @@ class TaskScheduler:
                 self._task_execution_db.complete_prediction_intent_events(
                     sorted(set(result.get("processed_intent_event_ids") or []) & set(event_ids)),
                 )
+
+    def _postprocess_prediction_reassessment_task(self, event: Dict[str, Any]) -> None:
+        with self._prediction_lock:
+            try:
+                if event.get("succeeded"):
+                    self._prediction_reassessment_retry_at = 0.0
+                else:
+                    # Replays use their logical clock; real-time retries wait
+                    # from completion, not from the start of a slow LLM call.
+                    reference = (event.get("payload") or {}).get("reference_timestamp")
+                    now = datetime.now().astimezone()
+                    if reference is not None:
+                        try:
+                            now = datetime.fromisoformat(str(reference).replace("Z", "+00:00"))
+                        except ValueError:
+                            self._logger.warning("Invalid reassessment retry timestamp: %r", reference)
+                    self._prediction_reassessment_retry_at = (
+                        now.timestamp() + self._prediction_reassessment_retry_seconds
+                    )
+            finally:
+                self._prediction_reassessment_pending = False
 
     def _schedule_after_user_prediction_task(
         self, event: Dict[str, Any], completion: Dict[str, Any],

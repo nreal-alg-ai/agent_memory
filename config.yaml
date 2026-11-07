@@ -213,6 +213,8 @@ personal_world_model:
     enable_user_proactive_policy_evaluation: true
     # Forecast behavior within this horizon; do not gate on intent deadlines.
     user_prediction_horizon_hours: 6
+    # Failed due-defer reassessments stay scheduled; avoid retrying on every tick.
+    user_prediction_reassessment_retry_seconds: 300
     enable_memory_user_claim_update: true
     enable_memory_user_observed_pattern_update: true
     enable_memory_user_intent_update: true

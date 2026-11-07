@@ -1,4 +1,4 @@
-"""Intent-event-driven forecasts of user preparation behavior."""
+"""Intent-event forecasts and time-driven reassessment of deferred behaviors."""
 
 from __future__ import annotations
 
@@ -11,10 +11,12 @@ from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence
 
 from prompts_en import (
+    USER_PREDICTION_REASSESSMENT_PROMPT_EN,
     USER_PREDICTION_NEAR_TERM_PREPARATION_PROMPT_EN,
     USER_PREDICTION_INTENT_UPDATE_PROMPT_EN,
 )
 from prompts_zh import (
+    USER_PREDICTION_REASSESSMENT_PROMPT_ZH,
     USER_PREDICTION_NEAR_TERM_PREPARATION_PROMPT_ZH,
     USER_PREDICTION_INTENT_UPDATE_PROMPT_ZH,
 )
@@ -29,7 +31,8 @@ if TYPE_CHECKING:
 class UserPrediction:
     """Generate, inspect and verify preparation forecasts without changing intent."""
 
-    TASK_KIND = "user_prediction_update_from_intent_events"
+    NEW_INTENT_TRIGGERED_TASK_NAME = "user_prediction_update_from_intent_events"
+    TIME_TICK_TRIGGERED_TASK_NAME = "user_prediction_reassessment"
     MODEL_VERSION = "intent_preparation_v5"
     ACTIVE_INTENT_STATUSES = {
         "goal": {"active"}, "plan": {"planned", "rescheduled"},
@@ -42,20 +45,29 @@ class UserPrediction:
         world_owner_entity_name: str = "用户本人",
         logger: Optional[logging.Logger] = None,
     ) -> None:
-        self._db = db
+        self._user_memory_db = db
         self._model_db = model_db
         self._llm_client = llm_client
         self._task_scheduler = task_scheduler
-        self._owner_name = world_owner_entity_name
+        self._world_owner_entity_name = str(world_owner_entity_name or "用户本人").strip()
+        self._world_owner_entity_id = int(self._user_memory_db.add_entity_names(
+            [self._world_owner_entity_name]
+        )[self._world_owner_entity_name])
         self._logger = logger or logging.getLogger(__name__)
         task_scheduler.register_handler(
-            self.TASK_KIND, self.process_user_prediction_update_from_intent_events_task,
+            self.NEW_INTENT_TRIGGERED_TASK_NAME, self.process_user_prediction_update_from_intent_events_task,
+        )
+        task_scheduler.register_handler(
+            self.TIME_TICK_TRIGGERED_TASK_NAME, self.process_user_prediction_reassessment_task,
         )
 
-    def _log_event(self, event: str, payload: Dict[str, Any], *, level: int = logging.INFO) -> None:
+    def _log_event(
+        self, event: str, payload: Dict[str, Any], *, level: int = logging.INFO,
+        scope: Optional[str] = None,
+    ) -> None:
         if self._logger.isEnabledFor(level):
             self._logger.log(level, "\n%s", json.dumps(
-                {"scope": self.TASK_KIND, "event": event, "payload": payload},
+                {"scope": scope or self.NEW_INTENT_TRIGGERED_TASK_NAME, "event": event, "payload": payload},
                 ensure_ascii=False, indent=2, default=str,
             ))
 
@@ -121,11 +133,11 @@ class UserPrediction:
         self, *, owner_id: int, as_of: datetime,
         horizon_end: datetime, intent_event_ids: Sequence[int],
     ) -> Dict[str, Any]:
-        events = self._db.get_user_intent_events(event_ids=intent_event_ids)
+        events = self._user_memory_db.get_user_intent_events(event_ids=intent_event_ids)
         if {int(event["id"]) for event in events} != set(intent_event_ids):
             raise ValueError("Prediction input contains missing intent events")
         intent_ids = sorted({int(event["intent_id"]) for event in events})
-        rows = self._db.get_user_intent_items_by_ids(intent_ids)
+        rows = self._user_memory_db.get_user_intent_items_by_ids(intent_ids)
         if {int(intent["id"]) for intent in rows} != set(intent_ids):
             raise ValueError("Prediction event references a missing intent")
         if any(
@@ -158,6 +170,13 @@ class UserPrediction:
                                          if prediction["id"] in links.get(intent["id"], set())],
             })
 
+        return {"intent_cases": cases, "recurring_states": self._get_prediction_recurring_states(
+            as_of=as_of, horizon_end=horizon_end,
+        )}
+
+    def _get_prediction_recurring_states(
+        self, *, as_of: datetime, horizon_end: datetime,
+    ) -> List[Dict[str, Any]]:
         states = self._model_db.get_user_states(
             state_types=["recurring_state"],
             statuses=["active"], limit=500,
@@ -178,7 +197,173 @@ class UserPrediction:
                 "confidence": state.get("confidence"),
                 "updated_at": state.get("updated_at") or "",
             })
-        return {"intent_cases": cases, "recurring_states": active_states}
+        return active_states
+
+    def process_user_prediction_reassessment_task(
+        self, *, reference_timestamp: Optional[Any] = None, horizon_hours: float = 6.0,
+    ) -> Dict[str, Any]:
+        """Consume only due defer assessments, using current evidence and a new horizon."""
+        started_at = time.monotonic()
+        now = self._now(None)
+        if reference_timestamp is not None:
+            parsed_time = self._as_datetime(reference_timestamp, now)
+            if parsed_time is None:
+                raise ValueError("Invalid prediction reassessment reference_timestamp")
+            now = parsed_time
+        end = now + timedelta(hours=max(0.1, float(horizon_hours)))
+        report: Dict[str, Any] = {
+            "status": "empty", "predictions": [], "prediction_assessments": [],
+            "invalidated_prediction_ids": [], "processed_assessment_keys": [],
+            "prediction_context": {
+                "as_of": now.isoformat(), "horizon_start": now.isoformat(),
+                "horizon_end": end.isoformat(), "trigger_source": "time_tick",
+                "predictor_version": self.MODEL_VERSION,
+            },
+        }
+        owner_id = self._world_owner_entity_id
+        due = self._model_db.get_user_prediction_reassessment_schedules(
+            user_entity_id=owner_id, due_at=now.isoformat(),
+        )
+        self._log_event("reassessment_start", {
+            "as_of": now.isoformat(), "horizon_end": end.isoformat(), "due_count": len(due),
+            "assessment_keys": [item["assessment_key"] for item in due],
+        }, scope=self.TIME_TICK_TRIGGERED_TASK_NAME)
+        if not due:
+            return report
+        try:
+            rows = self._user_memory_db.get_user_intent_items_by_ids(sorted({item["intent_id"] for item in due}))
+            intents = {item["id"]: item for item in rows}
+            cases, obsolete = [], []
+            for schedule in due:
+                intent = intents.get(schedule["intent_id"])
+                if (intent is None or intent.get("world_owner_entity_id") != owner_id
+                        or intent.get("status") not in self.ACTIVE_INTENT_STATUSES.get(
+                            intent.get("object_type"), set())):
+                    obsolete.append(schedule)
+                    continue
+                snapshot = self._intent_snapshot(intent)
+                fact_ids = self._user_memory_db.get_intent_evidence_fact_ids(
+                    [(intent["object_type"], intent["id"])],
+                ).get((intent["object_type"], intent["id"]), [])
+                existing = self._model_db.get_user_predictions_by_intent_ids(
+                    [intent["id"]], statuses=["pending"], user_entity_id=owner_id,
+                )
+                cases.append({
+                    "assessment_key": schedule["assessment_key"],
+                    "current_intent": snapshot,
+                    "intent_events": self._user_memory_db.get_user_intent_events(event_ids=schedule["intent_event_ids"]),
+                    "previous_assessment": {
+                        key: schedule[key] for key in ("reason", "evaluated_at", "next_evaluate_at")
+                    },
+                    "intent_changed_since_assessment": self._hash(snapshot) != schedule["intent_basis_hash"],
+                    "related_facts": [{
+                        "fact_id": fact["id"], "summary": fact.get("summary") or "",
+                        "event_time_key": fact.get("event_time_key"),
+                        "dialogue_time_key": fact.get("dialogue_time_key"),
+                    } for fact in self._user_memory_db.get_memory_facts_by_ids(fact_ids)],
+                    "existing_predictions": [item for item in existing
+                        if (self._as_datetime(item.get("window_end"), now) or now) > now],
+                })
+            states = self._get_prediction_recurring_states(as_of=now, horizon_end=end) if cases else []
+            self._log_event("reassessment_inputs_loaded", {
+                "cases": cases, "recurring_states": states,
+            }, scope=self.TIME_TICK_TRIGGERED_TASK_NAME)
+            predictions, assessments = self._reassess_predictions_with_llm(
+                cases, states=states, as_of=now, horizon_end=end,
+            ) if cases else ([], [])
+            # No event is fabricated or re-consumed. Only the selected schedules
+            # are replaced; unrelated predictions and future schedules stay intact.
+            with self._model_db.transaction():
+                saved = []
+                for item in predictions:
+                    prediction_id, action = self._model_db.save_user_prediction({
+                        **item, "user_entity_id": owner_id,
+                    })
+                    saved.append({"id": prediction_id, "save_action": action, **item})
+                for schedule in due:
+                    self._model_db.delete_user_prediction_reassessment_schedule(
+                        intent_id=schedule["intent_id"], assessment_key=schedule["assessment_key"],
+                        user_entity_id=owner_id,
+                    )
+                for item in assessments:
+                    if item["decision"] == "defer":
+                        self._model_db.upsert_user_prediction_reassessment_schedule(
+                            user_entity_id=owner_id, **{key: item[key] for key in (
+                                "intent_id", "assessment_key", "next_evaluate_at", "reason",
+                                "evaluated_at", "intent_basis_hash", "intent_event_ids",
+                            )},
+                        )
+            report.update(
+                status="ok", predictions=saved, prediction_assessments=assessments,
+                processed_assessment_keys=[item["assessment_key"] for item in due],
+                obsolete_assessment_keys=[item["assessment_key"] for item in obsolete],
+            )
+        except Exception as exc:
+            self._logger.exception("Prediction reassessment failed as_of=%s schedules_preserved=True", now.isoformat())
+            report.update(status="error", error=f"{type(exc).__name__}: {exc}")
+        self._log_event("reassessment_finish", {
+            **report, "elapsed_ms": round((time.monotonic() - started_at) * 1000, 2),
+        }, scope=self.TIME_TICK_TRIGGERED_TASK_NAME)
+        return report
+
+    def _reassess_predictions_with_llm(
+        self, cases: Sequence[Dict[str, Any]], *, states: Sequence[Dict[str, Any]],
+        as_of: datetime, horizon_end: datetime,
+    ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        chinese = bool(re.search(r"[\u4e00-\u9fff]", " ".join(case["current_intent"]["summary"] for case in cases)))
+        template = USER_PREDICTION_REASSESSMENT_PROMPT_ZH if chinese else USER_PREDICTION_REASSESSMENT_PROMPT_EN
+        prompt = template.format(
+            as_of=as_of.isoformat(), horizon_start=as_of.isoformat(), horizon_end=horizon_end.isoformat(),
+            assessment_cases="\n".join(json.dumps(case, ensure_ascii=False) for case in cases),
+            states="\n".join(json.dumps(state, ensure_ascii=False) for state in states),
+        )
+        stage = "user_prediction_reassessment"
+        raw = self._llm_client.call_llm(prompt, stage_name=stage)
+        try:
+            parsed = self._llm_client.parse_json_object_from_llm_text(raw or "", stage_name=stage)
+            if not isinstance(parsed, dict) or set(parsed) != {"prediction_results"}:
+                raise ValueError("Reassessment response requires only prediction_results")
+            results = parsed["prediction_results"]
+            if not isinstance(results, list):
+                raise ValueError("prediction_results must be an array")
+            by_key = {case["assessment_key"]: case for case in cases}
+            seen, predictions, assessments = set(), [], []
+            for result in results:
+                if not isinstance(result, dict) or set(result) != {
+                    "assessment_key", "decision", "reason", "next_evaluate_at", "prediction",
+                }:
+                    raise ValueError("Invalid reassessment result fields")
+                key = result["assessment_key"]
+                if not isinstance(key, str) or key not in by_key or key in seen:
+                    raise ValueError("Unknown or duplicate reassessment key")
+                seen.add(key)
+                case = by_key[key]
+                generated, assessed = self._normalize_prediction_results(
+                    [{"intent_id": case["current_intent"]["id"], **{
+                        name: value for name, value in result.items() if name != "assessment_key"
+                    }}], cases=[case], states=states, as_of=as_of, horizon_end=horizon_end,
+                )
+                existing_behaviors = {self._normalize_behavior_text(item["behavior_text"])
+                                      for item in case["existing_predictions"]}
+                for item in generated:
+                    identity = (item["basis"]["intent"]["id"], self._normalize_behavior_text(item["behavior_text"]))
+                    if identity[1] in existing_behaviors or any(
+                        identity == (old["basis"]["intent"]["id"], self._normalize_behavior_text(old["behavior_text"]))
+                        for old in predictions
+                    ):
+                        raise ValueError("Reassessment duplicates an existing or newly generated behavior")
+                assessed[0]["assessment_key"] = key
+                predictions.extend(generated)
+                assessments.extend(assessed)
+            if seen != set(by_key):
+                raise ValueError("Missing reassessment results")
+            return predictions, assessments
+        except Exception as exc:
+            self._log_prediction_response_failure(
+                "reassessment", raw=raw, error=exc, cases=cases, states=states,
+                as_of=as_of, horizon_end=horizon_end,
+            )
+            raise
 
     def process_user_prediction_update_from_intent_events_task(
         self, *, intent_event_ids: Sequence[int],
@@ -209,11 +394,7 @@ class UserPrediction:
                 event_ids, reference_timestamp, now.isoformat(),
             )
         end = now + timedelta(hours=max(0.1, float(horizon_hours)))
-        owner_id = self._db.get_entity_id_by_name(self._owner_name)
-        if owner_id is None:
-            self._logger.error("Prediction world owner is missing intent_event_ids=%s owner_name=%s",
-                               event_ids, self._owner_name)
-            raise ValueError("Prediction world owner is missing")
+        owner_id = self._world_owner_entity_id
         try:
             snapshot = self._build_user_prediction_prediction_inputs_using_intents(
                 owner_id=owner_id, as_of=now, horizon_end=end, intent_event_ids=event_ids,
@@ -690,12 +871,7 @@ class UserPrediction:
         prediction_ids: Optional[Sequence[int]] = None,
     ) -> List[Dict[str, Any]]:
         """Read unexpired, unresolved hypotheses; no delivery decision here."""
-        owner_id = self._db.get_entity_id_by_name(self._owner_name)
-        if owner_id is None:
-            self._log_event("active_predictions_read", {
-                "reason": "world_owner_missing", "prediction_ids": prediction_ids,
-            }, level=logging.DEBUG)
-            return []
+        owner_id = self._world_owner_entity_id
         reference = self._now(as_of)
         if prediction_ids is None:
             rows = self._model_db.get_active_user_predictions(
@@ -726,7 +902,7 @@ class UserPrediction:
                     "prediction_id": row["id"], "reason": "invalid_basis",
                 }, level=logging.DEBUG)
                 continue
-            intent = self._db.get_intent_object(
+            intent = self._user_memory_db.get_intent_object(
                 object_type=intent_type, object_id=intent_id,
             )
             if (not intent or intent.get("status") not in self.ACTIVE_INTENT_STATUSES.get(intent_type, set())

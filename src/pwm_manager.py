@@ -258,6 +258,14 @@ class PersonWorldModel:
         """Check persisted claims on a host signal and enqueue their state update."""
         return self._task_scheduler.trigger_user_state_update()
 
+    def trigger_user_prediction_time_tick(
+        self, *, reference_timestamp: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        """Ask the shared FIFO to reassess deferred behaviors whose time has arrived."""
+        return self._task_scheduler.trigger_user_prediction_time_tick(
+            reference_timestamp=reference_timestamp,
+        )
+
     def drain_pending_user_state_claims(self) -> Dict[str, Any]:
         return self._task_scheduler.drain_pending_user_state_claims()
 
