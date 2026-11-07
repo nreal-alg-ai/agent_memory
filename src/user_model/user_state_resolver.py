@@ -14,16 +14,14 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Sequence
 
 from prompts_en import (
-    USER_THREAD_STATE_UPDATE_PROMPT_EN,
-    USER_CLAIM_STATUS_REVIEW_PROMPT_EN,
-    USER_CLAIM_STATE_RESOLUTION_PROMPT_EN,
-    USER_OBSERVED_PATTERN_STATE_UPDATE_PROMPT_EN,
+    USER_STATE_UPDATE_FROM_USER_THREAD_PROMPT_EN,
+    USER_STATE_UPDATE_FROM_USER_CLAIM_PROMPT_EN,
+    USER_STATE_UPDATE_FROM_USER_OBSERVED_PATTERN_PROMPT_EN,
 )
 from prompts_zh import (
-    USER_THREAD_STATE_UPDATE_PROMPT_ZH,
-    USER_CLAIM_STATUS_REVIEW_PROMPT_ZH,
-    USER_CLAIM_STATE_RESOLUTION_PROMPT_ZH,
-    USER_OBSERVED_PATTERN_STATE_UPDATE_PROMPT_ZH,
+    USER_STATE_UPDATE_FROM_USER_THREAD_PROMPT_ZH,
+    USER_STATE_UPDATE_FROM_USER_CLAIM_PROMPT_ZH,
+    USER_STATE_UPDATE_FROM_USER_OBSERVED_PATTERN_PROMPT_ZH,
 )
 
 if TYPE_CHECKING:
@@ -100,6 +98,9 @@ class UserStateResolver:
         self._llm_client = llm_client
         self._world_owner_entity_name = str(world_owner_entity_name or "用户本人").strip()
         self._logger = logger or logging.getLogger(__name__)
+        self._world_owner_entity_id = int(self._user_memory_db.add_entity_names(
+            [self._world_owner_entity_name]
+        )[self._world_owner_entity_name])
         config = dict(user_state_config or {})
         self._update_limit = max(
             1,
@@ -125,7 +126,7 @@ class UserStateResolver:
     def set_logger(self, logger: Optional[logging.Logger]) -> None:
         self._logger = logger or logging.getLogger(__name__)
 
-    def _build_user_update_inputs_using_thread(
+    def _build_user_state_update_inputs_using_threads(
         self, thread_changes: Sequence[Mapping[str, Any]], *,
         reference_timestamp: Optional[Any] = None,
         runtime_context: Optional[Dict[str, Any]] = None,
@@ -247,9 +248,6 @@ class UserStateResolver:
                 value.replace("Z", "+00:00")
             ).astimezone()) if times else None
         )
-        owner_id = int(self._user_memory_db.add_entity_names(
-            [self._world_owner_entity_name]
-        )[self._world_owner_entity_name])
         return {
             "update_input": {
                 "reference_time": self._timestamp_text(effective_time),
@@ -258,7 +256,7 @@ class UserStateResolver:
                 "state_contexts": [
                     self._build_state_context(
                         state, detailed=state_id in detailed_state_ids,
-                        world_owner_entity_id=owner_id,
+                        world_owner_entity_id=self._world_owner_entity_id,
                     ) for state_id, state in states_by_id.items()
                 ],
             },
@@ -402,15 +400,15 @@ class UserStateResolver:
             report = {"status": "empty", "thread_count": 0, "operation_count": 0, "state_ids": []}
             self._log_update(report, task_kind=task_kind)
             return report
-        inputs = self._build_user_update_inputs_using_thread(
+        inputs = self._build_user_state_update_inputs_using_threads(
             thread_changes, reference_timestamp=reference_timestamp, runtime_context=runtime_context,
         )
         update_input = inputs["update_input"]
         language = self._resolve_prompt_language(
             "\n".join(case["thread"]["current_summary"] for case in update_input["thread_cases"])
         )
-        template = (USER_THREAD_STATE_UPDATE_PROMPT_EN if language == "en"
-                    else USER_THREAD_STATE_UPDATE_PROMPT_ZH)
+        template = (USER_STATE_UPDATE_FROM_USER_THREAD_PROMPT_EN if language == "en"
+                    else USER_STATE_UPDATE_FROM_USER_THREAD_PROMPT_ZH)
         prompt = template
         for key, value in update_input.items():
             if key == "thread_cases":
@@ -426,9 +424,8 @@ class UserStateResolver:
         self._logger.info("\n%s", json.dumps({
             "scope": task_kind, "event": "input", "payload": update_input,
         }, ensure_ascii=False, indent=2, default=str))
-        parsed = self._llm_client.parse_json_object_from_llm_text(
-            self._llm_client.call_llm(prompt, stage_name='user_state_update_from_user_threads') or "", stage_name='user_state_update_from_user_threads'
-        )
+        raw_output = self._llm_client.call_llm(prompt, stage_name='user_state_update_from_user_threads')
+        parsed = self._llm_client.parse_json_object_from_llm_text(raw_output or "", stage_name='user_state_update_from_user_threads')
         self._logger.info("\n%s", json.dumps({
             "scope": task_kind, "event": "llm_result", "payload": parsed,
         }, ensure_ascii=False, indent=2, default=str))
@@ -466,11 +463,8 @@ class UserStateResolver:
     ) -> Dict[str, Any]:
         """Project changed observed behavior into recurring states by domain."""
         reference_time = reference_timestamp
-        owner_id = int(self._user_memory_db.add_entity_names([self._world_owner_entity_name])[
-            self._world_owner_entity_name
-        ])
-        update_inputs = self._build_user_update_inputs_using_observed_pattern(
-            world_owner_entity_id=owner_id,
+        update_inputs = self._build_user_state_update_inputs_using_observed_patterns(
+            world_owner_entity_id=self._world_owner_entity_id,
             new_pattern_ids=new_pattern_ids or [],
             pattern_relation_event_ids=pattern_relation_event_ids or [],
             reference_time=reference_time,
@@ -486,12 +480,6 @@ class UserStateResolver:
         domains = update_inputs["domains"]
         failed = 0
         for domain, domain_input in domains.items():
-            if domain_input["input_truncated"]:
-                failed += 1
-                report["domain_reports"][domain] = {
-                    "status": "error", "error": "observed_pattern_state_input_limit_exceeded",
-                }
-                continue
             update_input = domain_input["update_input"]
             domain_patterns = domain_input["domain_patterns"]
             domain_changed = domain_input["domain_changed"]
@@ -506,9 +494,9 @@ class UserStateResolver:
                 item["pattern"]["pattern_text"] for item in pattern_cases
             )
             template = (
-                USER_OBSERVED_PATTERN_STATE_UPDATE_PROMPT_EN
+                USER_STATE_UPDATE_FROM_USER_OBSERVED_PATTERN_PROMPT_EN
                 if self._resolve_prompt_language(source) == "en"
-                else USER_OBSERVED_PATTERN_STATE_UPDATE_PROMPT_ZH
+                else USER_STATE_UPDATE_FROM_USER_OBSERVED_PATTERN_PROMPT_ZH
             )
             prompt = template
             for key, value in update_input.items():
@@ -517,9 +505,8 @@ class UserStateResolver:
                     json.dumps(value, ensure_ascii=False, indent=2)
                     if isinstance(value, (dict, list)) else str(value or ""),
                 )
-            parsed = self._llm_client.parse_json_object_from_llm_text(
-                self._llm_client.call_llm(prompt, stage_name='user_state_update_from_user_observed_patterns') or "", stage_name='user_state_update_from_user_observed_patterns'
-            )
+            raw_output = self._llm_client.call_llm(prompt, stage_name='user_state_update_from_user_observed_patterns')
+            parsed = self._llm_client.parse_json_object_from_llm_text(raw_output or "", stage_name='user_state_update_from_user_observed_patterns')
             if not isinstance(parsed, Mapping) or not isinstance(parsed.get("operations"), list):
                 failed += 1
                 report["domain_reports"][domain] = {
@@ -661,7 +648,7 @@ class UserStateResolver:
             json.dumps(record, ensure_ascii=False, sort_keys=False, indent=2, default=str),
         )
 
-    def _build_user_update_inputs_using_observed_pattern(
+    def _build_user_state_update_inputs_using_observed_patterns(
         self, *, world_owner_entity_id: int, new_pattern_ids: Sequence[int],
         pattern_relation_event_ids: Sequence[int], reference_time: Optional[Any],
     ) -> Dict[str, Any]:
@@ -776,12 +763,9 @@ class UserStateResolver:
             existing_states = self._user_model_db.get_user_states(
                 state_domains=[domain],
                 state_types=["recurring_state"], statuses=["active", "weakened"],
-                limit=self._update_limit + 1,
+                limit=self._update_limit,
                 include_evidence=True,
             )
-            if len(existing_states) > self._update_limit:
-                domains[domain] = {"input_truncated": True}
-                continue
             claim_ids = {
                 int(item["evidence_id"])
                 for state in existing_states
@@ -847,7 +831,6 @@ class UserStateResolver:
                         ),
                     )
             domains[domain] = {
-                "input_truncated": False,
                 "update_input": {
                     "reference_time": self._timestamp_text(reference_time),
                     "state_domain": domain,
@@ -882,6 +865,7 @@ class UserStateResolver:
             for claim in self._user_memory_db.get_user_claims_by_ids(new_claim_ids)
             if int(claim.get("subject_entity_id") or 0) == world_owner_entity_id
             and self._normalize_state_domain(claim.get("primary_domain"))
+            and claim.get("status") in {"active", "weakened"}
         }
         relation_refs = {
             (int(item["new_claim_id"]), int(item["relation_event_id"]))
@@ -908,7 +892,6 @@ class UserStateResolver:
         for claim_id, claim in claims_by_id.items():
             by_domain.setdefault(str(claim["primary_domain"]), []).append(claim_id)
         result: Dict[str, Dict[str, Any]] = {}
-        evidence_limit = max(480, self._update_limit * 12)
         effective_reference_time = self._timestamp_text(reference_time)
         for domain, changed_ids in by_domain.items():
             relations = [
@@ -949,7 +932,7 @@ class UserStateResolver:
             states = self._user_model_db.get_user_states(
                 state_domains=[domain],
                 state_types=sorted(self.STATE_TYPES),
-                statuses=["active", "weakened"], limit=self._update_limit + 1,
+                statuses=["active", "weakened"], limit=self._update_limit,
                 include_evidence=True,
             )
             detailed_state_ids = {
@@ -962,19 +945,8 @@ class UserStateResolver:
             }
             state_contexts = []
             linked_state_ids_by_claim: Dict[int, List[int]] = {}
-            detailed_claim_evidence_count = 0
-            detailed_pattern_evidence_count = 0
             for state in states:
                 is_detailed = int(state["id"]) in detailed_state_ids
-                if is_detailed:
-                    detailed_claim_evidence_count += sum(
-                        item["evidence_type"] == "user_claim"
-                        for item in state["evidence_items"]
-                    )
-                    detailed_pattern_evidence_count += sum(
-                        item["evidence_type"] == "user_observed_pattern"
-                        for item in state["evidence_items"]
-                    )
                 state_contexts.append(self._build_state_context(
                     state, detailed=is_detailed,
                     world_owner_entity_id=world_owner_entity_id,
@@ -990,12 +962,6 @@ class UserStateResolver:
                         int(related["existing_claim"]["id"]), [],
                     )
             result[domain] = {
-                "input_truncated": (
-                    len(relations) > max(400, self._update_limit * 8)
-                    or len(states) > self._update_limit
-                    or detailed_claim_evidence_count > evidence_limit
-                    or detailed_pattern_evidence_count > evidence_limit
-                ),
                 "state_domain": domain,
                 "reference_time": effective_reference_time,
                 "new_claim_cases": new_claim_cases,
@@ -1140,48 +1106,64 @@ class UserStateResolver:
             context["thread_evidence"].append(evidence)
         return context
 
+    def _log_state_validation(
+        self, reason: str, *, context: Mapping[str, Any], raw: Any = None,
+        outcome: str = "rejected", **details: Any,
+    ) -> None:
+        """Explain a validation branch without changing its result or retry policy."""
+        record = dict(context)
+        if isinstance(raw, Mapping):
+            record.update({key: raw.get(key) for key in (
+                "operation", "target_state_id", "state_type", "state_kind", "state_topic",
+            ) if key in raw})
+        record.update(outcome=outcome, reason=reason, **details)
+        log = self._logger.info if outcome == "skipped" else self._logger.warning
+        log("User state validation %s", json.dumps(
+            record, ensure_ascii=False, separators=(",", ":"), default=str,
+        ))
+
     def _normalize_user_claim_state_operations(
         self, parsed: Mapping[str, Any], *, update_input: Mapping[str, Any],
     ) -> Optional[List[Dict[str, Any]]]:
+        context = {
+            "stage_name": "user_state_update_from_user_claims",
+            "state_domain": update_input["state_domain"],
+            "reference_time": update_input["reference_time"],
+            "new_claim_ids": [int(case["new_claim"]["id"])
+                              for case in update_input["new_claim_cases"]],
+        }
         raw_operations = parsed.get("operations")
         if not isinstance(raw_operations, list):
+            self._log_state_validation("operations_not_list", context=context,
+                                       actual_type=type(raw_operations).__name__)
             return None
         if len(raw_operations) > 24:
+            self._log_state_validation("operation_limit_exceeded", context=context,
+                                       actual_count=len(raw_operations), limit=24)
             return None
-        changed_ids: set[int] = set()
-        claims: Dict[int, Dict[str, Any]] = {}
-        for case in update_input["new_claim_cases"]:
-            new_claim = case["new_claim"]
-            claim_id = int(new_claim["id"])
-            changed_ids.add(claim_id)
-            claims[claim_id] = new_claim
-            for relation in case["related_claims"]:
-                old_claim = relation["existing_claim"]
-                old_claim_id = int(old_claim["id"])
-                claims[old_claim_id] = old_claim
+        # Input construction guarantees these are effective claims. Historical
+        # claims remain context, never new evidence for this domain's update.
+        allowed_evidence = {
+            ("user_claim", int(case["new_claim"]["id"])): case["new_claim"]
+            for case in update_input["new_claim_cases"]
+        }
         existing_states = {}
         state_contexts_by_id = {}
-        for context in update_input["state_contexts"]:
-            state = context["state"]
+        for state_context in update_input["state_contexts"]:
+            state = state_context["state"]
             state_id = int(state["id"])
             existing_states[state_id] = state
-            state_contexts_by_id[state_id] = context
-            for evidence in context.get("claim_evidence", []):
-                claim = evidence["claim"]
-                claims[int(claim["id"])] = claim
-        current_status = {
-            claim_id: str(item.get("status") or "")
-            for claim_id, item in claims.items()
-        }
-        allowed_evidence = {("user_claim", claim_id): item for claim_id, item in claims.items()}
+            state_contexts_by_id[state_id] = state_context
         operations: List[Dict[str, Any]] = []
         seen_states: set[tuple[str, ...]] = set()
-        for raw in raw_operations:
+        for index, raw in enumerate(raw_operations):
+            operation_context = {**context, "operation_index": index}
             operation = self._normalize_operation(
                 raw, existing_states=existing_states,
                 allowed_evidence=allowed_evidence,
                 state_domain=str(update_input["state_domain"]),
                 reference_time=str(update_input["reference_time"]),
+                diagnostic_context=operation_context,
             )
             if operation is None:
                 return None
@@ -1190,27 +1172,30 @@ class UserStateResolver:
                     and state_contexts_by_id.get(
                         operation["target_state_id"], {}
                     ).get("pattern_support_count", 0) > 0):
+                self._log_state_validation(
+                    "recurring_state_protected_by_pattern", context=operation_context,
+                    raw=raw, outcome="skipped",
+                    pattern_support_count=state_contexts_by_id[
+                        operation["target_state_id"]
+                    ]["pattern_support_count"],
+                )
                 continue
             raw_evidence = raw.get("evidence") if isinstance(raw, Mapping) else None
             if not isinstance(raw_evidence, list) or len(raw_evidence) != len(operation["evidence"]):
-                return None
-            if not any(
-                item["evidence_type"] == "user_claim"
-                and item["evidence_id"] in changed_ids
-                for item in operation["evidence"]
-            ):
+                self._log_state_validation(
+                    "evidence_filtered", context=operation_context, raw=raw,
+                    raw_evidence_count=len(raw_evidence) if isinstance(raw_evidence, list) else None,
+                    valid_evidence_count=len(operation["evidence"]),
+                )
                 return None
             if operation["operation"] in {"create", "reinforce", "revise"} and not any(
                 item["role"] in {"support", "change_trigger"}
-                and current_status[item["evidence_id"]] in {"active", "weakened"}
                 for item in operation["evidence"]
             ):
-                return None
-            if any(
-                item["role"] == "support"
-                and current_status[item["evidence_id"]] not in {"active", "weakened"}
-                for item in operation["evidence"]
-            ):
+                self._log_state_validation(
+                    "missing_effective_support", context=operation_context, raw=raw,
+                    required_roles=["support", "change_trigger"],
+                )
                 return None
             target_key = (
                 "id", str(operation["target_state_id"])
@@ -1219,6 +1204,8 @@ class UserStateResolver:
                 operation["state_topic"],
             )
             if target_key in seen_states:
+                self._log_state_validation("duplicate_target_operation",
+                                           context=operation_context, raw=raw, target_key=target_key)
                 return None
             seen_states.add(target_key)
             if operation["operation"] == "create" and any(
@@ -1227,6 +1214,14 @@ class UserStateResolver:
                 and state["state_topic"] == operation["state_topic"]
                 for state in existing_states.values()
             ):
+                self._log_state_validation(
+                    "state_identity_already_in_input", context=operation_context, raw=raw,
+                    conflicting_states=[{"id": state["id"], "status": state.get("status")}
+                                        for state in existing_states.values()
+                                        if state["state_type"] == operation["state_type"]
+                                        and state["state_kind"] == operation["state_kind"]
+                                        and state["state_topic"] == operation["state_topic"]],
+                )
                 return None
             if operation["operation"] == "create" and self._user_model_db.user_state_identity_exists(
                 state_domain=str(update_input["state_domain"]),
@@ -1234,148 +1229,18 @@ class UserStateResolver:
                 state_kind=operation["state_kind"],
                 state_topic=operation["state_topic"],
             ):
+                conflict = self._user_model_db.get_user_state_by_identity(
+                    state_domain=str(update_input["state_domain"]),
+                    state_type=operation["state_type"], state_kind=operation["state_kind"],
+                    state_topic=operation["state_topic"],
+                )
+                self._log_state_validation(
+                    "state_identity_already_exists", context=operation_context, raw=raw,
+                    conflicting_state=conflict,
+                )
                 return None
             operations.append(operation)
         return operations
-
-    def _review_user_claim_status_from_state_operations(
-        self, *, operations: Sequence[Mapping[str, Any]],
-        update_input: Mapping[str, Any],
-    ) -> Optional[List[Dict[str, Any]]]:
-        """Use a separate LLM decision to review old claims behind changed states."""
-        reviewable_operations = {
-            int(operation["target_state_id"]): operation
-            for operation in operations
-            if operation["operation"] in {"revise", "weaken", "expire"}
-        }
-        if not reviewable_operations:
-            return []
-        states_by_id = {
-            int(context["state"]["id"]): context["state"]
-            for context in update_input["state_contexts"]
-        }
-        related_by_old_id: Dict[int, Dict[str, Any]] = {}
-        for case in update_input["new_claim_cases"]:
-            new_claim = case["new_claim"]
-            new_claim_id = int(new_claim["id"])
-            for related in case["related_claims"]:
-                affected_ids = sorted(
-                    set(int(value) for value in related["linked_state_ids"])
-                    & reviewable_operations.keys()
-                )
-                if related["relation_event"]["semantic_relation"] not in {
-                    "refines", "contradicts", "supersedes",
-                }:
-                    continue
-                if not affected_ids or not any(
-                    item["evidence_type"] == "user_claim"
-                    and int(item["evidence_id"]) == new_claim_id
-                    for state_id in affected_ids
-                    for item in reviewable_operations[state_id]["evidence"]
-                ):
-                    continue
-                old_claim = related["existing_claim"]
-                old_claim_id = int(old_claim["id"])
-                if old_claim_id == new_claim_id or old_claim.get("status") not in {
-                    "active", "weakened",
-                }:
-                    continue
-                entry = related_by_old_id.setdefault(old_claim_id, {
-                    "old_claim": old_claim, "relations": {}, "affected_state_ids": set(),
-                })
-                event = related["relation_event"]
-                entry["relations"][int(event["id"])] = {
-                    "new_claim": new_claim, "relation_event": event,
-                }
-                entry["affected_state_ids"].update(affected_ids)
-        if not related_by_old_id:
-            return []
-        linked_states = self._user_model_db.get_active_user_states_for_claim_ids(
-            sorted(related_by_old_id),
-        )
-        review_cases: List[Dict[str, Any]] = []
-        for old_claim_id, entry in sorted(related_by_old_id.items()):
-            supported = linked_states.get(old_claim_id, [])
-            supported_affected_ids = {
-                int(state["id"]) for state in supported
-                if int(state["id"]) in entry["affected_state_ids"]
-            }
-            if not supported_affected_ids:
-                continue
-            review_cases.append({
-                "old_claim": entry["old_claim"],
-                "related_new_claims": list(entry["relations"].values()),
-                "affected_state_operations": [
-                    {"existing_state": states_by_id[state_id],
-                     "operation": reviewable_operations[state_id]}
-                    for state_id in sorted(supported_affected_ids)
-                ],
-                "other_effective_states": [
-                    state for state in supported
-                    if int(state["id"]) not in supported_affected_ids
-                ],
-            })
-        decisions: List[Dict[str, Any]] = []
-        for start in range(0, len(review_cases), 12):
-            batch = review_cases[start:start + 12]
-            source = "\n".join(
-                str(case["old_claim"]["claim_text"]) + "\n" + "\n".join(
-                    str(item["new_claim"]["claim_text"])
-                    for item in case["related_new_claims"]
-                ) for case in batch
-            )
-            template = (
-                USER_CLAIM_STATUS_REVIEW_PROMPT_EN
-                if self._resolve_prompt_language(source) == "en"
-                else USER_CLAIM_STATUS_REVIEW_PROMPT_ZH
-            )
-            prompt = template.replace(
-                "{reference_time}", str(update_input["reference_time"]),
-            ).replace(
-                "{review_cases}", json.dumps(batch, ensure_ascii=False, indent=2),
-            )
-            parsed = self._llm_client.parse_json_object_from_llm_text(
-                self._llm_client.call_llm(prompt, stage_name='user_claim_status_review_from_state_operations') or "", stage_name='user_claim_status_review_from_state_operations'
-            )
-            raw_decisions = parsed.get("claim_decisions") if isinstance(parsed, Mapping) else None
-            if not isinstance(raw_decisions, list) or len(raw_decisions) != len(batch):
-                return None
-            cases_by_id = {int(case["old_claim"]["id"]): case for case in batch}
-            seen_ids: set[int] = set()
-            for raw in raw_decisions:
-                if not isinstance(raw, Mapping):
-                    return None
-                claim_id = self._positive_int(raw.get("target_claim_id"))
-                if claim_id not in cases_by_id or claim_id in seen_ids:
-                    return None
-                seen_ids.add(claim_id)
-                action = str(raw.get("decision") or "").strip().lower()
-                if action not in {"keep", "weakened", "superseded"}:
-                    return None
-                case = cases_by_id[claim_id]
-                if action == "weakened" and case["old_claim"]["status"] != "active":
-                    return None
-                if action == "keep":
-                    continue
-                trigger_id = self._positive_int(raw.get("trigger_claim_id"))
-                event_id = self._positive_int(raw.get("relation_event_id"))
-                relation = next((
-                    item["relation_event"] for item in case["related_new_claims"]
-                    if int(item["new_claim"]["id"]) == trigger_id
-                    and int(item["relation_event"]["id"]) == event_id
-                ), None)
-                reason = self._compact(raw.get("reason"))
-                if not relation or not reason or (
-                    action == "superseded"
-                    and relation["semantic_relation"] not in {"contradicts", "supersedes"}
-                ):
-                    return None
-                decisions.append({
-                    "claim_id": claim_id, "new_status": action,
-                    "trigger_claim_id": trigger_id, "relation_event_id": event_id,
-                    "reason": reason[:300],
-                })
-        return decisions
 
     def process_user_state_update_from_user_claims_task(
         self,
@@ -1387,11 +1252,8 @@ class UserStateResolver:
         """Update enduring, recurring and situational states from new claims."""
         new_claim_ids = list(new_claim_ids or [])
         reference_time = reference_timestamp
-        world_owner_entity_id = int(self._user_memory_db.add_entity_names([self._world_owner_entity_name])[
-            self._world_owner_entity_name
-        ])
         update_inputs = self._build_user_state_update_inputs_using_claim(
-            world_owner_entity_id=world_owner_entity_id,
+            world_owner_entity_id=self._world_owner_entity_id,
             new_claim_ids=new_claim_ids,
             claim_relations=list(claim_relations or []),
             reference_time=reference_time,
@@ -1403,25 +1265,25 @@ class UserStateResolver:
             "existing_state_count": sum(len(item["state_contexts"]) for item in update_inputs.values()),
             "operation_count": 0,
             "created": 0, "reinforced": 0, "revised": 0, "weakened": 0,
-            "expired": 0, "state_ids": [], "claim_status_updated_count": 0,
+            "expired": 0, "state_ids": [],
             "domain_reports": {},
         }
         failed_count = 0
         for domain, update_input in update_inputs.items():
-            if update_input["input_truncated"]:
-                failed_count += 1
-                report["domain_reports"][domain] = {
-                    "status": "error", "error": "user_claim_state_input_limit_exceeded",
-                }
-                continue
+            context = {
+                "stage_name": "user_state_update_from_user_claims", "state_domain": domain,
+                "reference_time": update_input["reference_time"],
+                "new_claim_ids": [int(case["new_claim"]["id"])
+                                  for case in update_input["new_claim_cases"]],
+            }
             source = "\n".join(
                 case["new_claim"]["claim_text"]
                 for case in update_input["new_claim_cases"]
             )
             template = (
-                USER_CLAIM_STATE_RESOLUTION_PROMPT_EN
+                USER_STATE_UPDATE_FROM_USER_CLAIM_PROMPT_EN
                 if self._resolve_prompt_language(source) == "en"
-                else USER_CLAIM_STATE_RESOLUTION_PROMPT_ZH
+                else USER_STATE_UPDATE_FROM_USER_CLAIM_PROMPT_ZH
             )
             prompt = template
             for key in ("reference_time", "state_domain", "new_claim_cases", "state_contexts"):
@@ -1438,69 +1300,42 @@ class UserStateResolver:
                         value, ensure_ascii=False, indent=2,
                     ) if isinstance(value, (dict, list)) else str(value or "")
                 prompt = prompt.replace("{" + key + "}", text)
-            parsed = self._llm_client.parse_json_object_from_llm_text(
-                self._llm_client.call_llm(prompt, stage_name='user_state_update_from_user_claims') or "", stage_name='user_state_update_from_user_claims'
-            )
+            raw_output = self._llm_client.call_llm(prompt, stage_name='user_state_update_from_user_claims')
+            parsed = self._llm_client.parse_json_object_from_llm_text(raw_output or "", stage_name='user_state_update_from_user_claims')
+            if self._logger.isEnabledFor(logging.DEBUG):
+                self._logger.debug("User state LLM result %s", json.dumps(
+                    {**context, "parsed_result": parsed}, ensure_ascii=False, default=str,
+                ))
+            if not isinstance(parsed, Mapping):
+                self._log_state_validation("parsed_result_not_object", context=context,
+                                           actual_type=type(parsed).__name__)
             operations = self._normalize_user_claim_state_operations(
                 parsed, update_input=update_input,
             ) if isinstance(parsed, Mapping) else None
             if operations is None:
+                self._log_state_validation("domain_operations_rejected", context=context,
+                                           discarded_domain=True)
                 failed_count += 1
                 report["domain_reports"][domain] = {
                     "status": "error", "error": "invalid_llm_user_claim_state_decision",
                 }
                 continue
-            claim_decisions = self._review_user_claim_status_from_state_operations(
-                operations=operations, update_input=update_input,
-            )
-            if claim_decisions is None:
-                failed_count += 1
-                report["domain_reports"][domain] = {
-                    "status": "error", "error": "invalid_llm_user_claim_status_decision",
-                }
-                continue
-            superseded_claim_ids = {
-                decision["claim_id"] for decision in claim_decisions
-                if decision["new_status"] == "superseded"
-            }
-            if any(
-                item["evidence_type"] == "user_claim"
-                and item["role"] in {"support", "change_trigger"}
-                and item["evidence_id"] in superseded_claim_ids
-                for operation in operations
-                if operation["operation"] in {"create", "reinforce", "revise"}
-                for item in operation["evidence"]
-            ):
-                failed_count += 1
-                report["domain_reports"][domain] = {
-                    "status": "error", "error": "superseded_claim_used_as_active_state_support",
-                }
-                continue
-            # Keep both transactions open through both writes. SQLite still
-            # cannot guarantee an atomic commit across these separate files.
-            with self._user_memory_db.transaction(), self._user_model_db.transaction():
+            self._logger.info("User state decision %s", json.dumps({
+                **context, "outcome": "validated",
+                "reason": ("model_no_operations" if not parsed["operations"] else
+                           "no_applicable_operations" if not operations else "operations_validated"),
+                "raw_operation_count": len(parsed["operations"]), "operation_count": len(operations),
+            }, ensure_ascii=False, separators=(",", ":"), default=str))
+            with self._user_model_db.transaction():
                 applied = self.save_user_state_update_operations(
                     operations=operations,
                     reference_time=update_input["reference_time"],
                     merge_claim_evidence=True,
                     decision_source=self.CLAIM_RESOLVER_VERSION,
                 )
-                claim_status_updated_count = sum(
-                    bool(self._user_memory_db.apply_user_claim_status_decision(
-                        claim_id=decision["claim_id"],
-                        new_status=decision["new_status"],
-                        trigger_claim_id=decision["trigger_claim_id"],
-                        relation_event_id=decision["relation_event_id"],
-                        effective_at=update_input["reference_time"],
-                        reason=decision["reason"],
-                        decision_source="user_claim_status_review_v1",
-                    ))
-                    for decision in claim_decisions
-                )
             for key in ("operation_count", "created", "reinforced", "revised", "weakened", "expired"):
                 report[key] += int(applied.get(key) or 0)
             report["state_ids"].extend(applied["state_ids"])
-            report["claim_status_updated_count"] += claim_status_updated_count
             report["domain_reports"][domain] = {
                 "status": "ok", "changed_claim_count": len(update_input["new_claim_cases"]),
                 "related_claim_count": len({
@@ -1508,7 +1343,6 @@ class UserStateResolver:
                     for case in update_input["new_claim_cases"]
                     for relation in case["related_claims"]
                 }),
-                "claim_status_updated_count": claim_status_updated_count,
                 **applied,
             }
         report["state_ids"] = sorted(set(report["state_ids"]))
@@ -1678,32 +1512,62 @@ class UserStateResolver:
         allowed_evidence: Mapping[tuple[str, int], Mapping[str, Any]],
         state_domain: str,
         reference_time: str,
+        diagnostic_context: Optional[Mapping[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
+        context = {"stage_name": "user_state_operation_validation",
+                   "state_domain": state_domain, "reference_time": reference_time,
+                   **dict(diagnostic_context or {})}
         if not isinstance(raw, Mapping):
+            self._log_state_validation("operation_not_object", context=context,
+                                       actual_type=type(raw).__name__)
             return None
         action = str(raw.get("operation") or "").strip().lower()
         state_type = str(raw.get("state_type") or "").strip().lower()
-        if action not in self.OPERATIONS or state_type not in self.STATE_TYPES:
+        if action not in self.OPERATIONS:
+            self._log_state_validation("invalid_operation", context=context, raw=raw,
+                                       allowed_operations=sorted(self.OPERATIONS))
+            return None
+        if state_type not in self.STATE_TYPES:
+            self._log_state_validation("invalid_state_type", context=context, raw=raw,
+                                       allowed_state_types=sorted(self.STATE_TYPES))
             return None
         target_id = self._positive_int(raw.get("target_state_id"))
         target = existing_states.get(target_id)
         if action in {"reinforce", "revise", "weaken", "expire"} and target is None:
+            self._log_state_validation("target_state_not_in_input", context=context, raw=raw,
+                                       allowed_state_ids=sorted(existing_states))
             return None
         if target is not None and str(target.get("state_type") or "") != state_type:
+            self._log_state_validation("target_state_type_mismatch", context=context, raw=raw,
+                                       expected_state_type=target.get("state_type"))
             return None
         if target is not None and str(target.get("state_domain") or "") != state_domain:
+            self._log_state_validation("target_state_domain_mismatch", context=context, raw=raw,
+                                       expected_state_domain=target.get("state_domain"))
             return None
         if action == "create" and target_id:
+            self._log_state_validation("create_with_target_state_id", context=context, raw=raw)
             return None
         state_kind = self._normalize_state_kind(
             (target or {}).get("state_kind") if target is not None
             else raw.get("state_kind")
         )
         if target is None and state_kind not in self.STATE_KINDS_BY_TYPE[state_type]:
+            self._log_state_validation("invalid_state_kind", context=context, raw=raw,
+                                       normalized_state_kind=state_kind,
+                                       allowed_state_kinds=sorted(self.STATE_KINDS_BY_TYPE[state_type]))
             return None
         state_text = self._compact(raw.get("state_text") or (target or {}).get("state_text"))
-        evidence = self._normalize_evidence(raw.get("evidence"), allowed_evidence)
+        evidence = self._normalize_evidence(
+            raw.get("evidence"), allowed_evidence,
+            diagnostic_context={**context, **{key: raw.get(key) for key in (
+                "operation", "target_state_id", "state_type", "state_kind", "state_topic",
+            ) if key in raw}},
+        )
         if not state_kind or not state_text or not evidence:
+            reason = ("missing_state_kind" if not state_kind else
+                      "missing_state_text" if not state_text else "no_valid_evidence")
+            self._log_state_validation(reason, context=context, raw=raw)
             return None
         if target is not None:
             state_topic = str(target.get("state_topic") or "")
@@ -1743,22 +1607,46 @@ class UserStateResolver:
             "reason": self._compact(raw.get("reason"))[:300],
         }
 
-    def _normalize_evidence(self, raw_items: Any, allowed: Mapping[tuple[str, int], Mapping[str, Any]]) -> List[Dict[str, Any]]:
+    def _normalize_evidence(
+        self, raw_items: Any, allowed: Mapping[tuple[str, int], Mapping[str, Any]], *,
+        diagnostic_context: Optional[Mapping[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        context = {"stage_name": "user_state_operation_validation",
+                   **dict(diagnostic_context or {})}
         if not isinstance(raw_items, list):
+            self._log_state_validation("evidence_not_list", context=context,
+                                       actual_type=type(raw_items).__name__)
             return []
+        if len(raw_items) > 24:
+            self._log_state_validation("evidence_limit_exceeded", context=context,
+                                       raw_evidence_count=len(raw_items), limit=24)
         evidence: List[Dict[str, Any]] = []
         seen: set[tuple[str, int, str]] = set()
-        for raw in raw_items[:24]:
+        for index, raw in enumerate(raw_items[:24]):
+            evidence_context = {**context, "evidence_index": index}
             if not isinstance(raw, Mapping):
+                self._log_state_validation("evidence_not_object", context=evidence_context,
+                                           actual_type=type(raw).__name__)
                 continue
             evidence_type = str(raw.get("evidence_type") or "").strip()
             evidence_id = self._positive_int(raw.get("evidence_id"))
             role = str(raw.get("role") or "support").strip()
             key = (evidence_type, evidence_id, role)
-            if (
-                evidence_type not in self.EVIDENCE_TYPES or role not in self.EVIDENCE_ROLES
-                or not evidence_id or (evidence_type, evidence_id) not in allowed or key in seen
-            ):
+            reason = (
+                "invalid_evidence_type" if evidence_type not in self.EVIDENCE_TYPES else
+                "invalid_evidence_role" if role not in self.EVIDENCE_ROLES else
+                "invalid_evidence_id" if not evidence_id else
+                "evidence_not_in_input" if (evidence_type, evidence_id) not in allowed else
+                "duplicate_evidence" if key in seen else ""
+            )
+            if reason:
+                self._log_state_validation(
+                    reason, context=evidence_context,
+                    evidence_type=evidence_type, evidence_id=raw.get("evidence_id"), role=role,
+                    allowed_evidence=[{"evidence_type": kind, "evidence_id": value}
+                                      for kind, value in sorted(allowed)]
+                    if reason == "evidence_not_in_input" else None,
+                )
                 continue
             seen.add(key)
             evidence.append({

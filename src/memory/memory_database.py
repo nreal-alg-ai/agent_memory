@@ -2665,54 +2665,6 @@ class UserMemoryDB:
             )
         return [rows_by_id[event_id] for event_id in ids if event_id in rows_by_id]
 
-    def apply_user_claim_status_decision(
-        self, *, claim_id: int, new_status: str, trigger_claim_id: int,
-        relation_event_id: int, effective_at: str, reason: str,
-        decision_source: str,
-    ) -> bool:
-        """Change a claim's current status and retain the resolver decision."""
-        row = self._conn.execute(
-            "SELECT status FROM memory_user_claims WHERE id = ?", (int(claim_id),)
-        ).fetchone()
-        previous_status = str(row["status"] or "") if row else ""
-        if (
-            new_status not in {"weakened", "superseded"}
-            or previous_status not in {"active", "weakened"}
-            or previous_status == new_status
-            or (new_status == "weakened" and previous_status != "active")
-        ):
-            return False
-        self._conn.execute(
-            "UPDATE memory_user_claims SET status = ?, updated_at = ? WHERE id = ?",
-            (str(new_status), local_now_text(), int(claim_id)),
-        )
-        self._conn.execute(
-            """
-            INSERT INTO memory_user_claim_events (
-                target_claim_id, trigger_claim_id, event_type,
-                previous_status, new_status, semantic_relation, effective_at,
-                decision_source, semantic_reason, policy_reason, details, created_at
-            ) VALUES (?, ?, 'status_transition', ?, ?, '', ?, ?, '', ?, ?, ?)
-            """,
-            (
-                int(claim_id), int(trigger_claim_id), previous_status,
-                str(new_status), str(effective_at or ""),
-                str(decision_source or ""), str(reason or ""),
-                _json_dumps({"relation_event_id": int(relation_event_id)}),
-                local_now_text(),
-            ),
-        )
-        self._conn.execute(
-            """
-            UPDATE memory_recall_documents
-            SET status = ?, updated_at = ?
-            WHERE object_type = 'user_claim' AND object_id = ?
-            """,
-            (str(new_status), local_now_text(), int(claim_id)),
-        )
-        self._commit_if_needed()
-        return True
-
     def get_user_claims(
         self,
         *,
