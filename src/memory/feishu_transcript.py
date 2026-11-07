@@ -1,10 +1,12 @@
 """Pure Feishu Markdown parsing shared by desktop import and the CLI fixture.
 
-Relative offsets are utterance starts, never fabricated speech durations.
+Relative offsets are utterance starts. Ends are explicitly marked text-length
+estimates for batching, not measured audio boundaries.
 Preview leaves all speaker identities unchanged; import requires an explicit
 owner selection and maps only that exact name (or its room suffix).
 """
 from __future__ import annotations
+import math
 import re
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -17,6 +19,23 @@ DATE_RE = re.compile(r"(?P<year>\d{4})[年/-](?P<month>\d{1,2})[月/-](?P<day>\d
 TIME_RANGE_RE = re.compile(r"(?P<start>\d{1,2}:\d{2})\s*[-–—~～至]\s*(?P<end>\d{1,2}:\d{2})")
 TIMEZONE_RE = re.compile(r"GMT\s*(?P<sign>[+-])(?P<hours>\d{1,2})(?::(?P<minutes>\d{2}))?")
 MARKDOWN_ESCAPE_RE = re.compile(r"\\([!\"#$%&'()*+,\-./:;<=>?@\[\]^_`{|}~\\])")
+DEFAULT_SPEECH_RATE_CHARS_PER_SECOND = 4.0
+_SPEECH_UNIT_RE = re.compile(r"[A-Za-z]+(?:['’-][A-Za-z]+)*|[0-9]+|[^\W\d_]")
+
+
+def _estimate_speech_duration_seconds(text: str, chars_per_second: float) -> float:
+    """Approximate length: Chinese/other letters=1, English words=2, digits=1.
+
+    Count English words rather than their spelling length. Punctuation and
+    whitespace are ignored; numbers use digit counts, not invented readouts.
+    The rate is an engineering assumption, not a recovered speaker speed.
+    """
+    equivalent_chars = sum(
+        2 if unit.isascii() and unit[0].isalpha() else len(unit)
+        for unit in _SPEECH_UNIT_RE.findall(text)
+    )
+    return round(max(0.5, equivalent_chars / chars_per_second), 6)
+
 
 def plain_markdown(text: str) -> str:
     """Undo Markdown punctuation escapes without interpreting document commands."""
@@ -70,8 +89,18 @@ def read_meeting_metadata(lines: Iterable[str]) -> Dict[str, str]:
     return metadata
 
 
-def parse_meeting_text(text: str, *, filename: str, owner_name: str = "", session_start: str = "") -> Dict[str, Any]:
-    """Read Feishu speaker/HH:MM:SS blocks, keeping text and source line numbers."""
+def parse_meeting_text(
+    text: str, *, filename: str, owner_name: str = "", session_start: str = "",
+    speech_rate_chars_per_second: float = DEFAULT_SPEECH_RATE_CHARS_PER_SECOND,
+) -> Dict[str, Any]:
+    """Keep exported starts/text; estimate ends and cap at the next start.
+
+    Capping is a batching approximation, not proof that speakers never overlap.
+    The last utterance uses its uncapped estimate because its end is unknown.
+    """
+    speech_rate = float(speech_rate_chars_per_second)
+    if not math.isfinite(speech_rate) or speech_rate <= 0:
+        raise ValueError("speech_rate_chars_per_second must be finite and positive")
     path = Path(filename)
     owner = speaker_name(owner_name)
     lines = text.lstrip("\ufeff").splitlines()
@@ -133,10 +162,16 @@ def parse_meeting_text(text: str, *, filename: str, owner_name: str = "", sessio
     segments = []
     for index, item in enumerate(blocks, 1):
         timestamp = (start + timedelta(seconds=item["offset_seconds"])).isoformat()
+        duration = _estimate_speech_duration_seconds(item["text"], speech_rate)
+        estimated_end_offset = item["offset_seconds"] + duration
+        next_start_offset = blocks[index]["offset_seconds"] if index < len(blocks) else None
+        clipped = next_start_offset is not None and estimated_end_offset > next_start_offset
+        end_offset = round(next_start_offset if clipped else estimated_end_offset, 6)
         segments.append({
             "speaker": mapping[item["original_speaker"]],
             "role": "ambient_speaker", "text": item["text"],
-            "started_at": timestamp, "ended_at": timestamp,
+            "started_at": timestamp,
+            "ended_at": (start + timedelta(seconds=end_offset)).isoformat(),
             "segment_index": index,
             "metadata": {
                 "source": "feishu_markdown", "source_file": str(path),
@@ -144,8 +179,11 @@ def parse_meeting_text(text: str, *, filename: str, owner_name: str = "", sessio
                 "original_speaker": item["original_speaker"],
                 "offset_seconds": item["offset_seconds"],
                 "audio_start_s": item["offset_seconds"],
-                "audio_end_s": item["offset_seconds"],
-                "end_time_basis": "unknown_use_start_time",
+                "audio_end_s": end_offset,
+                "end_time_basis": "estimated_from_text_length",
+                "estimated_duration_seconds": duration,
+                "speech_rate_chars_per_second": speech_rate,
+                "clipped_to_next_start": clipped,
             },
         })
     return {
@@ -153,15 +191,28 @@ def parse_meeting_text(text: str, *, filename: str, owner_name: str = "", sessio
         "meeting_time_description": time_description,
         "session_start": start.isoformat(), "session_start_overridden": bool(session_start),
         "last_utterance_start": segments[-1]["started_at"],
-        "timestamp_policy": "exported relative starts; ends unknown and set equal to starts",
+        "last_utterance_end": segments[-1]["ended_at"],
+        "timestamp_policy": (
+            "exported relative starts; ends estimated from text length, not measured; "
+            "capped at next utterance start when available"
+        ),
+        "end_time_estimation": {
+            "speech_rate_chars_per_second": speech_rate,
+            "english_word_equivalent_chars": 2,
+            "minimum_duration_seconds": 0.5,
+        },
         "owner_name": owner, "owner_speaker": OWNER_SPEAKER,
         "speaker_mapping": mapping, "speakers": source_speakers, "source_segment_count": len(segments),
         "reordered_by_timestamp": reordered, "segments": segments,
     }
 
 
-def parse_meeting(path: Path, *, owner_name: str, session_start: str = "") -> Dict[str, Any]:
+def parse_meeting(
+    path: Path, *, owner_name: str, session_start: str = "",
+    speech_rate_chars_per_second: float = DEFAULT_SPEECH_RATE_CHARS_PER_SECOND,
+) -> Dict[str, Any]:
     if not speaker_name(owner_name):
         raise ValueError("--owner-name must not be empty")
     return parse_meeting_text(path.read_text(encoding="utf-8-sig"), filename=str(path),
-                              owner_name=owner_name, session_start=session_start)
+                              owner_name=owner_name, session_start=session_start,
+                              speech_rate_chars_per_second=speech_rate_chars_per_second)

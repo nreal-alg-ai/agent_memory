@@ -270,9 +270,12 @@ user_claim_signals rules:
 - At most 3 per fact. Independent preferences and temporary conditions may each be signalled; one does not crowd out the other, and no quota needs filling. Use the fields in the output schema.
 
 user_action_signals rules:
-- Identify one specific completed/ongoing action, real choice, or substantive participation, not a habit, preference, or induced pattern. Discussing an action is not performing it. User self must appear in this fact's entities.
-- action_kind is action|choice|participation: concrete performance, a choice among real options, or actual participation in a meeting/activity. action_text specifies what the wearer did and the supported time/object.
-- Return an empty array for future plans, suggestions, hypotheticals, merely asking or discussing, and assistant/third-party actions. "I run every Wednesday" is a reported routine, not multiple observed actions; emit a signal only if the text separately establishes a specific occurrence. Ordinary wearer–assistant conversation itself is not an action signal.
+- Record only one concrete practical action the wearer has performed or is performing. Do not carry opinions, suggestions, preferences, evaluations, or statements of a design choice, or produce habits, personality labels, or induced patterns. User self must appear in this fact's entities. Valuable non-action content may remain a fact; do not rewrite it just to emit a signal.
+- Distinguish reporting actual behavior through conversation from expressing conversational content. Allow reports such as "I measured latency with a slow-motion camera yesterday", "I have sent the requirements document to colleagues", and "I am organizing test feedback". Do not rewrite "I think option one is better", "we should test with users first", or "I decided to use option one later" as actual adoption or execution. Prefixing content with proposed, suggested, thought, confirmed, decided, emphasized, or discussed does not make it practical behavior. Actual communication or execution such as sending documents or conducting tests is not excluded merely because it occurs in an exchange.
+- action_kind is action|choice|participation. action means concrete execution. choice requires a choice already realized in actual use or execution, such as "I actually used option one to complete yesterday's test", not a preference, meeting statement, or unexecuted decision. participation requires evidence of actual activity participation; speaking, discussing a project, or suggesting work does not establish that the wearer performed the work. Ordinary wearer–assistant conversation itself is not an action signal.
+- Behavior may be reported by the wearer, explicitly confirmed, or reported by a grounded third party, subject to the shared ownership/provenance rules; reports are not direct system observations or independent verification. An exact quote proves it was said, not that a future action happened. "I should still find users for POC testing today" remains a future arrangement, not evidence that the test occurred.
+- action_text directly describes the practical behavior, known object, and explicitly supported timing, context, or preconditions, not an entire opinion, technical design, or future sequence. Do not invent motives, locations, conditions, or independent occurrences. Preserve uncertainty such as tried, may have, or approximately. evidence_basis identifies what in this fact supports the action having occurred or being underway, not merely an opinion or intention.
+- Return an empty array for future plans, suggestions, hypotheticals, merely asking or discussing, and assistant/third-party actions. "I run every Wednesday" is a reported routine, not multiple observed actions; emit a signal only for a separately evidenced concrete run. "I let many users try it" must not become multiple invented independent events. A coherent sequence of organizing and sending material may remain one observation; do not split mechanically by verb.
 - At most 3 per fact, using the output schema. Inherit the fact's event_time_key; do not output another signal time field.
 
 user_intent_signals rules:
@@ -333,11 +336,11 @@ Return JSON only, without markdown or extra explanation. Keep this field structu
         {
           "subject_entity": "user self",
           "action_kind": "action|choice|participation",
-          "action_text": "one concrete completed or ongoing wearer action, choice, or participation",
+          "action_text": "one concrete performed or ongoing practical action; choice must be realized in use or execution, not an opinion, suggestion, or unexecuted decision",
           "owner_evidence_type": "self_statement|confirmed_response|third_party_report",
           "owner_evidence_text": "exact wearer quote for self/response; empty for third-party report",
           "other_evidence_text": "exact other-speaker quote for response/report; otherwise empty",
-          "evidence_basis": "specific evidence in this fact supporting this occurrence",
+          "evidence_basis": "specific evidence in this fact that the practical action occurred or is underway, not merely an opinion or future intention",
           "confidence": 0.8
         }
       ],

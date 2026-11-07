@@ -732,17 +732,16 @@ class MemoryNodeManager:
             return report
         facts = list(fact_info.get("facts") or [])
         self._log_extracted_fact_info(facts=facts)
+        # Remote requests must finish before opening the fact write transaction.
+        prepared_facts = self._prepare_memory_fact_recall_documents(facts)
         with self._db.transaction():
             save_fact_info = self._store_extracted_memory_facts_into_db(
-                facts=facts,
+                prepared_facts=prepared_facts,
                 tags=tags,
             )
             self._db.insert_fact_source_mappings(
                 fact_ids=save_fact_info.get("fact_ids") or [],
                 source_segment_ids=source_unit_row_ids,
-            )
-            topic_report = self._db.upsert_memory_topic_items(
-                save_fact_info.get("topic_item_updates") or []
             )
         report = {
             "status": fact_info["status"],
@@ -771,8 +770,6 @@ class MemoryNodeManager:
             "source_unit_row_ids": source_unit_row_ids,
             "source_unit_count": len(units),
             "source_unit_row_count": len(source_unit_row_ids),
-            "topic_items_created": int(topic_report.get("created_count", 0) or 0),
-            "topic_items_updated": int(topic_report.get("updated_count", 0) or 0),
             "total_elapsed_ms": round((time.monotonic() - store_started_at) * 1000, 2),
         }
         self._log_info("memory_fact_extraction", "finish", report)
@@ -812,11 +809,7 @@ class MemoryNodeManager:
         The source tables own domain state. This helper owns only the stable
         textual representation shared by lexical search and embeddings.
         """
-        identity_text = "\n".join(
-            _compact_whitespace(line)
-            for line in identity_lines
-            if _compact_whitespace(line)
-        )
+        identity_text = self._format_recall_document_identity_text(identity_lines)
         return self._db.upsert_memory_recall_document(
             object_type=object_type,
             object_id=object_id,
@@ -834,41 +827,93 @@ class MemoryNodeManager:
             metadata=metadata,
         )
 
-    def _upsert_fact_recall_document(
-        self,
-        *,
-        fact_id: int,
-        summary: str,
-        keywords: Sequence[str],
-        entities: Sequence[str],
-        entity_ids: Sequence[int],
-        fact_topic: str,
-        event_time_key: str,
-        dialogue_time_key: str,
-        confidence: float,
-        importance: float,
-    ) -> int:
-        """Project one atomic fact into the shared recall-document store."""
-        keyword_text = " ".join(str(value) for value in keywords or [] if value)
-        return self._upsert_memory_recall_document(
-            object_type="fact",
-            object_id=fact_id,
-            title=_compact_whitespace(summary)[:120],
-            summary=summary,
-            identity_lines=[
-                f"summary: {_compact_whitespace(summary)}",
-                f"keywords: {keyword_text}",
-                f"entities: {', '.join(entities or [])}",
-                f"fact_topic: {fact_topic}",
-            ],
-            entity_ids=entity_ids,
-            topic_keys=[fact_topic],
-            time_start=event_time_key or dialogue_time_key,
-            time_end=event_time_key or dialogue_time_key,
-            confidence=confidence,
-            importance=importance,
-            metadata={"projection_version": "v1"},
+    @staticmethod
+    def _format_recall_document_identity_text(identity_lines: Sequence[str]) -> str:
+        return "\n".join(
+            _compact_whitespace(line)
+            for line in identity_lines
+            if _compact_whitespace(line)
         )
+
+    def _prepare_memory_fact_recall_documents(
+        self,
+        facts: Sequence[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Normalize once and batch-embed task-local projections before DB writes.
+
+        Missing vectors keep their positions and remain NULL in storage. Never
+        retry these items through the single-document embedding path.
+        """
+        prepared_facts: List[Dict[str, Any]] = []
+        for source_fact in facts:
+            fact = dict(source_fact)
+            keywords = self._normalize_string_list(fact.get("keywords"), limit=18)
+            if not keywords:
+                keywords = self._keywords(fact.get("summary") or "", limit=18)
+            fact_topic = self._normalize_topic_name(fact.get("fact_topic"))
+            if not fact_topic:
+                fallback_topics = self._topic_candidates(fact["summary"])
+                fact_topic = self._normalize_topic_name(
+                    fallback_topics[0] if fallback_topics else ""
+                ) or "general"
+            fact["keywords"] = keywords
+            fact["fact_topic"] = fact_topic
+            identity_text = self._format_recall_document_identity_text([
+                f"summary: {_compact_whitespace(fact['summary'])}",
+                f"keywords: {' '.join(str(value) for value in keywords if value)}",
+                f"entities: {', '.join(fact.get('entities') or [])}",
+                f"fact_topic: {fact_topic}",
+            ])
+            time_key = fact.get("event_time_key") or fact.get("dialogue_time_key") or ""
+            prepared_facts.append({
+                "fact": fact,
+                "recall_document": {
+                    "object_type": "fact",
+                    "identity_text": identity_text,
+                    "identity_text_embedding": None,
+                    "title": _compact_whitespace(fact["summary"])[:120],
+                    "summary": fact["summary"],
+                    "topic_keys": [fact_topic],
+                    "time_start": time_key,
+                    "time_end": time_key,
+                    "confidence": float(fact["confidence"]),
+                    "importance": float(fact["importance"]),
+                    "metadata": {"projection_version": "v1"},
+                },
+            })
+        if not prepared_facts:
+            return []
+
+        embedding_started_at = time.monotonic()
+        client = None
+        vectors = [None] * len(prepared_facts)
+        error_type = ""
+        try:
+            if self._ensure_embedding_client():
+                client = self._embedding_client
+            if client is not None:
+                batch_vectors = client.embed_batch([
+                    item["recall_document"]["identity_text"] for item in prepared_facts
+                ])
+                if len(batch_vectors) != len(prepared_facts):
+                    raise ValueError("Fact recall embedding batch result length mismatch")
+                vectors = batch_vectors
+        except Exception as exc:
+            # Facts and lexical search remain usable even when embeddings fail.
+            error_type = type(exc).__name__
+            self._logger.warning("Fact recall batch embedding failed: %s", exc)
+        for item, vector in zip(prepared_facts, vectors):
+            item["recall_document"]["identity_text_embedding"] = vector
+        success_count = sum(vector is not None for vector in vectors)
+        self._log_info("memory_fact_extraction", "recall_document_embeddings", {
+            "requested_count": len(prepared_facts),
+            "success_count": success_count,
+            "missing_count": len(prepared_facts) - success_count,
+            "batch_size": client.batch_size if client is not None else 0,
+            "embedding_elapsed_ms": round((time.monotonic() - embedding_started_at) * 1000, 2),
+            "error_type": error_type,
+        })
+        return prepared_facts
 
     def _log_extracted_fact_info(
         self,
@@ -2030,75 +2075,6 @@ class MemoryNodeManager:
             ]).replace("\r", "\\r").replace("\n", "\\n"))
         return "\n".join(blocks)
 
-    def _is_indexable_memory_topic(self, value: Any) -> bool:
-        """Reject fallback labels that must not become reusable topic names."""
-        topic = self._normalize_topic_name(value)
-        if not topic:
-            return False
-        return self._generate_topic_name_key(topic) not in {
-            "general",
-            "通用",
-            "其他",
-            "其它",
-            "unknown",
-            "未知",
-        }
-
-    def _build_memory_topic_item_updates(
-        self,
-        *,
-        canonical_topics: Sequence[Any],
-        aspect_topics: Sequence[Any] = (),
-        fact_id: Optional[int] = None,
-    ) -> List[Dict[str, Any]]:
-        """Create compact topic-registry updates from persisted memory fields."""
-        normalized_fact_id = int(fact_id or 0)
-        updates: List[Dict[str, Any]] = []
-        def add(topic_kind: str, value: Any) -> None:
-            topic_name = self._normalize_topic_name(value)
-            if not topic_name or not self._is_indexable_memory_topic(topic_name):
-                return
-            topic_key = self._generate_topic_name_key(topic_name)
-            item: Dict[str, Any] = {
-                "topic_kind": topic_kind,
-                "topic_name": topic_name,
-                "topic_key": topic_key,
-                "fact_ids": [normalized_fact_id] if normalized_fact_id > 0 else [],
-            }
-            if not any(
-                existing["topic_kind"] == topic_kind
-                and existing["topic_key"] == topic_key
-                for existing in updates
-            ):
-                updates.append(item)
-
-        for topic in canonical_topics or ():
-            add("canonical", topic)
-        # Aspect topics are defined only by facts.
-        if normalized_fact_id > 0:
-            for topic in aspect_topics or ():
-                add("aspect", topic)
-        return updates
-
-    @staticmethod
-    def _coerce_topic_list(value: Any) -> List[Any]:
-        if isinstance(value, str):
-            return re.split(r"[,，;；\n]+", value)
-        if isinstance(value, list):
-            out: List[Any] = []
-            for item in value:
-                if isinstance(item, dict):
-                    out.append(
-                        item.get("canonical_topic")
-                        or item.get("topic")
-                        or item.get("name")
-                        or item.get("text")
-                    )
-                else:
-                    out.append(item)
-            return out
-        return []
-
     @staticmethod
     def _normalize_topic_name(value: Any) -> str:
         text = _compact_whitespace(value)
@@ -2188,11 +2164,10 @@ class MemoryNodeManager:
     def _store_extracted_memory_facts_into_db(
         self,
         *,
-        facts: List[Dict[str, Any]],
+        prepared_facts: Sequence[Dict[str, Any]],
         tags: List[str],
     ) -> Dict[str, Any]:
         fact_ids: List[int] = []
-        topic_item_updates: List[Dict[str, Any]] = []
         user_claim_signal_mapping_updates: List[Dict[str, Any]] = []
         user_action_signal_updates: List[Dict[str, Any]] = []
         user_intent_signal_mapping_updates: List[Dict[str, Any]] = []
@@ -2206,26 +2181,15 @@ class MemoryNodeManager:
                 owner_entity_id, status="confirmed", limit=4096,
             )
         }
-        for fact in facts:
-            keywords = self._normalize_string_list(
-                fact.get("keywords"),
-                limit=18,
-            )
-            if not keywords:
-                keywords = self._keywords(fact.get("summary") or "", limit=18)
+        for prepared in prepared_facts:
+            fact = prepared["fact"]
+            keywords = fact["keywords"]
             fact_entities = list(fact.get("entities") or [])
             entity_descriptors = list(fact.get("entity_descriptors") or [])
             raw_metadata = fact.get("metadata")
             metadata = dict(raw_metadata) if isinstance(raw_metadata, dict) else {}
             resolved_world_owner_aliases = list(fact["resolved_world_owner_aliases"])
-            fallback_topics = self._topic_candidates(fact["summary"])
-            fact_topic = (
-                self._normalize_topic_name(fact.get("fact_topic"))
-                or self._normalize_topic_name(
-                    fallback_topics[0] if fallback_topics else ""
-                )
-                or "general"
-            )
+            fact_topic = fact["fact_topic"]
             owner_alias_keys = {
                 self._db.normalize_owner_alias_key(alias)
                 for alias in resolved_world_owner_aliases
@@ -2286,17 +2250,10 @@ class MemoryNodeManager:
                     source_speaker=alias["source_speaker"],
                 )
                 stored_confirmed_alias_keys.add(alias_key)
-            self._upsert_fact_recall_document(
-                fact_id=fact_id,
-                summary=fact["summary"],
-                keywords=keywords,
-                entities=fact_entities,
+            self._db.upsert_memory_recall_document(
+                **prepared["recall_document"],
+                object_id=fact_id,
                 entity_ids=entity_ids,
-                fact_topic=fact_topic,
-                event_time_key=fact.get("event_time_key") or "",
-                dialogue_time_key=fact.get("dialogue_time_key") or "",
-                confidence=float(fact["confidence"]),
-                importance=float(fact["importance"]),
             )
             fact_ids.append(fact_id)
             user_claim_updates = (
@@ -2319,13 +2276,6 @@ class MemoryNodeManager:
             user_intent_signal_mapping_updates.extend(user_intent_updates)
             if user_intent_updates:
                 user_intent_signal_fact_ids.append(fact_id)
-            topic_item_updates.extend(
-                self._build_memory_topic_item_updates(
-                    canonical_topics=[],
-                    aspect_topics=[fact_topic],
-                    fact_id=fact_id,
-                )
-            )
         self._db.upsert_fact_user_claim_signals(
             user_claim_signal_mapping_updates
         )
@@ -2335,7 +2285,6 @@ class MemoryNodeManager:
         )
         return {
             "fact_ids": fact_ids,
-            "topic_item_updates": topic_item_updates,
             "user_claim_signal_fact_count": len(user_claim_signal_fact_ids),
             "user_claim_signal_count": len(user_claim_signal_mapping_updates),
             "user_action_signal_fact_count": len(user_action_signal_fact_ids),

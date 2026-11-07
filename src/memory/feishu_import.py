@@ -35,7 +35,8 @@ def document(params):
 
 def summary(meeting):
     return {key: meeting[key] for key in ('meeting_title', 'session_start', 'last_utterance_start',
-                                          'source_segment_count', 'speakers', 'timestamp_policy')}
+                                          'last_utterance_end', 'source_segment_count', 'speakers',
+                                          'timestamp_policy', 'end_time_estimation')}
 
 
 class FeishuMeetingImports:

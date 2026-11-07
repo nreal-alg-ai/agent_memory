@@ -16,8 +16,9 @@ time, not filename or modification time, and share one PWM and databases.
 Omit --parse-only to run extraction, without recall. Exact owner names may
 include Feishu's " 在 <meeting room>" suffix; anonymous room/device speakers
 are never inferred to be that person. Exported offsets are utterance STARTS,
-not measured speech durations: inputs use point timestamps, with this
-limitation recorded explicitly in the parsed transcript and report.
+not measured speech durations: ends are estimated from text length and capped
+at the next start. The estimate and its rate are recorded in metadata/report;
+use --speech-rate-chars-per-second to change the default engineering assumption.
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import re
 import sys
 from datetime import date, datetime, timedelta, timezone
@@ -49,7 +51,7 @@ DEFAULT_OUTPUT_ROOT = REPO_ROOT / "tmp/ambient_transcript/feishu_meeting"
 from memory.feishu_transcript import (
     SHANGHAI, OWNER_SPEAKER, HEADER_RE, DATE_RE, TIME_RANGE_RE, TIMEZONE_RE,
     MARKDOWN_ESCAPE_RE, plain_markdown, speaker_name, resolve_meeting_start,
-    read_meeting_metadata, parse_meeting,
+    read_meeting_metadata, parse_meeting, DEFAULT_SPEECH_RATE_CHARS_PER_SECOND,
 )
 MEMORY_TABLES = (
     "memory_source_segments", "memory_facts", "memory_user_activity_items",
@@ -141,6 +143,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, help="New or empty directory; existing data is never reused")
     parser.add_argument("--session-start", default="", help="Single-file time override; naive ISO time means GMT+08")
     parser.add_argument("--segment-limit", type=int, default=0, help="First N chronological utterances per file; 0 means all")
+    parser.add_argument(
+        "--speech-rate-chars-per-second", type=float,
+        default=DEFAULT_SPEECH_RATE_CHARS_PER_SECOND,
+        help="Estimated equivalent characters/second for missing speech ends (default: 4; not measured timing)",
+    )
     parser.add_argument("--parse-only", action="store_true", help="Export normalized inputs only; no models or databases")
     parser.add_argument("--llm-model")
     parser.add_argument("--llm-base-url")
@@ -152,6 +159,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         parser.error("--file-limit must be nonnegative")
     if args.segment_limit < 0:
         parser.error("--segment-limit must be nonnegative")
+    if not math.isfinite(args.speech_rate_chars_per_second) or args.speech_rate_chars_per_second <= 0:
+        parser.error("--speech-rate-chars-per-second must be finite and positive")
     if args.session_start and len(args.meeting_file) != 1:
         parser.error("--session-start requires one explicit --meeting-file; other files use their own meeting times")
     return args
@@ -325,7 +334,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # Sort by export timestamps and apply the file limit before parsing speech.
     # Validate all selected sources before starting models or creating output.
     for source in select_meeting_files(args):
-        meeting = parse_meeting(source, owner_name=args.owner_name, session_start=args.session_start)
+        meeting = parse_meeting(
+            source, owner_name=args.owner_name, session_start=args.session_start,
+            speech_rate_chars_per_second=args.speech_rate_chars_per_second,
+        )
         if args.segment_limit:
             meeting["segments"] = meeting["segments"][:args.segment_limit]
         meeting["selected_segment_count"] = len(meeting["segments"])
@@ -334,6 +346,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         meeting["segment_limit"] = args.segment_limit
         meeting["last_utterance_start"] = meeting["segments"][-1]["started_at"]
+        meeting["last_utterance_end"] = meeting["segments"][-1]["ended_at"]
         meetings.append(meeting)
     output_dir = (
         args.output_dir.expanduser().resolve() if args.output_dir else

@@ -500,27 +500,6 @@ class UserMemoryDB:
                 FOREIGN KEY(entity_id) REFERENCES memory_entity_nodes(id) ON DELETE CASCADE
             );
 
-            CREATE TABLE IF NOT EXISTS memory_topic_items (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                topic_kind TEXT NOT NULL,
-                topic_name TEXT NOT NULL,
-                topic_key TEXT NOT NULL,
-                fact_occurrence_count INTEGER NOT NULL DEFAULT 0,
-                first_seen_at TEXT NOT NULL,
-                last_seen_at TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                UNIQUE(topic_kind, topic_key)
-            );
-
-            CREATE TABLE IF NOT EXISTS memory_topic_mapping (
-                topic_item_id INTEGER PRIMARY KEY,
-                fact_ids TEXT NOT NULL DEFAULT '[]',
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                FOREIGN KEY(topic_item_id) REFERENCES memory_topic_items(id) ON DELETE CASCADE
-            );
-
             CREATE TABLE IF NOT EXISTS memory_user_claims (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 subject_entity_id INTEGER NOT NULL,
@@ -722,8 +701,6 @@ class UserMemoryDB:
             ON memory_source_segments(processed_for_user_activity, id);
             CREATE INDEX IF NOT EXISTS idx_memory_fact_source_segment
             ON memory_fact_source_mapping(source_segment_id, fact_id);
-            CREATE INDEX IF NOT EXISTS idx_memory_topic_items_kind_seen
-            ON memory_topic_items(topic_kind, last_seen_at DESC);
             CREATE INDEX IF NOT EXISTS idx_memory_user_claims_subject
             ON memory_user_claims(subject_entity_id, claim_type, claim_origin, status);
             CREATE INDEX IF NOT EXISTS idx_memory_user_observed_patterns_subject
@@ -1390,165 +1367,6 @@ class UserMemoryDB:
                 WHERE mapping.source_segment_id IN ({placeholders})
                 ORDER BY fact.dialogue_time_key ASC, fact.id ASC LIMIT ?""",
             (*ids, max(1, int(limit))),
-        ).fetchall()
-        return [self._row_to_dict(row) for row in rows]
-
-    def upsert_memory_topic_items(
-        self,
-        items: Sequence[Dict[str, Any]],
-    ) -> Dict[str, Any]:
-        """Upsert topic registry items and merge their fact IDs.
-
-        ``memory_topic_items`` holds one reusable topic name per
-        ``(topic_kind, topic_key)``. Its companion mapping row deliberately
-        stores the aggregated evidence IDs as JSON arrays, matching the
-        compact topic-directory model used by this project.
-        """
-        grouped: Dict[str, Dict[str, Any]] = {}
-
-        def normalize_ids(value: Any) -> List[int]:
-            values = value if isinstance(value, (list, tuple, set)) else [value]
-            normalized: List[int] = []
-            for raw in values:
-                try:
-                    item_id = int(raw)
-                except (TypeError, ValueError):
-                    continue
-                if item_id > 0 and item_id not in normalized:
-                    normalized.append(item_id)
-            return normalized
-
-        for item in items or []:
-            if not isinstance(item, dict):
-                continue
-            topic_kind = str(item.get("topic_kind") or "").strip().lower()
-            topic_name = str(item.get("topic_name") or "").strip()
-            topic_key = str(item.get("topic_key") or "").strip().lower()
-            if topic_kind not in {"canonical", "aspect"} or not topic_name or not topic_key:
-                continue
-            group_key = f"{topic_kind}\x1f{topic_key}"
-            grouped_item = grouped.setdefault(
-                group_key,
-                {
-                    "topic_kind": topic_kind,
-                    "topic_name": topic_name,
-                    "topic_key": topic_key,
-                    "fact_ids": [],
-                },
-            )
-            for field in ("fact_ids",):
-                for item_id in normalize_ids(item.get(field)):
-                    if item_id not in grouped_item[field]:
-                        grouped_item[field].append(item_id)
-
-        report = {
-            "topic_item_ids": [],
-            "created_count": 0,
-            "updated_count": 0,
-            "fact_links_added": 0,
-        }
-        if not grouped:
-            return report
-
-        now = local_now_text()
-        for item in grouped.values():
-            existing = self._conn.execute(
-                """
-                SELECT id FROM memory_topic_items
-                WHERE topic_kind = ? AND topic_key = ?
-                """,
-                (item["topic_kind"], item["topic_key"]),
-            ).fetchone()
-            if existing is None:
-                cur = self._conn.execute(
-                    """
-                    INSERT INTO memory_topic_items (
-                        topic_kind, topic_name, topic_key,
-                        fact_occurrence_count,
-                        first_seen_at, last_seen_at, created_at, updated_at
-                    ) VALUES (?, ?, ?, 0, ?, ?, ?, ?)
-                    """,
-                    (
-                        item["topic_kind"],
-                        item["topic_name"],
-                        item["topic_key"],
-                        now,
-                        now,
-                        now,
-                        now,
-                    ),
-                )
-                topic_item_id = int(cur.lastrowid)
-                report["created_count"] += 1
-            else:
-                topic_item_id = int(existing["id"])
-
-            mapping = self._conn.execute(
-                """
-                SELECT fact_ids FROM memory_topic_mapping
-                WHERE topic_item_id = ?
-                """,
-                (topic_item_id,),
-            ).fetchone()
-            existing_fact_ids = normalize_ids(
-                _json_loads(mapping["fact_ids"], []) if mapping else []
-            )
-            new_fact_ids = [
-                fact_id for fact_id in item["fact_ids"]
-                if fact_id not in existing_fact_ids
-            ]
-            merged_fact_ids = [*existing_fact_ids, *new_fact_ids]
-
-            self._conn.execute(
-                """
-                INSERT INTO memory_topic_mapping (
-                    topic_item_id, fact_ids, created_at, updated_at
-                ) VALUES (?, ?, ?, ?)
-                ON CONFLICT(topic_item_id) DO UPDATE SET
-                    fact_ids = excluded.fact_ids,
-                    updated_at = excluded.updated_at
-                """,
-                (
-                    topic_item_id,
-                    _json_dumps(merged_fact_ids),
-                    now,
-                    now,
-                ),
-            )
-            if new_fact_ids:
-                self._conn.execute(
-                    """
-                    UPDATE memory_topic_items
-                    SET fact_occurrence_count = fact_occurrence_count + ?,
-                        last_seen_at = ?, updated_at = ?
-                    WHERE id = ?
-                    """,
-                    (
-                        len(new_fact_ids),
-                        now,
-                        now,
-                        topic_item_id,
-                    ),
-                )
-                report["updated_count"] += 1
-            report["topic_item_ids"].append(topic_item_id)
-            report["fact_links_added"] += len(new_fact_ids)
-
-        self._commit_if_needed()
-        return report
-
-    def list_memory_topic_items(self, *, limit: int = 240) -> List[Dict[str, Any]]:
-        """Load recent topic registry items with their compact evidence IDs."""
-        rows = self._conn.execute(
-            """
-            SELECT item.*, mapping.fact_ids
-            FROM memory_topic_items AS item
-            LEFT JOIN memory_topic_mapping AS mapping
-                ON mapping.topic_item_id = item.id
-            ORDER BY item.last_seen_at DESC, item.id DESC
-            LIMIT ?
-            """,
-            (max(1, int(limit or 240)),),
         ).fetchall()
         return [self._row_to_dict(row) for row in rows]
 
