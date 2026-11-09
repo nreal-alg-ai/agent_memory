@@ -220,6 +220,8 @@ personal_world_model:
     enable_memory_user_intent_update: true
     enable_memory_user_thread_update: true
     enable_memory_user_state_update: true
+    # 接收并处理外部 Agent 的服务执行和用户反馈（共享任务队列）
+    enable_proactive_service_feedback: true
     # Interaction batches remain more responsive than ambient input, but a
     # fact follow-up task still needs multiple committed batches and signal-bearing
     # facts. Signal counts themselves are diagnostic only: one fact may emit

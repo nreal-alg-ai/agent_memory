@@ -1070,23 +1070,3 @@ class UserPrediction:
             reference.isoformat(), prediction_ids, len(rows), [row["id"] for row in current],
         )
         return current
-
-    def record_prediction_outcome(
-        self, *, prediction_id: int, status: str,
-        observed_at: Optional[datetime] = None,
-        evidence_refs: Optional[Sequence[Dict[str, Any]]] = None,
-        note: str = "",
-    ) -> bool:
-        """Attach an external validation result without creating memory evidence."""
-        outcome = {
-            "observed_at": self._now(observed_at).isoformat(),
-            "evidence_refs": list(evidence_refs or []), "note": str(note),
-        }
-        changed = self._model_db.record_user_prediction_outcome(
-            prediction_id=prediction_id, outcome_status=status, outcome=outcome,
-        )
-        self._log_info(self.NEW_INTENT_TRIGGERED_TASK_NAME, "prediction_outcome_recorded", {
-            "prediction_id": prediction_id, "status": status, "changed": changed,
-            "outcome": outcome,
-        })
-        return changed

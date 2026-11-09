@@ -253,6 +253,7 @@ class TaskOperationReporter:
             "user_prediction_reassessment",
             "user_prediction_window_expiration",
             "user_proactive_policy_evaluation",
+            "proactive_service_feedback",
         }:
             if not isinstance(result, dict):
                 return False
@@ -369,6 +370,9 @@ class TaskScheduler:
             ),
             "user_proactive_policy_evaluation": self._config_bool(
                 settings.get("enable_user_proactive_policy_evaluation"), True,
+            ),
+            "proactive_service_feedback": self._config_bool(
+                settings.get("enable_proactive_service_feedback"), True,
             ),
         }
         self._user_prediction_horizon_hours = max(
@@ -1086,6 +1090,7 @@ class TaskScheduler:
         task_kind = str(event.get("task_kind") or "")
         postprocessors = {
             "memory_fact_extraction": self._postprocess_fact_extraction_task,
+            "proactive_service_feedback": self._postprocess_fact_extraction_task,
             "memory_user_activity_extraction": self._postprocess_user_activity_task,
             "memory_user_thread_update": self._postprocess_user_thread_update_task,
             "memory_user_claim_update": self._postprocess_user_claim_update_task,
@@ -1111,6 +1116,7 @@ class TaskScheduler:
         task_kind = str(event.get("task_kind") or "")
         schedulers = {
             "memory_fact_extraction": self._schedule_after_fact_extraction_task,
+            "proactive_service_feedback": self._schedule_after_fact_extraction_task,
             "memory_user_activity_extraction": self._schedule_after_user_activity_task,
             "memory_user_thread_update": self._schedule_after_user_thread_update_task,
             "memory_user_observed_pattern_update": (
@@ -1141,8 +1147,16 @@ class TaskScheduler:
                 source_task_id=str(event.get("task_id") or ""),
             )
         if event.get("succeeded") and isinstance(result, dict):
+            context = event.get("completion_context")
+            if event.get("task_kind") == "proactive_service_feedback":
+                self._record_input_time_end(result.get("reference_timestamp"))
+                context = {
+                    **(context or {}),
+                    "input_time_end": result.get("reference_timestamp"),
+                    "contains_interaction_turn": result.get("contains_interaction_turn", False),
+                }
             self._record_fact_extraction_task_result(
-                result, completion_context=event.get("completion_context"),
+                result, completion_context=context,
             )
 
     def _schedule_after_fact_extraction_task(

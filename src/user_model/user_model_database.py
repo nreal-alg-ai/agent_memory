@@ -118,7 +118,6 @@ class UserModelDB:
                 rationale TEXT NOT NULL DEFAULT '',
                 basis TEXT NOT NULL DEFAULT '{}',
                 status TEXT NOT NULL DEFAULT 'pending',
-                outcome TEXT NOT NULL DEFAULT '{}',
                 resolved_at TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL
             );
@@ -180,6 +179,26 @@ class UserModelDB:
                 decisions TEXT NOT NULL DEFAULT '[]',
                 FOREIGN KEY(prediction_id) REFERENCES user_predictions(id) ON DELETE CASCADE
             );
+            CREATE TABLE IF NOT EXISTS user_proactive_service_feedback_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                service_id INTEGER NOT NULL,
+                execution_id TEXT NOT NULL,
+                execution_status TEXT NOT NULL CHECK(execution_status IN (
+                    'not_executed', 'presented', 'running', 'succeeded', 'failed', 'cancelled'
+                )),
+                user_response TEXT NOT NULL CHECK(user_response IN (
+                    'unknown', 'accepted', 'declined', 'deferred', 'not_needed'
+                )),
+                user_feedback TEXT NOT NULL DEFAULT '',
+                execution_result TEXT NOT NULL DEFAULT '{}',
+                agent_note TEXT NOT NULL DEFAULT '',
+                context TEXT NOT NULL DEFAULT '{}',
+                observed_at TEXT NOT NULL,
+                received_at TEXT NOT NULL,
+                FOREIGN KEY(service_id) REFERENCES user_proactive_services(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_proactive_feedback_service
+            ON user_proactive_service_feedback_events(service_id, observed_at, id);
             CREATE INDEX IF NOT EXISTS idx_user_states_domain_type_status
             ON user_states(state_domain, state_type, status, updated_at DESC);
             CREATE INDEX IF NOT EXISTS idx_user_state_evidence_state
@@ -418,9 +437,8 @@ class UserModelDB:
     ) -> Dict[str, List[int]]:
         """Expire ended forecasts and close their unprovided services atomically.
 
-        Expiration is not a verification outcome. Preserve forecasts, evidence,
-        and outcome data, and also close any open services of already-expired
-        forecasts so repeated maintenance converges safely.
+        Preserve forecast content and evidence, and also close any open services
+        of already-expired forecasts so repeated maintenance converges safely.
         """
         owner_id = int(user_entity_id)
         if owner_id <= 0 or self._conn.execute(
@@ -464,7 +482,7 @@ class UserModelDB:
     def invalidate_user_predictions(
         self, prediction_ids: Sequence[int], *, user_entity_id: int, as_of: Optional[str] = None,
     ) -> List[int]:
-        """Invalidate only specified pending forecasts, preserving basis and outcome."""
+        """Invalidate only specified pending forecasts, preserving content and basis."""
         ids = sorted({int(value) for value in prediction_ids if int(value) > 0})
         invalidated = []
         with self.transaction():
@@ -488,8 +506,7 @@ class UserModelDB:
     @staticmethod
     def _prediction_row_to_api(row: sqlite3.Row) -> Dict[str, Any]:
         item = dict(row)
-        for field, fallback in (("conditions", []), ("uncertainties", []),
-                                ("basis", {}), ("outcome", {})):
+        for field, fallback in (("conditions", []), ("uncertainties", []), ("basis", {})):
             item[field] = _json_loads(item.get(field), fallback)
         return item
 
@@ -606,6 +623,61 @@ class UserModelDB:
             )
             return int(cursor.lastrowid), "created"
 
+    def get_user_proactive_service(self, service_id: int) -> Optional[Dict[str, Any]]:
+        row = self._conn.execute(
+            "SELECT * FROM user_proactive_services WHERE id = ?", (int(service_id),),
+        ).fetchone()
+        if row is None:
+            return None
+        item = dict(row)
+        item["constraints"] = _json_loads(item["constraints"], [])
+        return item
+
+    def insert_user_proactive_service_feedback(self, payload: Dict[str, Any]) -> int:
+        """Append a report, not a prediction verdict or an intent completion."""
+        cursor = self._conn.execute(
+            """INSERT INTO user_proactive_service_feedback_events (
+                service_id, execution_id, execution_status, user_response,
+                user_feedback, execution_result, agent_note, context, observed_at, received_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (payload["service_id"], payload["execution_id"], payload["execution_status"],
+             payload["user_response"], payload["user_feedback"],
+             _json_dumps(payload["execution_result"]), payload["agent_note"],
+             _json_dumps(payload["context"]), payload["observed_at"], local_now_text()),
+        )
+        self._commit_if_needed()
+        return int(cursor.lastrowid)
+
+    def get_user_proactive_service_feedback(
+        self, *, user_entity_id: int, service_id: Optional[int] = None,
+        prediction_id: Optional[int] = None, observed_before: Optional[str] = None,
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        clauses, params = ["service.user_entity_id = ?"], [int(user_entity_id)]
+        if service_id is not None:
+            clauses.append("feedback.service_id = ?")
+            params.append(int(service_id))
+        if prediction_id is not None:
+            clauses.append("service.prediction_id = ?")
+            params.append(int(prediction_id))
+        if observed_before is not None:
+            clauses.append("julianday(feedback.observed_at) <= julianday(?)")
+            params.append(observed_before)
+        params.append(max(1, int(limit)))
+        rows = self._conn.execute(
+            "SELECT feedback.* FROM user_proactive_service_feedback_events AS feedback "
+            "JOIN user_proactive_services AS service ON service.id = feedback.service_id "
+            f"WHERE {' AND '.join(clauses)} "
+            "ORDER BY julianday(feedback.observed_at) DESC, feedback.id DESC LIMIT ?", params,
+        ).fetchall()
+        items = []
+        for row in rows:
+            item = dict(row)
+            for key in ("execution_result", "context"):
+                item[key] = _json_loads(item[key], {})
+            items.append(item)
+        return items
+
     def get_user_proactive_services(
         self, *, user_entity_id: Optional[int] = None, limit: Optional[int] = 100,
         prediction_id: Optional[int] = None, statuses: Optional[Sequence[str]] = None,
@@ -658,21 +730,6 @@ class UserModelDB:
                 [status, str(reason), str(as_of), local_now_text(), *params],
             )
         return [int(row["id"]) for row in rows]
-
-    def record_user_prediction_outcome(
-        self, *, prediction_id: int, outcome_status: str,
-        outcome: Dict[str, Any],
-    ) -> bool:
-        if outcome_status not in {"confirmed", "contradicted", "unverifiable", "invalidated"}:
-            raise ValueError("Unsupported prediction outcome status")
-        cursor = self._conn.execute(
-            """UPDATE user_predictions
-            SET status = ?, outcome = ?, resolved_at = ?
-            WHERE id = ? AND status = 'pending'""",
-            (outcome_status, _json_dumps(outcome), local_now_text(), int(prediction_id)),
-        )
-        self._commit_if_needed()
-        return cursor.rowcount == 1
 
     def get_user_states(
         self,

@@ -54,6 +54,7 @@ from prompts_en import (
     MEMORY_RETRIEVED_SECTION_SPECS_EN,
     RECALL_QUERY_ANALYSIS_PROMPT_EN,
     UNIFIED_MEMORY_EXTRACTION_PROMPT_EN,
+    PROACTIVE_SERVICE_FEEDBACK_EXTRACTION_GUIDANCE_EN,
 )
 from prompts_zh import (
     DERIVED_USER_CLAIM_EXTRACTION_PROMPT_ZH,
@@ -70,6 +71,7 @@ from prompts_zh import (
     MEMORY_RETRIEVED_SECTION_SPECS_ZH,
     RECALL_QUERY_ANALYSIS_PROMPT_ZH,
     UNIFIED_MEMORY_EXTRACTION_PROMPT_ZH,
+    PROACTIVE_SERVICE_FEEDBACK_EXTRACTION_GUIDANCE_ZH,
 )
 from .utils import _cal_embedding_cosine_similarity
 from .user_action_similarity import action_lexical_similarity
@@ -687,8 +689,13 @@ class MemoryNodeManager:
         units: List[MemoryUnit],
         preceding_context_units: Optional[List[MemoryUnit]] = None,
         tags: List[str],
+        feedback_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         store_started_at = time.monotonic()
+        stage_name = (
+            "memory_proactive_service_feedback_extraction"
+            if feedback_context is not None else "memory_fact_extraction"
+        )
         units = self._valid_memory_units(units)
         preceding_units = list(preceding_context_units or [])
         if not units:
@@ -704,15 +711,18 @@ class MemoryNodeManager:
                 "source_unit_row_count": 0,
                 "total_elapsed_ms": elapsed_ms,
             }
-            self._log_info("memory_fact_extraction", "finish", report)
+            self._log_info(stage_name, "finish", report)
             return report
-        with self._db.transaction():
-            source_unit_row_ids = self._db.insert_memory_source_segments(
-                units=units,
-            )
+        # Feedback's authoritative raw source is its dedicated event record.
+        # Do not add tool reports to the ordinary activity observation window.
+        source_unit_row_ids = []
+        if feedback_context is None:
+            with self._db.transaction():
+                source_unit_row_ids = self._db.insert_memory_source_segments(units=units)
         fact_info = self._extract_memory_fact_from_units(
             units,
             preceding_context_units=preceding_units,
+            **({"feedback_context": feedback_context} if feedback_context is not None else {}),
         )
         if fact_info["status"] != "ok":
             report = {
@@ -728,9 +738,17 @@ class MemoryNodeManager:
             }
             if fact_info.get("error_type"):
                 report["error_type"] = fact_info["error_type"]
-            self._log_info("memory_fact_extraction", "finish", report)
+            self._log_info(stage_name, "finish", report)
             return report
         facts = list(fact_info.get("facts") or [])
+        if feedback_context is not None:
+            for fact in facts:
+                fact["metadata"].update({
+                    "source": "proactive_service_feedback",
+                    **{key: feedback_context[key] for key in (
+                        "feedback_id", "service_id", "execution_id", "prediction_id",
+                    )},
+                })
         self._log_extracted_fact_info(facts=facts)
         # Remote requests must finish before opening the fact write transaction.
         prepared_facts = self._prepare_memory_fact_recall_documents(facts)
@@ -772,8 +790,47 @@ class MemoryNodeManager:
             "source_unit_row_count": len(source_unit_row_ids),
             "total_elapsed_ms": round((time.monotonic() - store_started_at) * 1000, 2),
         }
-        self._log_info("memory_fact_extraction", "finish", report)
+        self._log_info(stage_name, "finish", report)
         return report
+
+    def extract_memory_from_proactive_service_feedback(
+        self, feedback: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Process actual feedback sources directly, bypassing Runtime windows.
+
+        MemoryUnit is reused only as the source/evidence representation. This
+        does not inject a synthetic conversation into Runtime or trigger an
+        activity/thread observation for an Agent's tool execution.
+        """
+        sources = []
+        if feedback["user_feedback"].strip():
+            sources.append(("speaker_用户本人", feedback["user_feedback"]))
+        if feedback["execution_result"]:
+            sources.append(("speaker_执行结果报告", json.dumps(
+                feedback["execution_result"], ensure_ascii=False,
+            )))
+        if not sources:
+            return {"status": "empty", "reason": "no_memory_evidence", "fact_ids": [],
+                    "new_fact_count": 0, "attempt_count": 0}
+        timestamp = feedback["observed_at"]
+        tags = ["proactive_service_feedback", f"service_feedback:{feedback['id']}"]
+        units = [MemoryUnit(
+            unit_type="transcript", texts=[text], speakers=[speaker],
+            started_ats=[timestamp], ended_ats=[timestamp],
+            token_count=max(1, len(text) // 2), tags=tags,
+        ) for speaker, text in sources]
+        context = {
+            "feedback_id": feedback["id"], "service_id": feedback["service_id"],
+            "execution_id": feedback["execution_id"],
+            "prediction_id": feedback["context"]["service"]["prediction_id"],
+            "execution_status": feedback["execution_status"],
+            "user_response": feedback["user_response"],
+            "observed_at": timestamp, "agent_note": feedback["agent_note"],
+            **feedback["context"],
+        }
+        return self._process_memory_fact_extraction_task(
+            units=units, tags=tags, feedback_context=context,
+        )
 
     @staticmethod
     def _valid_memory_units(
@@ -955,6 +1012,7 @@ class MemoryNodeManager:
         units: Sequence[MemoryUnit],
         *,
         preceding_context_units: Optional[Sequence[MemoryUnit]] = None,
+        feedback_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Return ok/empty/failed, facts, a reason and the extraction attempt count."""
         current_units = self._valid_memory_units(units)
@@ -964,7 +1022,11 @@ class MemoryNodeManager:
         prompt_language = self._resolve_prompt_language_from_memory_units(
             [*current_units, *preceding_units],
         )
-        self._log_info("memory_fact_extraction", "start", {
+        stage_name = (
+            "memory_proactive_service_feedback_extraction"
+            if feedback_context is not None else "memory_fact_extraction"
+        )
+        self._log_info(stage_name, "start", {
             "source_unit_count": len(current_units),
             "preceding_context_unit_count": len(preceding_units),
             "current_units": self._memory_units_log_view(current_units),
@@ -983,6 +1045,10 @@ class MemoryNodeManager:
                 limit=128,
             )
         ]
+        if feedback_context is not None:
+            # The service is already verified as belonging to this wearer.
+            # This permits attribution without labelling Agent output as user speech.
+            known_world_owner_aliases = [self._world_owner_entity_name, *known_world_owner_aliases]
         prompt = (
             prompt_template
             .replace(
@@ -1004,10 +1070,18 @@ class MemoryNodeManager:
                 ) or ("(none)" if prompt_language == "en" else "（无）"),
             )
         )
+        if feedback_context is not None:
+            guidance = (
+                PROACTIVE_SERVICE_FEEDBACK_EXTRACTION_GUIDANCE_EN
+                if prompt_language == "en" else PROACTIVE_SERVICE_FEEDBACK_EXTRACTION_GUIDANCE_ZH
+            )
+            prompt += "\n\n" + guidance.replace(
+                "{feedback_context}", json.dumps(feedback_context, ensure_ascii=False),
+            )
         failure_info: Dict[str, Any] = {}
         for attempt in range(2):
             try:
-                result = self._llm_client.call_llm(prompt, stage_name='memory_fact_extraction')
+                result = self._llm_client.call_llm(prompt, stage_name=stage_name)
             except Exception as exc:
                 failure_info = {"reason": "llm_request_error", "error_type": type(exc).__name__}
                 continue
@@ -1017,7 +1091,7 @@ class MemoryNodeManager:
                 if attempt == 0:
                     self._logger.debug("Unified memory LLM extraction failed, retrying")
                 continue
-            parsed = self._llm_client.parse_json_object_from_llm_text(result or "", stage_name='memory_fact_extraction')
+            parsed = self._llm_client.parse_json_object_from_llm_text(result or "", stage_name=stage_name)
             if parsed is None:
                 failure_info = {"reason": "invalid_llm_json_object"}
             else:

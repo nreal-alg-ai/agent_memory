@@ -115,6 +115,10 @@ class UserProactiveService:
                 prediction_id=int(prediction["id"]), user_entity_id=int(prediction["user_entity_id"]),
                 limit=None,
             ),
+            "recent_service_feedback": self._model_db.get_user_proactive_service_feedback(
+                user_entity_id=int(prediction["user_entity_id"]),
+                prediction_id=int(prediction["id"]), observed_before=as_of.isoformat(), limit=20,
+            ),
         }
         self._log_event("inputs_loaded", {
             "prediction": {key: prediction.get(key) for key in (
@@ -184,7 +188,96 @@ class UserProactiveService:
                 "id", "service_type", "objective", "agent_guidance", "constraints", "status", "reason",
                 "evaluated_at", "next_evaluate_at", "recheck_condition", "expires_at",
             )) for item in case["existing_services"]]
+        if "recent_service_feedback" in case:
+            view["recent_service_feedback"] = [select(item, (
+                "id", "service_id", "execution_status", "user_response", "user_feedback",
+                "execution_result", "observed_at",
+            )) for item in case["recent_service_feedback"]]
         return json.dumps(view, ensure_ascii=False)
+
+    def record_service_feedback(
+        self, *, service_id: int, execution_id: str, execution_status: str,
+        user_response: str = "unknown", user_feedback: str = "",
+        execution_result: Optional[Dict[str, Any]] = None,
+        agent_note: str = "", observed_at: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        """Persist execution reports independently of the service proposal status.
+
+        Called by PWM's shared-worker handler. Late reports remain useful even
+        when the proposal or prediction has expired; nothing is reactivated.
+        """
+        if type(service_id) is not int or service_id <= 0:
+            raise ValueError("service_id must be a positive integer")
+        if not isinstance(execution_id, str) or not execution_id.strip():
+            raise ValueError("execution_id must be nonempty text")
+        if not isinstance(execution_status, str) or execution_status not in {
+            "not_executed", "presented", "running", "succeeded", "failed", "cancelled",
+        }:
+            raise ValueError("Unsupported service execution_status")
+        if not isinstance(user_response, str) or user_response not in {
+            "unknown", "accepted", "declined", "deferred", "not_needed",
+        }:
+            raise ValueError("Unsupported service user_response")
+        if not isinstance(user_feedback, str) or not isinstance(agent_note, str):
+            raise ValueError("user_feedback and agent_note must be text")
+        if execution_result is not None and not isinstance(execution_result, dict):
+            raise ValueError("execution_result must be an object")
+        result = dict(execution_result or {})
+        # Reject unserializable reports before any write. A report is structured
+        # data, never executable content or a source of tool authorization.
+        json.dumps(result, ensure_ascii=False, allow_nan=False)
+        now = datetime.now().astimezone()
+        observed = self._as_datetime(observed_at, now) if observed_at is not None else now
+        if observed is None:
+            raise ValueError("Invalid feedback observed_at")
+        owner_id = self._memory_db.get_entity_id_by_name(self._owner_name)
+        service = self._model_db.get_user_proactive_service(service_id)
+        if service is None or service["user_entity_id"] != owner_id:
+            raise ValueError("Unknown service or service belongs to another user")
+        predictions = self._model_db.get_user_predictions_by_ids([service["prediction_id"]])
+        if not predictions:
+            raise ValueError("Feedback service has no source prediction")
+        prediction = predictions[0]
+        source = (prediction.get("basis") or {}).get("intent") or {}
+        intent = self._memory_db.get_intent_object(
+            object_type=source["object_type"], object_id=int(source["id"]),
+        )
+        context = {
+            "service": {key: service[key] for key in (
+                "id", "prediction_id", "service_type", "objective", "agent_guidance", "constraints",
+                "status", "evaluated_at", "expires_at",
+            )},
+            "prediction": {key: prediction.get(key) for key in (
+                "id", "behavior_text", "window_start", "window_end", "status",
+            )},
+            "current_intent": {key: intent.get(key) for key in (
+                "id", "object_type", "summary", "primary_domain", "status",
+                "time_start", "time_end", "time_precision", "details",
+            )} if intent else None,
+        }
+        payload = {
+            "service_id": service_id, "execution_id": execution_id.strip(),
+            "execution_status": execution_status, "user_response": user_response,
+            "user_feedback": user_feedback, "execution_result": result,
+            "agent_note": agent_note, "observed_at": observed.isoformat(), "context": context,
+        }
+        payload["id"] = self._model_db.insert_user_proactive_service_feedback(payload)
+        self._log_event("service_feedback_recorded", {
+            "feedback_id": payload["id"], "service_id": service_id,
+            "execution_id": payload["execution_id"], "execution_status": execution_status,
+            "user_response": user_response, "observed_at": payload["observed_at"],
+        })
+        return payload
+
+    def get_service_feedback(
+        self, *, service_id: Optional[int] = None, limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        owner_id = self._memory_db.get_entity_id_by_name(self._owner_name)
+        if owner_id is None:
+            return []
+        return self._model_db.get_user_proactive_service_feedback(
+            user_entity_id=owner_id, service_id=service_id, limit=limit,
+        )
 
     def _evaluate_with_llm(self, cases: Sequence[Dict[str, Any]], *, as_of: datetime,
                            runtime_context: Dict[str, Any], agent_capabilities: Dict[str, Any]) -> Any:

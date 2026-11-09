@@ -22,6 +22,8 @@ from user_model import (
 class PersonWorldModel:
     """Own the shared memory worker, evidence runtime, and user model."""
 
+    PROACTIVE_SERVICE_FEEDBACK_TASK_KIND = "proactive_service_feedback"
+
     def __init__(
         self,
         *,
@@ -117,6 +119,10 @@ class PersonWorldModel:
                 llm_client=self._llm_client,
                 world_owner_entity_name=self._memory_runtime.manager.world_owner_entity_name,
                 logger=self._logging_manager.get_logger("user_proactive_service"),
+            )
+            self._task_scheduler.register_handler(
+                self.PROACTIVE_SERVICE_FEEDBACK_TASK_KIND,
+                self._process_proactive_service_feedback_task,
             )
             self._memory_runtime.manager.initialize_embedding_cache()
             self._task_scheduler.start()
@@ -293,17 +299,71 @@ class PersonWorldModel:
         with self._task_scheduler.execution_lock:
             return self._user_prediction.get_active_predictions(as_of=as_of)
 
-    def record_prediction_outcome(
-        self, *, prediction_id: int, status: str,
-        observed_at: Optional[datetime] = None,
-        evidence_refs: Optional[Sequence[Dict[str, Any]]] = None,
-        note: str = "",
-    ) -> bool:
-        with self._task_scheduler.execution_lock:
-            return self._user_prediction.record_prediction_outcome(
-                prediction_id=prediction_id, status=status,
-                observed_at=observed_at, evidence_refs=evidence_refs, note=note,
+    def accept_proactive_service_feedback(
+        self, *, service_id: int, execution_id: str, execution_status: str,
+        user_response: str = "unknown", user_feedback: str = "",
+        execution_result: Optional[Dict[str, Any]] = None,
+        agent_note: str = "", observed_at: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        """Record and extract one report on the shared worker, then return its result.
+
+        execution_id identifies the external Agent's run. user_feedback must
+        be the user's actual words; execution_result is JSON-compatible Agent/
+        tool output, while agent_note is interpretation, not memory evidence.
+        A failed memory_status does not discard the recorded raw feedback.
+        Follow-up claim/intent/state work remains asynchronous and follows the
+        existing scheduler thresholds. No dialogue deduplication is performed.
+        """
+        if self._closed:
+            raise RuntimeError("PWM is closed")
+        report = self._task_scheduler.submit_and_wait(
+            self.PROACTIVE_SERVICE_FEEDBACK_TASK_KIND,
+            deepcopy({
+                "service_id": service_id, "execution_id": execution_id,
+                "execution_status": execution_status, "user_response": user_response,
+                "user_feedback": user_feedback, "execution_result": execution_result,
+                "agent_note": agent_note, "observed_at": observed_at,
+            }),
+        )
+        if report.get("fact_ids"):
+            # Ensure finalize/close can drain below-threshold feedback signals,
+            # even if no ordinary conversation has entered MemoryRuntime.
+            self._memory_inputs_need_flush = True
+        return report
+
+    def _process_proactive_service_feedback_task(self, **payload: Any) -> Dict[str, Any]:
+        """Coordinate service records and memory extraction, not domain decisions."""
+        feedback = self._user_proactive_service.record_service_feedback(**payload)
+        try:
+            memory = self.memory_manager.extract_memory_from_proactive_service_feedback(feedback)
+        except Exception as exc:
+            self._logger.exception(
+                "Service feedback memory extraction failed feedback_id=%s service_id=%s; raw report retained",
+                feedback["id"], feedback["service_id"],
             )
+            memory = {"status": "failed", "reason": "feedback_memory_extraction_error",
+                      "error_type": type(exc).__name__, "fact_ids": [], "new_fact_count": 0}
+        report = {
+            **memory,
+            "status": "failed" if memory["status"] == "failed" else "ok",
+            "memory_status": memory["status"], "feedback_recorded": True,
+            "feedback_id": feedback["id"], "service_id": feedback["service_id"],
+            "execution_id": feedback["execution_id"],
+            "reference_timestamp": feedback["observed_at"],
+            "contains_interaction_turn": bool(feedback["user_feedback"].strip()),
+        }
+        self._logger.info(
+            "Service feedback processed feedback_id=%s service_id=%s status=%s memory_status=%s fact_ids=%s",
+            report["feedback_id"], report["service_id"], report["status"],
+            report["memory_status"], report.get("fact_ids", []),
+        )
+        return report
+
+    def get_proactive_service_feedback(
+        self, *, service_id: Optional[int] = None, limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        with self._task_scheduler.execution_lock:
+            return self._user_proactive_service.get_service_feedback(service_id=service_id, limit=limit)
 
     def generate_proactive_services_from_predictions(
         self, *, runtime_context: Optional[Dict[str, Any]] = None,
