@@ -362,7 +362,9 @@ class UserProactiveService:
                 continue
             if prediction_id not in active:
                 ending = self._as_datetime(prediction.get("window_end"), now)
-                status = "expired" if prediction["status"] == "pending" and ending and ending <= now else "cancelled"
+                status = "expired" if prediction["status"] == "expired" or (
+                    prediction["status"] == "pending" and ending and ending <= now
+                ) else "cancelled"
                 closed = self._model_db.close_user_proactive_services(
                     prediction_id=prediction_id, user_entity_id=owner_id, status=status,
                     reason="Source prediction is no longer effective", as_of=now.isoformat(),

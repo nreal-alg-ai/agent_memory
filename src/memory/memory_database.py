@@ -664,7 +664,9 @@ class UserMemoryDB:
             CREATE TABLE IF NOT EXISTS memory_user_intent_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 intent_id INTEGER NOT NULL,
-                event_type TEXT NOT NULL CHECK(event_type IN ('created', 'updated')),
+                event_type TEXT NOT NULL CHECK(event_type IN (
+                    'created', 'updated', 'rescheduled', 'cancelled', 'completed', 'occurred'
+                )),
                 previous_payload TEXT NOT NULL DEFAULT '{}',
                 new_payload TEXT NOT NULL,
                 source_signal_id INTEGER NOT NULL,
@@ -2451,22 +2453,57 @@ class UserMemoryDB:
             items.extend(self._intent_row_to_api(row) for row in rows)
         return items
 
+    @staticmethod
+    def _classify_user_intent_event_type(
+        previous: Dict[str, Any], current: Dict[str, Any],
+    ) -> str:
+        """Classify the committed transition, not an extraction hint or report time."""
+        if not previous:
+            return "created"
+        status = current.get("status")
+        if status != previous.get("status"):
+            if status in {"cancelled", "completed", "occurred"}:
+                return status
+            if status == "rescheduled":
+                return "rescheduled"
+
+        def time_shifted(old_value: Any, new_value: Any) -> bool:
+            old_text, new_text = str(old_value or "").strip(), str(new_value or "").strip()
+            # Adding an unknown time is enrichment, not rescheduling.
+            if not old_text or not new_text or old_text == new_text:
+                return False
+            try:
+                old = datetime.fromisoformat(old_text.replace("Z", "+00:00"))
+                new = datetime.fromisoformat(new_text.replace("Z", "+00:00"))
+            except ValueError:
+                return False
+            if len(old_text) == 10 or len(new_text) == 10:
+                # Refining a known day to an hour on the same day is enrichment.
+                return old.date() != new.date()
+            if (old.tzinfo is None) != (new.tzinfo is None):
+                # A newly supplied timezone alone cannot establish a time shift.
+                return False
+            return old != new
+
+        if any(time_shifted(previous.get(field), current.get(field))
+               for field in ("time_start", "time_end")):
+            return "rescheduled"
+        return "updated"
+
     def insert_user_intent_event(
         self,
         *,
         intent_id: int,
-        event_type: str,
+        event_type: Optional[str] = None,
         new_payload: Dict[str, Any],
         source_signal_id: int,
         previous_payload: Optional[Dict[str, Any]] = None,
         lifecycle_observation_id: Optional[int] = None,
         effective_at: str = "",
     ) -> int:
-        """Record an applied intent mutation; callers share its write transaction."""
-        if event_type not in {"created", "updated"}:
-            raise ValueError("Intent event must be created or updated")
+        """Infer and record an applied mutation; an explicit type must match it."""
         if (event_type == "created" and previous_payload) or (
-            event_type == "updated" and not previous_payload
+            event_type is not None and event_type != "created" and not previous_payload
         ):
             raise ValueError("Intent event has an invalid previous payload")
         intent = self._conn.execute(
@@ -2494,8 +2531,12 @@ class UserMemoryDB:
         updated = {key: new_payload[key] for key in columns}
         if updated != {key: current[key] for key in columns}:
             raise ValueError("Intent event must describe the persisted intent")
-        if event_type == "updated" and previous == updated:
+        if previous and previous == updated:
             raise ValueError("Intent event must contain an actual change")
+        inferred_type = self._classify_user_intent_event_type(previous, updated)
+        if event_type is not None and event_type != inferred_type:
+            raise ValueError(f"Intent event type must match its actual transition: {inferred_type}")
+        event_type = inferred_type
         cursor = self._conn.execute(
             """INSERT INTO memory_user_intent_events (
                 intent_id, event_type, previous_payload, new_payload,

@@ -261,7 +261,7 @@ class PersonWorldModel:
     def trigger_user_prediction_time_tick(
         self, *, reference_timestamp: Optional[Any] = None,
     ) -> Dict[str, Any]:
-        """Ask the shared FIFO to reassess deferred behaviors whose time has arrived."""
+        """Queue window expiration and due-defer reassessment in the shared FIFO."""
         return self._task_scheduler.trigger_user_prediction_time_tick(
             reference_timestamp=reference_timestamp,
         )

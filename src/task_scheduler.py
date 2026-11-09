@@ -250,6 +250,7 @@ class TaskOperationReporter:
             "user_state_update_from_user_observed_patterns",
             "user_prediction_update_from_intent_events",
             "user_prediction_reassessment",
+            "user_prediction_window_expiration",
             "user_proactive_policy_evaluation",
         }:
             if not isinstance(result, dict):
@@ -361,6 +362,9 @@ class TaskScheduler:
             "user_prediction_reassessment": self._config_bool(
                 settings.get("enable_user_prediction"), True,
             ),
+            "user_prediction_window_expiration": self._config_bool(
+                settings.get("enable_user_prediction"), True,
+            ),
             "user_proactive_policy_evaluation": self._config_bool(
                 settings.get("enable_user_proactive_policy_evaluation"), True,
             ),
@@ -371,6 +375,7 @@ class TaskScheduler:
         self._prediction_lock = threading.RLock()
         self._prediction_events_inflight: set[int] = set()
         self._prediction_reassessment_pending = False
+        self._prediction_window_expiration_pending = False
         self._prediction_reassessment_retry_at = 0.0
         self._prediction_reassessment_retry_seconds = max(
             1.0, float(settings.get("user_prediction_reassessment_retry_seconds", 300)),
@@ -591,6 +596,8 @@ class TaskScheduler:
                 return self._reject_locked(task_kind, task_id, "worker_queue_full")
             if task_kind == "user_prediction_reassessment" and self._prediction_reassessment_pending:
                 return self._reject_locked(task_kind, task_id, "reassessment_already_pending")
+            if task_kind == "user_prediction_window_expiration" and self._prediction_window_expiration_pending:
+                return self._reject_locked(task_kind, task_id, "window_expiration_already_pending")
             if task_kind == "memory_user_thread_update":
                 if self._task_execution_db is None:
                     return self._reject_locked(task_kind, task_id, "task_execution_database_unavailable")
@@ -648,6 +655,8 @@ class TaskScheduler:
             # worker may take it immediately after put_nowait returns.
             if task_kind == "user_prediction_reassessment":
                 self._prediction_reassessment_pending = True
+            if task_kind == "user_prediction_window_expiration":
+                self._prediction_window_expiration_pending = True
             self._queue.put_nowait(task)
             self._logger.info(
                 "scheduled task queued task_kind=%s task_id=%s queue_depth=%s",
@@ -860,7 +869,11 @@ class TaskScheduler:
     def trigger_user_prediction_time_tick(
         self, *, reference_timestamp: Optional[Any] = None,
     ) -> Dict[str, Any]:
-        """Queue due-defer maintenance, never a scan to forecast every active intent."""
+        """Queue window cleanup first, then independently consider due-defer work.
+
+        Each subreport describes one task; queued means at least one was queued.
+        Defer retry cooldown must never suppress deterministic expiration.
+        """
         reference = datetime.now().astimezone()
         if reference_timestamp is not None:
             reference = (reference_timestamp if isinstance(reference_timestamp, datetime)
@@ -868,17 +881,34 @@ class TaskScheduler:
             if reference.tzinfo is None:
                 reference = reference.replace(tzinfo=datetime.now().astimezone().tzinfo)
         with self._prediction_lock:
+            timestamp = reference.isoformat() if reference_timestamp is not None else None
+            if self._prediction_window_expiration_pending:
+                expiration_report = {
+                    "queued": False, "status": "skipped", "reason": "window_expiration_already_pending",
+                }
+            else:
+                expiration_report = self.submit(
+                    "user_prediction_window_expiration", {"reference_timestamp": timestamp},
+                )
             if self._prediction_reassessment_pending:
-                return {"queued": False, "status": "skipped", "reason": "reassessment_already_pending"}
-            if reference.timestamp() < self._prediction_reassessment_retry_at:
-                return {"queued": False, "status": "skipped", "reason": "reassessment_retry_cooldown"}
-            # Keep None for real-time ticks: the handler resolves actual time when
-            # its FIFO slot executes. Explicit replay timestamps remain exact.
-            payload = {
-                "reference_timestamp": reference.isoformat() if reference_timestamp is not None else None,
-                "horizon_hours": self._user_prediction_horizon_hours,
-            }
-            report = self.submit("user_prediction_reassessment", payload)
+                reassessment_report = {
+                    "queued": False, "status": "skipped", "reason": "reassessment_already_pending",
+                }
+            elif reference.timestamp() < self._prediction_reassessment_retry_at:
+                reassessment_report = {
+                    "queued": False, "status": "skipped", "reason": "reassessment_retry_cooldown",
+                }
+            else:
+                # Resolve real time at execution; preserve an explicit replay clock.
+                reassessment_report = self.submit("user_prediction_reassessment", {
+                    "reference_timestamp": timestamp,
+                    "horizon_hours": self._user_prediction_horizon_hours,
+                })
+        queued = bool(expiration_report.get("queued") or reassessment_report.get("queued"))
+        report = {
+            "queued": queued, "status": "queued" if queued else "skipped",
+            "window_expiration_task": expiration_report, "reassessment_task": reassessment_report,
+        }
         self._logger.info("prediction time tick reference_timestamp=%s report=%s", reference.isoformat(), report)
         return report
 
@@ -1025,6 +1055,7 @@ class TaskScheduler:
             ),
             "user_prediction_update_from_intent_events": self._postprocess_user_prediction_task,
             "user_prediction_reassessment": self._postprocess_prediction_reassessment_task,
+            "user_prediction_window_expiration": self._postprocess_prediction_window_expiration_task,
         }
         completion: Dict[str, Any] = {"postprocessed": False}
         postprocess = postprocessors.get(task_kind)
@@ -1148,11 +1179,15 @@ class TaskScheduler:
         with self._prediction_lock:
             self._prediction_events_inflight.difference_update(event_ids)
             if (event.get("succeeded") and isinstance(result, dict)
-                    and result.get("status") in {"ok", "empty"}
+                    and result.get("status") in {"ok", "empty", "partial"}
                     and self._task_execution_db is not None):
                 self._task_execution_db.complete_prediction_intent_events(
                     sorted(set(result.get("processed_intent_event_ids") or []) & set(event_ids)),
                 )
+
+    def _postprocess_prediction_window_expiration_task(self, event: Dict[str, Any]) -> None:
+        with self._prediction_lock:
+            self._prediction_window_expiration_pending = False
 
     def _postprocess_prediction_reassessment_task(self, event: Dict[str, Any]) -> None:
         with self._prediction_lock:

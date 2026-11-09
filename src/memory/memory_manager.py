@@ -3248,36 +3248,30 @@ class MemoryNodeManager:
                 if len(results) != 1:
                     raise ValueError("missing_or_duplicate_future_intent_decision")
                 result = results[0]
-                if (type(result.get("save_new_intent")) is not bool
+                if (set(result) != {
+                        "candidate_index", "save_new_intent", "target_intent_id",
+                        "relation", "intent_update", "reason",
+                    }
+                        or type(result.get("save_new_intent")) is not bool
                         or not isinstance(result.get("reason"), str)):
                     raise ValueError("invalid_future_intent_decision_fields")
-                relations = result.get("relations")
-                updates = result.get("intent_updates")
-                if (not isinstance(relations, list) or len(relations) > 1
-                        or not isinstance(updates, list) or len(updates) > 1):
-                    raise ValueError("invalid_future_intent_relations_or_updates")
                 object_type = candidate["object_type"]
-                normalized_relations = []
-                normalized_updates = []
-                target_id = None
-                if relations:
-                    relation = relations[0]
-                    if not isinstance(relation, dict):
-                        raise ValueError("invalid_future_intent_relation")
-                    target_id = relation.get("target_intent_id")
+                target_id = result["target_intent_id"]
+                relation = result["relation"]
+                update = result["intent_update"]
+                normalized_update = None
+                if target_id is None:
+                    if relation is not None or update is not None:
+                        raise ValueError("unmatched_future_intent_has_relation_or_update")
+                else:
                     if (type(target_id) is not int
                             or target_id not in existing_by_id
                             or existing_by_id[target_id]["object_type"] != object_type
-                            or relation.get("relation") not in {"same_intent", "supersedes", "conflicts"}):
+                            or relation not in {"same_intent", "supersedes", "conflicts"}):
                         raise ValueError("invalid_future_intent_target_or_relation")
-                    normalized_relations.append({
-                        "target_intent_id": target_id, "relation": relation["relation"],
-                    })
-                if updates:
-                    update = updates[0]
+                if update is not None:
                     if (not isinstance(update, dict) or target_id is None
-                            or type(update.get("target_intent_id")) is not int
-                            or update["target_intent_id"] != target_id
+                            or set(update) != {"status", "field_updates", "effective_at"}
                             or update.get("status") not in allowed_statuses[object_type]):
                         raise ValueError("invalid_future_intent_update_target_or_status")
                     patch = update.get("field_updates")
@@ -3308,13 +3302,13 @@ class MemoryNodeManager:
                     effective_at = effective_at.strip()
                     if effective_at:
                         datetime.fromisoformat(effective_at.replace("Z", "+00:00"))
-                    normalized_updates.append({
-                        "target_intent_id": target_id, "status": update["status"],
+                    normalized_update = {
+                        "status": update["status"],
                         "field_updates": patch, "effective_at": effective_at,
-                    })
+                    }
                 decisions[index] = {
                     "save_new_intent": result["save_new_intent"],
-                    "relations": normalized_relations, "intent_updates": normalized_updates,
+                    "target_intent_id": target_id, "relation": relation, "intent_update": normalized_update,
                     "reason": _compact_whitespace(result["reason"])[:480],
                 }
             except Exception as exc:
@@ -3326,20 +3320,23 @@ class MemoryNodeManager:
         updates_by_target: Dict[int, Dict[str, Any]] = {}
         conflicting_targets = set()
         for decision in decisions.values():
-            for update in decision["intent_updates"]:
-                fields = {"status": update["status"]}
-                for field, value in update["field_updates"].items():
-                    if field == "details":
-                        fields.update({f"details.{key}": detail for key, detail in value.items()})
-                    else:
-                        fields[field] = value
-                previous = updates_by_target.setdefault(update["target_intent_id"], {})
-                if any(key in previous and previous[key] != value for key, value in fields.items()):
-                    conflicting_targets.add(update["target_intent_id"])
-                previous.update(fields)
+            update = decision["intent_update"]
+            if update is None:
+                continue
+            target_id = decision["target_intent_id"]
+            fields = {"status": update["status"]}
+            for field, value in update["field_updates"].items():
+                if field == "details":
+                    fields.update({f"details.{key}": detail for key, detail in value.items()})
+                else:
+                    fields[field] = value
+            previous = updates_by_target.setdefault(target_id, {})
+            if any(key in previous and previous[key] != value for key, value in fields.items()):
+                conflicting_targets.add(target_id)
+            previous.update(fields)
         for index in list(decisions):
-            if any(update["target_intent_id"] in conflicting_targets
-                   for update in decisions[index]["intent_updates"]):
+            if (decisions[index]["intent_update"] is not None
+                    and decisions[index]["target_intent_id"] in conflicting_targets):
                 del decisions[index]
                 self._log_info("memory_user_intent_update", "signal_error", {
                     "signal_id": candidates[index].get("signal_id"), "candidate_index": index,
@@ -3542,40 +3539,28 @@ class MemoryNodeManager:
         for index, case in enumerate(cases):
             try:
                 if not case["existing_intents"]:
-                    decision = {"relations": [], "intent_updates": [], "reason": "no_related_intent"}
+                    decision = {"target_intent_id": None, "intent_update": None, "reason": "no_related_intent"}
                 else:
                     results = decisions_by_index.get(index, [])
                     if len(results) != 1:
                         raise ValueError("missing_or_duplicate_lifecycle_matching_decision")
                     decision = results[0]
-                relations = decision.get("relations")
-                updates = decision.get("intent_updates")
-                if (not isinstance(relations, list) or len(relations) > 1
-                        or not isinstance(updates, list) or len(updates) > 1
-                        or not isinstance(decision.get("reason"), str)):
+                    if set(decision) != {"observation_index", "target_intent_id", "intent_update", "reason"}:
+                        raise ValueError("invalid_lifecycle_decision_fields")
+                if not isinstance(decision.get("reason"), str):
                     raise ValueError("invalid_lifecycle_decision_fields")
                 object_type = case["intent_lifecycle_observation"]["object_type"]
-                normalized_relations = []
-                normalized_updates = []
-                target_id = None
-                if relations:
-                    relation = relations[0]
-                    if not isinstance(relation, dict):
-                        raise ValueError("invalid_lifecycle_relation")
-                    target_id = relation.get("target_intent_id")
+                target_id = decision["target_intent_id"]
+                update = decision["intent_update"]
+                normalized_update = None
+                if target_id is not None:
                     if (type(target_id) is not int or target_id <= 0
-                            or relation.get("relation") != "same_intent"
                             or target_id not in {item["id"] for item in case["existing_intents"]
                                                  if item["object_type"] == object_type}):
                         raise ValueError("invalid_lifecycle_matching_target")
-                    normalized_relations.append({
-                        "target_intent_id": target_id, "relation": "same_intent",
-                    })
-                if updates:
-                    update = updates[0]
+                if update is not None:
                     if (not isinstance(update, dict) or target_id is None
-                            or type(update.get("target_intent_id")) is not int
-                            or update["target_intent_id"] != target_id
+                            or set(update) != {"status", "field_updates", "effective_at"}
                             or update.get("status") not in allowed_statuses[object_type]):
                         raise ValueError("invalid_lifecycle_update_target_or_status")
                     patch = update.get("field_updates")
@@ -3606,12 +3591,12 @@ class MemoryNodeManager:
                     effective_at = effective_at.strip()
                     if effective_at:
                         datetime.fromisoformat(effective_at.replace("Z", "+00:00"))
-                    normalized_updates.append({
-                        "target_intent_id": target_id, "status": update["status"],
+                    normalized_update = {
+                        "status": update["status"],
                         "field_updates": patch, "effective_at": effective_at,
-                    })
+                    }
                 decisions[index] = {
-                    "relations": normalized_relations, "intent_updates": normalized_updates,
+                    "target_intent_id": target_id, "intent_update": normalized_update,
                     "reason": _compact_whitespace(decision["reason"])[:480],
                 }
             except Exception as exc:
@@ -3622,20 +3607,23 @@ class MemoryNodeManager:
         updates_by_target: Dict[int, Dict[str, Any]] = {}
         conflicting_targets = set()
         for decision in decisions.values():
-            for update in decision["intent_updates"]:
-                fields = {"status": update["status"]}
-                for field, value in update["field_updates"].items():
-                    if field == "details":
-                        fields.update({f"details.{key}": detail for key, detail in value.items()})
-                    else:
-                        fields[field] = value
-                previous = updates_by_target.setdefault(update["target_intent_id"], {})
-                if any(key in previous and previous[key] != value for key, value in fields.items()):
-                    conflicting_targets.add(update["target_intent_id"])
-                previous.update(fields)
+            update = decision["intent_update"]
+            if update is None:
+                continue
+            target_id = decision["target_intent_id"]
+            fields = {"status": update["status"]}
+            for field, value in update["field_updates"].items():
+                if field == "details":
+                    fields.update({f"details.{key}": detail for key, detail in value.items()})
+                else:
+                    fields[field] = value
+            previous = updates_by_target.setdefault(target_id, {})
+            if any(key in previous and previous[key] != value for key, value in fields.items()):
+                conflicting_targets.add(target_id)
+            previous.update(fields)
         for index in list(decisions):
-            if any(update["target_intent_id"] in conflicting_targets
-                   for update in decisions[index]["intent_updates"]):
+            if (decisions[index]["intent_update"] is not None
+                    and decisions[index]["target_intent_id"] in conflicting_targets):
                 del decisions[index]
                 self._log_info("memory_user_intent_update", "signal_error", {
                     "observation_index": index, "phase": "lifecycle_reconciliation",
@@ -3668,14 +3656,13 @@ class MemoryNodeManager:
                 decision = decisions.get(index)
                 if decision is None:
                     raise ValueError("missing_valid_lifecycle_matching_decision")
-                relation = decision["relations"][0] if decision["relations"] else None
-                update = decision["intent_updates"][0] if decision["intent_updates"] else None
+                target_id = decision["target_intent_id"]
+                update = decision["intent_update"]
                 event_id = None
                 with self._db.transaction():
                     observation_id = self._db.upsert_user_intent_lifecycle_observation(observation)
-                    if relation:
+                    if target_id is not None:
                         object_type = observation["object_type"]
-                        target_id = relation["target_intent_id"]
                         target = self._db.get_intent_object(object_type=object_type, object_id=target_id)
                         if (not target
                                 or target["world_owner_entity_id"] != world_owner_id):
@@ -3713,7 +3700,6 @@ class MemoryNodeManager:
                                     raise ValueError("updated_lifecycle_intent_missing")
                                 event_id = self._db.insert_user_intent_event(
                                     intent_id=target_id,
-                                    event_type="updated",
                                     previous_payload=target,
                                     new_payload=updated_target,
                                     source_signal_id=signal_id,
@@ -3739,7 +3725,7 @@ class MemoryNodeManager:
             report["completed_signal_ids"].append(signal_id)
             if event_id is not None:
                 report["intent_event_ids"].append(event_id)
-            if not relation:
+            if target_id is None:
                 report["unmatched_observation_ids"].append(observation_id)
             self._log_info("memory_user_intent_update", "lifecycle_relation", {
                 **decision, "signal_id": signal_id,
@@ -3780,14 +3766,13 @@ class MemoryNodeManager:
                 if decision is None:
                     raise ValueError("missing_valid_future_intent_decision")
                 object_type = candidate["object_type"]
-                relation = decision["relations"][0] if decision["relations"] else None
-                update = decision["intent_updates"][0] if decision["intent_updates"] else None
-                target_id = relation["target_intent_id"] if relation else 0
+                target_id = decision["target_intent_id"]
+                update = decision["intent_update"]
                 with self._db.transaction():
                     target = self._db.get_intent_object(
                         object_type=object_type, object_id=target_id,
-                    ) if target_id else None
-                    if relation and (
+                    ) if target_id is not None else None
+                    if target_id is not None and (
                         not target or target["world_owner_entity_id"] != candidate["world_owner_entity_id"]
                     ):
                         raise ValueError("future_intent_target_missing_or_owner_mismatch")
@@ -3849,7 +3834,6 @@ class MemoryNodeManager:
                                     raise ValueError("updated_future_intent_missing")
                                 signal_event_ids.append(self._db.insert_user_intent_event(
                                     intent_id=target_id,
-                                    event_type="updated",
                                     previous_payload=target,
                                     new_payload=updated_target,
                                     source_signal_id=signal_id,
@@ -3858,7 +3842,7 @@ class MemoryNodeManager:
                         self._db.upsert_intent_evidence([{
                             "object_type": object_type, "object_id": target_id,
                             "evidence_type": "fact", "evidence_id": fact_id,
-                            "role": relation["relation"], "observed_at": observed_at,
+                            "role": decision["relation"], "observed_at": observed_at,
                         } for fact_id in candidate["evidence_fact_ids"]])
             except Exception as exc:
                 report["failed_signal_ids"].append(signal_id)

@@ -109,7 +109,6 @@ class UserModelDB:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_entity_id INTEGER NOT NULL,
                 prediction_key TEXT NOT NULL,
-                basis_hash TEXT NOT NULL,
                 behavior_text TEXT NOT NULL,
                 window_start TEXT NOT NULL,
                 window_end TEXT NOT NULL,
@@ -131,17 +130,15 @@ class UserModelDB:
                 FOREIGN KEY(prediction_id) REFERENCES user_predictions(id) ON DELETE CASCADE
             );
             CREATE TABLE IF NOT EXISTS user_prediction_reassessment_schedule (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
                 intent_id INTEGER NOT NULL CHECK(intent_id > 0),
-                assessment_key TEXT NOT NULL CHECK(length(assessment_key) > 0),
                 user_entity_id INTEGER NOT NULL,
                 next_evaluate_at TEXT NOT NULL,
                 reason TEXT NOT NULL,
                 evaluated_at TEXT NOT NULL,
-                intent_basis_hash TEXT NOT NULL,
                 intent_event_ids TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
-                PRIMARY KEY(intent_id, assessment_key),
                 CHECK(julianday(next_evaluate_at) IS NOT NULL
                       AND julianday(evaluated_at) IS NOT NULL
                       AND julianday(next_evaluate_at) > julianday(evaluated_at))
@@ -192,22 +189,21 @@ class UserModelDB:
             ON user_prediction_reassessment_schedule(julianday(next_evaluate_at), intent_id);
             CREATE INDEX IF NOT EXISTS idx_user_proactive_services_user_status
             ON user_proactive_services(user_entity_id, status, evaluated_at DESC);
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_user_predictions_pending_key
-            ON user_predictions(user_entity_id, prediction_key)
-            WHERE status = 'pending';
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_user_predictions_write_key
+            ON user_predictions(user_entity_id, prediction_key);
         """)
         self._commit_if_needed()
 
     def upsert_user_prediction_reassessment_schedule(
-        self, *, intent_id: int, assessment_key: str, user_entity_id: int, next_evaluate_at: str,
-        reason: str, evaluated_at: str, intent_basis_hash: str,
-        intent_event_ids: Sequence[int],
-    ) -> None:
-        """Keep one deferred behavior assessment; an intent may have several."""
+        self, *, intent_id: int, user_entity_id: int, next_evaluate_at: str,
+        reason: str, evaluated_at: str, intent_event_ids: Sequence[int],
+        assessment_id: Optional[int] = None,
+    ) -> int:
+        """Create a deferred direction, or update the same record by its stable ID."""
         event_ids = sorted({int(value) for value in intent_event_ids})
         if (int(intent_id) <= 0 or int(user_entity_id) <= 0 or not event_ids
                 or any(value <= 0 for value in event_ids) or not str(reason).strip()
-                or not str(intent_basis_hash).strip() or not str(assessment_key).strip()):
+                or (assessment_id is not None and (type(assessment_id) is not int or assessment_id <= 0))):
             raise ValueError("Invalid prediction reassessment schedule")
         with self.transaction():
             existing = self._conn.execute(
@@ -217,18 +213,26 @@ class UserModelDB:
             if existing and existing["user_entity_id"] != int(user_entity_id):
                 raise ValueError("Cannot replace another user's reassessment schedule")
             now = local_now_text()
-            self._conn.execute(
+            if assessment_id is not None:
+                cursor = self._conn.execute(
+                    """UPDATE user_prediction_reassessment_schedule SET next_evaluate_at = ?, reason = ?,
+                        evaluated_at = ?, intent_event_ids = ?, updated_at = ?
+                        WHERE id = ? AND intent_id = ? AND user_entity_id = ?""",
+                    (str(next_evaluate_at), str(reason).strip(), str(evaluated_at), _json_dumps(event_ids), now,
+                     assessment_id, int(intent_id), int(user_entity_id)),
+                )
+                if cursor.rowcount != 1:
+                    raise ValueError("Missing or foreign reassessment schedule")
+                return assessment_id
+            cursor = self._conn.execute(
                 """INSERT INTO user_prediction_reassessment_schedule (
-                    intent_id, assessment_key, user_entity_id, next_evaluate_at, reason, evaluated_at,
-                    intent_basis_hash, intent_event_ids, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(intent_id, assessment_key) DO UPDATE SET
-                    next_evaluate_at=excluded.next_evaluate_at, reason=excluded.reason,
-                    evaluated_at=excluded.evaluated_at, intent_basis_hash=excluded.intent_basis_hash,
-                    intent_event_ids=excluded.intent_event_ids, updated_at=excluded.updated_at""",
-                (int(intent_id), str(assessment_key).strip(), int(user_entity_id), str(next_evaluate_at), str(reason).strip(),
-                 str(evaluated_at), str(intent_basis_hash), _json_dumps(event_ids), now, now),
+                    intent_id, user_entity_id, next_evaluate_at, reason, evaluated_at,
+                    intent_event_ids, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (int(intent_id), int(user_entity_id), str(next_evaluate_at), str(reason).strip(),
+                 str(evaluated_at), _json_dumps(event_ids), now, now),
             )
+            return int(cursor.lastrowid)
 
     def get_user_prediction_reassessment_schedules(
         self, *, intent_ids: Optional[Sequence[int]] = None,
@@ -258,7 +262,7 @@ class UserModelDB:
                 item = dict(row)
                 item["intent_event_ids"] = _json_loads(item["intent_event_ids"], [])
                 schedules.append(item)
-        schedules.sort(key=lambda item: (item["due_order"], item["intent_id"], item["assessment_key"]))
+        schedules.sort(key=lambda item: (item["due_order"], item["intent_id"], item["id"]))
         for item in schedules:
             item.pop("due_order")
         return schedules
@@ -280,27 +284,26 @@ class UserModelDB:
         return deleted
 
     def delete_user_prediction_reassessment_schedule(
-        self, *, intent_id: int, assessment_key: str, user_entity_id: int,
+        self, *, assessment_id: int, user_entity_id: int,
     ) -> int:
         """Consume one assessment without clearing other behaviors of the intent."""
         cursor = self._conn.execute(
             "DELETE FROM user_prediction_reassessment_schedule "
-            "WHERE intent_id = ? AND assessment_key = ? AND user_entity_id = ?",
-            (int(intent_id), str(assessment_key), int(user_entity_id)),
+            "WHERE id = ? AND user_entity_id = ?",
+            (int(assessment_id), int(user_entity_id)),
         )
         self._commit_if_needed()
         return cursor.rowcount
 
     def save_user_prediction(self, payload: Dict[str, Any]) -> Tuple[int, str]:
-        """Atomically save a forecast and link its intent, retaining the basis snapshot."""
+        """Deduplicate an exact write across all statuses; never refresh an existing forecast."""
         owner_id = int(payload["user_entity_id"])
         prediction_key = str(payload["prediction_key"])
-        basis_hash = str(payload["basis_hash"])
         basis = payload.get("basis") or {}
         with self.transaction():
             existing = self._conn.execute(
                 """SELECT * FROM user_predictions
-                WHERE user_entity_id = ? AND prediction_key = ? AND status = 'pending'""",
+                WHERE user_entity_id = ? AND prediction_key = ?""",
                 (owner_id, prediction_key),
             ).fetchone()
             forecast_fields = {
@@ -313,25 +316,21 @@ class UserModelDB:
                 "rationale": str(payload.get("rationale") or ""),
             }
             existing_payload = self._prediction_row_to_api(existing) if existing else {}
-            if (existing and existing["basis_hash"] == basis_hash
-                    and all(existing_payload[key] == value for key, value in forecast_fields.items())):
+            if existing:
+                if (not all(existing_payload[key] == value for key, value in forecast_fields.items())
+                        or existing_payload["basis"].get("intent", {}).get("id") != basis.get("intent", {}).get("id")):
+                    raise ValueError("Prediction write key reused for different forecast content")
                 prediction_id, save_action = int(existing["id"]), "reused"
                 basis = _json_loads(existing["basis"], {})
             else:
-                if existing:
-                    self._conn.execute(
-                        """UPDATE user_predictions SET status = 'superseded',
-                        resolved_at = ? WHERE id = ?""",
-                        (local_now_text(), int(existing["id"])),
-                    )
                 cursor = self._conn.execute(
                     """INSERT INTO user_predictions (
-                        user_entity_id, prediction_key, basis_hash, behavior_text,
+                        user_entity_id, prediction_key, behavior_text,
                         window_start, window_end, conditions, likelihood_band,
                         uncertainties, rationale, basis, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
-                        owner_id, prediction_key, basis_hash,
+                        owner_id, prediction_key,
                         str(payload["behavior_text"]), str(payload["window_start"]),
                         str(payload["window_end"]),
                         _json_dumps(payload.get("conditions") or []),
@@ -407,8 +406,56 @@ class UserModelDB:
                 predictions[int(row["id"])] = self._prediction_row_to_api(row)
         return [predictions[prediction_id] for prediction_id in sorted(predictions)]
 
+    def expire_user_predictions(
+        self, *, user_entity_id: int, as_of: str,
+    ) -> Dict[str, List[int]]:
+        """Expire ended forecasts and close their unprovided services atomically.
+
+        Expiration is not a verification outcome. Preserve forecasts, evidence,
+        and outcome data, and also close any open services of already-expired
+        forecasts so repeated maintenance converges safely.
+        """
+        owner_id = int(user_entity_id)
+        if owner_id <= 0 or self._conn.execute(
+            "SELECT julianday(?)", (as_of,),
+        ).fetchone()[0] is None:
+            raise ValueError("Invalid prediction expiration owner or reference time")
+        due_query = """SELECT id FROM user_predictions
+            WHERE user_entity_id = ? AND status = 'pending'
+              AND julianday(window_end) <= julianday(?)"""
+        service_source_query = """SELECT id FROM user_predictions
+            WHERE user_entity_id = ? AND (
+                status = 'expired' OR (status = 'pending'
+                    AND julianday(window_end) <= julianday(?))
+            )"""
+        service_filter = f"""user_entity_id = ? AND status IN ('ready', 'waiting')
+            AND prediction_id IN ({service_source_query})"""
+        service_params = (owner_id, owner_id, as_of)
+        with self.transaction():
+            prediction_ids = [int(row["id"]) for row in self._conn.execute(
+                f"{due_query} ORDER BY id", (owner_id, as_of),
+            ).fetchall()]
+            service_ids = [int(row["id"]) for row in self._conn.execute(
+                f"SELECT id FROM user_proactive_services WHERE {service_filter} ORDER BY id",
+                service_params,
+            ).fetchall()]
+            # Close services before changing prediction status; both writes
+            # share this transaction and neither invokes policy generation.
+            self._conn.execute(
+                "UPDATE user_proactive_services SET status = 'expired', "
+                "reason = ?, next_evaluate_at = NULL, recheck_condition = '', "
+                f"evaluated_at = ?, updated_at = ? WHERE {service_filter}",
+                ("Source prediction window ended", as_of, local_now_text(), *service_params),
+            )
+            self._conn.execute(
+                "UPDATE user_predictions SET status = 'expired', resolved_at = ? "
+                f"WHERE id IN ({due_query})",
+                (as_of, owner_id, as_of),
+            )
+        return {"expired_prediction_ids": prediction_ids, "expired_service_ids": service_ids}
+
     def invalidate_user_predictions(
-        self, prediction_ids: Sequence[int], *, user_entity_id: int,
+        self, prediction_ids: Sequence[int], *, user_entity_id: int, as_of: Optional[str] = None,
     ) -> List[int]:
         """Invalidate only specified pending forecasts, preserving basis and outcome."""
         ids = sorted({int(value) for value in prediction_ids if int(value) > 0})
@@ -426,7 +473,7 @@ class UserModelDB:
                 self._conn.execute(
                     "UPDATE user_predictions SET status = 'invalidated', resolved_at = ? "
                     f"WHERE user_entity_id = ? AND id IN ({placeholders}) AND status = 'pending'",
-                    [local_now_text(), *params],
+                    [as_of or local_now_text(), *params],
                 )
                 invalidated.extend(int(row["id"]) for row in rows)
         return invalidated
@@ -561,7 +608,7 @@ class UserModelDB:
         with self.transaction():
             rows = self._conn.execute(f"SELECT id FROM user_proactive_services WHERE {where}", params).fetchall()
             self._conn.execute(
-                "UPDATE user_proactive_services SET status = ?, reason = ?, next_evaluate_at = NULL, "
+                "UPDATE user_proactive_services SET status = ?, reason = ?, next_evaluate_at = NULL, recheck_condition = '', "
                 f"evaluated_at = ?, updated_at = ? WHERE {where}",
                 [status, str(reason), str(as_of), local_now_text(), *params],
             )
