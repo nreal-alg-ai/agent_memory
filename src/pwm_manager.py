@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
@@ -67,7 +68,7 @@ class PersonWorldModel:
                 logger=self._logging_manager.get_logger("llm_client"),
             )
             # Both memory and user-state handlers are registered before the
-            # shared worker starts processing its FIFO.
+            # shared worker starts processing its priority queue.
             self._task_scheduler = TaskScheduler(
                 operation_reporter=self._operation_reporter,
                 maxsize=int(scheduler_config.get("task_queue_maxsize", 100) or 100),
@@ -245,6 +246,8 @@ class PersonWorldModel:
         tags: Optional[List[str]] = None,
         time_end: Optional[str] = None,
     ) -> Dict[str, Any]:
+        if self._closed:
+            raise RuntimeError("PWM is closed")
         return self._memory_runtime.trigger_memory_recall(
             query,
             tags=tags,
@@ -261,7 +264,7 @@ class PersonWorldModel:
     def trigger_user_prediction_time_tick(
         self, *, reference_timestamp: Optional[Any] = None,
     ) -> Dict[str, Any]:
-        """Queue window expiration and due-defer reassessment in the shared FIFO."""
+        """Queue expiration and defer reassessment on the shared worker."""
         return self._task_scheduler.trigger_user_prediction_time_tick(
             reference_timestamp=reference_timestamp,
         )
@@ -301,6 +304,34 @@ class PersonWorldModel:
                 prediction_id=prediction_id, status=status,
                 observed_at=observed_at, evidence_refs=evidence_refs, note=note,
             )
+
+    def generate_proactive_services_from_predictions(
+        self, *, runtime_context: Optional[Dict[str, Any]] = None,
+        agent_capabilities: Optional[Dict[str, Any]] = None,
+        reference_timestamp: Optional[Any] = None,
+        max_predictions: int = 10,
+    ) -> Dict[str, Any]:
+        """Host-driven assessment; return current help, not a queue receipt.
+
+        Queues at highest priority, waits for this task, and returns assistance.
+        Does not interrupt a running task or flush background work. Waiting
+        services are persisted internally; no tools are executed.
+        """
+        if self._closed:
+            raise RuntimeError("PWM is closed")
+        if runtime_context is not None and not isinstance(runtime_context, dict):
+            raise ValueError("runtime_context must be an object")
+        if agent_capabilities is not None and not isinstance(agent_capabilities, dict):
+            raise ValueError("agent_capabilities must be an object")
+        return self._task_scheduler.submit_and_wait(
+            UserProactiveService.TASK_KIND,
+            {
+                "runtime_context": deepcopy(runtime_context),
+                "agent_capabilities": deepcopy(agent_capabilities),
+                "reference_timestamp": reference_timestamp,
+                "max_predictions": max_predictions,
+            },
+        )
 
     def get_proactive_services(
         self, *, statuses: Optional[Sequence[str]] = None, limit: int = 100,

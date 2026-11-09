@@ -1,7 +1,7 @@
 """SQLite projection store for durable user states and hypotheses.
 
 The memory database owns evidence; cross-database evidence IDs here are logical
-references, not SQLite foreign keys. A single FIFO worker orders updates.
+references, not SQLite foreign keys. A single priority worker orders updates.
 """
 
 from __future__ import annotations
@@ -160,7 +160,6 @@ class UserModelDB:
                 recheck_condition TEXT NOT NULL DEFAULT '',
                 expires_at TEXT NOT NULL,
                 policy_version TEXT NOT NULL,
-                source_prediction_task_id TEXT NOT NULL DEFAULT '',
                 evaluated_at TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
@@ -172,6 +171,14 @@ class UserModelDB:
                     AND julianday(next_evaluate_at) < julianday(expires_at)
                 )),
                 CHECK(status != 'ready' OR next_evaluate_at IS NULL)
+            );
+            CREATE TABLE IF NOT EXISTS user_proactive_prediction_assessments (
+                prediction_id INTEGER PRIMARY KEY,
+                user_entity_id INTEGER NOT NULL,
+                input_signature TEXT NOT NULL,
+                evaluated_at TEXT NOT NULL,
+                decisions TEXT NOT NULL DEFAULT '[]',
+                FOREIGN KEY(prediction_id) REFERENCES user_predictions(id) ON DELETE CASCADE
             );
             CREATE INDEX IF NOT EXISTS idx_user_states_domain_type_status
             ON user_states(state_domain, state_type, status, updated_at DESC);
@@ -512,6 +519,41 @@ class UserModelDB:
         ).fetchall()
         return [self._prediction_row_to_api(row) for row in rows]
 
+    def get_user_proactive_prediction_assessment(
+        self, *, prediction_id: int, user_entity_id: int,
+    ) -> Optional[Dict[str, Any]]:
+        row = self._conn.execute(
+            "SELECT * FROM user_proactive_prediction_assessments "
+            "WHERE prediction_id = ? AND user_entity_id = ?",
+            (prediction_id, user_entity_id),
+        ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        result["decisions"] = _json_loads(result["decisions"], [])
+        return result
+
+    def save_user_proactive_prediction_assessment(
+        self, *, prediction_id: int, user_entity_id: int, input_signature: str,
+        evaluated_at: str, decisions: Sequence[Dict[str, Any]],
+    ) -> None:
+        """Remember successful evaluation even if no service was generated."""
+        prediction = self._conn.execute(
+            "SELECT user_entity_id FROM user_predictions WHERE id = ?", (prediction_id,),
+        ).fetchone()
+        if not prediction or prediction["user_entity_id"] != user_entity_id:
+            raise ValueError("Assessment must reference the same owner's prediction")
+        self._conn.execute(
+            """INSERT INTO user_proactive_prediction_assessments (
+                prediction_id, user_entity_id, input_signature, evaluated_at, decisions
+            ) VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(prediction_id) DO UPDATE SET
+                input_signature = excluded.input_signature,
+                evaluated_at = excluded.evaluated_at, decisions = excluded.decisions""",
+            (prediction_id, user_entity_id, input_signature, evaluated_at, _json_dumps(list(decisions))),
+        )
+        self._commit_if_needed()
+
     def save_user_proactive_service(
         self, payload: Dict[str, Any],
     ) -> Tuple[int, str]:
@@ -540,7 +582,7 @@ class UserModelDB:
                 key: payload[key] for key in (
                     "service_key", "service_type", "objective", "agent_guidance", "status", "reason",
                     "next_evaluate_at", "recheck_condition", "expires_at", "policy_version",
-                    "source_prediction_task_id", "evaluated_at",
+                    "evaluated_at",
                 )
             }
             fields["constraints"] = _json_dumps(payload["constraints"])
@@ -565,7 +607,7 @@ class UserModelDB:
             return int(cursor.lastrowid), "created"
 
     def get_user_proactive_services(
-        self, *, user_entity_id: Optional[int] = None, limit: int = 100,
+        self, *, user_entity_id: Optional[int] = None, limit: Optional[int] = 100,
         prediction_id: Optional[int] = None, statuses: Optional[Sequence[str]] = None,
     ) -> List[Dict[str, Any]]:
         clauses = []
@@ -580,10 +622,13 @@ class UserModelDB:
             clauses.append(f"status IN ({','.join('?' for _ in statuses)})")
             params.extend(statuses)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        limit_sql = ""
+        if limit is not None:
+            limit_sql = " LIMIT ?"
+            params.append(max(1, int(limit)))
         rows = self._conn.execute(
-            f"""SELECT * FROM user_proactive_services {where}
-                ORDER BY evaluated_at DESC, id DESC LIMIT ?""",
-            (*params, max(1, int(limit))),
+            f"SELECT * FROM user_proactive_services {where} "
+            f"ORDER BY evaluated_at DESC, id DESC{limit_sql}", params,
         ).fetchall()
         result = []
         for row in rows:

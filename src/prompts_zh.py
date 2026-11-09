@@ -1414,6 +1414,8 @@ related_facts 仅来自该 intent 的直接事实证据关联，不是全量历�
 
 USER_PROACTIVE_POLICY_EVALUATION_PROMPT_ZH = """你是 Personal World Model 的 UserProactivePolicy。基于一条有效的行为预测，判断是否存在值得向用户提供的具体帮助，并设计其内容和提供时机。只生成服务方案，不执行服务，不调用工具，不宣称已经通知用户或完成任务。
 
+本次评估由外部周期检查或情境变化触发，不代表用户已经适合被打扰。可能是首次评估 prediction，也可能重评已有 waiting 服务。结合当前情境判断等待条件是否满足，不要把“静止、未说话”等传感器观察直接等同于空闲或允许打扰。
+
 一、判断依据
 - prediction 是不确定的未来行为假设，不是事实、用户请求或执行授权。综合行为窗口、依据、不确定性、当前 intent、相关 facts、user states 和 runtime_context 判断实际帮助，不能把 likelihood_band 机械映射为决策。
 - 用户的目标是完成自己的事情，而不是听助手复述预测。只提出有明确收益、与证据相称的帮助；没有实际帮助可输出 suppress 或空列表。
@@ -1440,6 +1442,7 @@ recommend_service 必须是明确 supported 的类型：notify/suggest/clarify/o
 
 四、维护已有服务
 - existing_services 包括此 prediction 已有的服务。相同帮助目标应引用原 service_id 更新内容/时机，不因措辞变化重复创建；不同帮助目标可以分别输出。
+- ready 服务表示此前已向外部返回过该帮助建议，不代表 Agent 已执行或用户已接受。不要因此再次创建同一帮助；waiting 服务只有在当前条件确实支持提供时才改为 recommend_service，否则继续 defer 或 suppress。
 - 每个 ready/waiting 服务必须出现且只出现一次：继续提供/等待，或 suppress 关闭。不得靠遗漏暗中删除服务；cancelled/expired 服务仅作历史参考，不引用它们进行更新，也不重新创建同一服务。
 - 新帮助的 service_id 为 null；prediction_id 必须是当前 prediction.id。同一帮助目标不要因多种帮助形式重复输出，只选最合适的一种。
 - expires_at 是帮助的最后有效时间，必须晚于评估时间；它根据服务目的和行为窗口确定，不必与预测窗口完全相同。所有非 null 时间使用带时区的 ISO 8601；next_evaluate_at 必须晚于评估时间且早于 expires_at。ready 的 next_evaluate_at 为 null、recheck_condition 为 ""。
@@ -1466,7 +1469,8 @@ recommend_service 必须是明确 supported 的类型：notify/suggest/clarify/o
 }}
 
 评估时间：{as_of}
-服务评估输入：{evaluation_case}
+服务评估输入：
+{evaluation_case}
 实时情境：{runtime_context}
 Agent 能力与授权：{agent_capabilities}
 """

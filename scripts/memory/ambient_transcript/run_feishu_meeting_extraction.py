@@ -19,6 +19,9 @@ are never inferred to be that person. Exported offsets are utterance STARTS,
 not measured speech durations: ends are estimated from text length and capped
 at the next start. The estimate and its rate are recorded in metadata/report;
 use --speech-rate-chars-per-second to change the default engineering assumption.
+After each meeting's memory/state tasks finish, evaluate proactive assistance
+at its last selected utterance end. This explicitly simulates availability for
+conversational help, with no background authorization or actual Agent execution.
 """
 
 from __future__ import annotations
@@ -40,6 +43,7 @@ if str(REPO_ROOT / "src") not in sys.path:
 from config import split_memory_config
 from pwm_manager import PersonWorldModel
 from task_scheduler import TaskOperationReporter
+from user_model.user_proactive_service import UserProactiveService
 
 try:  # Support both direct CLI execution and package imports in tests.
     from .run_transcript_Ali_eval import (configure_logging, write_transcript_txt)
@@ -170,6 +174,46 @@ def meeting_output_dir(output_dir: Path, index: int, count: int) -> Path:
     return output_dir if count == 1 else output_dir / f"meeting_{index:04d}"
 
 
+def evaluate_post_meeting_proactive_services(
+    pwm: PersonWorldModel, meeting: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Simulate a post-meeting opportunity, never inferred sensor availability."""
+    evaluation = {
+        "scenario": "simulated_post_meeting_availability",
+        "reference_timestamp": meeting["last_utterance_end"],
+        "runtime_context": {"can_present": True},
+        "agent_capabilities": {
+            "supported_service_types": ["notify", "suggest", "clarify", "offer_assistance"],
+            "authorized_service_types": [],
+        },
+    }
+    try:
+        result = pwm.generate_proactive_services_from_predictions(
+            reference_timestamp=evaluation["reference_timestamp"],
+            runtime_context=evaluation["runtime_context"],
+            agent_capabilities=evaluation["agent_capabilities"],
+        )
+        if not isinstance(result, dict) or result.get("status") not in {"ok", "empty", "partial", "error", "failed"}:
+            raise ValueError(f"Invalid proactive service result: {result!r}")
+    except Exception as exc:
+        if isinstance(exc, RuntimeError) and str(exc) == "Task not queued: task_disabled":
+            result = {"status": "skipped", "reason": "task_disabled", "assistance_items": []}
+            logging.info("Post-meeting proactive evaluation disabled source=%s", meeting["source_file"])
+        else:
+            result = {"status": "error", "error": f"{type(exc).__name__}: {exc}", "assistance_items": []}
+            logging.exception(
+                "Post-meeting proactive evaluation failed source=%s reference_timestamp=%s; continuing",
+                meeting["source_file"], evaluation["reference_timestamp"],
+            )
+    evaluation["result"] = result
+    logging.info(
+        "Post-meeting proactive evaluation source=%s reference_timestamp=%s status=%s assistance_count=%s",
+        meeting["source_file"], evaluation["reference_timestamp"], result["status"],
+        len(result.get("assistance_items") or []),
+    )
+    return evaluation
+
+
 def extract_meeting(
     pwm: PersonWorldModel, reporter: TaskOperationReporter,
     meeting: Dict[str, Any], report: Dict[str, Any],
@@ -197,13 +241,17 @@ def extract_meeting(
     report["state_tick"] = pwm.drain_pending_user_state_claims()
     if not pwm.wait_for_memory_tasks():
         raise RuntimeError("User state tasks did not drain")
+    # Wait for this meeting's predictions and states before the high-priority
+    # service task can evaluate them. No prediction time tick or Agent dispatch.
+    report["proactive_service_evaluation"] = evaluate_post_meeting_proactive_services(pwm, meeting)
     report["table_counts"] = {
         table: int(pwm.database._conn.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0])
         for table in MEMORY_TABLES
     }
-    report["table_counts"]["user_states"] = int(
-        pwm.user_model_database._conn.execute("SELECT COUNT(*) FROM user_states").fetchone()[0]
-    )
+    for table in ("user_states", "user_predictions", "user_proactive_services"):
+        report["table_counts"][table] = int(
+            pwm.user_model_database._conn.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0]
+        )
     snapshot = reporter.snapshot()
     operation_delta = {}
     for kind, counts in snapshot["counts"].items():
@@ -236,14 +284,20 @@ def extract_meeting(
     ]
     if unexpected_rejections:
         report["unexpected_rejections"] = unexpected_rejections
-        raise RuntimeError(f"Task submissions rejected: {unexpected_rejections}")
-    report["status"] = "completed_with_failures" if failures or report["partial_tasks"] else "completed"
-    if failures or report["partial_tasks"]:
+        blocking_rejections = [item for item in unexpected_rejections
+                               if item.get("operation_type") != UserProactiveService.TASK_KIND]
+        if blocking_rejections:
+            raise RuntimeError(f"Task submissions rejected: {blocking_rejections}")
+    proactive_status = report["proactive_service_evaluation"]["result"]["status"]
+    has_failures = bool(failures or report["partial_tasks"] or unexpected_rejections
+                        or proactive_status in {"error", "failed", "partial"})
+    report["status"] = "completed_with_failures" if has_failures else "completed"
+    if has_failures:
         logging.warning(
-            "Meeting extraction completed with task failures source=%s failures=%s partial_task_ids=%s; "
+            "Meeting extraction completed with task failures source=%s failures=%s partial_task_ids=%s proactive_status=%s; "
             "continuing with the next file",
             meeting["source_file"], failures,
-            [item["task_id"] for item in report["partial_tasks"]],
+            [item["task_id"] for item in report["partial_tasks"]], proactive_status,
         )
 
 
@@ -321,6 +375,7 @@ def run_extraction(args: argparse.Namespace, meetings: Sequence[Dict[str, Any]],
                 for key in (
                     "input_report", "finalization", "state_tick", "table_counts",
                     "operation_delta", "failed_tasks", "partial_tasks", "unexpected_rejections",
+                    "proactive_service_evaluation",
                 ):
                     if key in meeting_reports[0]:
                         report[key] = meeting_reports[0][key]

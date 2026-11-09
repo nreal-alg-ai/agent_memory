@@ -1390,11 +1390,14 @@ objective states the actual problem to solve. agent_guidance instructs a downstr
 - defer: useful assistance must await a specific time, context, capability or permission. Include the complete service content and save as waiting. reason explains the deferral basis and next evaluation focus. Supply next_evaluate_at and/or a meaningful recheck_condition. Use a condition instead of inventing a reevaluation time.
 - suppress: no service should be retained, or explicitly close an existing one. service, expires_at and next_evaluate_at are null; recheck_condition is "". A null service_id records only the assessment, creating no service.
 
+This evaluation is triggered by an external periodic check or context change, not permission to interrupt. It may assess a prediction for the first time or reassess a waiting service. Decide whether waiting conditions are actually satisfied; sensor observations such as stillness or silence do not prove availability or permission to interrupt.
+
 agent_capabilities.supported_service_types lists explicitly available service types; authorized_service_types lists authorized background types. Missing/empty lists mean unknown, not supported or authorized.
 recommend_service requires a supported type. notify/suggest/clarify/offer_assistance also require runtime_context.can_present to be explicitly true; prepare/delegate also require the type to be authorized. Otherwise defer or suppress; never invent authorization to output ready. Use evidence-based reasoning, not fixed utility-score rules, to decide value and waiting conditions.
 
 4. Existing services
 - existing_services contains this prediction's services. Reference the original service_id when updating the same help objective, even if reworded. Different objectives may have separate entries.
+- A ready service was previously returned as assistance to the caller; it is not proof of Agent execution or user acceptance. Do not recreate the same help. Change a waiting service to recommend_service only if current conditions support provision; otherwise defer or suppress it.
 - Include every ready/waiting service exactly once: continue, defer or suppress it. Omission must not silently delete a service. cancelled/expired services are history only: do not reference them for updates or recreate the same service.
 - New assistance uses service_id:null. prediction_id must equal the current prediction.id. Do not duplicate one help objective across multiple service types; choose the best form.
 - expires_at is the last useful time for this assistance, after evaluation time, grounded in its purpose and the behavior window; it need not equal the prediction window. Non-null times must be timezone-aware ISO 8601. next_evaluate_at must be after evaluation time and before expires_at. Ready services use next_evaluate_at:null and recheck_condition:"".
@@ -1421,7 +1424,8 @@ Return JSON only. Each service_results element evaluates one service; not every 
 }}
 
 Evaluation time: {as_of}
-Service evaluation case: {evaluation_case}
+Service evaluation case:
+{evaluation_case}
 Runtime context: {runtime_context}
 Agent capabilities and authorization: {agent_capabilities}
 """

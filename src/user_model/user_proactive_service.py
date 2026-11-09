@@ -113,7 +113,7 @@ class UserProactiveService:
             )} for state in relevant[:40]],
             "existing_services": self._model_db.get_user_proactive_services(
                 prediction_id=int(prediction["id"]), user_entity_id=int(prediction["user_entity_id"]),
-                limit=1000,
+                limit=None,
             ),
         }
         self._log_event("inputs_loaded", {
@@ -132,9 +132,63 @@ class UserProactiveService:
         })
         return case
 
+    @staticmethod
+    def _format_evaluation_case_for_prompt(case: Dict[str, Any]) -> str:
+        """One compact business-only case; leave persisted/internal records intact."""
+        def select(item, fields):
+            return {name: item[name] for name in fields if name in item}
+
+        def intent_view(intent):
+            result = select(intent, (
+                "id", "object_type", "summary", "primary_domain", "status", "confidence",
+                "time_start", "time_end", "time_precision",
+            ))
+            if "details" in intent:
+                result["details"] = select(intent.get("details") or {}, (
+                    "desired_outcome", "success_criteria", "target_at",
+                    "event_or_activity", "time_precision", "location_text", "participants",
+                    "action_text", "deliverable", "responsibility_type", "priority", "completed_at",
+                    "beneficiary_entities", "delegator_entities", "collaborator_entities",
+                ))
+            return result
+
+        state_fields = (
+            "id", "state_domain", "state_type", "state_kind", "state_topic", "state_text",
+            "conditions", "confidence", "valid_from", "valid_to", "last_observed_at",
+        )
+        prediction = case["prediction"]
+        prediction_view = select(prediction, (
+            "id", "behavior_text", "window_start", "window_end", "conditions",
+            "likelihood_band", "uncertainties", "rationale",
+        ))
+        if "basis" in prediction:
+            basis = prediction.get("basis") or {}
+            basis_view = {}
+            if "intent" in basis:
+                basis_view["intent"] = intent_view(basis["intent"])
+            if "recurring_states" in basis:
+                basis_view["recurring_states"] = [select(item, state_fields) for item in basis["recurring_states"]]
+            context = basis.get("prediction_context") or {}
+            if "as_of" in context:
+                basis_view["prediction_context"] = {"as_of": context["as_of"]}
+            prediction_view["basis"] = basis_view
+        view = {"prediction": prediction_view, "current_intent": intent_view(case["current_intent"])}
+        if "related_facts" in case:
+            view["related_facts"] = [select(item, (
+                "id", "summary", "event_time_key", "dialogue_time_key",
+            )) for item in case["related_facts"]]
+        if "relevant_user_states" in case:
+            view["relevant_user_states"] = [select(item, state_fields) for item in case["relevant_user_states"]]
+        if "existing_services" in case:
+            view["existing_services"] = [select(item, (
+                "id", "service_type", "objective", "agent_guidance", "constraints", "status", "reason",
+                "evaluated_at", "next_evaluate_at", "recheck_condition", "expires_at",
+            )) for item in case["existing_services"]]
+        return json.dumps(view, ensure_ascii=False)
+
     def _evaluate_with_llm(self, case: Dict[str, Any], *, as_of: datetime,
                            runtime_context: Dict[str, Any], agent_capabilities: Dict[str, Any]) -> Any:
-        source_text = json.dumps(case, ensure_ascii=False)
+        source_text = self._format_evaluation_case_for_prompt(case)
         chinese = bool(re.search(r"[\u4e00-\u9fff]", source_text))
         prompt_template = (
             USER_PROACTIVE_POLICY_EVALUATION_PROMPT_ZH
@@ -272,7 +326,7 @@ class UserProactiveService:
 
     def _save_service_results(
         self, results: Sequence[Dict[str, Any]], *, case: Dict[str, Any], as_of: datetime,
-        source_prediction_task_id: str,
+        input_signature: str,
     ) -> List[Dict[str, Any]]:
         existing = {int(item["id"]): item for item in case["existing_services"]}
         saved = []
@@ -296,28 +350,115 @@ class UserProactiveService:
                     prediction_id=case["prediction"]["id"],
                     user_entity_id=case["prediction"]["user_entity_id"],
                     policy_version=self.POLICY_VERSION, evaluated_at=as_of.isoformat(),
-                    source_prediction_task_id=source_prediction_task_id,
                 )
                 service_id, action = self._model_db.save_user_proactive_service(payload)
                 saved.append({**item, "service_id": service_id, "status": payload["status"],
                               "save_action": action})
+            self._model_db.save_user_proactive_prediction_assessment(
+                prediction_id=case["prediction"]["id"],
+                user_entity_id=case["prediction"]["user_entity_id"],
+                input_signature=input_signature, evaluated_at=as_of.isoformat(),
+                decisions=[{"decision": item["decision"], "reason": item["reason"]} for item in results],
+            )
         self._log_event("services_saved", {
             "prediction_id": case["prediction"]["id"],
-            "source_prediction_task_id": source_prediction_task_id,
             "service_results": saved,
         })
         return saved
 
+    def _evaluation_input_signature(
+        self, case: Dict[str, Any], *, runtime_context: Dict[str, Any],
+        agent_capabilities: Dict[str, Any], as_of: datetime,
+    ) -> str:
+        """Compare evidence/context, excluding the clock and our own service writes."""
+        inputs = {key: value for key, value in case.items() if key != "existing_services"}
+        inputs.update(runtime_context=runtime_context, agent_capabilities=agent_capabilities)
+        window_start = self._as_datetime(case["prediction"].get("window_start"), as_of)
+        inputs["prediction_window_started"] = window_start is not None and window_start <= as_of
+        return hashlib.sha256(json.dumps(
+            inputs, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ).encode()).hexdigest()
+
+    def _service_evaluation_reason(
+        self, case: Dict[str, Any], *, input_signature: str, as_of: datetime,
+    ) -> Optional[str]:
+        prediction = case["prediction"]
+        previous = self._model_db.get_user_proactive_prediction_assessment(
+            prediction_id=prediction["id"], user_entity_id=prediction["user_entity_id"],
+        )
+        if previous is None:
+            return "not_evaluated"
+        if previous["input_signature"] != input_signature:
+            return "evidence_or_context_changed"
+        if any(
+            service["status"] == "waiting"
+            and (due := self._as_datetime(service.get("next_evaluate_at"), as_of)) is not None
+            and due <= as_of
+            for service in case["existing_services"]
+        ):
+            return "waiting_service_due"
+        return None
+
+    def _cleanup_proactive_service_lifecycle(
+        self, *, owner_id: int, open_services: Sequence[Dict[str, Any]],
+        active_predictions: Dict[int, Dict[str, Any]], as_of: datetime,
+    ) -> List[int]:
+        """Close services with ineffective sources or expired service windows.
+
+        This is deterministic maintenance, independent of LLM evaluation and
+        its per-call limit. Prediction records themselves are not changed.
+        """
+        source_ids = sorted({service["prediction_id"] for service in open_services})
+        sources = {row["id"]: row for row in self._model_db.get_user_predictions_by_ids(source_ids)}
+        closed_ids = []
+        for prediction_id in source_ids:
+            prediction = sources.get(prediction_id)
+            if not prediction or prediction.get("user_entity_id") != owner_id:
+                self._log_event("lifecycle_source_skipped", {
+                    "prediction_id": prediction_id, "reason": "missing_or_foreign_prediction",
+                })
+                continue
+            if prediction_id not in active_predictions:
+                ending = self._as_datetime(prediction.get("window_end"), as_of)
+                status = "expired" if prediction["status"] == "expired" or (
+                    prediction["status"] == "pending" and ending and ending <= as_of
+                ) else "cancelled"
+                closed = self._model_db.close_user_proactive_services(
+                    prediction_id=prediction_id, user_entity_id=owner_id, status=status,
+                    reason="Source prediction is no longer effective", as_of=as_of.isoformat(),
+                )
+                closed_ids.extend(closed)
+                self._log_event("services_closed_for_inactive_prediction", {
+                    "prediction_id": prediction_id, "prediction_status": prediction["status"],
+                    "closed_service_ids": closed, "closed_service_status": status,
+                    "as_of": as_of.isoformat(),
+                })
+                continue
+            expired = self._model_db.close_user_proactive_services(
+                prediction_id=prediction_id, user_entity_id=owner_id, status="expired",
+                reason="Service validity period ended", as_of=as_of.isoformat(), expired_only=True,
+            )
+            closed_ids.extend(expired)
+            if expired:
+                self._log_event("services_expired", {
+                    "prediction_id": prediction_id, "expired_service_ids": expired, "as_of": as_of.isoformat(),
+                })
+        return closed_ids
+
     def generate_proactive_services_from_predictions(
-        self, *, prediction_ids: Sequence[int], source_prediction_task_id: str = "",
-        runtime_context: Optional[Dict[str, Any]] = None,
+        self, *, runtime_context: Optional[Dict[str, Any]] = None,
         agent_capabilities: Optional[Dict[str, Any]] = None,
         reference_timestamp: Optional[Any] = None,
+        max_predictions: int = 10,
     ) -> Dict[str, Any]:
-        """Persist service opportunities; ready does not mean dispatched or delivered."""
+        """Shared-worker handler: evaluate a host tick and return current help.
+
+        Select effective forecasts and open-service sources internally.
+        Waiting services remain internal. Unchanged successful assessments are not
+        repeated unless a waiting service is due. Ready is not proof of delivery.
+        """
         started_at = time.monotonic()
         self._log_event("proactive_services_generation_start", {
-            "prediction_ids": prediction_ids, "source_prediction_task_id": source_prediction_task_id,
             "reference_timestamp": reference_timestamp,
             "runtime_context": runtime_context, "agent_capabilities": agent_capabilities,
         })
@@ -340,58 +481,59 @@ class UserProactiveService:
             ):
                 raise ValueError(f"Invalid capability list: {name}")
             capabilities[name] = sorted(set(values))
-        if any(type(value) is not int or value <= 0 for value in prediction_ids):
-            raise ValueError("prediction_ids must contain positive integer IDs")
-        ids = sorted(set(prediction_ids))
-        rows = {int(row["id"]): row for row in self._model_db.get_user_predictions_by_ids(ids)}
-        active = {int(row["id"]): row for row in self._prediction_reader(prediction_ids=ids, as_of=now)}
-        states = self._active_user_states(as_of=now, model_db=self._model_db) if active else []
+        if type(max_predictions) is not int or max_predictions <= 0:
+            raise ValueError("max_predictions must be a positive integer")
         owner_id = self._memory_db.get_entity_id_by_name(self._owner_name)
+        if owner_id is None:
+            return {"status": "empty", "assistance_items": [], "failed_predictions": []}
+        open_services = self._model_db.get_user_proactive_services(
+            user_entity_id=owner_id, statuses=["ready", "waiting"], limit=None,
+        )
+        active = {int(row["id"]): row for row in self._prediction_reader(as_of=now)}
+        closed_ids = self._cleanup_proactive_service_lifecycle(
+            owner_id=owner_id, open_services=open_services, active_predictions=active, as_of=now,
+        )
+        closed_set = set(closed_ids)
+        ids = sorted(active)
+        # Waiting service sources precede fresh forecasts; within each group,
+        # nearer behavior-window endings are evaluated first.
+        waiting_ids = {service["prediction_id"] for service in open_services
+                       if service["status"] == "waiting" and service["id"] not in closed_set}
+        ids.sort(key=lambda key: (
+            key not in waiting_ids,
+            (self._as_datetime(active[key].get("window_end"), now) or now).timestamp(),
+            key,
+        ))
+        states = self._active_user_states(as_of=now, model_db=self._model_db) if active else []
         self._log_event("predictions_loaded", {
-            "source_prediction_task_id": source_prediction_task_id,
-            "requested_prediction_ids": ids, "loaded_prediction_ids": sorted(rows),
+            "candidate_prediction_ids": ids,
             "active_prediction_ids": sorted(active), "owner_id": owner_id,
             "active_state_count": len(states), "as_of": now.isoformat(),
         })
-        results, failures, skipped, closed_ids, processed = [], [], [], [], []
+        results, failures, skipped, processed, assistance = [], [], [], [], []
+        attempts = 0
         for prediction_id in ids:
-            prediction = rows.get(prediction_id)
+            prediction = active[prediction_id]
             if not prediction or prediction.get("user_entity_id") != owner_id:
                 skipped.append({"prediction_id": prediction_id, "reason": "missing_or_foreign_prediction"})
                 self._log_event("prediction_skipped", skipped[-1])
                 continue
-            if prediction_id not in active:
-                ending = self._as_datetime(prediction.get("window_end"), now)
-                status = "expired" if prediction["status"] == "expired" or (
-                    prediction["status"] == "pending" and ending and ending <= now
-                ) else "cancelled"
-                closed = self._model_db.close_user_proactive_services(
-                    prediction_id=prediction_id, user_entity_id=owner_id, status=status,
-                    reason="Source prediction is no longer effective", as_of=now.isoformat(),
-                )
-                closed_ids.extend(closed)
-                self._log_event("prediction_skipped", {
-                    "prediction_id": prediction_id, "reason": "inactive_prediction",
-                    "prediction_status": prediction["status"], "window_end": prediction.get("window_end"),
-                    "closed_service_ids": closed, "closed_service_status": status,
-                    "as_of": now.isoformat(),
-                })
-                skipped.append({"prediction_id": prediction_id, "reason": "inactive_prediction"})
-                continue
-            expired = self._model_db.close_user_proactive_services(
-                prediction_id=prediction_id, user_entity_id=owner_id, status="expired",
-                reason="Service validity period ended", as_of=now.isoformat(), expired_only=True,
-            )
-            closed_ids.extend(expired)
-            if expired:
-                self._log_event("services_expired", {
-                    "prediction_id": prediction_id, "expired_service_ids": expired, "as_of": now.isoformat(),
-                })
             response = None
             evaluation_started_at = time.monotonic()
             stage = "build_inputs"
             try:
                 case = self._build_service_evaluation_input(prediction, states=states, as_of=now)
+                signature = self._evaluation_input_signature(
+                    case, runtime_context=context, agent_capabilities=capabilities, as_of=now,
+                )
+                reason = self._service_evaluation_reason(case, input_signature=signature, as_of=now)
+                if reason is None or attempts >= max_predictions:
+                    skipped.append({"prediction_id": prediction_id, "reason": (
+                        "assessment_unchanged" if reason is None else "evaluation_limit"
+                    )})
+                    continue
+                attempts += 1
+                self._log_event("evaluation_selected", {"prediction_id": prediction_id, "reason": reason})
                 stage = "llm_evaluation"
                 response = self._evaluate_with_llm(
                     case, as_of=now, runtime_context=context, agent_capabilities=capabilities,
@@ -401,9 +543,16 @@ class UserProactiveService:
                     response, case=case, as_of=now, runtime_context=context, agent_capabilities=capabilities,
                 )
                 stage = "save_services"
-                results.extend(self._save_service_results(
-                    normalized, case=case, as_of=now, source_prediction_task_id=source_prediction_task_id,
-                ))
+                saved = self._save_service_results(
+                    normalized, case=case, as_of=now,
+                    input_signature=signature,
+                )
+                results.extend(saved)
+                previous_ready = {item["id"] for item in case["existing_services"] if item["status"] == "ready"}
+                assistance.extend({
+                    "service_id": item["service_id"], "prediction_id": prediction_id,
+                    **item["service"], "reason": item["reason"], "expires_at": item["expires_at"],
+                } for item in saved if item.get("status") == "ready" and item["service_id"] not in previous_ready)
                 processed.append(prediction_id)
                 self._log_event("prediction_finished", {
                     "prediction_id": prediction_id, "status": "ok", "result_count": len(normalized),
@@ -411,15 +560,16 @@ class UserProactiveService:
                 })
             except Exception as exc:
                 self._logger.exception(
-                    "proactive service evaluation failed prediction_id=%s source_prediction_task_id=%s "
+                    "proactive service evaluation failed prediction_id=%s "
                     "stage=%s elapsed_ms=%.2f existing_unexpired_services_unchanged=True response=%s",
-                    prediction_id, source_prediction_task_id, stage,
+                    prediction_id, stage,
                     (time.monotonic() - evaluation_started_at) * 1000, response,
                 )
                 failures.append({"prediction_id": prediction_id, "error": f"{type(exc).__name__}: {exc}"})
         closed_ids.extend(item["service_id"] for item in results if item.get("status") == "cancelled")
         report = {
-            "status": "error" if failures else "ok" if processed or closed_ids else "empty",
+            "status": ("partial" if failures and (processed or closed_ids) else "error" if failures
+                       else "ok" if processed or closed_ids else "empty"),
             "evaluated_count": len(processed), "failed_count": len(failures),
             "processed_prediction_ids": processed,
             "new_service_ids": [item["service_id"] for item in results if item["save_action"] == "created"],
@@ -431,11 +581,11 @@ class UserProactiveService:
         }
         self._log_event("finish", {
             **{key: value for key, value in report.items() if key != "service_results"},
-            "source_prediction_task_id": source_prediction_task_id, "prediction_ids": ids,
+            "candidate_prediction_ids": ids,
             "result_count": len(results),
             "total_elapsed_ms": round((time.monotonic() - started_at) * 1000, 2),
         })
-        return report
+        return {"status": report["status"], "assistance_items": assistance, "failed_predictions": failures}
 
     def get_services(
         self, *, user_entity_id: Optional[int] = None, statuses: Optional[Sequence[str]] = None,

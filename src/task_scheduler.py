@@ -1,4 +1,4 @@
-"""FIFO execution and operation reporting for asynchronous memory tasks."""
+"""Priority execution and operation reporting; FIFO within each priority."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import queue
 import sqlite3
 import threading
 import time
+from concurrent.futures import Future
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence
 
@@ -296,7 +297,7 @@ class TaskOperationReporter:
 
 
 class TaskScheduler:
-    """Own the complete lifecycle of queued tasks on one FIFO worker."""
+    """Own queued tasks on one worker, with FIFO within each priority."""
 
     _FACT_FOLLOWUP_TASK_KINDS = (
         "memory_user_claim_update",
@@ -322,9 +323,10 @@ class TaskScheduler:
     ) -> None:
         self._operation_reporter = operation_reporter
         self._handlers: Dict[str, TaskHandler] = {}
-        self._queue: queue.Queue[Dict[str, Any]] = queue.Queue(
+        self._queue: queue.PriorityQueue = queue.PriorityQueue(
             maxsize=max(1, int(maxsize)),
         )
+        self._submission_sequence = 0
         self._logger = logger or logging.getLogger(__name__)
         self._worker_name = worker_name
         self._worker_thread: Optional[threading.Thread] = None
@@ -564,8 +566,19 @@ class TaskScheduler:
         *,
         completion_context: Optional[Dict[str, Any]] = None,
         report_payload: Optional[Dict[str, Any]] = None,
+        priority: Optional[int] = None,
+        result_future: Optional[Future] = None,
     ) -> Dict[str, Any]:
-        """Enqueue and report a task, or return a recorded rejection."""
+        """Enqueue a non-preemptive task; lower priority numbers run first.
+
+        Proactive service defaults to 0 (highest), other tasks to 10. Tasks
+        with equal priority execute in submission order.
+        """
+        resolved_priority = priority
+        if resolved_priority is None:
+            resolved_priority = 0 if task_kind == "user_proactive_policy_evaluation" else 10
+        if type(resolved_priority) is not int or resolved_priority < 0:
+            raise ValueError("priority must be a nonnegative integer")
         # Enqueueing must not wait for the worker's long-running LLM handler.
         # The worker still holds _execution_lock for its shared writer connection;
         # signal validation above uses its own read-only connection.
@@ -591,6 +604,8 @@ class TaskScheduler:
                 "task_id": task_id,
                 "started_at": time.monotonic(),
                 "completion_context": task_completion_context,
+                "priority": resolved_priority,
+                "result_future": result_future,
             }
             if self._queue.full():
                 return self._reject_locked(task_kind, task_id, "worker_queue_full")
@@ -657,10 +672,11 @@ class TaskScheduler:
                 self._prediction_reassessment_pending = True
             if task_kind == "user_prediction_window_expiration":
                 self._prediction_window_expiration_pending = True
-            self._queue.put_nowait(task)
+            self._submission_sequence += 1
+            self._queue.put_nowait((resolved_priority, self._submission_sequence, task))
             self._logger.info(
-                "scheduled task queued task_kind=%s task_id=%s queue_depth=%s",
-                task_kind, task_id, self._queue.qsize(),
+                "scheduled task queued task_kind=%s task_id=%s priority=%s queue_depth=%s",
+                task_kind, task_id, resolved_priority, self._queue.qsize(),
             )
             self._ensure_worker_locked()
         return {
@@ -669,6 +685,22 @@ class TaskScheduler:
             "task_id": task_id,
             "operation_type": task_kind,
         }
+
+    def submit_and_wait(
+        self, task_kind: str, payload: Dict[str, Any], *, timeout: Optional[float] = None,
+    ) -> Any:
+        """Wait for this task's result, without holding the worker execution lock.
+
+        A timeout stops waiting, not execution. A handler must not wait on its
+        own worker; background tasks should use submit instead.
+        """
+        if threading.current_thread() is self._worker_thread:
+            raise RuntimeError("Cannot wait for a queued task from its worker")
+        future = Future()
+        report = self.submit(task_kind, payload, result_future=future)
+        if not report.get("queued"):
+            raise RuntimeError(f"Task not queued: {report.get('reason')}")
+        return future.result(timeout=timeout)
 
     def reject(self, task_kind: str, reason: str) -> Dict[str, Any]:
         """Record a domain-level rejection before a task enters the queue."""
@@ -765,17 +797,20 @@ class TaskScheduler:
     def _worker_loop(self) -> None:
         while not self._shutdown_event.is_set() or not self._queue.empty():
             try:
-                task = self._queue.get(timeout=0.2)
+                _, _, task = self._queue.get(timeout=0.2)
             except queue.Empty:
                 continue
             try:
                 self._execute_scheduled_task(task)
-            except Exception:
+            except Exception as exc:
                 self._logger.exception(
                     "Scheduled task handler failed task_kind=%s task_id=%s",
                     task.get("kind"),
                     task.get("task_id"),
                 )
+                future = task.get("result_future")
+                if future is not None and not future.done():
+                    future.set_exception(exc)
             finally:
                 self._queue.task_done()
 
@@ -787,8 +822,8 @@ class TaskScheduler:
         error: Optional[BaseException] = None
         handler_started_at = time.monotonic()
         self._logger.info(
-            "scheduled task started task_kind=%s task_id=%s queue_wait_ms=%.1f",
-            task_kind, task_id,
+            "scheduled task started task_kind=%s task_id=%s priority=%s queue_wait_ms=%.1f",
+            task_kind, task_id, task.get("priority"),
             (handler_started_at - float(task["started_at"])) * 1000,
         )
         try:
@@ -865,6 +900,12 @@ class TaskScheduler:
             "scheduled task follow-up finished task_kind=%s task_id=%s queue_depth=%s",
             task_kind, task_id, self._queue.qsize(),
         )
+        future = task.get("result_future")
+        if future is not None and not future.done():
+            if error is not None:
+                future.set_exception(error)
+            else:
+                future.set_result(result)
 
     def trigger_user_prediction_time_tick(
         self, *, reference_timestamp: Optional[Any] = None,
@@ -1001,7 +1042,7 @@ class TaskScheduler:
         return self.trigger_user_state_update(drain=True)
 
     def submit_flush_fact_followup_tasks(self) -> Dict[str, Any]:
-        """Queue a FIFO boundary; resolve pending signals only when it executes."""
+        """Queue a normal-priority boundary; resolve signals when it executes."""
         return self.submit("memory_flush_fact_followups", {})
 
     def _process_flush_fact_followup_tasks(self) -> Dict[str, Any]:
@@ -1079,8 +1120,6 @@ class TaskScheduler:
             "user_state_update_from_user_claims": (
                 self._schedule_after_user_state_update_from_user_claims_task
             ),
-            "user_prediction_update_from_intent_events": self._schedule_after_user_prediction_task,
-            "user_prediction_reassessment": self._schedule_after_user_prediction_task,
         }
         schedule = schedulers.get(task_kind)
         if schedule is None:
@@ -1209,49 +1248,6 @@ class TaskScheduler:
                     )
             finally:
                 self._prediction_reassessment_pending = False
-
-    def _schedule_after_user_prediction_task(
-        self, event: Dict[str, Any], completion: Dict[str, Any],
-    ) -> None:
-        result = event.get("result")
-        if not event.get("succeeded") or not isinstance(result, dict):
-            return
-        new_prediction_ids = sorted({
-            int(item["id"])
-            for item in result.get("predictions") or []
-            if isinstance(item, dict)
-            and item.get("save_action") == "created"
-            and str(item.get("id") or "").isdigit()
-            and int(item["id"]) > 0
-        })
-        invalidated_prediction_ids = [
-            int(value) for value in result.get("invalidated_prediction_ids") or []
-            if str(value).isdigit() and int(value) > 0
-        ]
-        # Closing services for invalidated sources is cleanup, not a fresh LLM evaluation.
-        prediction_ids = sorted(set(new_prediction_ids + invalidated_prediction_ids))
-        if not prediction_ids:
-            return
-        reference_timestamp = (result.get("prediction_context") or {}).get("as_of")
-        report = self.submit(
-            "user_proactive_policy_evaluation",
-            {
-                "prediction_ids": prediction_ids,
-                "source_prediction_task_id": str(event.get("task_id") or ""),
-                "runtime_context": {},
-                "reference_timestamp": reference_timestamp,
-            },
-            report_payload={
-                "prediction_ids": prediction_ids,
-                "source_prediction_task_id": str(event.get("task_id") or ""),
-                "reference_timestamp": reference_timestamp,
-            },
-        )
-        if not report.get("queued"):
-            self._logger.warning(
-                "proactive policy evaluation was not queued prediction_ids=%s reason=%s",
-                prediction_ids, report.get("reason") or "unknown",
-            )
 
     def _postprocess_user_state_update_from_user_claims_task(
         self, event: Dict[str, Any],
