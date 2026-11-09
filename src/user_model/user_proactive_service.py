@@ -24,7 +24,7 @@ class UserProactiveService:
     """LLM policy owns service content/timing; execution belongs to a downstream Agent."""
 
     TASK_KIND = "user_proactive_policy_evaluation"
-    POLICY_VERSION = "llm_services_v2"
+    POLICY_VERSION = "llm_services_v4"
     SERVICE_TYPES = {"notify", "suggest", "clarify", "offer_assistance", "prepare", "delegate"}
 
     def __init__(
@@ -186,9 +186,9 @@ class UserProactiveService:
             )) for item in case["existing_services"]]
         return json.dumps(view, ensure_ascii=False)
 
-    def _evaluate_with_llm(self, case: Dict[str, Any], *, as_of: datetime,
+    def _evaluate_with_llm(self, cases: Sequence[Dict[str, Any]], *, as_of: datetime,
                            runtime_context: Dict[str, Any], agent_capabilities: Dict[str, Any]) -> Any:
-        source_text = self._format_evaluation_case_for_prompt(case)
+        source_text = "\n".join(self._format_evaluation_case_for_prompt(case) for case in cases)
         chinese = bool(re.search(r"[\u4e00-\u9fff]", source_text))
         prompt_template = (
             USER_PROACTIVE_POLICY_EVALUATION_PROMPT_ZH
@@ -197,14 +197,14 @@ class UserProactiveService:
         )
         prompt = prompt_template.format(
             as_of=as_of.isoformat(),
-            evaluation_case=source_text,
+            evaluation_cases=source_text,
             runtime_context=json.dumps(runtime_context, ensure_ascii=False),
             agent_capabilities=json.dumps(agent_capabilities, ensure_ascii=False),
         )
         started_at = time.monotonic()
-        prediction_id = case["prediction"]["id"]
+        prediction_ids = [case["prediction"]["id"] for case in cases]
         self._log_event("llm_started", {
-            "prediction_id": prediction_id, "as_of": as_of.isoformat(),
+            "prediction_ids": prediction_ids, "as_of": as_of.isoformat(),
             "prompt_language": "zh" if chinese else "en", "prompt_chars": len(prompt),
             "runtime_context": runtime_context, "agent_capabilities": agent_capabilities,
         })
@@ -214,13 +214,13 @@ class UserProactiveService:
             parsed = self._llm_client.parse_json_object_from_llm_text(raw or "", stage_name='user_proactive_policy_evaluation')
             if not isinstance(parsed, dict):
                 self._logger.error(
-                    "proactive service invalid JSON prediction_id=%s response=%r", prediction_id, raw,
+                    "proactive service invalid JSON prediction_ids=%s response=%r", prediction_ids, raw,
                 )
             return parsed
         except Exception:
             self._logger.exception(
-                "proactive service LLM call or parse failed prediction_id=%s elapsed_ms=%.2f response=%r",
-                prediction_id, (time.monotonic() - started_at) * 1000, raw,
+                "proactive service LLM call or parse failed prediction_ids=%s elapsed_ms=%.2f response=%r",
+                prediction_ids, (time.monotonic() - started_at) * 1000, raw,
             )
             raise
 
@@ -231,7 +231,7 @@ class UserProactiveService:
         if not isinstance(response, dict) or not isinstance(response.get("service_results"), list):
             raise ValueError("Proactive response must contain a service_results list")
         existing = {int(item["id"]): item for item in case["existing_services"]}
-        open_ids = {key for key, item in existing.items() if item["status"] in {"ready", "waiting"}}
+        open_ids = {key for key, item in existing.items() if item["status"] == "waiting"}
         seen_ids, seen_keys, results = set(), set(), []
 
         def future_time(value: Any) -> datetime:
@@ -321,8 +321,35 @@ class UserProactiveService:
                 seen_ids.add(service_id)
             results.append(item)
         if seen_ids != open_ids:
-            raise ValueError("Every open existing service must be explicitly updated or suppressed")
+            raise ValueError("Every waiting service must be explicitly updated or suppressed")
         return results
+
+    def _normalize_round_service_results(
+        self, response: Any, *, cases: Sequence[Dict[str, Any]], as_of: datetime,
+        runtime_context: Dict[str, Any], agent_capabilities: Dict[str, Any],
+    ) -> Dict[int, List[Dict[str, Any]]]:
+        """Validate the complete joint decision before writing any services."""
+        if not isinstance(response, dict) or not isinstance(response.get("service_results"), list):
+            raise ValueError("Proactive response must contain a service_results list")
+        grouped = {case["prediction"]["id"]: [] for case in cases}
+        for item in response["service_results"]:
+            if (not isinstance(item, dict) or type(item.get("prediction_id")) is not int
+                    or item["prediction_id"] not in grouped):
+                raise ValueError("Service references an unrelated prediction")
+            grouped[item["prediction_id"]].append(item)
+        normalized = {}
+        recommendation_count = 0
+        for case in cases:
+            prediction_id = case["prediction"]["id"]
+            results = self._normalize_service_results(
+                {"service_results": grouped[prediction_id]}, case=case, as_of=as_of,
+                runtime_context=runtime_context, agent_capabilities=agent_capabilities,
+            )
+            recommendation_count += sum(item["decision"] == "recommend_service" for item in results)
+            normalized[prediction_id] = results
+        if recommendation_count > 1:
+            raise ValueError("At most one service may be recommended per round, regardless of service type")
+        return normalized
 
     def _save_service_results(
         self, results: Sequence[Dict[str, Any]], *, case: Dict[str, Any], as_of: datetime,
@@ -453,7 +480,7 @@ class UserProactiveService:
     ) -> Dict[str, Any]:
         """Shared-worker handler: evaluate a host tick and return current help.
 
-        Select effective forecasts and open-service sources internally.
+        Jointly evaluate eligible forecasts and their waiting services in one LLM call.
         Waiting services remain internal. Unchanged successful assessments are not
         repeated unless a waiting service is due. Ready is not proof of delivery.
         """
@@ -510,7 +537,7 @@ class UserProactiveService:
             "active_prediction_ids": sorted(active), "owner_id": owner_id,
             "active_state_count": len(states), "as_of": now.isoformat(),
         })
-        results, failures, skipped, processed, assistance = [], [], [], [], []
+        results, failures, skipped, processed, assistance, evaluations = [], [], [], [], [], []
         attempts = 0
         for prediction_id in ids:
             prediction = active[prediction_id]
@@ -534,30 +561,7 @@ class UserProactiveService:
                     continue
                 attempts += 1
                 self._log_event("evaluation_selected", {"prediction_id": prediction_id, "reason": reason})
-                stage = "llm_evaluation"
-                response = self._evaluate_with_llm(
-                    case, as_of=now, runtime_context=context, agent_capabilities=capabilities,
-                )
-                stage = "normalize_response"
-                normalized = self._normalize_service_results(
-                    response, case=case, as_of=now, runtime_context=context, agent_capabilities=capabilities,
-                )
-                stage = "save_services"
-                saved = self._save_service_results(
-                    normalized, case=case, as_of=now,
-                    input_signature=signature,
-                )
-                results.extend(saved)
-                previous_ready = {item["id"] for item in case["existing_services"] if item["status"] == "ready"}
-                assistance.extend({
-                    "service_id": item["service_id"], "prediction_id": prediction_id,
-                    **item["service"], "reason": item["reason"], "expires_at": item["expires_at"],
-                } for item in saved if item.get("status") == "ready" and item["service_id"] not in previous_ready)
-                processed.append(prediction_id)
-                self._log_event("prediction_finished", {
-                    "prediction_id": prediction_id, "status": "ok", "result_count": len(normalized),
-                    "elapsed_ms": round((time.monotonic() - evaluation_started_at) * 1000, 2),
-                })
+                evaluations.append({"case": case, "input_signature": signature})
             except Exception as exc:
                 self._logger.exception(
                     "proactive service evaluation failed prediction_id=%s "
@@ -566,6 +570,56 @@ class UserProactiveService:
                     (time.monotonic() - evaluation_started_at) * 1000, response,
                 )
                 failures.append({"prediction_id": prediction_id, "error": f"{type(exc).__name__}: {exc}"})
+
+        if evaluations:
+            cases = [item["case"] for item in evaluations]
+            response = None
+            stage = "llm_evaluation"
+            try:
+                response = self._evaluate_with_llm(
+                    cases, as_of=now, runtime_context=context, agent_capabilities=capabilities,
+                )
+                stage = "normalize_response"
+                normalized = self._normalize_round_service_results(
+                    response, cases=cases, as_of=now,
+                    runtime_context=context, agent_capabilities=capabilities,
+                )
+                for evaluation in evaluations:
+                    evaluation["results"] = normalized[evaluation["case"]["prediction"]["id"]]
+                self._log_event("round_evaluated", {
+                    "prediction_ids": list(normalized),
+                    "result_count": sum(len(items) for items in normalized.values()),
+                })
+            except Exception as exc:
+                self._logger.exception(
+                    "Proactive joint evaluation failed stage=%s; services and assessments unchanged response=%s",
+                    stage, response,
+                )
+                failures.extend({
+                    "prediction_id": case["prediction"]["id"],
+                    "error": f"{type(exc).__name__}: {exc}", "stage": stage,
+                } for case in cases)
+                evaluations = []
+
+        for evaluation in evaluations:
+            case = evaluation["case"]
+            prediction_id = case["prediction"]["id"]
+            try:
+                saved = self._save_service_results(
+                    evaluation["results"], case=case, as_of=now, input_signature=evaluation["input_signature"],
+                )
+                results.extend(saved)
+                previous_ready = {item["id"] for item in case["existing_services"] if item["status"] == "ready"}
+                assistance.extend({
+                    "service_id": item["service_id"], "prediction_id": prediction_id,
+                    **item["service"], "reason": item["reason"], "expires_at": item["expires_at"],
+                } for item in saved if item.get("status") == "ready" and item["service_id"] not in previous_ready)
+                processed.append(prediction_id)
+                self._log_event("prediction_finished", {"prediction_id": prediction_id, "status": "ok",
+                                                       "result_count": len(saved)})
+            except Exception as exc:
+                self._logger.exception("Proactive service save failed prediction_id=%s", prediction_id)
+                failures.append({"prediction_id": prediction_id, "error": f"{type(exc).__name__}: {exc}", "stage": "save_services"})
         closed_ids.extend(item["service_id"] for item in results if item.get("status") == "cancelled")
         report = {
             "status": ("partial" if failures and (processed or closed_ids) else "error" if failures
