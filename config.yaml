@@ -152,6 +152,7 @@ personal_world_model:
         filename: memory_runtime.log
       memory_manager:
         filename: memory_manager.log
+        level: DEBUG  # 暂时启用 intent normalization 字段级诊断
       user_state:
         filename: user_state.log
       user_prediction:

@@ -10,7 +10,7 @@ import time
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence
 
-from memory.logging_utils import LogJSONEncoder
+from pwm_logging import as_pwm_logger
 from prompts_en import (
     USER_PREDICTION_REASSESSMENT_PROMPT_EN,
     USER_PREDICTION_GENERATED_FROM_NEW_INTENTS_PROMPT_EN,
@@ -50,7 +50,7 @@ class UserPrediction:
         self, *, db: UserMemoryDB, model_db: UserModelDB, llm_client: LLMClient,
         task_scheduler: TaskScheduler,
         world_owner_entity_name: str = "用户本人",
-        logger: Optional[logging.Logger] = None,
+        logger: Optional[logging.Logger | logging.LoggerAdapter] = None,
     ) -> None:
         self._user_memory_db = db
         self._model_db = model_db
@@ -60,7 +60,7 @@ class UserPrediction:
         self._world_owner_entity_id = int(self._user_memory_db.add_entity_names(
             [self._world_owner_entity_name]
         )[self._world_owner_entity_name])
-        self._logger = logger or logging.getLogger(__name__)
+        self._logger = as_pwm_logger(logger or logging.getLogger(__name__))
         task_scheduler.register_handler(
             self.NEW_INTENT_TRIGGERED_TASK_NAME, self.process_user_prediction_update_from_intent_events_task,
         )
@@ -70,19 +70,6 @@ class UserPrediction:
         task_scheduler.register_handler(
             self.WINDOW_EXPIRATION_TASK_NAME, self.process_user_prediction_window_expiration_task,
         )
-
-    def _log_info(self, scope: str, event: str, payload: Dict[str, Any]) -> None:
-        record = {"scope": scope, "event": event, "payload": payload}
-        try:
-            body = json.dumps(
-                record, ensure_ascii=False, sort_keys=False, indent=2, cls=LogJSONEncoder,
-            )
-        except (TypeError, ValueError):
-            body = json.dumps(
-                {"scope": scope, "event": event, "payload": str(payload)},
-                ensure_ascii=False, sort_keys=False, indent=2,
-            )
-        self._logger.info("\n%s", body)
 
     @staticmethod
     def _as_datetime(value: Any, reference: datetime) -> Optional[datetime]:
@@ -236,7 +223,7 @@ class UserPrediction:
             if parsed is None:
                 raise ValueError("Invalid prediction expiration reference_timestamp")
             reference = parsed
-        self._log_info(self.WINDOW_EXPIRATION_TASK_NAME, "window_expiration_start", {
+        self._logger.log_json_format(self.WINDOW_EXPIRATION_TASK_NAME, "window_expiration_start", {
             "as_of": reference.isoformat(), "owner_id": self._world_owner_entity_id,
         })
         try:
@@ -253,7 +240,7 @@ class UserPrediction:
             "status": "ok" if expired["expired_prediction_ids"] or expired["expired_service_ids"] else "empty",
             "reference_timestamp": reference.isoformat(), **expired,
         }
-        self._log_info(self.WINDOW_EXPIRATION_TASK_NAME, "window_expiration_finish", {
+        self._logger.log_json_format(self.WINDOW_EXPIRATION_TASK_NAME, "window_expiration_finish", {
             **report, "elapsed_ms": round((time.monotonic() - started_at) * 1000, 2),
         })
         return report
@@ -283,7 +270,7 @@ class UserPrediction:
         due = self._model_db.get_user_prediction_reassessment_schedules(
             user_entity_id=owner_id, due_at=now.isoformat(),
         )
-        self._log_info(self.TIME_TICK_TRIGGERED_TASK_NAME, "reassessment_start", {
+        self._logger.log_json_format(self.TIME_TICK_TRIGGERED_TASK_NAME, "reassessment_start", {
             "as_of": now.isoformat(), "horizon_end": end.isoformat(), "due_count": len(due),
             "assessment_ids": [item["id"] for item in due],
         })
@@ -323,7 +310,7 @@ class UserPrediction:
                         if (self._as_datetime(item.get("window_end"), now) or now) > now],
                 })
             states = self._get_prediction_recurring_states(as_of=now, horizon_end=end) if cases else []
-            self._log_info(self.TIME_TICK_TRIGGERED_TASK_NAME, "reassessment_inputs_loaded", {
+            self._logger.log_json_format(self.TIME_TICK_TRIGGERED_TASK_NAME, "reassessment_inputs_loaded", {
                 "cases": cases, "recurring_states": states,
             })
             predictions, assessments = self._reassess_predictions_with_llm(
@@ -362,7 +349,7 @@ class UserPrediction:
         except Exception as exc:
             self._logger.exception("Prediction reassessment failed as_of=%s schedules_preserved=True", now.isoformat())
             report.update(status="error", error=f"{type(exc).__name__}: {exc}")
-        self._log_info(self.TIME_TICK_TRIGGERED_TASK_NAME, "reassessment_finish", {
+        self._logger.log_json_format(self.TIME_TICK_TRIGGERED_TASK_NAME, "reassessment_finish", {
             **report, "elapsed_ms": round((time.monotonic() - started_at) * 1000, 2),
         })
         return report
@@ -434,12 +421,12 @@ class UserPrediction:
         """Route latest intents to creation, change review, or deterministic cleanup."""
         started_at = time.monotonic()
         event_ids = sorted({int(value) for value in intent_event_ids if int(value) > 0})
-        self._log_info(self.NEW_INTENT_TRIGGERED_TASK_NAME, "user_prediction_update_start", {
+        self._logger.log_json_format(self.NEW_INTENT_TRIGGERED_TASK_NAME, "user_prediction_update_start", {
             "intent_event_ids": event_ids, "reference_timestamp": reference_timestamp,
             "horizon_hours": horizon_hours,
         })
         if not event_ids:
-            self._log_info(self.NEW_INTENT_TRIGGERED_TASK_NAME, "user_prediction_update_finish", {
+            self._logger.log_json_format(self.NEW_INTENT_TRIGGERED_TASK_NAME, "user_prediction_update_finish", {
                 "status": "empty", "reason": "no_intent_events",
                 "total_elapsed_ms": round((time.monotonic() - started_at) * 1000, 2),
             })
@@ -463,7 +450,7 @@ class UserPrediction:
                                    event_ids, now.isoformat())
             raise
         states = snapshot["recurring_states"]
-        self._log_info(self.NEW_INTENT_TRIGGERED_TASK_NAME, "inputs_loaded", {
+        self._logger.log_json_format(self.NEW_INTENT_TRIGGERED_TASK_NAME, "inputs_loaded", {
             "intent_event_ids": event_ids, "owner_id": owner_id,
             "horizon_start": now.isoformat(), "horizon_end": end.isoformat(),
             "intent_cases": [{
@@ -512,7 +499,7 @@ class UserPrediction:
                 retained_prediction_ids.extend(retained)
                 assessments.extend(assessed)
                 processed_event_ids.extend(selected_events)
-                self._log_info(self.NEW_INTENT_TRIGGERED_TASK_NAME, "intent_path_results_saved", {
+                self._logger.log_json_format(self.NEW_INTENT_TRIGGERED_TASK_NAME, "intent_path_results_saved", {
                     "processing_path": path, "intent_event_ids": selected_events,
                     "intent_ids": [case["current_intent"]["id"] for case in cases],
                     **committed, "retained_prediction_ids": retained, "prediction_assessments": assessed,
@@ -532,7 +519,7 @@ class UserPrediction:
             or any(expired.values()) or any(item["decision"] == "defer" for item in assessments) else "empty"
         )
         error = "; ".join(item["error"] for item in failures)
-        self._log_info(self.NEW_INTENT_TRIGGERED_TASK_NAME, "finish", {
+        self._logger.log_json_format(self.NEW_INTENT_TRIGGERED_TASK_NAME, "finish", {
             "status": status, "intent_event_ids": event_ids, "prediction_count": len(saved),
             "retained_prediction_ids": retained_prediction_ids,
             "invalidated_prediction_ids": invalidated_prediction_ids,
@@ -669,7 +656,7 @@ class UserPrediction:
             states=json.dumps(states, ensure_ascii=False),
         )
         started_at = time.monotonic()
-        self._log_info(self.NEW_INTENT_TRIGGERED_TASK_NAME, "llm_started", {
+        self._logger.log_json_format(self.NEW_INTENT_TRIGGERED_TASK_NAME, "llm_started", {
             "stage": "created", "intent_ids": [case["current_intent"]["id"] for case in cases],
             "prompt_language": "zh" if chinese else "en", "prompt_chars": len(prompt),
             "state_ids": [state["id"] for state in states],
@@ -805,7 +792,7 @@ class UserPrediction:
             states=json.dumps(states, ensure_ascii=False),
         )
         started_at = time.monotonic()
-        self._log_info(self.NEW_INTENT_TRIGGERED_TASK_NAME, "llm_started", {
+        self._logger.log_json_format(self.NEW_INTENT_TRIGGERED_TASK_NAME, "llm_started", {
             "stage": "updated", "intent_ids": [case["current_intent"]["id"] for case in cases],
             "existing_prediction_ids": [item["id"] for case in cases for item in case["existing_predictions"]],
             "prompt_language": "zh" if chinese else "en", "prompt_chars": len(prompt),
@@ -825,7 +812,7 @@ class UserPrediction:
                 cases=cases, states=states,
                 as_of=as_of, horizon_end=horizon_end,
             )
-            self._log_info(self.NEW_INTENT_TRIGGERED_TASK_NAME, "llm_finished", {
+            self._logger.log_json_format(self.NEW_INTENT_TRIGGERED_TASK_NAME, "llm_finished", {
                 "stage": "updated", "intent_ids": [case["current_intent"]["id"] for case in cases],
                 "prediction_count": len(predictions), "retained_prediction_ids": retained,
                 "proposed_invalidated_prediction_ids": sorted({

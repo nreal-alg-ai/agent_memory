@@ -2,12 +2,72 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import sys
 import uuid
+from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Mapping, Optional
+
+
+@dataclass(frozen=True)
+class CompactLogValue:
+    """Render this value on one line within an otherwise indented JSON record."""
+
+    value: Any
+
+
+class LogJSONEncoder(json.JSONEncoder):
+    """Honor business-selected compact values without inspecting field names."""
+
+    def encode(self, value: Any) -> str:
+        compact_values = {}
+
+        def serialize(item: Any) -> str:
+            if isinstance(item, CompactLogValue):
+                marker = f"__compact_log_{uuid.uuid4().hex}__"
+                compact_values[marker] = json.dumps(
+                    item.value, ensure_ascii=self.ensure_ascii, default=str,
+                )
+                return marker
+            return str(item)
+
+        body = json.JSONEncoder(
+            ensure_ascii=self.ensure_ascii, sort_keys=self.sort_keys,
+            indent=self.indent, default=serialize,
+        ).encode(value)
+        for marker, compact in compact_values.items():
+            body = body.replace(json.dumps(marker), compact)
+        return body
+
+
+class PWMLogger(logging.LoggerAdapter):
+    """Add structured records while retaining standard logging methods and routing."""
+
+    def log_json_format(
+        self, scope: str, event: str, payload: Any, *, level: int = logging.INFO,
+    ) -> None:
+        """Write a structured record, checking its logging level before rendering."""
+        if not self.isEnabledFor(level):
+            return
+        try:
+            body = json.dumps(
+                {"scope": scope, "event": event, "payload": payload},
+                ensure_ascii=False, sort_keys=False, indent=2, cls=LogJSONEncoder,
+            )
+        except (TypeError, ValueError):
+            body = json.dumps(
+                {"scope": scope, "event": event, "payload": str(payload)},
+                ensure_ascii=False, sort_keys=False, indent=2,
+            )
+        self.log(level, "\n%s", body, stacklevel=2)
+
+
+def as_pwm_logger(logger: logging.Logger | logging.LoggerAdapter) -> PWMLogger:
+    """Wrap without installing handlers or taking ownership of the supplied logger."""
+    return logger if isinstance(logger, PWMLogger) else PWMLogger(logger, {})
 
 
 class PWMLoggingManager:
@@ -28,7 +88,7 @@ class PWMLoggingManager:
         modules = settings.get("modules", {})
         if not isinstance(modules, Mapping) or set(modules) - set(self.MODULES):
             raise ValueError("PWM logging.modules must contain only known module names")
-        self._loggers: dict[str, logging.Logger] = {}
+        self._loggers: dict[str, PWMLogger] = {}
         self._closed = False
         namespace = f"pwm.{uuid.uuid4().hex}"
         formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -45,7 +105,7 @@ class PWMLoggingManager:
                 # as well as handler collisions between users and successive runs.
                 logger = logging.Logger(f"{namespace}.{module}", level=level)
                 logger.propagate = False
-                self._loggers[module] = logger
+                self._loggers[module] = as_pwm_logger(logger)
                 if not self._boolean(options.get("enabled", True), "enabled"):
                     logger.addHandler(logging.NullHandler())
                     continue
@@ -80,7 +140,7 @@ class PWMLoggingManager:
             raise ValueError(f"PWM logging.{field} must be a boolean")
         return value
 
-    def get_logger(self, module: str) -> logging.Logger:
+    def get_logger(self, module: str) -> PWMLogger:
         if self._closed:
             raise RuntimeError("PWM loggers are closed")
         return self._loggers[module]
@@ -91,8 +151,8 @@ class PWMLoggingManager:
             return
         self._closed = True
         for logger in self._loggers.values():
-            for handler in list(logger.handlers):
-                logger.removeHandler(handler)
+            for handler in list(logger.logger.handlers):
+                logger.logger.removeHandler(handler)
                 try:
                     handler.flush()
                 finally:

@@ -9,7 +9,6 @@ turns or transcript segments into typed Manager-facing memory units.
 from __future__ import annotations
 
 import logging
-import json
 import re
 from datetime import datetime
 from difflib import SequenceMatcher
@@ -26,6 +25,7 @@ from .memory_manager import (
     _to_timestamp_text,
 )
 from llm_client import LLMClient
+from pwm_logging import CompactLogValue, as_pwm_logger
 from task_scheduler import TaskScheduler
 from .memory_context_manager import (
     FactExtractionTaskDecision,
@@ -58,11 +58,11 @@ class MemoryRuntime:
         memory_runtime_config: Optional[Dict[str, Any]] = None,
         memory_manager_config: Optional[Dict[str, Any]] = None,
         embedding_config: Optional[Dict[str, Any]] = None,
-        logger: Optional[logging.Logger] = None,
-        memory_manager_logger: Optional[logging.Logger] = None,
+        logger: Optional[logging.Logger | logging.LoggerAdapter] = None,
+        memory_manager_logger: Optional[logging.Logger | logging.LoggerAdapter] = None,
     ) -> None:
         """Initialize input batching around already-composed shared resources."""
-        self._logger = logger or logging.getLogger(__name__)
+        self._logger = as_pwm_logger(logger or logging.getLogger(__name__))
         manager_config = dict(memory_manager_config or {})
         runtime_config = dict(memory_runtime_config or {})
         if Path(db_path).expanduser().resolve() != database.db_path.expanduser().resolve():
@@ -548,7 +548,7 @@ class MemoryRuntime:
                 for tag in unit.tags
                 if tag is not None and str(tag).strip()
             }
-            self._log_info(
+            self._logger.log_json_format(
                 "memory_runtime",
                 "memory_input_batch_detail",
                 {
@@ -606,50 +606,6 @@ class MemoryRuntime:
         finally:
             if not queued:
                 self._memory_context_manager.restore_pending_units(pending_units)
-
-    def _log_info(self, scope: str, event: str, payload: Dict[str, Any]) -> None:
-        """Emit a structured JSON log record for runtime diagnostics."""
-        record = {
-            "scope": scope,
-            "event": event,
-            "payload": payload,
-        }
-        try:
-            body = json.dumps(
-                record,
-                ensure_ascii=False,
-                sort_keys=False,
-                indent=2,
-                default=str,
-            )
-            # Keep the record indented, but render each unit as one JSON object line.
-            for field in ("preceding_context_units", "units"):
-                items = payload.get(field)
-                if not isinstance(items, list) or not items:
-                    continue
-                expanded = json.dumps(
-                    items, ensure_ascii=False, indent=2, default=str,
-                ).replace("\n", "\n    ")
-                compact = "[\n" + ",\n".join(
-                    "      " + json.dumps(item, ensure_ascii=False, default=str)
-                    for item in items
-                ) + "\n    ]"
-                field_prefix = json.dumps(field) + ": "
-                body = body.replace(
-                    field_prefix + expanded, field_prefix + compact, 1,
-                )
-        except (TypeError, ValueError):
-            body = json.dumps(
-                {
-                    "scope": scope,
-                    "event": event,
-                    "payload": str(payload),
-                },
-                ensure_ascii=False,
-                sort_keys=False,
-                indent=2,
-            )
-        self._logger.info("\n%s", body)
 
     def trigger_memory_recall(
         self,
@@ -728,17 +684,17 @@ class MemoryRuntime:
         )
 
     @staticmethod
-    def _memory_units_log_view(units: Sequence[MemoryUnit]) -> List[Dict[str, Any]]:
+    def _memory_units_log_view(units: Sequence[MemoryUnit]) -> List[CompactLogValue]:
         """Return structured task-unit details without Runtime embeddings."""
         return [
-            {
+            CompactLogValue({
                 "unit_type": unit.unit_type,
                 "speakers": list(unit.speakers or []),
                 "texts": list(unit.texts or []),
                 "started_ats": list(unit.started_ats or []),
                 "ended_ats": list(unit.ended_ats or []),
                 "tags": list(unit.tags or []),
-            }
+            })
             for unit in units or []
             if _compact_whitespace(unit.text)
         ]

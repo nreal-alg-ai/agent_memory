@@ -10,7 +10,7 @@ import time
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-from memory.logging_utils import LogJSONEncoder
+from pwm_logging import as_pwm_logger
 
 if TYPE_CHECKING:
     from llm_client import LLMClient
@@ -34,7 +34,7 @@ class UserProactiveService:
         prediction_reader: Callable[..., List[Dict[str, Any]]], task_scheduler: TaskScheduler,
         llm_client: LLMClient,
         world_owner_entity_name: str = "用户本人",
-        logger: Optional[logging.Logger] = None,
+        logger: Optional[logging.Logger | logging.LoggerAdapter] = None,
     ) -> None:
         self._model_db = model_db
         self._memory_db = memory_db
@@ -43,21 +43,8 @@ class UserProactiveService:
         self._owner_entity_id = self._memory_db.get_entity_id_by_name(self._owner_name)
         self._task_scheduler = task_scheduler
         self._llm_client = llm_client
-        self._logger = logger or logging.getLogger(__name__)
+        self._logger = as_pwm_logger(logger or logging.getLogger(__name__))
         task_scheduler.register_handler(self.TASK_KIND, self.generate_proactive_services_from_predictions)
-
-    def _log_info(self, scope: str, event: str, payload: Dict[str, Any]) -> None:
-        record = {"scope": scope, "event": event, "payload": payload}
-        try:
-            body = json.dumps(
-                record, ensure_ascii=False, sort_keys=False, indent=2, cls=LogJSONEncoder,
-            )
-        except (TypeError, ValueError):
-            body = json.dumps(
-                {"scope": scope, "event": event, "payload": str(payload)},
-                ensure_ascii=False, sort_keys=False, indent=2,
-            )
-        self._logger.info("\n%s", body)
 
     @staticmethod
     def _as_datetime(value: Any, reference: datetime) -> Optional[datetime]:
@@ -134,7 +121,7 @@ class UserProactiveService:
                         prediction_id=int(prediction["id"]), observed_before=as_of.isoformat(), limit=20,
                     ),
                 }
-                self._log_info(self.TASK_KIND, "inputs_loaded", {
+                self._logger.log_json_format(self.TASK_KIND, "inputs_loaded", {
                     "prediction": {key: prediction.get(key) for key in (
                         "id", "behavior_text", "window_start", "window_end", "conditions",
                         "likelihood_band", "uncertainties", "rationale",
@@ -151,7 +138,7 @@ class UserProactiveService:
                 reason = "waiting_service_reassessment" if any(
                     service["status"] == "waiting" for service in case["existing_services"]
                 ) else "new_prediction"
-                self._log_info(self.TASK_KIND, "evaluation_selected", {
+                self._logger.log_json_format(self.TASK_KIND, "evaluation_selected", {
                     "prediction_id": prediction["id"], "reason": reason,
                 })
                 prediction_cases.append(case)
@@ -292,7 +279,7 @@ class UserProactiveService:
             "agent_note": agent_note, "observed_at": observed.isoformat(), "context": context,
         }
         payload["id"] = self._model_db.insert_user_proactive_service_feedback(payload)
-        self._log_info("proactive_service_feedback", "service_feedback_recorded", {
+        self._logger.log_json_format("proactive_service_feedback", "service_feedback_recorded", {
             "feedback_id": payload["id"], "service_id": service_id,
             "execution_id": payload["execution_id"], "execution_status": execution_status,
             "user_response": user_response, "observed_at": payload["observed_at"],
@@ -325,7 +312,7 @@ class UserProactiveService:
         )
         started_at = time.monotonic()
         prediction_ids = [case["prediction"]["id"] for case in cases]
-        self._log_info(self.TASK_KIND, "llm_started", {
+        self._logger.log_json_format(self.TASK_KIND, "llm_started", {
             "prediction_ids": prediction_ids, "as_of": as_of.isoformat(),
             "prompt_language": "zh" if chinese else "en", "prompt_chars": len(prompt),
             "runtime_context": runtime_context, "agent_capabilities": agent_capabilities,
@@ -507,7 +494,7 @@ class UserProactiveService:
                 user_entity_id=case["prediction"]["user_entity_id"],
                 evaluated_at=as_of.isoformat(),
             )
-        self._log_info(self.TASK_KIND, "services_saved", {
+        self._logger.log_json_format(self.TASK_KIND, "services_saved", {
             "prediction_id": case["prediction"]["id"],
             "service_results": saved,
         })
@@ -557,7 +544,7 @@ class UserProactiveService:
         for prediction_id in source_ids:
             prediction = sources.get(prediction_id)
             if not prediction or prediction.get("user_entity_id") != self._owner_entity_id:
-                self._log_info(self.TASK_KIND, "lifecycle_source_skipped", {
+                self._logger.log_json_format(self.TASK_KIND, "lifecycle_source_skipped", {
                     "prediction_id": prediction_id, "reason": "missing_or_foreign_prediction",
                 })
                 continue
@@ -571,7 +558,7 @@ class UserProactiveService:
                     reason="Source prediction is no longer effective", as_of=as_of.isoformat(),
                 )
                 closed_ids.extend(closed)
-                self._log_info(self.TASK_KIND, "services_closed_for_inactive_prediction", {
+                self._logger.log_json_format(self.TASK_KIND, "services_closed_for_inactive_prediction", {
                     "prediction_id": prediction_id, "prediction_status": prediction["status"],
                     "closed_service_ids": closed, "closed_service_status": status,
                     "as_of": as_of.isoformat(),
@@ -583,7 +570,7 @@ class UserProactiveService:
             )
             closed_ids.extend(expired)
             if expired:
-                self._log_info(self.TASK_KIND, "services_expired", {
+                self._logger.log_json_format(self.TASK_KIND, "services_expired", {
                     "prediction_id": prediction_id, "expired_service_ids": expired, "as_of": as_of.isoformat(),
                 })
         return closed_ids
@@ -602,7 +589,7 @@ class UserProactiveService:
         a waiting service are not reselected. Ready is not proof of delivery.
         """
         started_at = time.monotonic()
-        self._log_info(self.TASK_KIND, "proactive_services_generation_start", {
+        self._logger.log_json_format(self.TASK_KIND, "proactive_services_generation_start", {
             "reference_timestamp": reference_timestamp,
             "runtime_context": runtime_context, "agent_capabilities": agent_capabilities,
         })
@@ -638,7 +625,7 @@ class UserProactiveService:
         # Preserve the pending query's waiting-first, nearer-window ordering.
         ids = [prediction_id for prediction_id in candidate_ids if prediction_id in active]
         states = self._active_user_states(as_of=now, model_db=self._model_db) if ids else []
-        self._log_info(self.TASK_KIND, "predictions_loaded", {
+        self._logger.log_json_format(self.TASK_KIND, "predictions_loaded", {
             "candidate_prediction_ids": ids,
             "pending_prediction_ids": candidate_ids,
             "active_prediction_ids": sorted(active), "owner_id": self._owner_entity_id,
@@ -650,7 +637,7 @@ class UserProactiveService:
             prediction = active[prediction_id]
             if not prediction or prediction.get("user_entity_id") != self._owner_entity_id:
                 skipped.append({"prediction_id": prediction_id, "reason": "missing_or_foreign_prediction"})
-                self._log_info(self.TASK_KIND, "prediction_skipped", skipped[-1])
+                self._logger.log_json_format(self.TASK_KIND, "prediction_skipped", skipped[-1])
                 continue
             if len(predictions) >= max_predictions:
                 skipped.append({"prediction_id": prediction_id, "reason": "evaluation_limit"})
@@ -674,7 +661,7 @@ class UserProactiveService:
                     response, cases=prediction_cases, as_of=now,
                     runtime_context=context, agent_capabilities=capabilities,
                 )
-                self._log_info(self.TASK_KIND, "round_evaluated", {
+                self._logger.log_json_format(self.TASK_KIND, "round_evaluated", {
                     "prediction_ids": list(normalized),
                     "result_count": sum(len(items) for items in normalized.values()),
                 })
@@ -702,7 +689,7 @@ class UserProactiveService:
                     **item["service"], "reason": item["reason"], "expires_at": item["expires_at"],
                 } for item in saved if item.get("status") == "ready" and item["service_id"] not in previous_ready)
                 processed.append(prediction_id)
-                self._log_info(self.TASK_KIND, "prediction_finished", {"prediction_id": prediction_id, "status": "ok",
+                self._logger.log_json_format(self.TASK_KIND, "prediction_finished", {"prediction_id": prediction_id, "status": "ok",
                                                        "result_count": len(saved)})
             except Exception as exc:
                 self._logger.exception("Proactive service save failed prediction_id=%s", prediction_id)
@@ -720,7 +707,7 @@ class UserProactiveService:
             "closed_service_ids": sorted(set(closed_ids)),
             "skipped_predictions": skipped, "failed_predictions": failures, "service_results": results,
         }
-        self._log_info(self.TASK_KIND, "finish", {
+        self._logger.log_json_format(self.TASK_KIND, "finish", {
             **{key: value for key, value in report.items() if key != "service_results"},
             "candidate_prediction_ids": ids,
             "result_count": len(results),
@@ -736,7 +723,7 @@ class UserProactiveService:
         services = self._model_db.get_user_proactive_services(
             user_entity_id=user_entity_id, statuses=statuses, limit=limit,
         )
-        self._log_info(self.TASK_KIND, "services_read", {
+        self._logger.log_json_format(self.TASK_KIND, "services_read", {
             "user_entity_id": user_entity_id, "statuses": statuses, "limit": limit,
             "service_ids": [item["id"] for item in services],
         })
