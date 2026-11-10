@@ -13,6 +13,7 @@ import re
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Sequence
 
+from semantic_domains import SEMANTIC_DOMAINS
 from prompts_en import (
     USER_STATE_UPDATE_FROM_USER_THREAD_PROMPT_EN,
     USER_STATE_UPDATE_FROM_USER_CLAIM_PROMPT_EN,
@@ -37,10 +38,7 @@ class UserStateResolver:
     RESOLVER_VERSION = "user_state_incremental_v1"
     CLAIM_RESOLVER_VERSION = "user_claim_state_only_v1"
     STATE_TYPES = {"enduring_state", "recurring_state", "situational_state"}
-    STATE_DOMAINS = {
-        "general", "health", "work", "life", "information", "finance",
-        "family", "learning", "social", "interest", "travel",
-    }
+    STATE_DOMAINS = SEMANTIC_DOMAINS
     STATE_KINDS_BY_TYPE = {
         "enduring_state": {
             "communication_style",

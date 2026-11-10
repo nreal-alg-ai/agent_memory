@@ -6,7 +6,7 @@ import json
 import sqlite3
 import threading
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from functools import wraps
 from pathlib import Path
 from typing import Any, Dict, List, Sequence, Tuple
@@ -14,6 +14,13 @@ from typing import Any, Dict, List, Sequence, Tuple
 
 def _now() -> str:
     return datetime.now().astimezone().isoformat()
+
+
+def _timestamp(value: Any) -> datetime:
+    parsed = value if isinstance(value, datetime) else datetime.fromisoformat(
+        str(value).strip().replace("Z", "+00:00")
+    )
+    return parsed if parsed.tzinfo is not None else parsed.astimezone()
 
 
 def _ids(value: Any) -> List[int]:
@@ -35,20 +42,19 @@ def _locked(method):
 class TaskExecutionDB:
     """One row per producer task; memory.db owns the referenced content."""
 
+    # Signal target -> (batch table, pending IDs column, processed column).
     _SIGNAL_BATCHES = {
-        "claim": "user_claim_signal_consolidation_task_info",
-        "intent": "user_intent_signal_consolidation_task_info",
-        "action": "user_action_signal_consolidation_task_info",
-    }
-    _PENDING_COLUMNS = {
-        "explicit_user_claim": (
-            "claim", "pending_user_claim_signal_ids", "processed_explicit_user_claim",
+        "user_claim_signal": (
+            "user_claim_signal_consolidation_task_info",
+            "pending_user_claim_signal_ids", "processed_explicit_user_claim",
         ),
-        "user_intent_update": (
-            "intent", "pending_user_intent_signal_ids", "processed_user_intent",
+        "user_intent_signal": (
+            "user_intent_signal_consolidation_task_info",
+            "pending_user_intent_signal_ids", "processed_user_intent",
         ),
-        "user_action_signal_consolidation": (
-            "action", "pending_user_action_signal_ids", "processed_user_action",
+        "user_action_signal": (
+            "user_action_signal_consolidation_task_info",
+            "pending_user_action_signal_ids", "processed_user_action",
         ),
     }
 
@@ -111,6 +117,7 @@ class TaskExecutionDB:
                 signal_ids TEXT NOT NULL DEFAULT '[]',
                 pending_user_claim_signal_ids TEXT NOT NULL DEFAULT '[]',
                 processed_explicit_user_claim INTEGER NOT NULL DEFAULT 0,
+                source_time_end TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -124,6 +131,7 @@ class TaskExecutionDB:
                 signal_ids TEXT NOT NULL DEFAULT '[]',
                 pending_user_intent_signal_ids TEXT NOT NULL DEFAULT '[]',
                 processed_user_intent INTEGER NOT NULL DEFAULT 0,
+                source_time_end TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -165,18 +173,14 @@ class TaskExecutionDB:
                 "UPDATE user_thread_activity_progress SET status='pending',run_id=NULL,task_id=NULL "
                 "WHERE status='queued'"
             )
-            for signal_type, table in self._SIGNAL_BATCHES.items():
-                _, pending_column, processed_column = next(
-                    columns for columns in self._PENDING_COLUMNS.values()
-                    if columns[0] == signal_type
-                )
+            for table, pending_column, processed_column in self._SIGNAL_BATCHES.values():
                 self._conn.execute(
                     f"UPDATE {table} SET {processed_column}=0 "
                     f"WHERE {processed_column}=1 AND {pending_column} != '[]'"
                 )
         self._registered_signal_ids = {
-            signal_type: self._load_registered_signal_ids(table)
-            for signal_type, table in self._SIGNAL_BATCHES.items()
+            target: self._load_registered_signal_ids(table)
+            for target, (table, _, _) in self._SIGNAL_BATCHES.items()
         }
 
     @_locked
@@ -293,11 +297,12 @@ class TaskExecutionDB:
         return registered
 
     def _register_signal_batch(
-        self, signal_type: str, signal_ids: Sequence[int], source_task_id: str,
+        self, target: str, signal_ids: Sequence[int], source_task_id: str,
+        source_time_end: str,
     ) -> List[int]:
-        table = self._SIGNAL_BATCHES[signal_type]
+        table, _, _ = self._SIGNAL_BATCHES[target]
         new_ids = sorted(
-            set(_ids(signal_ids)) - self._registered_signal_ids[signal_type]
+            set(_ids(signal_ids)) - self._registered_signal_ids[target]
         )
         if not new_ids:
             return []
@@ -306,7 +311,7 @@ class TaskExecutionDB:
             f"SELECT * FROM {table} WHERE source_task_id = ?", (source,),
         ).fetchone()
         now = _now()
-        if signal_type == "claim":
+        if target == "user_claim_signal":
             if existing:
                 all_ids = _ids(existing["signal_ids"]) + new_ids
                 explicit = _ids(existing["pending_user_claim_signal_ids"]) + new_ids
@@ -322,11 +327,11 @@ class TaskExecutionDB:
                 self._conn.execute(
                     f"""INSERT INTO {table}
                         (source_task_id, signal_ids, pending_user_claim_signal_ids,
-                         created_at, updated_at)
-                        VALUES (?, ?, ?, ?, ?)""",
-                    (source, values, values, now, now),
+                         source_time_end, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?)""",
+                    (source, values, values, source_time_end, now, now),
                 )
-        elif signal_type == "action":
+        elif target == "user_action_signal":
             if existing:
                 all_ids = _ids(existing["signal_ids"]) + new_ids
                 pending = _ids(existing["pending_user_action_signal_ids"]) + new_ids
@@ -358,8 +363,8 @@ class TaskExecutionDB:
             self._conn.execute(
                 f"""INSERT INTO {table}
                     (source_task_id, signal_ids, pending_user_intent_signal_ids,
-                     created_at, updated_at) VALUES (?, ?, ?, ?, ?)""",
-                (source, values, values, now, now),
+                     source_time_end, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)""",
+                (source, values, values, source_time_end, now, now),
             )
         return new_ids
 
@@ -371,34 +376,50 @@ class TaskExecutionDB:
         intent_signal_ids: Sequence[int],
         action_signal_ids: Sequence[int] = (),
         source_task_id: str = "",
+        source_time_end: Any = "",
     ) -> int:
         """Append only IDs absent from prior producer batches."""
+        source_time_end = _timestamp(source_time_end).isoformat() if source_time_end else ""
         with self._conn:
             claim_added = self._register_signal_batch(
-                "claim", claim_signal_ids, source_task_id,
+                "user_claim_signal", claim_signal_ids, source_task_id, source_time_end,
             )
             intent_added = self._register_signal_batch(
-                "intent", intent_signal_ids, source_task_id,
+                "user_intent_signal", intent_signal_ids, source_task_id, source_time_end,
             )
             action_added = self._register_signal_batch(
-                "action", action_signal_ids, source_task_id,
+                "user_action_signal", action_signal_ids, source_task_id, source_time_end,
             )
-        self._registered_signal_ids["claim"].update(claim_added)
-        self._registered_signal_ids["intent"].update(intent_added)
-        self._registered_signal_ids["action"].update(action_added)
+        self._registered_signal_ids["user_claim_signal"].update(claim_added)
+        self._registered_signal_ids["user_intent_signal"].update(intent_added)
+        self._registered_signal_ids["user_action_signal"].update(action_added)
         return len(claim_added) + len(intent_added) + len(action_added)
 
     @_locked
-    def pending_signal_ids(self, target: str) -> List[int]:
+    def pending_signal_ids(
+        self, target: str, *, reference_timestamp: Any = None,
+        lookback_hours: float = 6,
+    ) -> List[int]:
+        """Read pending IDs, optionally bounded by the producer's input time.
+
+        An unbounded read is for diagnostics. Scheduling supplies a reference
+        clock for claim/intent; undated batches cannot enter that window.
+        """
         try:
-            signal_type, pending_column, processed_column = self._PENDING_COLUMNS[target]
+            table, pending_column, processed_column = self._SIGNAL_BATCHES[target]
         except KeyError as exc:
             raise ValueError(f"Invalid signal processing target: {target}") from exc
-        table = self._SIGNAL_BATCHES[signal_type]
+        condition = ""
+        params: Tuple[Any, ...] = ()
+        if reference_timestamp is not None and target in {"user_claim_signal", "user_intent_signal"}:
+            reference = _timestamp(reference_timestamp)
+            start = reference - timedelta(hours=lookback_hours)
+            condition = " AND julianday(source_time_end) BETWEEN julianday(?) AND julianday(?)"
+            params = (start.isoformat(), reference.isoformat())
         pending: List[int] = []
         for row in self._conn.execute(
             f"SELECT {pending_column} FROM {table} "
-            f"WHERE {processed_column}=0 ORDER BY batch_id"
+            f"WHERE {processed_column}=0{condition} ORDER BY batch_id", params,
         ):
             pending.extend(_ids(row[pending_column]))
         return list(dict.fromkeys(pending))
@@ -407,13 +428,12 @@ class TaskExecutionDB:
     def reserve_signal_ids(self, target: str, signal_ids: Sequence[int]) -> List[int]:
         """Hide submitted signals from later task snapshots until completion."""
         try:
-            signal_type, pending_column, processed_column = self._PENDING_COLUMNS[target]
+            table, pending_column, processed_column = self._SIGNAL_BATCHES[target]
         except KeyError as exc:
             raise ValueError(f"Invalid signal processing target: {target}") from exc
         selected = set(_ids(signal_ids))
         if not selected:
             return []
-        table = self._SIGNAL_BATCHES[signal_type]
         reserved: set[int] = set()
         with self._conn:
             for row in self._conn.execute(
@@ -439,14 +459,13 @@ class TaskExecutionDB:
     ) -> List[int]:
         """Acknowledge completed IDs and release uncompleted IDs for retry."""
         try:
-            signal_type, pending_column, processed_column = self._PENDING_COLUMNS[target]
+            table, pending_column, processed_column = self._SIGNAL_BATCHES[target]
         except KeyError as exc:
             raise ValueError(f"Invalid signal processing target: {target}") from exc
         selected = set(_ids(selected_ids))
         completed = set(_ids(completed_ids)) & selected
         if not selected:
             return []
-        table = self._SIGNAL_BATCHES[signal_type]
         changed: set[int] = set()
         with self._conn:
             for row in self._conn.execute(
@@ -470,13 +489,12 @@ class TaskExecutionDB:
         self, target: str, signal_ids: Sequence[int],
     ) -> List[int]:
         try:
-            signal_type, pending_column, processed_column = self._PENDING_COLUMNS[target]
+            table, pending_column, processed_column = self._SIGNAL_BATCHES[target]
         except KeyError as exc:
             raise ValueError(f"Invalid signal processing target: {target}") from exc
         completed = set(_ids(signal_ids))
         if not completed:
             return []
-        table = self._SIGNAL_BATCHES[signal_type]
         changed: set[int] = set()
         with self._conn:
             for row in self._conn.execute(

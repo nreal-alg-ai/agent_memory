@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from memory.memory_database import _json_dumps, _json_loads, local_now_text
+from storage_utils import json_dumps, json_loads, local_now_text
 
 
 class UserModelDB:
@@ -171,14 +171,14 @@ class UserModelDB:
                 )),
                 CHECK(status != 'ready' OR next_evaluate_at IS NULL)
             );
-            CREATE TABLE IF NOT EXISTS user_proactive_prediction_assessments (
+            CREATE TABLE IF NOT EXISTS user_prediction_proactive_service_mapping (
                 prediction_id INTEGER PRIMARY KEY,
-                user_entity_id INTEGER NOT NULL,
-                input_signature TEXT NOT NULL,
-                evaluated_at TEXT NOT NULL,
-                decisions TEXT NOT NULL DEFAULT '[]',
+                proactive_service_ids TEXT NOT NULL DEFAULT '[]',
+                evaluated_at TEXT,
                 FOREIGN KEY(prediction_id) REFERENCES user_predictions(id) ON DELETE CASCADE
             );
+            CREATE INDEX IF NOT EXISTS idx_prediction_proactive_service_pending
+            ON user_prediction_proactive_service_mapping(evaluated_at, prediction_id);
             CREATE TABLE IF NOT EXISTS user_proactive_service_feedback_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 service_id INTEGER NOT NULL,
@@ -244,7 +244,7 @@ class UserModelDB:
                     """UPDATE user_prediction_reassessment_schedule SET next_evaluate_at = ?, reason = ?,
                         evaluated_at = ?, intent_event_ids = ?, updated_at = ?
                         WHERE id = ? AND intent_id = ? AND user_entity_id = ?""",
-                    (str(next_evaluate_at), str(reason).strip(), str(evaluated_at), _json_dumps(event_ids), now,
+                    (str(next_evaluate_at), str(reason).strip(), str(evaluated_at), json_dumps(event_ids), now,
                      assessment_id, int(intent_id), int(user_entity_id)),
                 )
                 if cursor.rowcount != 1:
@@ -256,7 +256,7 @@ class UserModelDB:
                     intent_event_ids, created_at, updated_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (int(intent_id), int(user_entity_id), str(next_evaluate_at), str(reason).strip(),
-                 str(evaluated_at), _json_dumps(event_ids), now, now),
+                 str(evaluated_at), json_dumps(event_ids), now, now),
             )
             return int(cursor.lastrowid)
 
@@ -286,7 +286,7 @@ class UserModelDB:
             ).fetchall()
             for row in rows:
                 item = dict(row)
-                item["intent_event_ids"] = _json_loads(item["intent_event_ids"], [])
+                item["intent_event_ids"] = json_loads(item["intent_event_ids"], [])
                 schedules.append(item)
         schedules.sort(key=lambda item: (item["due_order"], item["intent_id"], item["id"]))
         for item in schedules:
@@ -347,7 +347,7 @@ class UserModelDB:
                         or existing_payload["basis"].get("intent", {}).get("id") != basis.get("intent", {}).get("id")):
                     raise ValueError("Prediction write key reused for different forecast content")
                 prediction_id, save_action = int(existing["id"]), "reused"
-                basis = _json_loads(existing["basis"], {})
+                basis = json_loads(existing["basis"], {})
             else:
                 cursor = self._conn.execute(
                     """INSERT INTO user_predictions (
@@ -359,14 +359,18 @@ class UserModelDB:
                         owner_id, prediction_key,
                         str(payload["behavior_text"]), str(payload["window_start"]),
                         str(payload["window_end"]),
-                        _json_dumps(payload.get("conditions") or []),
+                        json_dumps(payload.get("conditions") or []),
                         str(payload["likelihood_band"]),
-                        _json_dumps(payload.get("uncertainties") or []),
+                        json_dumps(payload.get("uncertainties") or []),
                         str(payload.get("rationale") or ""),
-                        _json_dumps(payload.get("basis") or {}), local_now_text(),
+                        json_dumps(payload.get("basis") or {}), local_now_text(),
                     ),
                 )
                 prediction_id, save_action = int(cursor.lastrowid), "created"
+                self._conn.execute(
+                    "INSERT INTO user_prediction_proactive_service_mapping(prediction_id) VALUES (?)",
+                    (prediction_id,),
+                )
             intent = basis.get("intent")
             if intent is not None:
                 self.upsert_user_prediction_evidence([{
@@ -507,7 +511,7 @@ class UserModelDB:
     def _prediction_row_to_api(row: sqlite3.Row) -> Dict[str, Any]:
         item = dict(row)
         for field, fallback in (("conditions", []), ("uncertainties", []), ("basis", {})):
-            item[field] = _json_loads(item.get(field), fallback)
+            item[field] = json_loads(item.get(field), fallback)
         return item
 
     def get_active_user_predictions(
@@ -536,39 +540,59 @@ class UserModelDB:
         ).fetchall()
         return [self._prediction_row_to_api(row) for row in rows]
 
-    def get_user_proactive_prediction_assessment(
+    def get_user_prediction_proactive_service_mapping(
         self, *, prediction_id: int, user_entity_id: int,
     ) -> Optional[Dict[str, Any]]:
         row = self._conn.execute(
-            "SELECT * FROM user_proactive_prediction_assessments "
-            "WHERE prediction_id = ? AND user_entity_id = ?",
+            "SELECT mapping.* FROM user_prediction_proactive_service_mapping AS mapping "
+            "JOIN user_predictions AS prediction ON prediction.id = mapping.prediction_id "
+            "WHERE mapping.prediction_id = ? AND prediction.user_entity_id = ?",
             (prediction_id, user_entity_id),
         ).fetchone()
         if row is None:
             return None
         result = dict(row)
-        result["decisions"] = _json_loads(result["decisions"], [])
+        result["proactive_service_ids"] = json_loads(result["proactive_service_ids"], [])
         return result
 
-    def save_user_proactive_prediction_assessment(
-        self, *, prediction_id: int, user_entity_id: int, input_signature: str,
-        evaluated_at: str, decisions: Sequence[Dict[str, Any]],
+    def get_pending_proactive_prediction_ids(self, *, user_entity_id: int) -> List[int]:
+        """Read unevaluated or waiting-service sources after lifecycle cleanup.
+
+        Waiting sources precede new forecasts, then nearer window endings first.
+        Effective-prediction checks still belong to the prediction reader.
+        """
+        rows = self._conn.execute(
+            """WITH candidates AS (
+                SELECT mapping.prediction_id, mapping.evaluated_at, prediction.window_end,
+                    EXISTS (
+                        SELECT 1 FROM user_proactive_services AS service
+                        WHERE service.prediction_id = mapping.prediction_id
+                            AND service.user_entity_id = prediction.user_entity_id
+                            AND service.status = 'waiting'
+                    ) AS has_waiting_service
+                FROM user_prediction_proactive_service_mapping AS mapping
+                JOIN user_predictions AS prediction ON prediction.id = mapping.prediction_id
+                WHERE prediction.user_entity_id = ? AND prediction.status = 'pending'
+            )
+            SELECT prediction_id FROM candidates
+            WHERE evaluated_at IS NULL OR has_waiting_service
+            ORDER BY has_waiting_service DESC, julianday(window_end), prediction_id""",
+            (int(user_entity_id),),
+        ).fetchall()
+        return [int(row["prediction_id"]) for row in rows]
+
+    def mark_user_prediction_proactive_service_evaluated(
+        self, *, prediction_id: int, user_entity_id: int, evaluated_at: str,
     ) -> None:
-        """Remember successful evaluation even if no service was generated."""
-        prediction = self._conn.execute(
-            "SELECT user_entity_id FROM user_predictions WHERE id = ?", (prediction_id,),
-        ).fetchone()
-        if not prediction or prediction["user_entity_id"] != user_entity_id:
-            raise ValueError("Assessment must reference the same owner's prediction")
-        self._conn.execute(
-            """INSERT INTO user_proactive_prediction_assessments (
-                prediction_id, user_entity_id, input_signature, evaluated_at, decisions
-            ) VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(prediction_id) DO UPDATE SET
-                input_signature = excluded.input_signature,
-                evaluated_at = excluded.evaluated_at, decisions = excluded.decisions""",
-            (prediction_id, user_entity_id, input_signature, evaluated_at, _json_dumps(list(decisions))),
+        """Mark a successful decision, including one producing no services."""
+        cursor = self._conn.execute(
+            "UPDATE user_prediction_proactive_service_mapping SET evaluated_at = ? "
+            "WHERE prediction_id = ? AND prediction_id IN ("
+            "SELECT id FROM user_predictions WHERE user_entity_id = ?)",
+            (evaluated_at, int(prediction_id), int(user_entity_id)),
         )
+        if cursor.rowcount != 1:
+            raise ValueError("No proactive service mapping for this user's prediction")
         self._commit_if_needed()
 
     def save_user_proactive_service(
@@ -602,26 +626,40 @@ class UserModelDB:
                     "evaluated_at",
                 )
             }
-            fields["constraints"] = _json_dumps(payload["constraints"])
+            fields["constraints"] = json_dumps(payload["constraints"])
             now = local_now_text()
             if existing:
                 if existing["status"] in {"cancelled", "expired"}:
                     raise ValueError("Closed services cannot be silently reactivated")
                 if all(existing[key] == value for key, value in fields.items()):
-                    return int(existing["id"]), "reused"
-                self._conn.execute(
-                    f"UPDATE user_proactive_services SET {', '.join(key + ' = ?' for key in fields)}, "
-                    "updated_at = ? WHERE id = ?",
-                    [*fields.values(), now, int(existing["id"])],
+                    service_id, action = int(existing["id"]), "reused"
+                else:
+                    self._conn.execute(
+                        f"UPDATE user_proactive_services SET {', '.join(key + ' = ?' for key in fields)}, "
+                        "updated_at = ? WHERE id = ?",
+                        [*fields.values(), now, int(existing["id"])],
+                    )
+                    service_id, action = int(existing["id"]), "updated"
+            else:
+                fields = {"prediction_id": prediction_id, "user_entity_id": owner_id, **fields,
+                          "created_at": now, "updated_at": now}
+                cursor = self._conn.execute(
+                    f"INSERT INTO user_proactive_services ({', '.join(fields)}) "
+                    f"VALUES ({','.join('?' for _ in fields)})", list(fields.values()),
                 )
-                return int(existing["id"]), "updated"
-            fields = {"prediction_id": prediction_id, "user_entity_id": owner_id, **fields,
-                      "created_at": now, "updated_at": now}
-            cursor = self._conn.execute(
-                f"INSERT INTO user_proactive_services ({', '.join(fields)}) "
-                f"VALUES ({','.join('?' for _ in fields)})", list(fields.values()),
+                service_id, action = int(cursor.lastrowid), "created"
+            mapping = self.get_user_prediction_proactive_service_mapping(
+                prediction_id=prediction_id, user_entity_id=owner_id,
             )
-            return int(cursor.lastrowid), "created"
+            if mapping is None:
+                raise ValueError("Prediction has no proactive service mapping")
+            if service_id not in mapping["proactive_service_ids"]:
+                self._conn.execute(
+                    "UPDATE user_prediction_proactive_service_mapping SET proactive_service_ids = ? "
+                    "WHERE prediction_id = ?",
+                    (json_dumps([*mapping["proactive_service_ids"], service_id]), prediction_id),
+                )
+            return service_id, action
 
     def get_user_proactive_service(self, service_id: int) -> Optional[Dict[str, Any]]:
         row = self._conn.execute(
@@ -630,7 +668,7 @@ class UserModelDB:
         if row is None:
             return None
         item = dict(row)
-        item["constraints"] = _json_loads(item["constraints"], [])
+        item["constraints"] = json_loads(item["constraints"], [])
         return item
 
     def insert_user_proactive_service_feedback(self, payload: Dict[str, Any]) -> int:
@@ -642,8 +680,8 @@ class UserModelDB:
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (payload["service_id"], payload["execution_id"], payload["execution_status"],
              payload["user_response"], payload["user_feedback"],
-             _json_dumps(payload["execution_result"]), payload["agent_note"],
-             _json_dumps(payload["context"]), payload["observed_at"], local_now_text()),
+             json_dumps(payload["execution_result"]), payload["agent_note"],
+             json_dumps(payload["context"]), payload["observed_at"], local_now_text()),
         )
         self._commit_if_needed()
         return int(cursor.lastrowid)
@@ -674,7 +712,7 @@ class UserModelDB:
         for row in rows:
             item = dict(row)
             for key in ("execution_result", "context"):
-                item[key] = _json_loads(item[key], {})
+                item[key] = json_loads(item[key], {})
             items.append(item)
         return items
 
@@ -705,7 +743,7 @@ class UserModelDB:
         result = []
         for row in rows:
             item = dict(row)
-            item["constraints"] = _json_loads(item.get("constraints"), [])
+            item["constraints"] = json_loads(item.get("constraints"), [])
             result.append(item)
         return result
 
@@ -768,8 +806,8 @@ class UserModelDB:
         result: List[Dict[str, Any]] = []
         for row in rows:
             item = self._row_to_dict(row)
-            item["conditions"] = _json_loads(item.get("conditions"), {})
-            item["metadata"] = _json_loads(item.get("metadata"), {})
+            item["conditions"] = json_loads(item.get("conditions"), {})
+            item["metadata"] = json_loads(item.get("metadata"), {})
             result.append(item)
         if include_evidence:
             states_by_id = {int(state["id"]): state for state in result}
@@ -799,8 +837,8 @@ class UserModelDB:
             row = by_id.get(state_id)
             if not row:
                 continue
-            row["conditions"] = _json_loads(row.get("conditions"), {})
-            row["metadata"] = _json_loads(row.get("metadata"), {})
+            row["conditions"] = json_loads(row.get("conditions"), {})
+            row["metadata"] = json_loads(row.get("metadata"), {})
             result.append(row)
         return result
 
@@ -961,11 +999,11 @@ class UserModelDB:
                     str(state_text or old.get("state_text") or ""),
                     str(status or old.get("status") or "active"),
                     float(confidence),
-                    _json_dumps(conditions if isinstance(conditions, dict) else {}),
+                    json_dumps(conditions if isinstance(conditions, dict) else {}),
                     str(valid_from or old.get("valid_from") or ""),
                     str(valid_to or old.get("valid_to") or ""),
                     str(last_observed_at or old.get("last_observed_at") or ""),
-                    _json_dumps(metadata if isinstance(metadata, dict) else {}),
+                    json_dumps(metadata if isinstance(metadata, dict) else {}),
                     now,
                     state_id,
                 ),
@@ -985,10 +1023,10 @@ class UserModelDB:
                 str(state_domain), str(state_type), str(state_kind),
                 topic, str(state_text),
                 str(status or "active"), float(confidence),
-                _json_dumps(conditions if isinstance(conditions, dict) else {}),
+                json_dumps(conditions if isinstance(conditions, dict) else {}),
                 str(valid_from or ""), str(valid_to or ""),
                 str(last_observed_at or ""),
-                _json_dumps(metadata if isinstance(metadata, dict) else {}), now, now,
+                json_dumps(metadata if isinstance(metadata, dict) else {}), now, now,
             ),
         )
         self._commit_if_needed()
@@ -1023,7 +1061,7 @@ class UserModelDB:
                     state_id, evidence_type, evidence_id, role,
                     float(item.get("weight") or 0.0),
                     str(item.get("observed_at") or ""),
-                    _json_dumps(item.get("details") or {}), now, now,
+                    json_dumps(item.get("details") or {}), now, now,
                 ),
             )
             changed += 1
@@ -1061,10 +1099,10 @@ class UserModelDB:
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                int(state_id), str(operation), _json_dumps(previous_payload or {}),
-                _json_dumps(new_payload or {}),
-                _json_dumps(sorted(set(normalized_claim_ids))),
-                _json_dumps(list(trigger_intent_objects or [])), str(effective_at or ""),
+                int(state_id), str(operation), json_dumps(previous_payload or {}),
+                json_dumps(new_payload or {}),
+                json_dumps(sorted(set(normalized_claim_ids))),
+                json_dumps(list(trigger_intent_objects or [])), str(effective_at or ""),
                 str(decision_source or ""), float(confidence), str(reason or ""),
                 local_now_text(),
             ),

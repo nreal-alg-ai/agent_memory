@@ -14,9 +14,10 @@ from memory.memory_database import UserMemoryDB
 from memory.memory_manager import MemoryNodeManager
 from memory.memory_runtime import MemoryRuntime
 from task_scheduler import TaskOperationReporter, TaskScheduler
-from user_model import (
-    UserModelDB, UserPrediction, UserProactiveService, UserStateResolver,
-)
+from user_model.user_model_database import UserModelDB
+from user_model.user_prediction import UserPrediction
+from user_model.user_proactive_service import UserProactiveService
+from user_model.user_state_resolver import UserStateResolver
 
 
 class PersonWorldModel:
@@ -75,7 +76,7 @@ class PersonWorldModel:
                 operation_reporter=self._operation_reporter,
                 maxsize=int(scheduler_config.get("task_queue_maxsize", 100) or 100),
                 logger=self._logging_manager.get_logger("task_scheduler"),
-                claim_state_database=self._user_memory_database,
+                user_memory_db=self._user_memory_database,
                 task_scheduling_config=scheduler_config,
                 memory_enabled=manager_config.get("memory_enabled", True),
             )

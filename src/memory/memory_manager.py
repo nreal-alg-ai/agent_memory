@@ -34,6 +34,7 @@ except ImportError:  # pragma: no cover - exercised only in minimal installs
 
 from embedding_client import EmbeddingClient
 from llm_client import LLMClient
+from semantic_domains import SEMANTIC_DOMAINS
 from .memory_database import UserMemoryDB
 from .memory_types import MemoryUnit
 from .logging_utils import CompactLogValue, LogJSONEncoder
@@ -75,11 +76,8 @@ from prompts_zh import (
 )
 from .utils import _cal_embedding_cosine_similarity
 from .user_action_similarity import action_lexical_similarity
-from user_model import UserStateResolver
 
 RecallTimeBounds = Optional[Tuple[Optional[str], Optional[str]]]
-
-_PRIMARY_DOMAINS = UserStateResolver.STATE_DOMAINS
 
 _STOPWORDS = {
     "the", "a", "an", "and", "or", "to", "of", "in", "on", "for", "with",
@@ -197,11 +195,7 @@ class MemoryNodeManager:
         self._task_scheduler = task_scheduler
         self._llm_client = llm_client
         self._memory_cfg = dict(memory_manager_config or {})
-        configured_embedding = self._memory_cfg.get("embedding")
-        self._embedding_cfg = dict(
-            embedding_config
-            or (configured_embedding if isinstance(configured_embedding, dict) else {})
-        )
+        self._embedding_cfg = dict(embedding_config or {})
         self._memory_prompt_language = str(
             self._memory_cfg.get("memory_prompt_language_mode")
             or "source"
@@ -6160,7 +6154,7 @@ class MemoryNodeManager:
         domain = re.sub(
             r"[^a-z]+", "_", str(value or "").strip().lower(),
         ).strip("_")
-        return domain if domain in _PRIMARY_DOMAINS else ""
+        return domain if domain in SEMANTIC_DOMAINS else ""
 
     @staticmethod
     def _normalize_unique_labels(

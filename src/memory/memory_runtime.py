@@ -82,9 +82,7 @@ class MemoryRuntime:
         )
         self._memory_database = database
         self._memory_manager = manager
-        self._embedding_client = EmbeddingClient(
-            dict(resolved_embedding_config or getattr(manager, "_embedding_cfg", {}) or {}),
-        )
+        self._embedding_client = EmbeddingClient(resolved_embedding_config)
         if hasattr(self._memory_manager, "set_embedding_client"):
             self._memory_manager.set_embedding_client(self._embedding_client)
         memory_context_manager_config = build_memory_context_manager_config(

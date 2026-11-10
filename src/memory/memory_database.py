@@ -13,7 +13,6 @@ memory object writes one document there; source tables retain only domain data.
 from __future__ import annotations
 
 import hashlib
-import json
 import re
 import sqlite3
 import unicodedata
@@ -24,6 +23,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+from storage_utils import json_dumps, json_loads, local_now_text
 from .memory_types import MemoryUnit
 
 try:
@@ -108,10 +108,6 @@ def _lexical_index_text(identity_text: Any) -> str:
     return " ".join(tokens)
 
 
-def local_now_text() -> str:
-    return datetime.now().astimezone().isoformat()
-
-
 def _coerce_reference_datetime(value: Any) -> datetime:
     if isinstance(value, datetime):
         dt = value
@@ -127,19 +123,6 @@ def _coerce_reference_datetime(value: Any) -> datetime:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=datetime.now().astimezone().tzinfo)
     return dt
-
-
-def _json_dumps(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True)
-
-
-def _json_loads(value: Any, default: Any) -> Any:
-    if value in (None, ""):
-        return default
-    try:
-        return json.loads(value)
-    except Exception:
-        return default
 
 
 def _embedding_to_blob(embedding: Optional[np.ndarray]) -> Optional[bytes]:
@@ -478,7 +461,6 @@ class UserMemoryDB:
                 subject_entity_id INTEGER,
                 signal_purpose TEXT NOT NULL DEFAULT '',
                 candidate_object_types TEXT NOT NULL DEFAULT '[]',
-                operation_hint TEXT NOT NULL DEFAULT '',
                 user_role TEXT NOT NULL DEFAULT '',
                 user_intent_anchor TEXT NOT NULL DEFAULT '',
                 user_intent_anchor_key TEXT NOT NULL DEFAULT '',
@@ -864,14 +846,14 @@ class UserMemoryDB:
                 str(summary or ""),
                 str(identity_text or ""),
                 _embedding_to_blob(identity_text_embedding),
-                _json_dumps(normalized_entity_ids),
-                _json_dumps(normalized_topic_keys),
+                json_dumps(normalized_entity_ids),
+                json_dumps(normalized_topic_keys),
                 str(time_start or ""),
                 str(time_end or ""),
                 str(status or ""),
                 float(confidence or 0.0),
                 float(importance or 0.0),
-                _json_dumps(metadata or {}),
+                json_dumps(metadata or {}),
                 now,
                 now,
             ),
@@ -950,9 +932,9 @@ class UserMemoryDB:
                 float(confidence),
                 started_at,
                 ended_at,
-                _json_dumps(list(evidence_fact_ids)),
-                _json_dumps(list(source_segment_ids)),
-                _json_dumps(metadata or {}),
+                json_dumps(list(evidence_fact_ids)),
+                json_dumps(list(source_segment_ids)),
+                json_dumps(metadata or {}),
                 now,
                 now,
             ),
@@ -1108,15 +1090,15 @@ class UserMemoryDB:
         # Retry-safe for the same grounded delta; different evidence remains auditable.
         activity_ids = sorted(set(evidence_activity_ids))
         fact_ids = sorted(set(evidence_fact_ids))
-        event_key = hashlib.sha256(_json_dumps([
+        event_key = hashlib.sha256(json_dumps([
             thread_id, event_type, summary.strip(), activity_ids, fact_ids, occurred_at,
         ]).encode('utf-8')).hexdigest()
         cursor = self._conn.execute(
             "INSERT OR IGNORE INTO memory_user_thread_events "
             "(thread_id,event_key,event_type,summary,evidence_activity_ids,evidence_fact_ids,"
             "occurred_at,known_at,created_at) VALUES (?,?,?,?,?,?,?,?,?)",
-            (thread_id, event_key, event_type, summary.strip(), _json_dumps(activity_ids),
-             _json_dumps(fact_ids), occurred_at, known_at, local_now_text()),
+            (thread_id, event_key, event_type, summary.strip(), json_dumps(activity_ids),
+             json_dumps(fact_ids), occurred_at, known_at, local_now_text()),
         )
         self._commit_if_needed()
         return int(cursor.lastrowid) if cursor.rowcount else None
@@ -1202,8 +1184,8 @@ class UserMemoryDB:
                 ),
                 batch_started_at,
                 batch_ended_at,
-                _json_dumps(batch_tags),
-                _json_dumps({
+                json_dumps(batch_tags),
+                json_dumps({
                     "storage_format": "unit_batch_v1",
                     "unit_count": len(normalized_units),
                     "units": normalized_units,
@@ -1699,11 +1681,11 @@ class UserMemoryDB:
                 """
                 INSERT INTO memory_fact_user_intent_signals (
                     fact_id, signal_key, subject_entity_id, signal_purpose,
-                    candidate_object_types, operation_hint, user_role,
+                    candidate_object_types, user_role,
                     user_intent_anchor, user_intent_anchor_key,
                     assertion_source, evidence_basis,
                     confidence, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(fact_id, signal_key) DO UPDATE SET
                     candidate_object_types = excluded.candidate_object_types,
                     user_role = excluded.user_role,
@@ -1718,7 +1700,7 @@ class UserMemoryDB:
                 """,
                 (
                     fact_id, signal_key, subject_entity_id or None, signal_purpose,
-                    _json_dumps(candidate_object_types), "", user_role,
+                    json_dumps(candidate_object_types), user_role,
                     user_intent_anchor, user_intent_anchor_key,
                     assertion_source,
                     str(mapping.get("evidence_basis") or "").strip(),
@@ -1750,7 +1732,7 @@ class UserMemoryDB:
         mappings: Dict[str, Dict[str, Any]] = {}
         for row in rows:
             mapping = self._row_to_dict(row)
-            mapping["candidate_object_types"] = _json_loads(
+            mapping["candidate_object_types"] = json_loads(
                 mapping.get("candidate_object_types"), []
             )
             mapping["subject_entity"] = str(mapping.get("subject") or "")
@@ -1779,7 +1761,7 @@ class UserMemoryDB:
             ).fetchall()
             for row in rows:
                 signal = self._row_to_dict(row)
-                signal["candidate_object_types"] = _json_loads(
+                signal["candidate_object_types"] = json_loads(
                     signal.get("candidate_object_types"), []
                 )
                 signal["subject_entity"] = str(signal.get("subject") or "")
@@ -1798,7 +1780,7 @@ class UserMemoryDB:
             (signal_id,),
         ).fetchone()
         if (not source or source["signal_purpose"] != "lifecycle_update"
-                or object_type not in _json_loads(source["candidate_object_types"], [])):
+                or object_type not in json_loads(source["candidate_object_types"], [])):
             raise ValueError("Observation must reference a lifecycle signal of the same object type")
         now = local_now_text()
         self._conn.execute(
@@ -1823,7 +1805,7 @@ class UserMemoryDB:
                 str(observation["observation_text"]), str(observation["lifecycle_evidence"]),
                 str(observation.get("effective_at") or ""),
                 float(observation.get("confidence", 0.7)),
-                _json_dumps(observation.get("details") or {}), now, now,
+                json_dumps(observation.get("details") or {}), now, now,
             ),
         )
         row = self._conn.execute(
@@ -1849,7 +1831,7 @@ class UserMemoryDB:
             ).fetchall()
             for row in rows:
                 item = dict(row)
-                item["details"] = _json_loads(item["details"], {})
+                item["details"] = json_loads(item["details"], {})
                 observations.append(item)
         return observations
 
@@ -1903,7 +1885,7 @@ class UserMemoryDB:
                     claim_text, str(primary_domain or ""),
                     max(float(existing["confidence"] or 0.0), float(confidence or 0.0)),
                     valid_from, valid_to, source_actor_entity_id, extractor_version,
-                    prompt_version, _json_dumps(metadata or {}), now, claim_id,
+                    prompt_version, json_dumps(metadata or {}), now, claim_id,
                 ),
             )
             self._commit_if_needed()
@@ -1921,7 +1903,7 @@ class UserMemoryDB:
                 subject_id, predicate, object_id, claim_text,
                 claim_type, origin, str(primary_domain or ""), status, float(confidence or 0.0),
                 valid_from, valid_to, source_actor_entity_id, extractor_version,
-                prompt_version, _json_dumps(metadata or {}), now, now,
+                prompt_version, json_dumps(metadata or {}), now, now,
             ),
         )
         self._commit_if_needed()
@@ -1944,7 +1926,7 @@ class UserMemoryDB:
             "WHERE subject_entity_id = ? AND pattern_key = ?",
             (subject_id, normalized_key),
         ).fetchone()
-        merged_metadata = dict(_json_loads(existing["metadata"], {}) or {}) if existing else {}
+        merged_metadata = dict(json_loads(existing["metadata"], {}) or {}) if existing else {}
         merged_metadata.update(metadata or {})
         if existing:
             pattern_id = int(existing["id"])
@@ -1955,7 +1937,7 @@ class UserMemoryDB:
                 (
                     text, str(condition_text or ""), str(primary_domain or ""),
                     max(float(existing["confidence"] or 0.0), float(confidence or 0.0)),
-                    _json_dumps(merged_metadata), now, pattern_id,
+                    json_dumps(merged_metadata), now, pattern_id,
                 ),
             )
             self._commit_if_needed()
@@ -1968,7 +1950,7 @@ class UserMemoryDB:
             (
                 subject_id, normalized_key, text, str(condition_text or ""),
                 str(primary_domain or ""), float(confidence or 0.0),
-                _json_dumps(merged_metadata), now, now,
+                json_dumps(merged_metadata), now, now,
             ),
         )
         self._commit_if_needed()
@@ -2017,8 +1999,8 @@ class UserMemoryDB:
             (
                 int(target_pattern_id),
                 int(trigger_pattern_id) if trigger_pattern_id else None,
-                str(semantic_relation), _json_dumps(ids),
-                _json_dumps(candidate_snapshot), float(semantic_confidence),
+                str(semantic_relation), json_dumps(ids),
+                json_dumps(candidate_snapshot), float(semantic_confidence),
                 str(semantic_reason), local_now_text(),
             ),
         )
@@ -2097,10 +2079,10 @@ class UserMemoryDB:
         events = []
         for row in sorted(rows_by_id.values(), key=lambda item: int(item["id"]), reverse=True):
             event = self._row_to_dict(row)
-            event["support_signal_ids"] = _json_loads(
+            event["support_signal_ids"] = json_loads(
                 event.get("support_signal_ids"), [],
             )
-            event["candidate_snapshot"] = _json_loads(
+            event["candidate_snapshot"] = json_loads(
                 event.get("candidate_snapshot"), {},
             )
             events.append(event)
@@ -2122,10 +2104,10 @@ class UserMemoryDB:
             ).fetchall()
             for row in rows:
                 event = self._row_to_dict(row)
-                event["support_signal_ids"] = _json_loads(
+                event["support_signal_ids"] = json_loads(
                     event.get("support_signal_ids"), [],
                 )
-                event["candidate_snapshot"] = _json_loads(
+                event["candidate_snapshot"] = json_loads(
                     event.get("candidate_snapshot"), {},
                 )
                 events.append(event)
@@ -2190,7 +2172,7 @@ class UserMemoryDB:
                 str(decision_source or ""),
                 float(semantic_confidence) if semantic_confidence is not None else None,
                 str(semantic_reason or ""),
-                _json_dumps(details or {}),
+                json_dumps(details or {}),
                 local_now_text(),
             ),
         )
@@ -2264,9 +2246,9 @@ class UserMemoryDB:
     @staticmethod
     def _intent_row_to_api(row: sqlite3.Row | Dict[str, Any]) -> Dict[str, Any]:
         item = dict(row)
-        details = _json_loads(item.get("details"), {})
+        details = json_loads(item.get("details"), {})
         details = details if isinstance(details, dict) else {}
-        metadata = _json_loads(item.get("metadata"), {})
+        metadata = json_loads(item.get("metadata"), {})
         item["details"] = details
         item["metadata"] = metadata if isinstance(metadata, dict) else {}
         object_type = str(item.get("object_type") or "")
@@ -2312,7 +2294,7 @@ class UserMemoryDB:
         for column in columns:
             value = normalized_payload.get(column)
             if column in {"metadata", "details"}:
-                value = _json_dumps(value if isinstance(value, dict) else {})
+                value = json_dumps(value if isinstance(value, dict) else {})
             elif column == "confidence":
                 value = float(value or 0.0)
             elif column.endswith("_entity_id"):
@@ -2345,7 +2327,7 @@ class UserMemoryDB:
             return False
         existing = dict(existing_row)
         for json_field in ("details", "metadata"):
-            existing[json_field] = _json_loads(existing.get(json_field), {})
+            existing[json_field] = json_loads(existing.get(json_field), {})
             if not isinstance(existing[json_field], dict):
                 existing[json_field] = {}
         if "details" in payload or any(
@@ -2387,7 +2369,7 @@ class UserMemoryDB:
                 continue
             value = normalized_payload[column]
             if column in {"metadata", "details"}:
-                value = _json_dumps(value if isinstance(value, dict) else {})
+                value = json_dumps(value if isinstance(value, dict) else {})
             elif column == "confidence":
                 value = float(value or 0.0)
             elif column.endswith("_entity_id"):
@@ -2543,7 +2525,7 @@ class UserMemoryDB:
                 source_signal_id, lifecycle_observation_id, effective_at, created_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
             (
-                int(intent_id), event_type, _json_dumps(previous), _json_dumps(updated),
+                int(intent_id), event_type, json_dumps(previous), json_dumps(updated),
                 int(source_signal_id), lifecycle_observation_id,
                 str(effective_at or ""), local_now_text(),
             ),
@@ -2579,7 +2561,7 @@ class UserMemoryDB:
             for row in rows:
                 item = dict(row)
                 for key in ("previous_payload", "new_payload"):
-                    item[key] = _json_loads(item[key], {})
+                    item[key] = json_loads(item[key], {})
                 events.append(item)
         return events
 
@@ -3127,7 +3109,7 @@ class UserMemoryDB:
             """,
             (
                 int(claim_id), str(rule_id or ""), str(rule_version or ""),
-                str(derivation_key or ""), now, _json_dumps(metadata or {}),
+                str(derivation_key or ""), now, json_dumps(metadata or {}),
                 now, now,
             ),
         )
@@ -3292,15 +3274,15 @@ class UserMemoryDB:
             (
                 fact_type,
                 summary,
-                _json_dumps(keyword_values),
-                _json_dumps(list(entities or [])),
-                _json_dumps([int(value) for value in entity_ids or []]),
+                json_dumps(keyword_values),
+                json_dumps(list(entities or [])),
+                json_dumps([int(value) for value in entity_ids or []]),
                 str(fact_topic or ""),
                 event_time_key,
                 dialogue_time_key,
                 float(confidence),
                 float(importance),
-                _json_dumps(metadata or {}),
+                json_dumps(metadata or {}),
                 now,
                 now,
             ),
@@ -3523,7 +3505,7 @@ class UserMemoryDB:
         return [
             {
                 "entity_id": int(row["entity_id"]),
-                "fact_id": _json_loads(row["fact_id"], []),
+                "fact_id": json_loads(row["fact_id"], []),
             }
             for row in rows
         ]
@@ -3542,7 +3524,7 @@ class UserMemoryDB:
 
         def normalize_ids(value: Any) -> List[int]:
             if isinstance(value, str):
-                parsed = _json_loads(value, None)
+                parsed = json_loads(value, None)
                 values = parsed if isinstance(parsed, list) else [value]
             else:
                 values = value if isinstance(value, (list, tuple, set)) else [value]
@@ -3603,7 +3585,7 @@ class UserMemoryDB:
                     WHERE entity_id = ?
                     """,
                     (
-                        _json_dumps(merged["fact_id"]),
+                        json_dumps(merged["fact_id"]),
                         now,
                         entity_id,
                     ),
@@ -3617,7 +3599,7 @@ class UserMemoryDB:
                     """,
                     (
                         entity_id,
-                        _json_dumps(merged["fact_id"]),
+                        json_dumps(merged["fact_id"]),
                         now,
                         now,
                     ),
@@ -3649,7 +3631,7 @@ class UserMemoryDB:
         item = dict(row)
         if "keywords" in item:
             raw_keywords = item["keywords"]
-            parsed_keywords = _json_loads(raw_keywords, None)
+            parsed_keywords = json_loads(raw_keywords, None)
             if isinstance(parsed_keywords, list):
                 item["keywords"] = [
                     str(value).strip()
@@ -3683,7 +3665,7 @@ class UserMemoryDB:
             "source_segment_ids",
         ):
             if key in item:
-                item[key] = _json_loads(
+                item[key] = json_loads(
                     item[key],
                     {} if key in {"metadata", "payload", "details"} else [],
                 )

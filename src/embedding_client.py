@@ -13,7 +13,6 @@ import json
 import logging
 import os
 import re
-from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 import numpy as np
@@ -32,20 +31,6 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "timeout": 30,
     "batch_size": 32,
 }
-
-
-def _load_project_config() -> Dict[str, Any]:
-    try:
-        import yaml
-
-        config_path = Path(__file__).resolve().parents[2] / "config.yaml"
-        loaded = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
-        pwm_config = loaded.get("personal_world_model")
-        if isinstance(pwm_config, dict) and isinstance(pwm_config.get("embedding_model"), dict):
-            return dict(pwm_config["embedding_model"])
-    except Exception:
-        pass
-    return {}
 
 
 def _resolve_env(value: Any) -> str:
@@ -68,13 +53,15 @@ def _build_openai_embedding_url(base_url: str) -> str:
 
 
 class EmbeddingClient:
-    """OpenAI-compatible embedding client without synthetic-vector fallback."""
+    """Embedding client using only explicit config and field-level defaults.
 
-    def __init__(self, config: Optional[Dict[str, Any]] = None) -> None:
+    File loading and application environment overrides belong to ``config.py``.
+    An explicit empty mapping selects code defaults, never a config file.
+    """
+
+    def __init__(self, config: Dict[str, Any]) -> None:
         merged = dict(DEFAULT_CONFIG)
-        merged.update(_load_project_config())
-        if config:
-            merged.update(config)
+        merged.update(config)
         self._config = merged
         self._provider = str(merged.get("provider") or "local_hash").strip().lower()
         self._model = str(merged.get("model") or "local-hash-embedding")
