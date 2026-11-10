@@ -13,6 +13,11 @@ in that directory (non-recursive; 0 means all). Pass filenames after
 file paths without a directory. Multiple paths and repeated --meeting-file
 are supported. All selected meetings are ordered by their actual meeting start
 time, not filename or modification time, and share one PWM and databases.
+Across the selected speech in each run, the wearer keeps speaker_用户本人;
+other speakers receive speaker_1, speaker_2, ... in first-appearance order.
+Named speakers share IDs across files; anonymous labels are file-scoped.
+Original labels remain in speaker_mapping and segment metadata, not replaced
+inside utterance text. Unselected segments do not consume speaker IDs.
 Omit --parse-only to run extraction, without recall. Exact owner names may
 include Feishu's " 在 <meeting room>" suffix; anonymous room/device speakers
 are never inferred to be that person. Exported offsets are utterance STARTS,
@@ -50,8 +55,10 @@ from user_model.user_proactive_service import UserProactiveService
 
 try:  # Support both direct CLI execution and package imports in tests.
     from .run_transcript_Ali_eval import (configure_logging, write_transcript_txt)
+    from .feishu_test_speaker_mapping import remap_meeting_speakers
 except ImportError:
     from run_transcript_Ali_eval import (configure_logging, write_transcript_txt)
+    from feishu_test_speaker_mapping import remap_meeting_speakers
 
 
 DEFAULT_OUTPUT_ROOT = REPO_ROOT / "tmp/ambient_transcript/feishu_meeting"
@@ -575,6 +582,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         meeting["last_utterance_start"] = meeting["segments"][-1]["started_at"]
         meeting["last_utterance_end"] = meeting["segments"][-1]["ended_at"]
         meetings.append(meeting)
+    remap_meeting_speakers(meetings)
     replay_clock_settings(args, meetings)
     output_dir = (
         args.output_dir.expanduser().resolve() if args.output_dir else
