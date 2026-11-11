@@ -11,6 +11,11 @@ from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence
 
 from pwm_logging import as_pwm_logger
+from intent_lifecycle import (
+    ACTIVE_USER_INTENT_STATUSES,
+    CLOSED_USER_INTENT_STATUSES,
+    USER_INTENT_EVENT_TYPES,
+)
 from prompts_en import (
     USER_PREDICTION_REASSESSMENT_PROMPT_EN,
     USER_PREDICTION_GENERATED_FROM_NEW_INTENTS_PROMPT_EN,
@@ -36,15 +41,6 @@ class UserPrediction:
     TIME_TICK_TRIGGERED_TASK_NAME = "user_prediction_reassessment"
     WINDOW_EXPIRATION_TASK_NAME = "user_prediction_window_expiration"
     MODEL_VERSION = "intent_preparation_v5"
-    ACTIVE_INTENT_STATUSES = {
-        "goal": {"active", "blocked"}, "plan": {"planned", "rescheduled", "blocked"},
-        "work_item": {"open", "in_progress", "blocked"},
-    }
-    CLOSED_INTENT_STATUSES = {
-        "goal": {"completed", "cancelled"}, "plan": {"occurred", "cancelled"},
-        "work_item": {"completed", "cancelled"},
-    }
-    INTENT_EVENT_TYPES = {"created", "updated", "rescheduled", "cancelled", "completed", "occurred"}
 
     def __init__(
         self, *, db: UserMemoryDB, model_db: UserModelDB, llm_client: LLMClient,
@@ -106,6 +102,7 @@ class UserPrediction:
         return {
             "object_type": intent["object_type"], "id": int(intent["id"]),
             "summary": intent.get("summary") or "",
+            "current_progress": intent.get("current_progress") or "",
             "time_start": intent.get("time_start") or "",
             "time_end": intent.get("time_end") or "",
             "time_precision": intent.get("time_precision") or "unknown",
@@ -121,7 +118,7 @@ class UserPrediction:
         events = self._user_memory_db.get_user_intent_events(event_ids=intent_event_ids)
         if {int(event["id"]) for event in events} != set(intent_event_ids):
             raise ValueError("Prediction input contains missing intent events")
-        if any(event["event_type"] not in self.INTENT_EVENT_TYPES for event in events):
+        if any(event["event_type"] not in USER_INTENT_EVENT_TYPES for event in events):
             raise ValueError("Prediction input contains unknown intent event types")
         intent_ids = sorted({int(event["intent_id"]) for event in events})
         rows = self._user_memory_db.get_user_intent_items_by_ids(intent_ids)
@@ -155,9 +152,9 @@ class UserPrediction:
                 if prediction["id"] in links.get(intent["id"], set())
                 and (self._as_datetime(prediction.get("window_end"), as_of) or as_of) > as_of]
             deferred = [schedule for schedule in schedules if schedule["intent_id"] == intent["id"]]
-            if intent["status"] in self.CLOSED_INTENT_STATUSES.get(intent["object_type"], set()):
+            if intent["status"] in CLOSED_USER_INTENT_STATUSES:
                 path = "ruling_cleanup"
-            elif intent["status"] not in self.ACTIVE_INTENT_STATUSES.get(intent["object_type"], set()):
+            elif intent["status"] not in ACTIVE_USER_INTENT_STATUSES:
                 raise ValueError(f"Unsupported current intent status: {intent['status']!r}")
             elif (changed_since_event or existing_predictions or deferred
                   or any(event["event_type"] != "created" for event in related_events)):
@@ -283,8 +280,7 @@ class UserPrediction:
             for schedule in due:
                 intent = intents.get(schedule["intent_id"])
                 if (intent is None or intent.get("world_owner_entity_id") != owner_id
-                        or intent.get("status") not in self.ACTIVE_INTENT_STATUSES.get(
-                            intent.get("object_type"), set())):
+                        or intent.get("status") not in ACTIVE_USER_INTENT_STATUSES):
                     obsolete.append(schedule)
                     continue
                 snapshot = self._intent_snapshot(intent)
@@ -547,9 +543,7 @@ class UserPrediction:
         self, cases: Sequence[Dict[str, Any]], *, as_of: datetime,
     ) -> Dict[str, Any]:
         """Invalidate pending forecasts, close open services, and remove defers atomically."""
-        if any(case["current_intent"]["status"] not in self.CLOSED_INTENT_STATUSES.get(
-            case["current_intent"]["object_type"], set(),
-        ) for case in cases):
+        if any(case["current_intent"]["status"] not in CLOSED_USER_INTENT_STATUSES for case in cases):
             raise ValueError("Prediction cleanup requires closed intents")
         owner_id = self._world_owner_entity_id
         invalidated, closed = [], []
@@ -624,7 +618,7 @@ class UserPrediction:
         for case in cases:
             intent = case["current_intent"]
             intent_view = {key: intent[key] for key in (
-                "object_type", "id", "summary", "time_start", "time_end", "time_precision", "status",
+                "object_type", "id", "summary", "current_progress", "time_start", "time_end", "time_precision", "status",
             ) if key in intent and intent[key] not in ("", [], {}, None)}
             details = intent.get("details") or {}
             detail_view = {key: details[key] for key in detail_fields[intent["object_type"]]
@@ -760,7 +754,7 @@ class UserPrediction:
                         or not re.search(r"(?:Z|[+-]\d{2}:\d{2})$", value)
                         or next_time <= as_of):
                     raise ValueError("Deferred assessment requires a future evaluation datetime")
-                if current["status"] not in self.ACTIVE_INTENT_STATUSES.get(current["object_type"], set()):
+                if current["status"] not in ACTIVE_USER_INTENT_STATUSES:
                     raise ValueError("Closed intents cannot be deferred for preparation prediction")
                 next_evaluate_at = next_time.isoformat()
             elif result.get("next_evaluate_at") is not None:
@@ -848,8 +842,7 @@ class UserPrediction:
         for case in cases:
             current = case["current_intent"]
             old = {item["id"]: item for item in case["existing_predictions"]}
-            if (retained.intersection(old) and current["status"] not in
-                    self.ACTIVE_INTENT_STATUSES.get(current["object_type"], set())):
+            if retained.intersection(old) and current["status"] not in ACTIVE_USER_INTENT_STATUSES:
                 raise ValueError("Closed intents cannot retain preparation predictions")
             retained_texts = {self._normalize_behavior_text(item["behavior_text"])
                               for key, item in old.items() if key in retained}
@@ -869,8 +862,8 @@ class UserPrediction:
     ) -> List[Dict[str, Any]]:
         if not isinstance(raw, list) or len(raw) > 5:
             raise ValueError("Expected at most five predictions")
-        intents = [case["current_intent"] for case in cases if case["current_intent"]["status"]
-                   in self.ACTIVE_INTENT_STATUSES.get(case["current_intent"]["object_type"], set())]
+        intents = [case["current_intent"] for case in cases
+                   if case["current_intent"]["status"] in ACTIVE_USER_INTENT_STATUSES]
         normalized = []
         seen = set()
         for index, candidate in enumerate(raw):
@@ -1026,7 +1019,7 @@ class UserPrediction:
             intent = self._user_memory_db.get_intent_object(
                 object_type=intent_type, object_id=intent_id,
             )
-            if (not intent or intent.get("status") not in self.ACTIVE_INTENT_STATUSES.get(intent_type, set())
+            if (not intent or intent.get("status") not in ACTIVE_USER_INTENT_STATUSES
                     or int(intent.get("world_owner_entity_id") or 0) != owner_id):
                 self._logger.debug(
                     "active_prediction_skipped prediction_id=%s intent_id=%s "

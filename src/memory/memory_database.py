@@ -24,6 +24,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 import numpy as np
 
 from storage_utils import json_dumps, json_loads, local_now_text
+from intent_lifecycle import USER_INTENT_STATUSES
 from .memory_types import MemoryUnit
 
 try:
@@ -608,7 +609,8 @@ class UserMemoryDB:
                 canonical_key TEXT NOT NULL,
                 summary TEXT NOT NULL,
                 primary_domain TEXT NOT NULL DEFAULT '',
-                status TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('pending', 'in_progress', 'blocked', 'completed', 'cancelled')),
+                current_progress TEXT NOT NULL DEFAULT '',
                 time_start TEXT NOT NULL DEFAULT '',
                 time_end TEXT NOT NULL DEFAULT '',
                 confidence REAL NOT NULL DEFAULT 0.7,
@@ -621,44 +623,52 @@ class UserMemoryDB:
 
             CREATE TABLE IF NOT EXISTS memory_user_intent_lifecycle_observations (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                signal_id INTEGER NOT NULL UNIQUE,
+                signal_id INTEGER UNIQUE,
+                source_activity_id INTEGER,
+                target_intent_id INTEGER,
                 object_type TEXT NOT NULL CHECK(object_type IN ('goal', 'plan', 'work_item')),
                 target_description TEXT NOT NULL CHECK(length(trim(target_description)) > 0),
                 observation_text TEXT NOT NULL CHECK(length(trim(observation_text)) > 0),
                 lifecycle_evidence TEXT NOT NULL CHECK(
-                    (object_type = 'goal' AND lifecycle_evidence IN (
-                        'confirmed', 'updated', 'completed', 'cancelled', 'blocked'
-                    )) OR (object_type = 'plan' AND lifecycle_evidence IN (
-                        'confirmed', 'updated', 'occurred', 'cancelled', 'rescheduled', 'blocked'
-                    )) OR (object_type = 'work_item' AND lifecycle_evidence IN (
-                        'confirmed', 'updated', 'completed', 'cancelled', 'blocked'
-                    ))
+                    lifecycle_evidence IN (
+                        'updated', 'rescheduled', 'started', 'blocked', 'resumed', 'completed', 'cancelled', 'reopened'
+                    )
                 ),
                 effective_at TEXT NOT NULL DEFAULT '',
                 confidence REAL NOT NULL DEFAULT 0.7 CHECK(confidence BETWEEN 0.0 AND 1.0),
                 details TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
+                CHECK((signal_id IS NOT NULL AND source_activity_id IS NULL AND target_intent_id IS NULL)
+                    OR (signal_id IS NULL AND source_activity_id IS NOT NULL AND target_intent_id IS NOT NULL)),
+                UNIQUE(source_activity_id, target_intent_id),
                 FOREIGN KEY(signal_id) REFERENCES memory_fact_user_intent_signals(signal_id)
-                    ON DELETE CASCADE
+                    ON DELETE CASCADE,
+                FOREIGN KEY(source_activity_id) REFERENCES memory_user_activity_items(id) ON DELETE CASCADE,
+                FOREIGN KEY(target_intent_id) REFERENCES memory_user_intent_items(id) ON DELETE CASCADE
             );
 
             CREATE TABLE IF NOT EXISTS memory_user_intent_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 intent_id INTEGER NOT NULL,
                 event_type TEXT NOT NULL CHECK(event_type IN (
-                    'created', 'updated', 'rescheduled', 'cancelled', 'completed', 'occurred'
+                    'created', 'updated', 'rescheduled', 'started', 'blocked', 'resumed', 'completed', 'cancelled', 'reopened'
                 )),
                 previous_payload TEXT NOT NULL DEFAULT '{}',
                 new_payload TEXT NOT NULL,
-                source_signal_id INTEGER NOT NULL,
+                source_signal_id INTEGER,
+                source_activity_id INTEGER,
                 lifecycle_observation_id INTEGER,
                 effective_at TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
                 UNIQUE(source_signal_id, intent_id, event_type),
+                UNIQUE(source_activity_id, intent_id, event_type),
+                CHECK((source_signal_id IS NOT NULL AND source_activity_id IS NULL)
+                    OR (source_signal_id IS NULL AND source_activity_id IS NOT NULL)),
                 FOREIGN KEY(intent_id) REFERENCES memory_user_intent_items(id) ON DELETE CASCADE,
                 FOREIGN KEY(source_signal_id) REFERENCES memory_fact_user_intent_signals(signal_id)
                     ON DELETE CASCADE,
+                FOREIGN KEY(source_activity_id) REFERENCES memory_user_activity_items(id) ON DELETE CASCADE,
                 FOREIGN KEY(lifecycle_observation_id)
                     REFERENCES memory_user_intent_lifecycle_observations(id) ON DELETE CASCADE
             );
@@ -674,6 +684,9 @@ class UserMemoryDB:
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY(object_type, object_id, evidence_type, evidence_id, role)
             );
+
+            CREATE INDEX IF NOT EXISTS idx_user_intent_events_latest
+            ON memory_user_intent_events(intent_id, id DESC);
 
             CREATE INDEX IF NOT EXISTS idx_memory_facts_event_time ON memory_facts(event_time_key);
             CREATE INDEX IF NOT EXISTS idx_memory_facts_dialogue_time ON memory_facts(dialogue_time_key);
@@ -1217,6 +1230,10 @@ class UserMemoryDB:
             """,
             (max(1, int(limit or 240)),),
         ).fetchall()
+        return self._memory_source_rows_to_units(rows)
+
+    def _memory_source_rows_to_units(self, rows: Sequence[sqlite3.Row]) -> List[MemoryUnit]:
+        """Decode persisted source units for activity extraction."""
         source_units: List[MemoryUnit] = []
         for row in rows:
             batch_row = self._row_to_dict(row)
@@ -1771,26 +1788,38 @@ class UserMemoryDB:
     def upsert_user_intent_lifecycle_observation(
         self, observation: Dict[str, Any],
     ) -> int:
-        """Save one extracted observation using its source signal as stable identity."""
-        signal_id = int(observation["signal_id"])
+        """Save signal observations or an activity/intent pair without synthetic signals."""
+        signal_id = observation.get("signal_id")
+        activity_id = observation.get("source_activity_id")
+        target_id = observation.get("target_intent_id")
         object_type = str(observation["object_type"])
-        source = self._conn.execute(
-            "SELECT signal_purpose, candidate_object_types "
-            "FROM memory_fact_user_intent_signals WHERE signal_id = ?",
-            (signal_id,),
-        ).fetchone()
-        if (not source or source["signal_purpose"] != "lifecycle_update"
-                or object_type not in json_loads(source["candidate_object_types"], [])):
-            raise ValueError("Observation must reference a lifecycle signal of the same object type")
+        if (signal_id is None) == (activity_id is None):
+            raise ValueError("Observation requires exactly one signal or activity source")
+        if signal_id is not None:
+            source = self._conn.execute(
+                "SELECT signal_purpose, candidate_object_types "
+                "FROM memory_fact_user_intent_signals WHERE signal_id = ?",
+                (signal_id,),
+            ).fetchone()
+            if (target_id is not None or not source or source["signal_purpose"] != "lifecycle_update"
+                    or object_type not in json_loads(source["candidate_object_types"], [])):
+                raise ValueError("Observation must reference a lifecycle signal of the same object type")
+            identity_field, identity_values = "signal_id", (int(signal_id),)
+        else:
+            activity = self.get_user_activity_items_by_ids([activity_id])
+            target = self.get_intent_object(object_type=object_type, object_id=int(target_id or 0))
+            if not activity or not target:
+                raise ValueError("Activity observation requires a real activity and same-type intent")
+            identity_field, identity_values = "source_activity_id, target_intent_id", (int(activity_id), int(target_id))
         now = local_now_text()
         self._conn.execute(
-            """
+            f"""
             INSERT INTO memory_user_intent_lifecycle_observations (
-                signal_id, object_type, target_description, observation_text,
+                signal_id, source_activity_id, target_intent_id, object_type, target_description, observation_text,
                 lifecycle_evidence, effective_at, confidence, details,
                 created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(signal_id) DO UPDATE SET
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT({identity_field}) DO UPDATE SET
                 object_type = excluded.object_type,
                 target_description = excluded.target_description,
                 observation_text = excluded.observation_text,
@@ -1801,19 +1830,31 @@ class UserMemoryDB:
                 updated_at = excluded.updated_at
             """,
             (
-                signal_id, object_type, str(observation["target_description"]),
+                signal_id, activity_id, target_id, object_type, str(observation["target_description"]),
                 str(observation["observation_text"]), str(observation["lifecycle_evidence"]),
                 str(observation.get("effective_at") or ""),
                 float(observation.get("confidence", 0.7)),
                 json_dumps(observation.get("details") or {}), now, now,
             ),
         )
+        where = ("signal_id = ?" if signal_id is not None
+                 else "source_activity_id = ? AND target_intent_id = ?")
         row = self._conn.execute(
-            "SELECT id FROM memory_user_intent_lifecycle_observations WHERE signal_id = ?",
-            (signal_id,),
+            f"SELECT id FROM memory_user_intent_lifecycle_observations WHERE {where}", identity_values,
         ).fetchone()
         self._commit_if_needed()
         return int(row["id"])
+
+    def get_activity_intent_lifecycle_observation(
+        self, activity_id: int, intent_id: int,
+    ) -> Optional[Dict[str, Any]]:
+        """Find a committed evaluation of this exact activity/intent pair."""
+        row = self._conn.execute(
+            "SELECT * FROM memory_user_intent_lifecycle_observations "
+            "WHERE source_activity_id = ? AND target_intent_id = ?",
+            (int(activity_id), int(intent_id)),
+        ).fetchone()
+        return self._row_to_dict(row) if row else None
 
     def get_user_intent_lifecycle_observations_by_ids(
         self, observation_ids: Sequence[int],
@@ -2186,7 +2227,7 @@ class UserMemoryDB:
             raise ValueError("object_type must be goal, plan, or work_item")
         return "memory_user_intent_items", (
             "object_type", "world_owner_entity_id",
-            "canonical_key", "summary", "primary_domain", "status",
+            "canonical_key", "summary", "primary_domain", "status", "current_progress",
             "time_start", "time_end", "confidence", "details", "metadata",
         )
 
@@ -2199,6 +2240,9 @@ class UserMemoryDB:
         normalized = str(object_type or "").strip().lower()
         if normalized not in {"goal", "plan", "work_item"}:
             raise ValueError("object_type must be goal, plan, or work_item")
+        status = payload.get("status", "pending")
+        if not isinstance(status, str) or status not in USER_INTENT_STATUSES:
+            raise ValueError("intent status must be pending, in_progress, blocked, completed, or cancelled")
         details = dict(payload.get("details") or {}) if isinstance(payload.get("details"), dict) else {}
         if normalized == "goal":
             details.update({
@@ -2235,7 +2279,8 @@ class UserMemoryDB:
             "canonical_key": payload.get("canonical_key"),
             "summary": payload.get("summary"),
             "primary_domain": payload.get("primary_domain"),
-            "status": payload.get("status"),
+            "status": status,
+            "current_progress": payload.get("current_progress"),
             "time_start": time_start,
             "time_end": time_end,
             "confidence": payload.get("confidence"),
@@ -2325,6 +2370,10 @@ class UserMemoryDB:
         ).fetchone()
         if not existing_row:
             return False
+        if "current_progress" not in payload:
+            normalized_payload.pop("current_progress", None)
+        if "status" not in payload:
+            normalized_payload.pop("status", None)
         existing = dict(existing_row)
         for json_field in ("details", "metadata"):
             existing[json_field] = json_loads(existing.get(json_field), {})
@@ -2444,10 +2493,14 @@ class UserMemoryDB:
             return "created"
         status = current.get("status")
         if status != previous.get("status"):
-            if status in {"cancelled", "completed", "occurred"}:
+            if status in {"cancelled", "completed"}:
                 return status
-            if status == "rescheduled":
-                return "rescheduled"
+            if previous.get("status") in {"completed", "cancelled"}:
+                return "reopened"
+            if status == "blocked":
+                return "blocked"
+            if status == "in_progress":
+                return "resumed" if previous.get("status") == "blocked" else "started"
 
         def time_shifted(old_value: Any, new_value: Any) -> bool:
             old_text, new_text = str(old_value or "").strip(), str(new_value or "").strip()
@@ -2478,7 +2531,8 @@ class UserMemoryDB:
         intent_id: int,
         event_type: Optional[str] = None,
         new_payload: Dict[str, Any],
-        source_signal_id: int,
+        source_signal_id: Optional[int] = None,
+        source_activity_id: Optional[int] = None,
         previous_payload: Optional[Dict[str, Any]] = None,
         lifecycle_observation_id: Optional[int] = None,
         effective_at: str = "",
@@ -2491,19 +2545,29 @@ class UserMemoryDB:
         intent = self._conn.execute(
             "SELECT * FROM memory_user_intent_items WHERE id = ?", (int(intent_id),),
         ).fetchone()
-        signal = self._conn.execute(
-            "SELECT subject_entity_id FROM memory_fact_user_intent_signals WHERE signal_id = ?",
-            (int(source_signal_id),),
-        ).fetchone()
-        if (not intent or not signal
-                or signal["subject_entity_id"] != intent["world_owner_entity_id"]):
-            raise ValueError("Intent event must reference a same-owner source signal")
+        if (source_signal_id is None) == (source_activity_id is None):
+            raise ValueError("Intent event requires exactly one signal or activity source")
+        if source_signal_id is not None:
+            signal = self._conn.execute(
+                "SELECT subject_entity_id FROM memory_fact_user_intent_signals WHERE signal_id = ?",
+                (int(source_signal_id),),
+            ).fetchone()
+            if (not intent or not signal
+                    or signal["subject_entity_id"] != intent["world_owner_entity_id"]):
+                raise ValueError("Intent event must reference a same-owner source signal")
+        elif not intent or not self.get_user_activity_items_by_ids([source_activity_id]):
+            raise ValueError("Intent event must reference a real activity and intent")
+        elif lifecycle_observation_id is None:
+            raise ValueError("Activity intent event requires its lifecycle observation")
         if lifecycle_observation_id is not None:
             observation = self._conn.execute(
-                "SELECT signal_id, object_type FROM memory_user_intent_lifecycle_observations "
+                "SELECT signal_id, source_activity_id, target_intent_id, object_type "
+                "FROM memory_user_intent_lifecycle_observations "
                 "WHERE id = ?", (int(lifecycle_observation_id),),
             ).fetchone()
-            if (not observation or observation["signal_id"] != int(source_signal_id)
+            if (not observation or observation["signal_id"] != source_signal_id
+                    or observation["source_activity_id"] != source_activity_id
+                    or (source_activity_id is not None and observation["target_intent_id"] != int(intent_id))
                     or observation["object_type"] != intent["object_type"]):
                 raise ValueError("Intent event observation does not match its source and type")
         # Store physical business fields, excluding timestamps and typed API aliases.
@@ -2522,11 +2586,11 @@ class UserMemoryDB:
         cursor = self._conn.execute(
             """INSERT INTO memory_user_intent_events (
                 intent_id, event_type, previous_payload, new_payload,
-                source_signal_id, lifecycle_observation_id, effective_at, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                source_signal_id, source_activity_id, lifecycle_observation_id, effective_at, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 int(intent_id), event_type, json_dumps(previous), json_dumps(updated),
-                int(source_signal_id), lifecycle_observation_id,
+                source_signal_id, source_activity_id, lifecycle_observation_id,
                 str(effective_at or ""), local_now_text(),
             ),
         )
@@ -2536,6 +2600,7 @@ class UserMemoryDB:
     def get_user_intent_events(
         self, *, event_ids: Optional[Sequence[int]] = None,
         source_signal_id: Optional[int] = None,
+        source_activity_id: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """Read applied changes in event order, optionally scoped to a source signal."""
         ids = None if event_ids is None else sorted({
@@ -2554,6 +2619,9 @@ class UserMemoryDB:
             if source_signal_id is not None:
                 clauses.append("source_signal_id = ?")
                 params.append(int(source_signal_id))
+            if source_activity_id is not None:
+                clauses.append("source_activity_id = ?")
+                params.append(int(source_activity_id))
             where = " WHERE " + " AND ".join(clauses) if clauses else ""
             rows = self._conn.execute(
                 f"SELECT * FROM memory_user_intent_events{where} ORDER BY id", params,
@@ -2564,6 +2632,14 @@ class UserMemoryDB:
                     item[key] = json_loads(item[key], {})
                 events.append(item)
         return events
+
+    def get_latest_user_intent_event(self, intent_id: int) -> Optional[Dict[str, Any]]:
+        """Read the latest applied mutation, including its logical effective time."""
+        row = self._conn.execute(
+            "SELECT id FROM memory_user_intent_events WHERE intent_id = ? ORDER BY id DESC LIMIT 1",
+            (int(intent_id),),
+        ).fetchone()
+        return self.get_user_intent_events(event_ids=[row["id"]])[0] if row else None
 
     def get_intent_object(
         self, *, object_type: str, object_id: int
@@ -2596,7 +2672,7 @@ class UserMemoryDB:
                 continue
             if (
                 object_type not in {"goal", "plan", "work_item"}
-                or evidence_type != "fact"
+                or evidence_type not in {"fact", "user_activity"}
                 or object_id <= 0 or evidence_id <= 0
             ):
                 continue

@@ -34,6 +34,13 @@ except ImportError:  # pragma: no cover - exercised only in minimal installs
 
 from embedding_client import EmbeddingClient
 from llm_client import LLMClient
+from intent_lifecycle import (
+    ACTIVE_USER_INTENT_STATUSES,
+    USER_INTENT_FIELD_ONLY_EVIDENCE_TYPES,
+    USER_INTENT_LIFECYCLE_EVIDENCE_TYPES,
+    USER_INTENT_STATUSES,
+    user_intent_status_after_evidence,
+)
 from semantic_domains import SEMANTIC_DOMAINS
 from .memory_database import UserMemoryDB
 from .memory_types import MemoryUnit
@@ -49,6 +56,7 @@ from prompts_en import (
     USER_OBSERVED_PATTERN_EXTRACTION_PROMPT_EN,
     INTENT_EXTRACTION_PROMPT_EN,
     INTENT_LIFECYCLE_RECONCILIATION_PROMPT_EN,
+    USER_INTENT_LIFECYCLE_FROM_ACTIVITIES_PROMPT_EN,
     INTENT_RECONCILIATION_PROMPT_EN,
     USER_ACTIVITY_EXTRACTION_PROMPT_EN,
     MEMORY_RETRIEVED_FORMAT_PROMPT_EN,
@@ -66,6 +74,7 @@ from prompts_zh import (
     USER_OBSERVED_PATTERN_EXTRACTION_PROMPT_ZH,
     INTENT_EXTRACTION_PROMPT_ZH,
     INTENT_LIFECYCLE_RECONCILIATION_PROMPT_ZH,
+    USER_INTENT_LIFECYCLE_FROM_ACTIVITIES_PROMPT_ZH,
     INTENT_RECONCILIATION_PROMPT_ZH,
     USER_ACTIVITY_EXTRACTION_PROMPT_ZH,
     MEMORY_RETRIEVED_FORMAT_PROMPT_ZH,
@@ -268,6 +277,10 @@ class MemoryNodeManager:
         )
         self._task_scheduler.register_handler(
             "memory_user_intent_update", self._process_memory_user_intent_update_task,
+        )
+        self._task_scheduler.register_handler(
+            "memory_user_intent_update_from_activities",
+            self._process_memory_user_intent_update_from_activities_task,
         )
     def _initialize_recall_config(self) -> None:
         """Parse nested recall settings and keep legacy flat overrides working."""
@@ -671,6 +684,7 @@ class MemoryNodeManager:
             "status": "ok",
             "new_user_activity_count": len(activity_ids),
             "user_activity_item_ids": activity_ids,
+            "reference_timestamp": source_ended_at,
             "fact_count": len(facts),
             "source_unit_count": len(source_units),
             "source_unit_row_count": processed_rows,
@@ -2471,6 +2485,213 @@ class MemoryNodeManager:
         self._logger.log_json_format("memory_user_claim", "finish", report)
         return report
 
+    def _build_activity_intent_lifecycle_cases(
+        self, activities: Sequence[Dict[str, Any]], *, world_owner_id: int,
+    ) -> Tuple[List[Dict[str, Any]], List[int]]:
+        """Recall existing intents; persisted prior pair decisions are idempotent."""
+        limit = max(1, int(self._memory_cfg.get("activity_intent_candidate_limit") or 8))
+        intents = [item for kind in ("goal", "plan", "work_item")
+                   for item in self._db.get_intent_objects(
+                       object_type=kind, world_owner_entity_id=world_owner_id, limit=120,
+                   )]
+        cases, replay_event_ids = [], []
+        for activity in activities:
+            facts = self._db.get_memory_facts_by_ids(activity["evidence_fact_ids"])
+            ranked = []
+            for intent in intents:
+                score = max(self._score_intent_candidate_against_existing_object(
+                    {"object_type": intent["object_type"], "summary": text}, intent,
+                ) for text in [activity["activity_text"], *[fact["summary"] for fact in facts]])
+                if score < 0.12:
+                    continue
+                if self._db.get_activity_intent_lifecycle_observation(activity["id"], intent["id"]):
+                    replay_event_ids.extend(event["id"] for event in self._db.get_user_intent_events(
+                        source_activity_id=activity["id"],
+                    ) if event["intent_id"] == intent["id"])
+                    continue
+                ranked.append((score, intent))
+            ranked.sort(key=lambda pair: (-pair[0], -int(pair[1]["id"])))
+            if not ranked:
+                continue
+            cases.append({
+                "activity": {key: activity[key] for key in (
+                    "id", "activity_text", "user_role", "started_at", "ended_at",
+                )},
+                "facts": [self._format_fact_view_for_user_intent_prompt(fact) for fact in facts],
+                "existing_intents": [{
+                    **self._intent_object_prompt_view(item["object_type"], item),
+                    "time_start": item["time_start"], "time_end": item["time_end"],
+                    "details": item["details"],
+                    "latest_event": self._activity_intent_latest_event_view(item["id"]),
+                } for _, item in ranked[:limit]],
+            })
+        return cases, sorted(set(replay_event_ids))
+
+    def _activity_intent_latest_event_view(self, intent_id: int) -> Optional[Dict[str, Any]]:
+        event = self._db.get_latest_user_intent_event(intent_id)
+        return {key: event[key] for key in ("id", "event_type", "effective_at")} if event else None
+
+    def _process_memory_user_intent_update_from_activities_task(
+        self, *, activity_ids: Sequence[int], reference_timestamp: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        """One LLM pass matches new activities and adjudicates old-intent progress."""
+        scope = "memory_user_intent_update_from_activities"
+        ids = sorted({int(value) for value in activity_ids if int(value) > 0})
+        activities = self._db.get_user_activity_items_by_ids(ids)
+        reference = str(reference_timestamp or max(
+            (item["ended_at"] for item in activities), default=_now_text(),
+        ))
+        report: Dict[str, Any] = {
+            "status": "empty", "reference_timestamp": reference, "intent_event_ids": [],
+            "processed_activity_ids": [], "failed_activity_ids": sorted(set(ids) - {a["id"] for a in activities}),
+        }
+        try:
+            as_of = datetime.fromisoformat(reference.replace("Z", "+00:00")).astimezone()
+        except (ValueError, TypeError):
+            return {**report, "status": "failed", "reason": "invalid_reference_timestamp",
+                    "failed_activity_ids": ids}
+        eligible = []
+        for activity in activities:
+            try:
+                end = datetime.fromisoformat(activity["ended_at"].replace("Z", "+00:00")).astimezone()
+                if end > as_of:
+                    raise ValueError("activity_after_reference_time")
+                eligible.append(activity)
+            except (ValueError, TypeError):
+                report["failed_activity_ids"].append(activity["id"])
+        owner_id = self._intent_world_owner_entity_id()
+        batch_size = max(1, int(self._memory_cfg.get("activity_intent_batch_size") or 4))
+        for offset in range(0, len(eligible), batch_size):
+            batch = eligible[offset:offset + batch_size]
+            batch_ids = {item["id"] for item in batch}
+            try:
+                cases, replay_ids = self._build_activity_intent_lifecycle_cases(batch, world_owner_id=owner_id)
+                report["intent_event_ids"].extend(replay_ids)
+                case_ids = {case["activity"]["id"] for case in cases}
+                report["processed_activity_ids"].extend(batch_ids - case_ids)
+                if not cases:
+                    continue
+                language = self._resolve_prompt_language_from_text("\n".join(a["activity_text"] for a in batch))
+                template = (USER_INTENT_LIFECYCLE_FROM_ACTIVITIES_PROMPT_EN if language == "en"
+                            else USER_INTENT_LIFECYCLE_FROM_ACTIVITIES_PROMPT_ZH)
+                prompt = (template.replace("{reference_timestamp}", reference)
+                          .replace("{activity_cases}", "[\n" + ",\n".join(
+                              json.dumps(case, ensure_ascii=False, separators=(",", ":")) for case in cases) + "\n]"))
+                self._logger.log_json_format(scope, "start", {"activity_ids": sorted(case_ids),
+                    "candidate_count": sum(len(case["existing_intents"]) for case in cases),
+                    "reference_timestamp": reference})
+                raw = self._llm_client.call_llm(prompt, stage_name=scope)
+                parsed = self._llm_client.parse_json_object_from_llm_text(raw or "", stage_name=scope)
+                if not isinstance(parsed, dict) or not isinstance(parsed.get("decisions"), list):
+                    raise ValueError("invalid_activity_intent_lifecycle_response")
+                by_activity: Dict[int, List[Dict[str, Any]]] = {value: [] for value in case_ids}
+                for decision in parsed["decisions"]:
+                    if (not isinstance(decision, dict) or type(decision.get("activity_id")) is not int
+                            or decision["activity_id"] not in by_activity):
+                        raise ValueError("invalid_activity_decision_id")
+                    by_activity[decision["activity_id"]].append(decision)
+                observations, validation_cases, raw_decisions = [], [], {}
+                for case in cases:
+                    activity_id = case["activity"]["id"]
+                    try:
+                        rows = by_activity[activity_id]
+                        if not rows:
+                            raise ValueError("missing_activity_decision")
+                        candidates = {item["id"]: item for item in case["existing_intents"]}
+                        fact_ids = {fact["id"] for fact in case["facts"]}
+                        seen, pending = set(), []
+                        for row in rows:
+                            if set(row) != {"activity_id", "target_intent_id", "intent_lifecycle_observation", "field_updates", "reason"}:
+                                raise ValueError("invalid_activity_decision_fields")
+                            target_id = row["target_intent_id"]
+                            if not isinstance(row["reason"], str) or target_id in seen:
+                                raise ValueError("invalid_or_duplicate_activity_target")
+                            if not isinstance(row["field_updates"], dict):
+                                raise ValueError("invalid_activity_field_updates")
+                            seen.add(target_id)
+                            if target_id is None:
+                                if row["intent_lifecycle_observation"] is not None or row["field_updates"] != {} or len(rows) != 1:
+                                    raise ValueError("invalid_unmatched_activity_decision")
+                                continue
+                            if type(target_id) is not int or target_id not in candidates:
+                                raise ValueError("activity_target_not_in_candidates")
+                            raw_observation = row["intent_lifecycle_observation"]
+                            if raw_observation is None and not row["field_updates"]:
+                                # A reliable match alone is not a lifecycle change.
+                                continue
+                            if not isinstance(raw_observation, dict):
+                                raise ValueError("missing_activity_lifecycle_observation")
+                            evidence_ids = raw_observation.get("evidence_fact_ids")
+                            if (not isinstance(evidence_ids, list)
+                                    or any(type(value) is not int or value not in fact_ids for value in evidence_ids)):
+                                raise ValueError("activity_fact_evidence_not_in_case")
+                            observation = self._normalize_single_intent_lifecycle_observation(raw_observation)
+                            if observation["object_type"] != candidates[target_id]["object_type"]:
+                                raise ValueError("activity_target_type_mismatch")
+                            timestamp = observation["effective_at"]
+                            if timestamp and datetime.fromisoformat(timestamp.replace("Z", "+00:00")).astimezone() > as_of:
+                                raise ValueError("activity_change_after_reference_time")
+                            observation.update(source_activity_id=activity_id, target_intent_id=target_id,
+                                               observed_at=case["activity"]["ended_at"])
+                            pending.append((observation, row, candidates[target_id]))
+                        if not pending:
+                            report["processed_activity_ids"].append(activity_id)
+                        for observation, row, target in pending:
+                            index = len(observations)
+                            observations.append(observation)
+                            validation_cases.append({"intent_lifecycle_observation": observation, "existing_intents": [target]})
+                            evidence_type = observation["lifecycle_evidence"]
+                            # This path has already matched and assessed the old
+                            # intent in one LLM pass. Derive its stage rather than
+                            # asking for a second, potentially conflicting status.
+                            update = None
+                            latest = target.get("latest_event") or {}
+                            change_at = latest.get("effective_at")
+                            historical = (
+                                latest.get("event_type") != "created" and bool(change_at)
+                                and datetime.fromisoformat(observation["observed_at"].replace("Z", "+00:00")).astimezone()
+                                < datetime.fromisoformat(change_at.replace("Z", "+00:00")).astimezone()
+                            )
+                            if not historical and (
+                                evidence_type not in USER_INTENT_FIELD_ONLY_EVIDENCE_TYPES or row["field_updates"]
+                            ):
+                                update = {
+                                    "status": user_intent_status_after_evidence(target["status"], evidence_type),
+                                    "field_updates": row["field_updates"],
+                                    "effective_at": observation["effective_at"],
+                                }
+                            raw_decisions[index] = [{"observation_index": index, "target_intent_id": target["id"],
+                                "intent_update": update, "reason": (
+                                    "Activity predates the latest intent change" if historical else row["reason"]
+                                )}]
+                    except Exception as exc:
+                        report["failed_activity_ids"].append(activity_id)
+                        self._logger.log_json_format(scope, "activity_error", {
+                            "activity_id": activity_id, "phase": "normalization", "error": str(exc)})
+                decisions = self._normalize_intent_lifecycle_decisions(validation_cases, raw_decisions, scope=scope)
+                saved = self._save_intent_lifecycle_observations(
+                    observations, decisions, world_owner_id=owner_id, scope=scope,
+                )
+                report["intent_event_ids"].extend(saved["intent_event_ids"])
+                report["processed_activity_ids"].extend(saved["completed_activity_ids"])
+                report["failed_activity_ids"].extend(saved["failed_activity_ids"])
+            except Exception as exc:
+                report["failed_activity_ids"].extend(batch_ids)
+                self._logger.log_json_format(scope, "batch_error", {
+                    "activity_ids": sorted(batch_ids), "error_type": type(exc).__name__, "error": str(exc)})
+        report["intent_event_ids"] = sorted(set(report["intent_event_ids"]))
+        report["failed_activity_ids"] = sorted(set(report["failed_activity_ids"]))
+        completed = set(report["processed_activity_ids"])
+        report["processed_activity_ids"] = sorted(completed - set(report["failed_activity_ids"]))
+        if report["failed_activity_ids"]:
+            # One activity may produce several independently committed intent
+            # updates. A failed sibling must not hide its already applied events.
+            report["status"] = "partial" if completed or report["intent_event_ids"] else "failed"
+        elif report["intent_event_ids"]:
+            report["status"] = "ok"
+        self._logger.log_json_format(scope, "finish", report)
+        return report
+
     def _process_memory_user_intent_update_task(
         self,
         *,
@@ -3014,12 +3235,7 @@ class MemoryNodeManager:
                 f"field=effective_at reason=invalid_type actual={raw.get('effective_at')!r} expected=string"
             )
         object_type = str(raw.get("object_type") or "")
-        allowed_evidence = {
-            "goal": {"confirmed", "updated", "completed", "cancelled", "blocked"},
-            "plan": {"confirmed", "updated", "occurred", "cancelled", "rescheduled", "blocked"},
-            "work_item": {"confirmed", "updated", "completed", "cancelled", "blocked"},
-        }
-        if object_type not in allowed_evidence:
+        if object_type not in {"goal", "plan", "work_item"}:
             raise ValueError(
                 f"field=object_type reason=invalid_enum actual={object_type!r} expected=goal|plan|work_item"
             )
@@ -3030,10 +3246,10 @@ class MemoryNodeManager:
             raise ValueError("field=target_description reason=empty_value actual='' expected=nonempty_text")
         if not text:
             raise ValueError("field=observation_text reason=empty_value actual='' expected=nonempty_text")
-        if lifecycle_evidence not in allowed_evidence[object_type]:
+        if lifecycle_evidence not in USER_INTENT_LIFECYCLE_EVIDENCE_TYPES:
             raise ValueError(
                 f"field=lifecycle_evidence reason=invalid_enum actual={raw.get('lifecycle_evidence')!r} "
-                f"expected={sorted(allowed_evidence[object_type])!r} for_object_type={object_type}"
+                f"expected={sorted(USER_INTENT_LIFECYCLE_EVIDENCE_TYPES)!r}"
             )
         effective_at = _compact_whitespace(raw.get("effective_at") or "")
         if effective_at:
@@ -3365,6 +3581,7 @@ class MemoryNodeManager:
                 "id": item["id"],
                 **self._future_intent_reconciliation_prompt_view(item["object_type"], item),
                 "status": item.get("status") or "",
+                "current_progress": item.get("current_progress") or "",
             }, ensure_ascii=False, separators=(",", ":"))
             for item in existing_objects
         ]
@@ -3421,11 +3638,6 @@ class MemoryNodeManager:
         existing_by_id = {
             int(item["id"]): item for item in existing_objects
         }
-        allowed_statuses = {
-            "goal": {"active", "blocked", "completed", "cancelled"},
-            "plan": {"planned", "rescheduled", "blocked", "occurred", "cancelled"},
-            "work_item": {"open", "in_progress", "blocked", "completed", "cancelled"},
-        }
         detail_fields = {
             "goal": {"desired_outcome", "success_criteria", "target_at"},
             "plan": {"event_or_activity", "time_precision", "location_text", "participants"},
@@ -3472,11 +3684,11 @@ class MemoryNodeManager:
                 if update is not None:
                     if (not isinstance(update, dict) or target_id is None
                             or set(update) != {"status", "field_updates", "effective_at"}
-                            or update.get("status") not in allowed_statuses[object_type]):
+                            or update.get("status") not in USER_INTENT_STATUSES):
                         raise ValueError("invalid_future_intent_update_target_or_status")
                     patch = update.get("field_updates")
                     if (not isinstance(patch, dict)
-                            or set(patch) - {"summary", "time_start", "time_end", "details"}):
+                            or set(patch) - {"summary", "current_progress", "time_start", "time_end", "details"}):
                         raise ValueError("invalid_future_intent_field_updates")
                     for field, value in patch.items():
                         if field == "details":
@@ -3555,6 +3767,7 @@ class MemoryNodeManager:
             "object_type": object_type,
             "id": item.get("id"),
             "primary_domain": item.get("primary_domain") or "",
+            "current_progress": item.get("current_progress") or "",
             **{field: item.get(field) or "" for field in fields},
         }
 
@@ -3690,7 +3903,6 @@ class MemoryNodeManager:
         """Match observations and adjudicate sparse intent updates without writing to storage."""
         if not observations:
             return {}
-        decisions: Dict[int, Dict[str, Any]] = {}
         cases = self._retrieve_intent_lifecycle_observation_cases(
             observations, facts_by_id=facts_by_id, world_owner_id=world_owner_id,
         )
@@ -3723,11 +3935,14 @@ class MemoryNodeManager:
                     "error": str(exc),
                 })
 
-        allowed_statuses = {
-            "goal": {"active", "blocked", "completed", "cancelled"},
-            "plan": {"planned", "rescheduled", "blocked", "occurred", "cancelled"},
-            "work_item": {"open", "in_progress", "blocked", "completed", "cancelled"},
-        }
+        return self._normalize_intent_lifecycle_decisions(cases, decisions_by_index)
+
+    def _normalize_intent_lifecycle_decisions(
+        self, cases: Sequence[Dict[str, Any]], decisions_by_index: Dict[int, List[Dict[str, Any]]],
+        *, scope: str = "memory_user_intent_update",
+    ) -> Dict[int, Dict[str, Any]]:
+        """Apply the same lifecycle patch and conflict checks to both evidence sources."""
+        decisions: Dict[int, Dict[str, Any]] = {}
         detail_fields = {
             "goal": {"desired_outcome", "success_criteria", "target_at"},
             "plan": {"event_or_activity", "time_precision", "location_text", "participants"},
@@ -3761,11 +3976,11 @@ class MemoryNodeManager:
                 if update is not None:
                     if (not isinstance(update, dict) or target_id is None
                             or set(update) != {"status", "field_updates", "effective_at"}
-                            or update.get("status") not in allowed_statuses[object_type]):
+                            or update.get("status") not in USER_INTENT_STATUSES):
                         raise ValueError("invalid_lifecycle_update_target_or_status")
                     patch = update.get("field_updates")
                     if (not isinstance(patch, dict)
-                            or set(patch) - {"summary", "time_start", "time_end", "details"}):
+                            or set(patch) - {"summary", "current_progress", "time_start", "time_end", "details"}):
                         raise ValueError("invalid_lifecycle_field_updates")
                     for field, value in patch.items():
                         if field == "details":
@@ -3800,18 +4015,23 @@ class MemoryNodeManager:
                     "reason": _compact_whitespace(decision["reason"])[:480],
                 }
             except Exception as exc:
-                self._logger.log_json_format("memory_user_intent_update", "signal_error", {
+                self._logger.log_json_format(scope, "signal_error", {
                     "observation_index": index, "phase": "lifecycle_reconciliation", "error": str(exc),
                 })
         # Do not let incompatible batch updates overwrite one another in list order.
         updates_by_target: Dict[int, Dict[str, Any]] = {}
         conflicting_targets = set()
-        for decision in decisions.values():
+        for index, decision in decisions.items():
             update = decision["intent_update"]
             if update is None:
                 continue
             target_id = decision["target_intent_id"]
-            fields = {"status": update["status"]}
+            observation = cases[index]["intent_lifecycle_observation"]
+            field_only_activity = (
+                observation.get("source_activity_id") is not None
+                and observation["lifecycle_evidence"] in USER_INTENT_FIELD_ONLY_EVIDENCE_TYPES
+            )
+            fields = {} if field_only_activity else {"status": update["status"]}
             for field, value in update["field_updates"].items():
                 if field == "details":
                     fields.update({f"details.{key}": detail for key, detail in value.items()})
@@ -3825,7 +4045,7 @@ class MemoryNodeManager:
             if (decisions[index]["intent_update"] is not None
                     and decisions[index]["target_intent_id"] in conflicting_targets):
                 del decisions[index]
-                self._logger.log_json_format("memory_user_intent_update", "signal_error", {
+                self._logger.log_json_format(scope, "signal_error", {
                     "observation_index": index, "phase": "lifecycle_reconciliation",
                     "error": "conflicting_lifecycle_updates",
                 })
@@ -3833,30 +4053,52 @@ class MemoryNodeManager:
 
     def _save_intent_lifecycle_observations(
         self, observations: Sequence[Dict[str, Any]], decisions: Dict[int, Dict[str, Any]], *,
-        world_owner_id: int,
+        world_owner_id: int, scope: str = "memory_user_intent_update",
     ) -> Dict[str, Any]:
-        """Atomically save each observation, its adjudicated intent changes, and fact evidence."""
+        """Atomically save either source's observation, applied changes and evidence."""
         report: Dict[str, Any] = {
             "intent_lifecycle_observation_ids": [],
             "intent_event_ids": [],
             "unmatched_observation_ids": [], "completed_signal_ids": [], "failed_signal_ids": [],
+            "completed_activity_ids": [], "failed_activity_ids": [],
         }
         for index, observation in enumerate(observations):
-            signal_id = observation["signal_id"]
+            signal_id = observation.get("signal_id")
+            activity_id = observation.get("source_activity_id")
+            target_id = observation.get("target_intent_id")
+            completed_key = "completed_signal_ids" if signal_id is not None else "completed_activity_ids"
+            failed_key = "failed_signal_ids" if signal_id is not None else "failed_activity_ids"
+            source_id = signal_id if signal_id is not None else activity_id
             try:
-                recorded_events = self._db.get_user_intent_events(source_signal_id=signal_id)
+                if (signal_id is None) == (activity_id is None):
+                    raise ValueError("observation_requires_exactly_one_source")
+                recorded_observation = (
+                    self._db.get_activity_intent_lifecycle_observation(activity_id, target_id)
+                    if activity_id is not None else None
+                )
+                recorded_events = self._db.get_user_intent_events(
+                    source_signal_id=signal_id, source_activity_id=activity_id,
+                )
+                if activity_id is not None:
+                    recorded_events = [event for event in recorded_events if event["intent_id"] == target_id]
                 if recorded_events:
                     report["intent_event_ids"].extend(event["id"] for event in recorded_events)
                     report["intent_lifecycle_observation_ids"].extend(
                         sorted({event["lifecycle_observation_id"] for event in recorded_events
                                 if event["lifecycle_observation_id"] is not None})
                     )
-                    report["completed_signal_ids"].append(signal_id)
+                    report[completed_key].append(source_id)
+                    continue
+                if recorded_observation:
+                    report["intent_lifecycle_observation_ids"].append(recorded_observation["id"])
+                    report[completed_key].append(source_id)
                     continue
                 decision = decisions.get(index)
                 if decision is None:
                     raise ValueError("missing_valid_lifecycle_matching_decision")
                 target_id = decision["target_intent_id"]
+                if activity_id is not None and target_id != observation["target_intent_id"]:
+                    raise ValueError("activity_observation_target_mismatch")
                 update = decision["intent_update"]
                 event_id = None
                 with self._db.transaction():
@@ -3868,11 +4110,23 @@ class MemoryNodeManager:
                                 or target["world_owner_entity_id"] != world_owner_id):
                             raise ValueError("invalid_lifecycle_matching_target")
                         if update:
+                            if activity_id is not None:
+                                latest = self._db.get_latest_user_intent_event(target_id)
+                                change_at = (latest or {}).get("effective_at") or ""
+                                observed_at = observation.get("observed_at") or ""
+                                if change_at and observed_at and (latest or {}).get("event_type") != "created":
+                                    change_time = datetime.fromisoformat(change_at.replace("Z", "+00:00")).astimezone()
+                                    observed_time = datetime.fromisoformat(observed_at.replace("Z", "+00:00")).astimezone()
+                                    if observed_time < change_time:
+                                        update = None
+                                        decision = {**decision, "intent_update": None,
+                                                    "reason": "Activity predates the latest intent change"}
+                        if update:
                             patch = update["field_updates"]
                             # Merge before calling the typed DB writer so sparse
                             # lifecycle patches cannot erase unrelated columns.
                             payload = {key: target[key] for key in (
-                                "world_owner_entity_id", "canonical_key", "summary", "primary_domain",
+                                "world_owner_entity_id", "canonical_key", "summary", "primary_domain", "current_progress",
                                 "time_start", "time_end", "confidence", "metadata",
                             )}
                             entity_field = {
@@ -3887,6 +4141,12 @@ class MemoryNodeManager:
                                     payload["details"]["target_at"] = patch["time_end"]
                                 elif "target_at" in patch.get("details", {}):
                                     payload["time_end"] = patch["details"]["target_at"]
+                            # Resolve against persisted state, including earlier
+                            # batch commits, failed siblings and chronology checks.
+                            if activity_id is not None:
+                                update["status"] = user_intent_status_after_evidence(
+                                    target["status"], observation["lifecycle_evidence"],
+                                )
                             payload["status"] = update["status"]
                             if any(payload[key] != target.get(key) for key in payload):
                                 if not self._db.update_intent_object(
@@ -3903,6 +4163,7 @@ class MemoryNodeManager:
                                     previous_payload=target,
                                     new_payload=updated_target,
                                     source_signal_id=signal_id,
+                                    source_activity_id=activity_id,
                                     lifecycle_observation_id=observation_id,
                                     effective_at=update["effective_at"],
                                 )
@@ -3915,20 +4176,28 @@ class MemoryNodeManager:
                             "role": observation["lifecycle_evidence"],
                             "observed_at": str(fact.get("dialogue_time_key") or fact.get("event_time_key") or ""),
                         } for fact in facts])
+                        if activity_id is not None:
+                            self._db.upsert_intent_evidence([{
+                                "object_type": object_type, "object_id": target_id,
+                                "evidence_type": "user_activity", "evidence_id": activity_id,
+                                "role": observation["lifecycle_evidence"],
+                                "observed_at": observation.get("observed_at") or "",
+                            }])
             except Exception as exc:
-                report["failed_signal_ids"].append(signal_id)
-                self._logger.log_json_format("memory_user_intent_update", "signal_error", {
-                    "signal_id": signal_id, "phase": "lifecycle_observation_save", "error": str(exc),
+                report[failed_key].append(source_id)
+                self._logger.log_json_format(scope, "signal_error", {
+                    "signal_id": signal_id, "activity_id": activity_id,
+                    "phase": "lifecycle_observation_save", "error": str(exc),
                 })
                 continue
             report["intent_lifecycle_observation_ids"].append(observation_id)
-            report["completed_signal_ids"].append(signal_id)
+            report[completed_key].append(source_id)
             if event_id is not None:
                 report["intent_event_ids"].append(event_id)
             if target_id is None:
                 report["unmatched_observation_ids"].append(observation_id)
-            self._logger.log_json_format("memory_user_intent_update", "lifecycle_relation", {
-                **decision, "signal_id": signal_id,
+            self._logger.log_json_format(scope, "lifecycle_relation", {
+                **decision, "signal_id": signal_id, "activity_id": activity_id,
                 "observation_id": observation_id, "intent_event_id": event_id,
             })
         return report
@@ -3977,12 +4246,9 @@ class MemoryNodeManager:
                     ):
                         raise ValueError("future_intent_target_missing_or_owner_mismatch")
                     if decision["save_new_intent"]:
-                        status = {
-                            "goal": "active", "plan": "planned", "work_item": "open",
-                        }[object_type]
                         object_id = self._db.create_intent_object(
                             object_type=object_type,
-                            payload=self._intent_storage_payload(candidate, status=status),
+                            payload=self._intent_storage_payload(candidate, status="pending"),
                         )
                         stored_object = self._db.get_intent_object(
                             object_type=object_type, object_id=object_id,
@@ -4006,7 +4272,7 @@ class MemoryNodeManager:
                             # first so unspecified columns and details cannot be erased.
                             patch = update["field_updates"]
                             payload = {key: target[key] for key in (
-                                "world_owner_entity_id", "canonical_key", "summary", "primary_domain",
+                                "world_owner_entity_id", "canonical_key", "summary", "primary_domain", "current_progress",
                                 "time_start", "time_end", "confidence", "metadata",
                             )}
                             entity_field = {
@@ -7341,12 +7607,10 @@ class MemoryNodeManager:
         object_type: str,
     ) -> Sequence[str]:
         """Keep Stage 1 focused on currently answerable derived objects."""
-        return {
-            "user_claim": ("active",),
-            "goal": ("active",),
-            "plan": ("planned", "rescheduled"),
-            "work_item": ("open", "blocked"),
-        }.get(str(object_type or "").strip().lower(), ())
+        normalized_type = str(object_type or "").strip().lower()
+        if normalized_type in {"goal", "plan", "work_item"}:
+            return tuple(sorted(ACTIVE_USER_INTENT_STATUSES))
+        return ("active",) if normalized_type == "user_claim" else ()
 
     @staticmethod
     def _recall_stage1_query_modes(

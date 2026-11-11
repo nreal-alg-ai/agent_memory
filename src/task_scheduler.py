@@ -246,6 +246,7 @@ class TaskOperationReporter:
             "memory_user_claim_update",
             "memory_user_observed_pattern_update",
             "memory_user_intent_update",
+            "memory_user_intent_update_from_activities",
             "user_state_update_from_user_claims",
             "user_state_update_from_user_threads",
             "user_state_update_from_user_observed_patterns",
@@ -362,6 +363,10 @@ class TaskScheduler:
             ),
             "memory_user_intent_update": self._config_bool(
                 settings.get("enable_memory_user_intent_update"), True,
+            ),
+            "memory_user_intent_update_from_activities": self._config_bool(
+                settings.get("enable_memory_user_intent_update_from_activities"),
+                self._config_bool(settings.get("enable_memory_user_intent_update"), True),
             ),
             "user_state_update_from_user_claims": user_state_updates_enabled,
             "user_state_update_from_user_threads": user_state_updates_enabled,
@@ -1159,6 +1164,7 @@ class TaskScheduler:
                 self._schedule_after_user_observed_pattern_update_task
             ),
             "memory_user_intent_update": self._schedule_after_user_intent_update_task,
+            "memory_user_intent_update_from_activities": self._schedule_after_user_intent_update_task,
             "user_state_update_from_user_claims": (
                 self._schedule_after_user_state_update_from_user_claims_task
             ),
@@ -1231,6 +1237,16 @@ class TaskScheduler:
         activity_ids = result.get("user_activity_item_ids") or []
         if not activity_ids:
             return
+        # New activities are the sole automatic entry. Do not scan historical
+        # activities from the intent-update completion path.
+        lifecycle_kind = "memory_user_intent_update_from_activities"
+        if self._task_enabled[lifecycle_kind] and lifecycle_kind in self._handlers:
+            report = self.submit(lifecycle_kind, {
+                "activity_ids": list(activity_ids),
+                "reference_timestamp": result.get("reference_timestamp") or self._latest_input_time_end or None,
+            })
+            if not report.get("queued"):
+                self._logger.warning("Activity intent lifecycle update not queued: %s", report)
         if self._task_enabled["memory_user_thread_update"]:
             report = self.submit("memory_user_thread_update", {})
             if not report.get("queued"):

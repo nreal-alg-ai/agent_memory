@@ -13,13 +13,15 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterator
 
+from intent_lifecycle import ACTIVE_USER_INTENT_STATUSES, USER_INTENT_STATUSES
+
 
 INTENT_TYPES = {"goal", "plan", "work_item"}
 STATE_TYPES = {"enduring_state", "recurring_state", "situational_state"}
 ACTIVITY_ROLES = {"actor", "participant", "contextual"}
-CURRENT_INTENT_STATUSES = {"active", "planned", "rescheduled", "open", "in_progress", "blocked"}
+CURRENT_INTENT_STATUSES = ACTIVE_USER_INTENT_STATUSES
 CURRENT_STATE_STATUSES = {"active", "weakened"}
-STATUSES = CURRENT_INTENT_STATUSES | CURRENT_STATE_STATUSES | {"completed", "cancelled", "occurred", "expired"}
+STATUSES = USER_INTENT_STATUSES | CURRENT_STATE_STATUSES | {"expired"}
 DETAIL_PAGE_SIZE = 20
 SOURCE_PAGE_SIZE = 6
 
