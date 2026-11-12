@@ -70,8 +70,8 @@ from memory.feishu_transcript import (
 MEMORY_TABLES = (
     "memory_source_segments", "memory_facts", "memory_user_activity_items",
     "memory_user_claims", "memory_user_observed_patterns", "memory_user_intent_items",
-    "memory_user_threads", "memory_fact_user_claim_signals",
-    "memory_fact_user_intent_signals", "memory_fact_user_action_signals",
+    "memory_user_threads", "memory_user_claim_signals",
+    "memory_user_intent_signals", "memory_user_action_signals",
 )
 
 

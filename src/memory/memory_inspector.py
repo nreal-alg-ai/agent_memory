@@ -309,7 +309,7 @@ class MemoryInspector:
             "user_thread": ("memory_user_threads", "current_summary"),
             "user_thread_event": ("memory_user_thread_events", "summary"),
             "user_observed_pattern": ("memory_user_observed_patterns", "pattern_text"),
-            "user_action_signal": ("memory_fact_user_action_signals", "action_text"),
+            "user_action_signal": ("memory_user_action_signals", "action_text"),
             **{kind: ("memory_user_intent_items", "summary") for kind in INTENT_TYPES},
         }
         for evidence in items:
@@ -331,15 +331,20 @@ class MemoryInspector:
             facts = [key] if kind == "fact" else _json(row.get("evidence_fact_ids"), [])
             segments = _json(row.get("source_segment_ids"), [])
             if kind == "user_action_signal":
-                facts = [row["fact_id"]]
+                facts = [row["source_id"]] if row["source_type"] == "fact" else []
+                segments.extend(ref.get("source_unit_row_id") for ref in _json(row.get("source_unit_refs"), []))
             if kind == "user_claim" and _table(connection, "memory_user_claim_evidence"):
                 facts = [item[0] for item in connection.execute(
                     "SELECT evidence_id FROM memory_user_claim_evidence WHERE claim_id=? AND evidence_type='fact' LIMIT 10", (key,),
                 )]
-            if kind == "user_observed_pattern" and _table(connection, "memory_user_observed_pattern_signals") and _table(connection, "memory_fact_user_action_signals"):
+            if kind == "user_observed_pattern" and _table(connection, "memory_user_observed_pattern_signals") and _table(connection, "memory_user_action_signals"):
                 facts = [item[0] for item in connection.execute(
-                    "SELECT s.fact_id FROM memory_user_observed_pattern_signals p JOIN memory_fact_user_action_signals s ON s.signal_id=p.signal_id WHERE p.pattern_id=? LIMIT 10", (key,),
+                    "SELECT s.source_id FROM memory_user_observed_pattern_signals p JOIN memory_user_action_signals s ON s.signal_id=p.signal_id WHERE p.pattern_id=? AND s.source_type='fact' LIMIT 10", (key,),
                 )]
+                for item in connection.execute(
+                    "SELECT s.source_unit_refs FROM memory_user_observed_pattern_signals p JOIN memory_user_action_signals s ON s.signal_id=p.signal_id WHERE p.pattern_id=? LIMIT 10", (key,),
+                ):
+                    segments.extend(ref.get("source_unit_row_id") for ref in _json(item[0], []))
             if kind in INTENT_TYPES and _table(connection, "memory_user_intent_evidence"):
                 facts = [item[0] for item in connection.execute(
                     "SELECT evidence_id FROM memory_user_intent_evidence WHERE object_type=? AND object_id=? AND evidence_type='fact' LIMIT 10", (kind, key),

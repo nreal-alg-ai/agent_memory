@@ -1188,7 +1188,7 @@ class TaskScheduler:
         if (isinstance(result, dict) and self._task_execution_db is not None
                 and self._user_memory_db is not None):
             signal_references = self._user_memory_db.get_user_signal_batches(
-                result.get("fact_ids") or [],
+                source_type="fact", source_ids=result.get("fact_ids") or [],
             )
             self._task_execution_db.register_signals(
                 **signal_references,
@@ -1216,6 +1216,26 @@ class TaskScheduler:
             self._task_execution_db.register_user_thread_activities(
                 result.get("user_activity_item_ids") or [],
             )
+            signal_ids = result.get("user_action_signal_ids") or []
+            if signal_ids:
+                added = self._task_execution_db.register_signals(
+                    claim_signal_ids=[], intent_signal_ids=[], action_signal_ids=signal_ids,
+                    source_task_id=str(event.get("task_id") or ""),
+                    source_time_end=result.get("reference_timestamp") or "",
+                )
+                if added:
+                    state = self._fact_followup_state["memory_user_observed_pattern_update"]
+                    state["generation"] += 1
+                    state["unscheduled_signal_batches"] += 1
+                    # The existing threshold counts evidence-bearing source
+                    # items; here they are activities rather than facts.
+                    state["unscheduled_signal_facts"] += int(
+                        result.get("user_action_signal_activity_count") or 1
+                    )
+                self._logger.info(
+                    "activity action signals registered task_id=%s signal_ids=%s added=%s",
+                    event.get("task_id"), signal_ids, added,
+                )
 
     def _postprocess_user_thread_update_task(self, event: Dict[str, Any]) -> None:
         if self._task_execution_db is None:
@@ -1234,6 +1254,8 @@ class TaskScheduler:
         result = event.get("result")
         if not event.get("succeeded") or not isinstance(result, dict):
             return
+        if result.get("user_action_signal_ids"):
+            self._schedule_fact_followup_if_eligible("memory_user_observed_pattern_update")
         activity_ids = result.get("user_activity_item_ids") or []
         if not activity_ids:
             return

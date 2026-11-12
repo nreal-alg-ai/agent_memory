@@ -178,7 +178,7 @@ class UserMemoryDB:
             if row is not None and row["signature"] == signature:
                 return False
             self._conn.execute("UPDATE memory_recall_documents SET identity_text_embedding=NULL")
-            self._conn.execute("UPDATE memory_fact_user_action_signals SET action_text_embedding=NULL")
+            self._conn.execute("UPDATE memory_user_action_signals SET action_text_embedding=NULL")
             self._conn.execute(
                 "INSERT INTO memory_embedding_profile(id, signature) VALUES(1, ?) "
                 "ON CONFLICT(id) DO UPDATE SET signature=excluded.signature", (signature,),
@@ -267,21 +267,6 @@ class UserMemoryDB:
                 "Observed-pattern evidence uses action signal IDs now; "
                 "back up the retired database and use a fresh path"
             )
-        for table in (
-            "memory_fact_user_claim_signals",
-            "memory_fact_user_intent_signals",
-        ):
-            if self._conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
-                (table,),
-            ).fetchone() and "signal_id" not in {
-                row["name"] for row in self._conn.execute(f"PRAGMA table_info({table})")
-            }:
-                self._conn.close()
-                raise RuntimeError(
-                    f"{table} uses the retired schema without signal_id; "
-                    "back up the database and use a fresh path"
-                )
         self._conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS memory_user_activity_items (
@@ -416,9 +401,10 @@ class UserMemoryDB:
                 FOREIGN KEY(evidence_fact_id) REFERENCES memory_facts(id) ON DELETE SET NULL
             );
 
-            CREATE TABLE IF NOT EXISTS memory_fact_user_claim_signals (
+            CREATE TABLE IF NOT EXISTS memory_user_claim_signals (
                 signal_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                fact_id INTEGER NOT NULL,
+                source_type TEXT NOT NULL CHECK(source_type = 'fact'),
+                source_id INTEGER NOT NULL CHECK(source_id > 0),
                 signal_key TEXT NOT NULL,
                 subject_entity_id INTEGER,
                 claim_type_hint TEXT NOT NULL DEFAULT '',
@@ -428,20 +414,23 @@ class UserMemoryDB:
                 confidence REAL NOT NULL DEFAULT 0.0,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
-                UNIQUE(fact_id, signal_key),
-                FOREIGN KEY(fact_id) REFERENCES memory_facts(id) ON DELETE CASCADE,
+                UNIQUE(source_type, source_id, signal_key),
                 FOREIGN KEY(subject_entity_id) REFERENCES memory_entity_nodes(id) ON DELETE CASCADE
             );
 
-            CREATE TABLE IF NOT EXISTS memory_fact_user_action_signals (
+            CREATE TABLE IF NOT EXISTS memory_user_action_signals (
                 signal_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                fact_id INTEGER NOT NULL,
+                source_type TEXT NOT NULL CHECK(source_type IN ('fact', 'user_activity')),
+                source_id INTEGER NOT NULL CHECK(source_id > 0),
                 signal_key TEXT NOT NULL,
                 subject_entity_id INTEGER NOT NULL,
                 action_kind TEXT NOT NULL CHECK(action_kind IN ('action', 'choice', 'participation')),
                 action_text TEXT NOT NULL CHECK(length(trim(action_text)) > 0),
                 action_text_embedding BLOB,
                 event_time_key TEXT NOT NULL DEFAULT '',
+                event_ended_at TEXT NOT NULL DEFAULT '',
+                time_scope TEXT NOT NULL DEFAULT 'reported_event',
+                source_unit_refs TEXT NOT NULL DEFAULT '[]',
                 location TEXT NOT NULL DEFAULT '',
                 owner_evidence_type TEXT NOT NULL,
                 owner_evidence_text TEXT NOT NULL DEFAULT '',
@@ -450,14 +439,14 @@ class UserMemoryDB:
                 confidence REAL NOT NULL DEFAULT 0.0 CHECK(confidence BETWEEN 0.0 AND 1.0),
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
-                UNIQUE(fact_id, signal_key),
-                FOREIGN KEY(fact_id) REFERENCES memory_facts(id) ON DELETE CASCADE,
+                UNIQUE(source_type, source_id, signal_key),
                 FOREIGN KEY(subject_entity_id) REFERENCES memory_entity_nodes(id) ON DELETE CASCADE
             );
 
-            CREATE TABLE IF NOT EXISTS memory_fact_user_intent_signals (
+            CREATE TABLE IF NOT EXISTS memory_user_intent_signals (
                 signal_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                fact_id INTEGER NOT NULL,
+                source_type TEXT NOT NULL CHECK(source_type = 'fact'),
+                source_id INTEGER NOT NULL CHECK(source_id > 0),
                 signal_key TEXT NOT NULL,
                 subject_entity_id INTEGER,
                 signal_purpose TEXT NOT NULL DEFAULT '',
@@ -470,8 +459,7 @@ class UserMemoryDB:
                 confidence REAL NOT NULL DEFAULT 0.0,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
-                UNIQUE(fact_id, signal_key),
-                FOREIGN KEY(fact_id) REFERENCES memory_facts(id) ON DELETE CASCADE,
+                UNIQUE(source_type, source_id, signal_key),
                 FOREIGN KEY(subject_entity_id) REFERENCES memory_entity_nodes(id) ON DELETE CASCADE
             );
 
@@ -585,7 +573,7 @@ class UserMemoryDB:
                 created_at TEXT NOT NULL,
                 PRIMARY KEY(pattern_id, signal_id),
                 FOREIGN KEY(pattern_id) REFERENCES memory_user_observed_patterns(id) ON DELETE CASCADE,
-                FOREIGN KEY(signal_id) REFERENCES memory_fact_user_action_signals(signal_id) ON DELETE CASCADE
+                FOREIGN KEY(signal_id) REFERENCES memory_user_action_signals(signal_id) ON DELETE CASCADE
             );
             CREATE TABLE IF NOT EXISTS memory_user_observed_pattern_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -642,7 +630,7 @@ class UserMemoryDB:
                 CHECK((signal_id IS NOT NULL AND source_activity_id IS NULL AND target_intent_id IS NULL)
                     OR (signal_id IS NULL AND source_activity_id IS NOT NULL AND target_intent_id IS NOT NULL)),
                 UNIQUE(source_activity_id, target_intent_id),
-                FOREIGN KEY(signal_id) REFERENCES memory_fact_user_intent_signals(signal_id)
+                FOREIGN KEY(signal_id) REFERENCES memory_user_intent_signals(signal_id)
                     ON DELETE CASCADE,
                 FOREIGN KEY(source_activity_id) REFERENCES memory_user_activity_items(id) ON DELETE CASCADE,
                 FOREIGN KEY(target_intent_id) REFERENCES memory_user_intent_items(id) ON DELETE CASCADE
@@ -666,7 +654,7 @@ class UserMemoryDB:
                 CHECK((source_signal_id IS NOT NULL AND source_activity_id IS NULL)
                     OR (source_signal_id IS NULL AND source_activity_id IS NOT NULL)),
                 FOREIGN KEY(intent_id) REFERENCES memory_user_intent_items(id) ON DELETE CASCADE,
-                FOREIGN KEY(source_signal_id) REFERENCES memory_fact_user_intent_signals(signal_id)
+                FOREIGN KEY(source_signal_id) REFERENCES memory_user_intent_signals(signal_id)
                     ON DELETE CASCADE,
                 FOREIGN KEY(source_activity_id) REFERENCES memory_user_activity_items(id) ON DELETE CASCADE,
                 FOREIGN KEY(lifecycle_observation_id)
@@ -714,15 +702,15 @@ class UserMemoryDB:
             ON memory_user_claim_derivations(claim_id, status, updated_at);
             CREATE INDEX IF NOT EXISTS idx_memory_user_claim_premises_claim
             ON memory_user_claim_premises(premise_claim_id, derivation_id);
-            CREATE INDEX IF NOT EXISTS idx_memory_fact_user_claim_signals_group
-            ON memory_fact_user_claim_signals(
-                subject_entity_id, claim_type_hint, claim_anchor_key, fact_id
+            CREATE INDEX IF NOT EXISTS idx_memory_user_claim_signals_group
+            ON memory_user_claim_signals(
+                subject_entity_id, claim_type_hint, claim_anchor_key, source_type, source_id
             );
-            CREATE INDEX IF NOT EXISTS idx_memory_fact_user_action_signals_subject_time
-            ON memory_fact_user_action_signals(subject_entity_id, event_time_key, fact_id);
-            CREATE INDEX IF NOT EXISTS idx_memory_fact_user_intent_signals_group
-            ON memory_fact_user_intent_signals(
-                subject_entity_id, user_intent_anchor_key, signal_purpose, fact_id
+            CREATE INDEX IF NOT EXISTS idx_memory_user_action_signals_subject_time
+            ON memory_user_action_signals(subject_entity_id, event_time_key, source_type, source_id);
+            CREATE INDEX IF NOT EXISTS idx_memory_user_intent_signals_group
+            ON memory_user_intent_signals(
+                subject_entity_id, user_intent_anchor_key, signal_purpose, source_type, source_id
             );
             CREATE INDEX IF NOT EXISTS idx_memory_user_claim_events_target
             ON memory_user_claim_events(target_claim_id, effective_at DESC, id DESC);
@@ -736,6 +724,19 @@ class UserMemoryDB:
             ON memory_user_intent_evidence(object_type, object_id, role);
             CREATE INDEX IF NOT EXISTS idx_memory_user_intent_events_intent
             ON memory_user_intent_events(intent_id, id);
+
+            -- Polymorphic source IDs cannot have a single foreign key.
+            -- Preserve source-deletion cleanup for both supported parents.
+            CREATE TRIGGER IF NOT EXISTS delete_fact_user_signals
+            AFTER DELETE ON memory_facts BEGIN
+                DELETE FROM memory_user_claim_signals WHERE source_type='fact' AND source_id=OLD.id;
+                DELETE FROM memory_user_intent_signals WHERE source_type='fact' AND source_id=OLD.id;
+                DELETE FROM memory_user_action_signals WHERE source_type='fact' AND source_id=OLD.id;
+            END;
+            CREATE TRIGGER IF NOT EXISTS delete_activity_user_signals
+            AFTER DELETE ON memory_user_activity_items BEGIN
+                DELETE FROM memory_user_action_signals WHERE source_type='user_activity' AND source_id=OLD.id;
+            END;
             """
         )
         # These tables belonged to the abandoned read-time user-state snapshot
@@ -1372,38 +1373,44 @@ class UserMemoryDB:
         return [self._row_to_dict(row) for row in rows]
 
     def get_user_signal_batches(
-        self, fact_ids: Optional[Sequence[int]] = None,
+        self, *, source_type: Optional[str] = None,
+        source_ids: Optional[Sequence[int]] = None,
     ) -> Dict[str, List[int]]:
-        """Return stable signal IDs; signal content remains in the memory DB."""
+        """Read all signal IDs, or restrict them to explicitly typed sources."""
+        if source_ids is not None and source_type is None:
+            raise ValueError("source_ids requires source_type")
+        if source_type is not None and source_type not in {"fact", "user_activity"}:
+            raise ValueError(f"Unknown signal source type: {source_type}")
         ids = sorted({
-            int(value) for value in fact_ids or []
+            int(value) for value in source_ids or []
             if str(value).strip().isdigit() and int(value) > 0
         })
-        if fact_ids is not None and not ids:
+        if source_ids is not None and not ids:
             return {
                 "claim_signal_ids": [],
                 "intent_signal_ids": [],
                 "action_signal_ids": [],
             }
-        condition = (
-            f"AND fact_id IN ({','.join('?' for _ in ids)})" if fact_ids is not None
-            else ""
-        )
+        condition = "AND source_type = ?" if source_type is not None else ""
+        params: List[Any] = [source_type] if source_type is not None else []
+        if source_ids is not None:
+            condition += f" AND source_id IN ({','.join('?' for _ in ids)})"
+            params.extend(ids)
         claim_rows = self._conn.execute(
-            "SELECT signal_id FROM memory_fact_user_claim_signals "
+            "SELECT signal_id FROM memory_user_claim_signals "
             f"WHERE subject_entity_id IS NOT NULL {condition} "
-            "ORDER BY fact_id, signal_key",
-            ids,
+            "ORDER BY source_type, source_id, signal_key",
+            params,
         ).fetchall()
         intent_rows = self._conn.execute(
-            "SELECT signal_id FROM memory_fact_user_intent_signals "
-            f"WHERE subject_entity_id IS NOT NULL {condition} ORDER BY fact_id, signal_key",
-            ids,
+            "SELECT signal_id FROM memory_user_intent_signals "
+            f"WHERE subject_entity_id IS NOT NULL {condition} ORDER BY source_type, source_id, signal_key",
+            params,
         ).fetchall()
         action_rows = self._conn.execute(
-            "SELECT signal_id FROM memory_fact_user_action_signals "
-            f"WHERE subject_entity_id IS NOT NULL {condition} ORDER BY fact_id, signal_key",
-            ids,
+            "SELECT signal_id FROM memory_user_action_signals "
+            f"WHERE subject_entity_id IS NOT NULL {condition} ORDER BY source_type, source_id, signal_key",
+            params,
         ).fetchall()
         return {
             "claim_signal_ids": [int(row["signal_id"]) for row in claim_rows],
@@ -1415,69 +1422,95 @@ class UserMemoryDB:
         self, signal_type: str, signal_ids: Sequence[int],
     ) -> List[Dict[str, Any]]:
         table = {
-            "claim": "memory_fact_user_claim_signals",
-            "intent": "memory_fact_user_intent_signals",
-            "action": "memory_fact_user_action_signals",
+            "claim": "memory_user_claim_signals",
+            "intent": "memory_user_intent_signals",
+            "action": "memory_user_action_signals",
         }.get(signal_type)
         if table is None:
             raise ValueError(f"Unknown signal type: {signal_type}")
-        columns = "signal_id, fact_id, signal_key"
-        if signal_type == "intent":
-            columns += ", signal_purpose"
         ids = sorted({int(value) for value in signal_ids if int(value) > 0})
         rows: List[Dict[str, Any]] = []
         for offset in range(0, len(ids), 500):
             chunk = ids[offset:offset + 500]
             placeholders = ",".join("?" for _ in chunk)
-            rows.extend(dict(row) for row in self._conn.execute(
-                f"SELECT {columns} FROM {table} "
-                f"WHERE signal_id IN ({placeholders}) ORDER BY signal_id",
+            rows.extend(self._row_to_dict(row) for row in self._conn.execute(
+                f"SELECT signal.*, entity.name AS subject FROM {table} AS signal "
+                "LEFT JOIN memory_entity_nodes AS entity ON entity.id = signal.subject_entity_id "
+                f"WHERE signal.signal_id IN ({placeholders}) ORDER BY signal.signal_id",
                 chunk,
             ).fetchall())
+        if signal_type == "intent":
+            for row in rows:
+                row["candidate_object_types"] = json_loads(row["candidate_object_types"], [])
+                row["subject_entity"] = str(row.get("subject") or "")
         return rows
 
-    def get_user_signals_by_fact_ids(
-        self, signal_type: str, fact_ids: Sequence[int],
+    def get_user_signals_by_source_ids(
+        self, signal_type: str, *, source_type: str, source_ids: Sequence[int],
     ) -> List[Dict[str, Any]]:
         table = {
-            "claim": "memory_fact_user_claim_signals",
-            "intent": "memory_fact_user_intent_signals",
-            "action": "memory_fact_user_action_signals",
+            "claim": "memory_user_claim_signals",
+            "intent": "memory_user_intent_signals",
+            "action": "memory_user_action_signals",
         }.get(signal_type)
         if table is None:
             raise ValueError(f"Unknown signal type: {signal_type}")
-        ids = sorted({int(value) for value in fact_ids if int(value) > 0})
-        rows: List[Dict[str, Any]] = []
+        allowed = {"fact", "user_activity"} if signal_type == "action" else {"fact"}
+        if source_type not in allowed:
+            raise ValueError(f"Unsupported {signal_type} signal source type: {source_type}")
+        ids = sorted({int(value) for value in source_ids if int(value) > 0})
+        signal_ids: List[int] = []
         for offset in range(0, len(ids), 500):
             chunk = ids[offset:offset + 500]
             placeholders = ",".join("?" for _ in chunk)
-            rows.extend(dict(row) for row in self._conn.execute(
-                f"SELECT signal_id, fact_id, signal_key FROM {table} "
-                f"WHERE fact_id IN ({placeholders}) ORDER BY fact_id, signal_id",
-                chunk,
+            signal_ids.extend(int(row[0]) for row in self._conn.execute(
+                f"SELECT signal_id FROM {table} "
+                f"WHERE source_type = ? AND source_id IN ({placeholders}) ORDER BY source_id, signal_id",
+                [source_type, *chunk],
             ).fetchall())
-        return rows
+        return self.get_user_signals_by_ids(signal_type, signal_ids)
 
-    def upsert_fact_user_action_signals(
+    def _validate_user_signal_source(self, signal_type: str, signal: Dict[str, Any]) -> Tuple[str, int]:
+        """Validate polymorphic references before writing any rows in a batch."""
+        source_type = signal.get("source_type")
+        allowed = {"fact", "user_activity"} if signal_type == "action" else {"fact"}
+        if not isinstance(source_type, str) or source_type not in allowed:
+            raise ValueError(f"Unsupported {signal_type} signal source type: {source_type}")
+        try:
+            if isinstance(signal["source_id"], bool) or not isinstance(signal["source_id"], (str, int)):
+                raise ValueError("source_id must be an integer")
+            source_id = int(signal["source_id"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("Signal requires a positive source_id") from exc
+        table = "memory_facts" if source_type == "fact" else "memory_user_activity_items"
+        if source_id <= 0 or not self._conn.execute(
+            f"SELECT 1 FROM {table} WHERE id = ?", (source_id,),
+        ).fetchone():
+            raise ValueError(f"Missing signal source {source_type}:{source_id}")
+        return source_type, source_id
+
+    def upsert_user_action_signals(
         self,
         signals: Sequence[Dict[str, Any]],
     ) -> int:
-        """Persist fact-grounded user actions without creating a claim."""
+        """Persist reported or activity-grounded actions in the same signal store."""
+        sources = [self._validate_user_signal_source("action", signal) for signal in signals or []]
         now = local_now_text()
         changed = 0
-        for signal in signals or []:
+        for signal, (source_type, source_id) in zip(signals or [], sources):
             self._conn.execute(
                 """
-                INSERT INTO memory_fact_user_action_signals (
-                    fact_id, signal_key, subject_entity_id, action_kind,
+                INSERT INTO memory_user_action_signals (
+                    source_type, source_id, signal_key, subject_entity_id, action_kind,
                     action_text, event_time_key, location, owner_evidence_type,
                     owner_evidence_text, other_evidence_text, evidence_basis,
-                    confidence, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(fact_id, signal_key) DO UPDATE SET
+                    confidence, created_at, updated_at,
+                    event_ended_at, time_scope, source_unit_refs
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(source_type, source_id, signal_key) DO UPDATE SET
                     action_text_embedding = CASE
-                        WHEN memory_fact_user_action_signals.action_text = excluded.action_text
-                        THEN memory_fact_user_action_signals.action_text_embedding
+                        WHEN memory_user_action_signals.action_text = excluded.action_text
+                        THEN memory_user_action_signals.action_text_embedding
                         ELSE NULL END,
                     action_text = excluded.action_text,
                     event_time_key = excluded.event_time_key,
@@ -1486,11 +1519,14 @@ class UserMemoryDB:
                     owner_evidence_text = excluded.owner_evidence_text,
                     other_evidence_text = excluded.other_evidence_text,
                     evidence_basis = excluded.evidence_basis,
+                    event_ended_at = excluded.event_ended_at,
+                    source_unit_refs = excluded.source_unit_refs,
+                    time_scope = excluded.time_scope,
                     confidence = excluded.confidence,
                     updated_at = excluded.updated_at
                 """,
                 (
-                    int(signal["fact_id"]), str(signal["signal_key"]),
+                    source_type, source_id, str(signal["signal_key"]),
                     int(signal["subject_entity_id"]), str(signal["action_kind"]),
                     str(signal["action_text"]), str(signal.get("event_time_key") or ""),
                     str(signal.get("location") or ""),
@@ -1499,46 +1535,28 @@ class UserMemoryDB:
                     str(signal.get("other_evidence_text") or ""),
                     str(signal.get("evidence_basis") or ""),
                     float(signal.get("confidence") or 0.0), now, now,
+                    str(signal.get("event_ended_at") or ""),
+                    str(signal.get("time_scope") or "reported_event"),
+                    json_dumps(signal.get("source_unit_refs") or []),
                 ),
             )
             changed += 1
         self._commit_if_needed()
         return changed
 
-    def get_fact_user_action_signals(self, fact_id: int) -> List[Dict[str, Any]]:
-        """Read one fact's action evidence for inspection and future consumers."""
-        if int(fact_id or 0) <= 0:
-            return []
-        rows = self._conn.execute(
-            "SELECT * FROM memory_fact_user_action_signals "
-            "WHERE fact_id = ? ORDER BY signal_id",
-            (int(fact_id),),
-        ).fetchall()
-        return [self._row_to_dict(row) for row in rows]
+    def get_user_action_signals_for_source(self, source_type: str, source_id: int) -> List[Dict[str, Any]]:
+        return self.get_user_signals_by_source_ids("action", source_type=source_type, source_ids=[source_id])
 
     def get_user_action_signals_by_ids(
         self, signal_ids: Sequence[int],
     ) -> List[Dict[str, Any]]:
         """Load the complete action signals selected for pattern extraction."""
-        ids = sorted({int(value) for value in signal_ids if int(value) > 0})
-        signals: List[Dict[str, Any]] = []
-        for offset in range(0, len(ids), 500):
-            chunk = ids[offset:offset + 500]
-            placeholders = ",".join("?" for _ in chunk)
-            rows = self._conn.execute(
-                "SELECT * FROM memory_fact_user_action_signals "
-                f"WHERE signal_id IN ({placeholders})",
-                chunk,
-            ).fetchall()
-            signals.extend(self._row_to_dict(row) for row in rows)
-        return sorted(signals, key=lambda signal: (
-            int(signal["fact_id"]), int(signal["signal_id"])
-        ))
+        return self.get_user_signals_by_ids("action", signal_ids)
 
     def get_user_action_signals(self) -> List[Dict[str, Any]]:
         """Read all user-self actions before semantic neighborhood selection."""
         rows = self._conn.execute(
-            "SELECT * FROM memory_fact_user_action_signals "
+            "SELECT * FROM memory_user_action_signals "
             "ORDER BY signal_id DESC",
         ).fetchall()
         return [self._row_to_dict(row) for row in rows]
@@ -1549,24 +1567,21 @@ class UserMemoryDB:
         """Cache action-text embeddings for later pattern updates."""
         for signal_id, embedding in embeddings:
             self._conn.execute(
-                "UPDATE memory_fact_user_action_signals "
+                "UPDATE memory_user_action_signals "
                 "SET action_text_embedding = ? WHERE signal_id = ?",
                 (_embedding_to_blob(embedding), int(signal_id)),
             )
         self._commit_if_needed()
 
-    def upsert_fact_user_claim_signals(
+    def upsert_user_claim_signals(
         self,
         mappings: Sequence[Dict[str, Any]],
     ) -> int:
         """Persist fact-level signals for explicit user-claim extraction."""
+        sources = [self._validate_user_signal_source("claim", mapping) for mapping in mappings or []]
         now = local_now_text()
         changed = 0
-        for mapping in mappings or []:
-            try:
-                fact_id = int(mapping["fact_id"])
-            except (KeyError, TypeError, ValueError):
-                continue
+        for mapping, (source_type, source_id) in zip(mappings or [], sources):
             signal_key = str(mapping.get("signal_key") or "").strip()
             try:
                 subject_entity_id = int(mapping["subject_entity_id"])
@@ -1576,7 +1591,7 @@ class UserMemoryDB:
             claim_anchor = str(mapping.get("claim_anchor") or "").strip()
             claim_anchor_key = str(mapping.get("claim_anchor_key") or "").strip()
             evidence_basis = str(mapping.get("evidence_basis") or "").strip()
-            if fact_id <= 0 or (
+            if (
                 subject_entity_id <= 0
                 or not claim_type_hint
                 or not claim_anchor
@@ -1597,22 +1612,22 @@ class UserMemoryDB:
                 )
             self._conn.execute(
                 """
-                INSERT INTO memory_fact_user_claim_signals (
-                    fact_id, signal_key, subject_entity_id, claim_type_hint,
+                INSERT INTO memory_user_claim_signals (
+                    source_type, source_id, signal_key, subject_entity_id, claim_type_hint,
                     claim_anchor, claim_anchor_key, evidence_basis,
                     confidence, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(fact_id, signal_key) DO UPDATE SET
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(source_type, source_id, signal_key) DO UPDATE SET
                     claim_anchor = excluded.claim_anchor,
                     evidence_basis = excluded.evidence_basis,
                     confidence = MAX(
-                        memory_fact_user_claim_signals.confidence,
+                        memory_user_claim_signals.confidence,
                         excluded.confidence
                     ),
                     updated_at = excluded.updated_at
                 """,
                 (
-                    fact_id, signal_key,
+                    source_type, source_id, signal_key,
                     subject_entity_id or None, claim_type_hint,
                     claim_anchor, claim_anchor_key, evidence_basis,
                     float(mapping.get("confidence") or 0.0), now, now,
@@ -1622,45 +1637,23 @@ class UserMemoryDB:
         self._commit_if_needed()
         return changed
 
-    def get_fact_user_claim_signals(
+    def get_user_claim_signals_for_source(
         self,
-        fact_id: int,
+        source_type: str, source_id: int,
     ) -> Dict[str, Dict[str, Any]]:
         """Load the normalized claim signals persisted for one stored fact."""
-        if int(fact_id or 0) <= 0:
-            return {}
-        rows = self._conn.execute(
-            """
-            SELECT signal.*, entity.name AS subject
-            FROM memory_fact_user_claim_signals AS signal
-            LEFT JOIN memory_entity_nodes AS entity
-                ON entity.id = signal.subject_entity_id
-            WHERE signal.fact_id = ?
-              AND signal.subject_entity_id IS NOT NULL
-            ORDER BY signal.claim_type_hint ASC,
-                     signal.claim_anchor_key ASC,
-                     signal.signal_key ASC
-            """,
-            (int(fact_id),),
-        ).fetchall()
-        return {
-            str(mapping["signal_key"]): mapping
-            for row in rows
-            for mapping in [self._row_to_dict(row)]
-        }
+        rows = self.get_user_signals_by_source_ids("claim", source_type=source_type, source_ids=[source_id])
+        return {str(row["signal_key"]): row for row in rows}
 
-    def upsert_fact_user_intent_signals(
+    def upsert_user_intent_signals(
         self,
         mappings: Sequence[Dict[str, Any]],
     ) -> int:
         """Persist normalized intent and lifecycle evidence signals for one fact."""
+        sources = [self._validate_user_signal_source("intent", mapping) for mapping in mappings or []]
         now = local_now_text()
         changed = 0
-        for mapping in mappings or []:
-            try:
-                fact_id = int(mapping["fact_id"])
-            except (KeyError, TypeError, ValueError):
-                continue
+        for mapping, (source_type, source_id) in zip(mappings or [], sources):
             signal_key = str(mapping.get("signal_key") or "").strip()
             try:
                 subject_entity_id = int(mapping["subject_entity_id"])
@@ -1676,7 +1669,7 @@ class UserMemoryDB:
                 for value in (mapping.get("candidate_object_types") or [])
                 if str(value).strip().lower() in {"goal", "plan", "work_item"}
             ))
-            if fact_id <= 0 or (
+            if (
                 subject_entity_id <= 0
                 or signal_purpose not in {"future_intent", "lifecycle_update"}
                 or not candidate_object_types
@@ -1696,27 +1689,27 @@ class UserMemoryDB:
                 )
             self._conn.execute(
                 """
-                INSERT INTO memory_fact_user_intent_signals (
-                    fact_id, signal_key, subject_entity_id, signal_purpose,
+                INSERT INTO memory_user_intent_signals (
+                    source_type, source_id, signal_key, subject_entity_id, signal_purpose,
                     candidate_object_types, user_role,
                     user_intent_anchor, user_intent_anchor_key,
                     assertion_source, evidence_basis,
                     confidence, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(fact_id, signal_key) DO UPDATE SET
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(source_type, source_id, signal_key) DO UPDATE SET
                     candidate_object_types = excluded.candidate_object_types,
                     user_role = excluded.user_role,
                     user_intent_anchor = excluded.user_intent_anchor,
                     assertion_source = excluded.assertion_source,
                     evidence_basis = excluded.evidence_basis,
                     confidence = MAX(
-                        memory_fact_user_intent_signals.confidence,
+                        memory_user_intent_signals.confidence,
                         excluded.confidence
                     ),
                     updated_at = excluded.updated_at
                 """,
                 (
-                    fact_id, signal_key, subject_entity_id or None, signal_purpose,
+                    source_type, source_id, signal_key, subject_entity_id or None, signal_purpose,
                     json_dumps(candidate_object_types), user_role,
                     user_intent_anchor, user_intent_anchor_key,
                     assertion_source,
@@ -1728,62 +1721,21 @@ class UserMemoryDB:
         self._commit_if_needed()
         return changed
 
-    def get_fact_user_intent_signals(
+    def get_user_intent_signals_for_source(
         self,
-        fact_id: int,
+        source_type: str, source_id: int,
     ) -> Dict[str, Dict[str, Any]]:
         """Load a fact's prospective signals keyed by stable signal identity."""
-        if int(fact_id or 0) <= 0:
-            return {}
-        rows = self._conn.execute(
-            """
-            SELECT signal.*, entity.name AS subject
-            FROM memory_fact_user_intent_signals AS signal
-            LEFT JOIN memory_entity_nodes AS entity ON entity.id = signal.subject_entity_id
-            WHERE signal.fact_id = ?
-              AND signal.subject_entity_id IS NOT NULL
-            ORDER BY signal.signal_purpose, signal.user_intent_anchor_key
-            """,
-            (int(fact_id),),
-        ).fetchall()
-        mappings: Dict[str, Dict[str, Any]] = {}
-        for row in rows:
-            mapping = self._row_to_dict(row)
-            mapping["candidate_object_types"] = json_loads(
-                mapping.get("candidate_object_types"), []
-            )
-            mapping["subject_entity"] = str(mapping.get("subject") or "")
-            mappings[str(mapping["signal_key"])] = mapping
-        return mappings
+        return {row["signal_key"]: row for row in self.get_user_signals_by_source_ids(
+            "intent", source_type=source_type, source_ids=[source_id],
+        )}
 
     def get_user_intent_signals_by_ids(
         self,
         signal_ids: Sequence[int],
     ) -> List[Dict[str, Any]]:
         """Load the complete intent signals selected for one update task."""
-        ids = sorted({int(value) for value in signal_ids if int(value) > 0})
-        signals: List[Dict[str, Any]] = []
-        for offset in range(0, len(ids), 500):
-            chunk = ids[offset:offset + 500]
-            placeholders = ",".join("?" for _ in chunk)
-            rows = self._conn.execute(
-                "SELECT signal.*, entity.name AS subject "
-                "FROM memory_fact_user_intent_signals AS signal "
-                "LEFT JOIN memory_entity_nodes AS entity "
-                "ON entity.id = signal.subject_entity_id "
-                f"WHERE signal.signal_id IN ({placeholders}) "
-                "AND signal.subject_entity_id IS NOT NULL "
-                "ORDER BY signal.signal_id",
-                chunk,
-            ).fetchall()
-            for row in rows:
-                signal = self._row_to_dict(row)
-                signal["candidate_object_types"] = json_loads(
-                    signal.get("candidate_object_types"), []
-                )
-                signal["subject_entity"] = str(signal.get("subject") or "")
-                signals.append(signal)
-        return signals
+        return self.get_user_signals_by_ids("intent", signal_ids)
 
     def upsert_user_intent_lifecycle_observation(
         self, observation: Dict[str, Any],
@@ -1798,7 +1750,7 @@ class UserMemoryDB:
         if signal_id is not None:
             source = self._conn.execute(
                 "SELECT signal_purpose, candidate_object_types "
-                "FROM memory_fact_user_intent_signals WHERE signal_id = ?",
+                "FROM memory_user_intent_signals WHERE signal_id = ?",
                 (signal_id,),
             ).fetchone()
             if (target_id is not None or not source or source["signal_purpose"] != "lifecycle_update"
@@ -2549,7 +2501,7 @@ class UserMemoryDB:
             raise ValueError("Intent event requires exactly one signal or activity source")
         if source_signal_id is not None:
             signal = self._conn.execute(
-                "SELECT subject_entity_id FROM memory_fact_user_intent_signals WHERE signal_id = ?",
+                "SELECT subject_entity_id FROM memory_user_intent_signals WHERE signal_id = ?",
                 (int(source_signal_id),),
             ).fetchone()
             if (not intent or not signal
@@ -3739,6 +3691,7 @@ class UserMemoryDB:
             "evidence_activity_ids",
             "fact_ids",
             "source_segment_ids",
+            "source_unit_refs",
         ):
             if key in item:
                 item[key] = json_loads(

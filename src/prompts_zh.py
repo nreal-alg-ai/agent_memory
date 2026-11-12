@@ -190,7 +190,45 @@ source_units 按时间排列，每行以 [U编号 类型] 标识一个 unit，�
 
 参与边界示例（仅说明规则，不是当前证据）：若前段只有他人体验设备并说“劲阳尚未上线”，输入已明确劲阳是用户本人，之后 speaker_用户本人 加入并开始讲解，则前段不能生成“用户本人体验设备／处理进会”的 activity，后段可概括为“用户本人中途加入会议，讲解设备方案并参与讨论”；若整个窗口都没有用户本人参与或接触的可靠证据，返回空列表。若明确有人向在场的用户本人展示设备、用户本人在旁观看，即使用户本人没有发言，也可记录有依据的 contextual 情境，不推断用户本人亲自操作。
 
-例如 interaction 中用户说“早上健了身”“昨晚看了电影”“明天想去黄山”，应输出一条类似：{"user_activities": [{"activity_text": "用户本人与助手交谈，主要讨论健身经历、电影和黄山旅行计划", "user_role": "participant", "confidence": 0.9, "evidence_fact_ids": []}]}。不要分别输出“用户正在健身”“用户正在看电影”“用户正在去黄山”。
+窗口内 user_action_signals：
+- 每条 activity 可附带 user_action_signals，表示原始交互过程本身支持的、用户本人在采集窗口内实际执行或参与的具体行为；不是 activity 摘要的改写，也不是从讨论主题猜测行动。activity 的保留与 action signal 的生成是两个独立判断：user_role=participant 或存在用户本人发言，不代表必须生成 participation signal。允许 activity 存在而 user_action_signals=[]，不要求 fact 引用或 user_role=actor；有明确依据的主持、讲解、观看演示、参与活动也可保留。
+- 严格区分“正在交谈”和“交谈中报告的行为”。“昨天跑步了”“我现在正在做饭”“已经发送文件”本身仍是行为报告，交给 fact 路径，不在此重复输出为直接观察；只有原始交互过程提供实际执行或参与证据时才输出。助手建议、用户观点、提问、方案表态和未来承诺都不是实践行为。普通用户—助手对话、唤醒、寒暄不必转为行为 signal。
+- action_kind 为 action|choice|participation：action 表示实际执行；choice 表示已落实到实际使用或执行中的选择，只有取舍、决定、同意或取消某项方案的口头表态不能证明选择已执行；participation 表示有意义的实际参与过程，应能辨认用户本人参与的活动及其实际参与方式，而不是为每条发言记录一个表达动作。
+- participation 不能作为其他类型不合格时的兜底。单独提出观点、建议、问题、评价、确认、同意、决定或承诺，即使真实发生在会议中，也不单独生成 action signal；不能通过加上“参与讨论”“回应”“提出”等措辞把表达内容包装成实践行为。此类发言可以帮助证明更完整的活动参与过程，但不作为逐条保存的行动。有依据的主持、实际讲解、组织活动及观看过程不因发生在交流场景而被排除，也不要求另有非语言动作。
+- action_text 描述用户本人实际参与或执行的过程，保留具体活动、对象及有证据的条件；不罗列表达的观点、技术方案、决定内容或未来待办，不把活动中谈到的工作认定为用户本人已经执行。不补造心理动机、地点、职责或结果，不生成习惯或长期规律。
+- 以连续活动过程组织 signal，不以发言条数或话题数量组织。一次连续讲解和答疑通常是一条参与行为，不按发言轮次、技术话题或动词拆分；同一过程中的意见与确认应留在对应 activity 或 facts 中。只有证据表明存在可独立辨认的实际执行、参与过程或活动组织变化时，才另生成 signal，不为增加行为样本数量而拆分。
+- subject_entity 固定为“用户本人”。source_evidence 引用 source_units 中的原话：unit_index 对应 U 后的编号，从 1 开始；entry_index 是该 unit 内由 | 分隔的非空发言序号，从 1 开始；quote 必须是该发言中可定位的连续原话。引用必须共同证明用户本人归属和具体行为，不可只引用助手或不明身份的其他人。旁听或观看须有明确在场与接触证据，静默不是证据。已确认身份可沿用，不自行确认别名。
+- 不输出或猜测行为精确起止时间；程序只以引用发言的时间给出“在该观察范围内发生”的边界。不能把整个窗口的开始时间当成用户加入、开始讲解或动作开始的时间。confidence 表示该项行为观察的把握，不是设备独立验证。
+- 同一次行为可能跨多个窗口，也可能已在 fact 的报告中出现；保留可追溯引用，不声称独立次数。后续归纳不能按 signal 数量直接计数。
+- 输出前逐条核对：去掉观点、建议、确认与承诺的具体内容后，是否仍能辨认有证据支持的实际执行或参与过程？evidence_basis 和 source_evidence 应说明并支持该过程，而不只是证明用户本人说过某句话。不满足时删除该 signal，可正常保留有依据的 activity，不靠更换 action_kind 或降低 confidence 保留。
+
+例如 interaction 中用户说“早上健了身”“昨晚看了电影”“明天想去黄山”，保留交谈 activity，user_action_signals=[]。不要分别输出“用户正在健身”“用户正在看电影”“用户正在去黄山”。以下为输出结构示例，原话与引用编号仅作格式说明，实际输出必须替换为当前输入中真实存在的证据；无合格活动时输出 user_activities=[]：
+{
+  "user_activities": [
+    {
+      "activity_text": "用户本人参加需求评审，主持方案讲解并回应参会者问题",
+      "user_role": "participant",
+      "confidence": 0.9,
+      "evidence_fact_ids": [],
+      "user_action_signals": [
+        {
+          "subject_entity": "用户本人",
+          "action_kind": "participation",
+          "action_text": "用户本人在需求评审中进行方案讲解并答疑",
+          "evidence_basis": "用户本人实际展开讲解，并在后续交互中回答参会者问题",
+          "source_evidence": [
+            {
+              "unit_index": 1,
+              "entry_index": 1,
+              "quote": "当前输入中支持行为的原话"
+            }
+          ],
+          "confidence": 0.9
+        }
+      ]
+    }
+  ]
+}
 
 原始 source_units：
 {source_units}
@@ -922,13 +960,13 @@ signal_items：
 
 USER_OBSERVED_PATTERN_EXTRACTION_PROMPT_ZH = """你是个人世界模型的 user_observed_pattern 提炼模块。
 
-输入是一组语义相近的 user_action_signal，包含本批新增信号与历史信号；每条信号都附有对应 fact、事件时间和证据来源。检索只说明动作相似，不证明它们是不同次事件。你需要判断这些证据是否足以支持用户本人的行为规律，以及规律成立的前提或情境。
+输入是一组语义相近的 user_action_signal，包含本批新增信号与历史信号。source_type + source_id 标识直接来源：fact 来源附有事实内容；user_activity 来源附有活动内容及原始发言引用，不要求 fact。time_scope=source_window 的时间只是观察范围，不是动作精确起止时间；缺少边界时不得猜测。检索只说明动作相似，不证明它们是不同次事件。你需要判断这些证据是否足以支持用户本人的行为规律，以及规律成立的前提或情境。
 
 user_observed_pattern 表达从多次独立行为事件中观察到的用户行为模式。它不是用户明确表达的主张，也不代表用户一定认同该模式。用户直接自述的习惯应留在 explicit user_claim 中。
 
 硬规则：
 1. 一条 pattern 至少需要 3 个不同的 support_signal_ids，且每个信号都必须直接支持当前模式；其中至少一个必须属于 new_signal_ids。
-2. 不同 fact 对同一事件的重复提及不能算作多次行为。单次表达、一次事件、计划、任务、助手建议不能归纳为规律；无法确认重复行为时返回空数组。
+2. 不同 fact 对同一事件的重复提及不能算作多次行为。同一次活动跨窗口形成的 signals、同一事件的报告与 activity 观察都不能重复计数；结合 source_unit_refs、观察范围、对象和活动连续性判断，不以来源对象或 signal_id 不同证明独立次数。source_id 必须结合 source_type 理解，不同来源类型的相同 ID 不代表同一对象。普通交谈或反复讨论某主题不证明反复执行主题中的动作。单次表达、一次事件、计划、任务、助手建议不能归纳为规律；无法确认重复行为时返回空数组。
 3. 不要把偶然行为升级为偏好；只能从可计数的独立事件归纳行为规律。不要把语料记录时间当成事件发生时间。
 4. subject_entity 必须等于输入中的用户本人（world_owner_entity），不得输出关于其他主体的模式。
 5. pattern_text 必须是带主体且语义完整的行为模式描述；condition_text 为空或简短条件。
@@ -952,7 +990,7 @@ user_observed_pattern 表达从多次独立行为事件中观察到的用户行�
 模式提炼目标与本批新增信号：
 {pattern_target}
 
-相似行为信号与对应 fact：
+相似行为信号及其报告或活动证据：
 {action_signals}
 """
 
@@ -989,6 +1027,8 @@ semantic_relation 只能是：
 
 
 USER_OBSERVED_PATTERN_SIGNAL_RELATION_PROMPT_ZH = """判断每条新的 user_action_signal 与检索到的每条 user_observed_pattern 的关系。相似性检索只提供候选，不构成支持证据；每条已有规律附有代表性的历史行为证据和事件时间。
+
+信号可能来自 fact 报告或 activity 观察。source_window 的时间只表示观察范围，不是动作精确持续时间。同一连续活动的跨窗口片段、同一事件的报告与观察都不是新增独立支持；结合 source_unit_refs、时间和对象判断。反复讨论某主题不能证明反复执行该动作。
 
 signal 与 pattern 的关系只能是：
 - supports：在该规律实际适用条件下发生了一次新的行为。仅动作词相似，或对同一事件的重复叙述，不能成为新的支持证据；

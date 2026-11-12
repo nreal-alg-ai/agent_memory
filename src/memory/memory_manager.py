@@ -667,7 +667,7 @@ class MemoryNodeManager:
                     int(value) for value in item.get("evidence_fact_ids") or []
                     if str(value).isdigit() and int(value) in fact_ids
                 ]
-                activity_ids.append(self._db.insert_user_activity_item(
+                activity_id = self._db.insert_user_activity_item(
                     activity_text=item["activity_text"],
                     user_role=item["user_role"],
                     confidence=item["confidence"],
@@ -676,7 +676,15 @@ class MemoryNodeManager:
                     evidence_fact_ids=supported_fact_ids,
                     source_segment_ids=source_row_ids,
                     metadata={"tags": list(tags or []), "time_scope": "source_window"},
-                ))
+                )
+                activity_ids.append(activity_id)
+                if item.get("user_action_signals"):
+                    owner_entity_id = self._intent_world_owner_entity_id()
+                    self._db.upsert_user_action_signals([
+                        {**signal, "source_type": "user_activity", "source_id": activity_id,
+                         "subject_entity_id": owner_entity_id}
+                        for signal in item["user_action_signals"]
+                    ])
             processed_rows = self._db.mark_memory_source_segments_processed_for_user_activity(
                 source_segment_ids=source_row_ids,
             )
@@ -684,6 +692,14 @@ class MemoryNodeManager:
             "status": "ok",
             "new_user_activity_count": len(activity_ids),
             "user_activity_item_ids": activity_ids,
+            "user_action_signal_ids": [
+                int(signal["signal_id"])
+                for signal in self._db.get_user_signals_by_source_ids(
+                    "action", source_type="user_activity", source_ids=activity_ids,
+                )
+            ],
+            "user_action_signal_count": sum(len(item.get("user_action_signals") or []) for item in activity_items),
+            "user_action_signal_activity_count": sum(bool(item.get("user_action_signals")) for item in activity_items),
             "reference_timestamp": source_ended_at,
             "fact_count": len(facts),
             "source_unit_count": len(source_units),
@@ -1206,9 +1222,97 @@ class MemoryNodeManager:
                         int(value) for value in raw_evidence_ids
                         if str(value).isdigit() and int(value) in allowed_fact_ids
                     )),
+                    "user_action_signals": self._normalize_activity_user_action_signals(
+                        raw.get("user_action_signals"), source_units=unit_list,
+                    ),
                 })
             return activities
         return None
+
+    def _normalize_activity_user_action_signals(
+        self, value: Any, *, source_units: Sequence[MemoryUnit],
+    ) -> List[Dict[str, Any]]:
+        """Validate window observations against exact, attributed source excerpts.
+
+        Referenced entry times bound the observation, not the action's exact
+        onset/duration. Reported actions continue through the fact path.
+        """
+        if not isinstance(value, list) or not value:
+            return []
+        owner_name = self._world_owner_entity_name
+        aliases = [owner_name]
+        aliases.extend(row["alias_name"] for row in self._db.get_owner_entity_aliases(
+            self._intent_world_owner_entity_id(), status="confirmed", limit=128,
+        ))
+        signals: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        for raw in value:
+            if not isinstance(raw, dict):
+                continue
+            if not self._is_world_owner_entity_reference(raw.get("subject_entity")):
+                continue
+            kind = str(raw.get("action_kind") or "")
+            text = _compact_whitespace(raw.get("action_text") or "")[:480]
+            basis = _compact_whitespace(raw.get("evidence_basis") or "")[:480]
+            evidence = raw.get("source_evidence")
+            if (kind not in {"action", "choice", "participation"} or not text or not basis
+                    or not isinstance(evidence, list) or not evidence):
+                continue
+            refs: List[Dict[str, Any]] = []
+            valid = True
+            for ref in evidence:
+                if not isinstance(ref, dict):
+                    valid = False
+                    break
+                try:
+                    unit_index, entry_index = int(ref["unit_index"]), int(ref["entry_index"])
+                    if unit_index < 1 or entry_index < 1:
+                        raise ValueError("source indices must be positive")
+                    unit = source_units[unit_index - 1]
+                    entry = unit.entries()[entry_index - 1]
+                except (KeyError, ValueError, TypeError, IndexError):
+                    valid = False
+                    break
+                quote = _compact_whitespace(ref.get("quote") or "")
+                if not quote or quote not in _compact_whitespace(entry["text"]):
+                    valid = False
+                    break
+                resolved = {
+                    "source_unit_row_id": unit.source_unit_row_id,
+                    "unit_index": unit_index, "entry_index": entry_index,
+                    "speaker": entry["speaker"], "quote": quote,
+                    "started_at": entry["started_at"], "ended_at": entry["ended_at"],
+                }
+                if resolved not in refs:
+                    refs.append(resolved)
+            if not valid or not any(
+                ref["speaker"] == "speaker_用户本人" or (
+                    ref["speaker"] != "speaker_助手" and any(
+                        alias.casefold() in ref["quote"].casefold() for alias in aliases
+                    )
+                ) for ref in refs
+            ):
+                self._logger.debug("Activity action rejected: ungrounded or owner-unattributed source evidence")
+                continue
+            refs.sort(key=lambda ref: (ref["unit_index"], ref["entry_index"]))
+            fingerprint = hashlib.sha256(json.dumps(
+                [kind, text.casefold(), refs], ensure_ascii=False, sort_keys=True,
+            ).encode("utf-8")).hexdigest()[:16]
+            if fingerprint in seen:
+                continue
+            seen.add(fingerprint)
+            signals.append({
+                "signal_key": f"activity|{fingerprint}",
+                "subject_entity": owner_name, "action_kind": kind, "action_text": text,
+                "evidence_basis": basis, "owner_evidence_type": "observed_activity",
+                "owner_evidence_text": "", "other_evidence_text": "",
+                "time_scope": "source_window",
+                "event_time_key": refs[0]["started_at"],
+                "event_ended_at": refs[-1]["ended_at"],
+                "source_unit_refs": refs,
+                "confidence": self._clamp_float(raw.get("confidence"), 0.0, 1.0, 0.7),
+            })
+        return signals
 
     @staticmethod
     def _format_facts_view_for_user_activity_prompt(
@@ -2359,11 +2463,11 @@ class MemoryNodeManager:
             user_intent_signal_mapping_updates.extend(user_intent_updates)
             if user_intent_updates:
                 user_intent_signal_fact_ids.append(fact_id)
-        self._db.upsert_fact_user_claim_signals(
+        self._db.upsert_user_claim_signals(
             user_claim_signal_mapping_updates
         )
-        self._db.upsert_fact_user_action_signals(user_action_signal_updates)
-        self._db.upsert_fact_user_intent_signals(
+        self._db.upsert_user_action_signals(user_action_signal_updates)
+        self._db.upsert_user_intent_signals(
             user_intent_signal_mapping_updates
         )
         return {
@@ -2707,7 +2811,7 @@ class MemoryNodeManager:
             selected_signal_ids,
         )
         facts = self._db.get_memory_facts_by_ids(
-            sorted({int(signal["fact_id"]) for signal in pending_signals})
+            sorted({int(signal["source_id"]) for signal in pending_signals if signal["source_type"] == "fact"})
         )
         report: Dict[str, Any] = {
             "status": "empty",
@@ -2723,7 +2827,9 @@ class MemoryNodeManager:
         }
         signal_items: List[Dict[str, Any]] = []
         for signal in pending_signals:
-            fact_id = int(signal["fact_id"])
+            if signal["source_type"] != "fact":
+                continue
+            fact_id = int(signal["source_id"])
             fact = facts_by_id.get(fact_id)
             if fact is None:
                 continue
@@ -4389,20 +4495,14 @@ class MemoryNodeManager:
             "claim", signal_ids,
         )
         explicit_facts = self._db.get_memory_facts_by_ids(sorted({
-            int(signal["fact_id"]) for signal in signals
+            int(signal["source_id"]) for signal in signals if signal["source_type"] == "fact"
         }))
         facts_by_id = {int(fact["id"]): fact for fact in explicit_facts}
-        signals_by_id = {
-            int(item["signal_id"]): item
-            for fact in explicit_facts
-            for item in self._get_user_claim_signals_from_fact(fact)
-        }
         signal_items = [
-            {"signal_id": int(row["signal_id"]), "fact": facts_by_id[int(row["fact_id"])],
-             "signal": signals_by_id[int(row["signal_id"])]}
+            {"signal_id": int(row["signal_id"]), "fact": facts_by_id[int(row["source_id"])],
+             "signal": row}
             for row in signals
-            if int(row["fact_id"]) in facts_by_id
-            and int(row["signal_id"]) in signals_by_id
+            if row["source_type"] == "fact" and int(row["source_id"]) in facts_by_id
         ]
         # Commit explicit results independently: a later derivation failure must
         # neither roll them back nor make their source signals pending again.
@@ -5725,7 +5825,8 @@ class MemoryNodeManager:
         facts_by_id = {
             int(fact["id"]): fact
             for fact in self._db.get_memory_facts_by_ids(
-                [int(signal["fact_id"]) for signal in seed_signals]
+                [self._user_action_signal_fact_id(signal) for signal in seed_signals
+                 if signal["source_type"] == "fact"]
             )
         }
         # A pattern is retrieved directly from its own text and supporting
@@ -5771,7 +5872,8 @@ class MemoryNodeManager:
             facts_by_id = {
                 int(fact["id"]): fact
                 for fact in self._db.get_memory_facts_by_ids(
-                    [int(signal["fact_id"]) for signal in ordered]
+                    [self._user_action_signal_fact_id(signal) for signal in ordered
+                     if signal["source_type"] == "fact"]
                 )
             }
             if len(ordered) < self._user_observed_pattern_min_support_signals:
@@ -5826,24 +5928,20 @@ class MemoryNodeManager:
         evidence_facts = {
             int(fact["id"]): fact
             for fact in self._db.get_memory_facts_by_ids([
-                int(signal["fact_id"]) for signal in evidence_signals
+                self._user_action_signal_fact_id(signal) for signal in evidence_signals
+                if signal["source_type"] == "fact"
             ])
         }
         evidence_by_id = {
             int(signal["signal_id"]): signal for signal in evidence_signals
         }
 
+        activities_by_id = self._user_action_signal_activities([*new_signals, *evidence_signals])
+
         def signal_view(signal: Dict[str, Any], fact: Dict[str, Any]) -> Dict[str, Any]:
-            return {
-                "signal_id": int(signal["signal_id"]),
-                "action_text": signal.get("action_text") or "",
-                "action_kind": signal.get("action_kind") or "",
-                "event_time": signal.get("event_time_key") or "",
-                "location": signal.get("location") or "",
-                "fact_id": int(signal["fact_id"]),
-                "fact_summary": fact.get("summary") or "",
-                "dialogue_time": fact.get("dialogue_time_key") or "",
-            }
+            return self._user_action_signal_pattern_prompt_view(
+                signal, fact, activities_by_id.get(int(signal["source_id"])),
+            )
 
         new_by_id = {int(signal["signal_id"]): signal for signal in new_signals}
         pattern_by_id = {int(pattern["id"]): pattern for pattern in existing_patterns}
@@ -5856,7 +5954,7 @@ class MemoryNodeManager:
         )
         raw = self._llm_client.call_llm(
             template.replace("{new_signals}", json.dumps([
-                signal_view(signal, facts_by_id.get(int(signal["fact_id"])) or {})
+                signal_view(signal, facts_by_id.get(self._user_action_signal_fact_id(signal)) or {})
                 for signal in new_signals
             ], ensure_ascii=False, indent=2)).replace("{existing_patterns}", json.dumps([
                 {
@@ -5866,7 +5964,7 @@ class MemoryNodeManager:
                     "confidence": pattern.get("confidence"),
                     "supporting_actions": [
                         signal_view(evidence_by_id[signal_id], evidence_facts.get(
-                            int(evidence_by_id[signal_id]["fact_id"])
+                            self._user_action_signal_fact_id(evidence_by_id[signal_id])
                         ) or {})
                         for signal_id in representative_ids(pattern)
                         if signal_id in evidence_by_id
@@ -5907,7 +6005,7 @@ class MemoryNodeManager:
             for (signal_id, pattern_id), decision in decisions.items():
                 signal = new_by_id[signal_id]
                 snapshot = signal_view(
-                    signal, facts_by_id.get(int(signal["fact_id"])) or {},
+                    signal, facts_by_id.get(self._user_action_signal_fact_id(signal)) or {},
                 )
                 if decision["semantic_relation"] == "supports":
                     added = self._db.add_user_observed_pattern_signals(
@@ -6099,7 +6197,7 @@ class MemoryNodeManager:
                 )).encode("utf-8")
             ).hexdigest()[:16]
             updates.append({
-                "fact_id": int(fact_id),
+                "source_type": "fact", "source_id": int(fact_id),
                 "signal_key": (
                     f"{int(entity_mapping[subject_entity])}|{claim_type_hint}|"
                     f"{claim_anchor_key}|{signal_fingerprint}"
@@ -6150,7 +6248,7 @@ class MemoryNodeManager:
                 )).encode("utf-8")
             ).hexdigest()[:16]
             updates.append({
-                "fact_id": int(fact_id),
+                "source_type": "fact", "source_id": int(fact_id),
                 "signal_key": f"{owner_entity_id}|{action_kind}|{fingerprint}",
                 "subject_entity_id": int(owner_entity_id),
                 "action_kind": action_kind,
@@ -6205,7 +6303,7 @@ class MemoryNodeManager:
             if not user_intent_anchor or user_intent_anchor_key == "general":
                 continue
             updates.append({
-                "fact_id": int(fact_id),
+                "source_type": "fact", "source_id": int(fact_id),
                 "signal_key": (
                     f"{int(entity_mapping[subject_name])}|{signal['signal_purpose']}|"
                     f"{user_intent_anchor_key}|"
@@ -6223,6 +6321,44 @@ class MemoryNodeManager:
             })
         return updates
 
+    @staticmethod
+    def _user_action_signal_fact_id(signal: Dict[str, Any]) -> int:
+        if signal["source_type"] not in {"fact", "user_activity"}:
+            raise ValueError(f"Unsupported action signal source: {signal['source_type']}")
+        return int(signal["source_id"]) if signal["source_type"] == "fact" else 0
+
+    def _user_action_signal_activities(self, signals: Sequence[Dict[str, Any]]) -> Dict[int, Dict[str, Any]]:
+        return {int(item["id"]): item for item in self._db.get_user_activity_items_by_ids(
+            sorted({int(signal["source_id"]) for signal in signals if signal["source_type"] == "user_activity"}),
+        )}
+
+    @staticmethod
+    def _user_action_signal_pattern_prompt_view(
+        signal: Dict[str, Any], fact: Dict[str, Any], activity: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Expose provenance so multiple records/windows cannot masquerade as events."""
+        view = {
+            "signal_id": int(signal["signal_id"]),
+            "action_kind": signal.get("action_kind") or "",
+            "action_text": signal.get("action_text") or "",
+            "event_time": signal.get("event_time_key") or "",
+            "event_ended_at": signal.get("event_ended_at") or "",
+            "time_scope": signal.get("time_scope") or "reported_event",
+            "location": signal.get("location") or "",
+            "source_type": signal["source_type"], "source_id": int(signal["source_id"]),
+            "owner_evidence_type": signal.get("owner_evidence_type") or "",
+            "owner_evidence_text": signal.get("owner_evidence_text") or "",
+            "other_evidence_text": signal.get("other_evidence_text") or "",
+            "evidence_basis": signal.get("evidence_basis") or "",
+        }
+        if signal["source_type"] == "fact":
+            view.update(fact_summary=fact.get("summary") or "",
+                        dialogue_time=fact.get("dialogue_time_key") or "")
+        elif signal["source_type"] == "user_activity":
+            view.update(source_unit_refs=signal.get("source_unit_refs") or [],
+                        activity={key: (activity or {}).get(key) for key in ("activity_text", "user_role")})
+        return view
+
     def _extract_user_observed_patterns(
         self,
         *,
@@ -6238,6 +6374,7 @@ class MemoryNodeManager:
             USER_OBSERVED_PATTERN_EXTRACTION_PROMPT_EN
             if language == "en" else USER_OBSERVED_PATTERN_EXTRACTION_PROMPT_ZH
         )
+        activities_by_id = self._user_action_signal_activities(signals)
         raw = self._llm_client.call_llm(
             prompt_template.replace("{pattern_target}", json.dumps({
                 "subject_entity": self._world_owner_entity_name,
@@ -6245,23 +6382,10 @@ class MemoryNodeManager:
                 "world_owner_entity": self._world_owner_entity_name,
                 "new_signal_ids": sorted(new_signal_ids),
             }, ensure_ascii=False, indent=2)).replace("{action_signals}", json.dumps([
-                {
-                    "signal_id": int(signal["signal_id"]),
-                    "action_kind": signal.get("action_kind") or "",
-                    "event_time": signal.get("event_time_key") or "",
-                    "action_text": signal.get("action_text") or "",
-                    "location": signal.get("location") or "",
-                    "owner_evidence_type": signal.get("owner_evidence_type") or "",
-                    "owner_evidence_text": signal.get("owner_evidence_text") or "",
-                    "other_evidence_text": signal.get("other_evidence_text") or "",
-                    "fact_id": int(signal["fact_id"]),
-                    "fact_summary": (
-                        facts_by_id.get(int(signal["fact_id"])) or {}
-                    ).get("summary") or "",
-                    "dialogue_time": (
-                        facts_by_id.get(int(signal["fact_id"])) or {}
-                    ).get("dialogue_time_key") or "",
-                }
+                self._user_action_signal_pattern_prompt_view(
+                    signal, facts_by_id.get(self._user_action_signal_fact_id(signal)) or {},
+                    activities_by_id.get(int(signal["source_id"])),
+                )
                 for signal in signals
             ], ensure_ascii=False, indent=2)), stage_name='memory_user_observed_pattern_extraction'
         )
@@ -6440,9 +6564,12 @@ class MemoryNodeManager:
         facts_by_id = {
             int(row["id"]): row
             for row in self._db.get_memory_facts_by_ids([
-                int(signal["fact_id"]) for signal in signals_by_id.values()
+                self._user_action_signal_fact_id(signal) for signal in signals_by_id.values()
+                if signal["source_type"] == "fact"
             ])
         }
+
+        activities_by_id = self._user_action_signal_activities(list(signals_by_id.values()))
 
         def evidence_view(signal_ids: Sequence[int], limit: int) -> List[Dict[str, Any]]:
             result: List[Dict[str, Any]] = []
@@ -6450,15 +6577,10 @@ class MemoryNodeManager:
                 signal = signals_by_id.get(int(signal_id))
                 if signal is None:
                     continue
-                result.append({
-                    "signal_id": int(signal_id),
-                    "action_text": signal.get("action_text") or "",
-                    "event_time": signal.get("event_time_key") or "",
-                    "location": signal.get("location") or "",
-                    "fact_summary": (
-                        facts_by_id.get(int(signal["fact_id"])) or {}
-                    ).get("summary") or "",
-                })
+                result.append(self._user_action_signal_pattern_prompt_view(
+                    signal, facts_by_id.get(self._user_action_signal_fact_id(signal)) or {},
+                    activities_by_id.get(int(signal["source_id"])),
+                ))
             return result
 
         language = self._resolve_prompt_language_from_text(
@@ -6825,15 +6947,6 @@ class MemoryNodeManager:
             ),
             "keyword_values": keyword_values,
         }
-
-    def _get_user_claim_signals_from_fact(self, fact: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Read claim-level signals from their normalized fact mapping rows."""
-        fact_id = int(fact.get("id") or 0)
-        if fact_id <= 0:
-            return []
-        return list(
-            self._db.get_fact_user_claim_signals(fact_id).values()
-        )
 
     def _subject_entity_for_user_claim_signal(
         self,

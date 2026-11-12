@@ -1666,6 +1666,11 @@ class UserStateResolver:
             "action_kind": str(signal.get("action_kind") or ""),
             "event_time": str(signal.get("event_time_key") or ""),
             "location": str(signal.get("location") or ""),
+            "source_type": str(signal["source_type"]),
+            "source_id": int(signal["source_id"]),
+            "time_scope": str(signal.get("time_scope") or "reported_event"),
+            "event_ended_at": str(signal.get("event_ended_at") or ""),
+            "source_unit_refs": signal.get("source_unit_refs") or [],
         }
 
     @classmethod

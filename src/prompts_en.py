@@ -164,7 +164,41 @@ Rules:
 
 Participation-boundary examples (rules only, not current evidence): an early segment contains only other people trying equipment and saying "Jinyang has not joined yet"; the input explicitly identifies Jinyang as user self, and later speaker_用户本人 joins and explains the design. Do not generate early activities of user self trying equipment or handling meeting entry. The later portion may become "User self joined the meeting midway, explained the equipment design, and participated in the discussion". Return an empty list if the entire window lacks reliable personal participation or exposure evidence. Conversely, when someone explicitly demonstrates equipment to user self present and watching, a contextual situation may be retained even without speech from user self; do not infer personal operation.
 
-For an interaction in which user self says they exercised this morning, saw a movie last night, and might visit a mountain tomorrow, output one activity such as: {"user_activities": [{"activity_text": "User self talked with the assistant about exercise, a movie, and plans for a mountain trip", "user_role": "participant", "confidence": 0.9, "evidence_fact_ids": []}]}. Do not output separate activities saying user self is exercising, watching a movie, or traveling.
+Window-grounded user_action_signals:
+- Each activity may include user_action_signals: concrete actions or participation by user self supported by the captured interaction itself. They are not rewrites of the activity summary or actions inferred from discussion topics. An activity may have signals=[]; fact references and user_role=actor are not prerequisites. Clearly evidenced hosting, presenting, watching a demonstration, and participation can qualify.
+- Distinguish talking from reported behavior. "I ran yesterday", "I am cooking right now", and "I sent the file" alone remain reports handled by the fact path, not direct observations here. Require execution or participation evidence in the interaction itself. Opinions, questions, suggestions, design statements, and future commitments are not practical actions. Ordinary assistant conversation, wake words, and greetings need not produce action signals.
+- action_kind is action|choice|participation. A choice must be put into actual practice, not merely decided or preferred. action_text retains the specific activity, object, and evidenced conditions; invent no motives, locations, duties, or results. A continuous presentation and Q&A usually form one participation behavior, not one per turn, topic, or verb. Do not infer habits or patterns.
+- subject_entity is "user self". source_evidence quotes raw source_units: unit_index is the U number, starting at 1; entry_index is the nonempty utterance's position within that unit, separated by |, starting at 1. quote must be a locatable contiguous excerpt. References must jointly establish personal attribution and behavior, not only assistant speech or unidentified others. Listening/watching requires explicit presence and exposure evidence; silence is not evidence. Reuse established identities but do not invent aliases.
+- Do not output or guess exact action start/end times. Code bounds observations using referenced utterance times, meaning only that the behavior occurred within that observation range. The entire window's start does not establish when user self joined or began presenting/acting. confidence concerns the observation, not independent device verification.
+- The same behavior can span windows or also be reported in a fact. Preserve traceable references, do not assert independent occurrence counts. Later induction must not count signals as separate events automatically.
+
+For an interaction reporting exercise this morning, a movie last night, and a possible mountain trip tomorrow, retain the conversation activity with user_action_signals=[]. Do not output separate activities saying user self is exercising, watching a movie, or traveling. The following illustrates the output structure only; replace quotes and indices with real evidence from the current input. Return user_activities=[] when no activity qualifies:
+{
+  "user_activities": [
+    {
+      "activity_text": "User self attended a requirements review, presented the design, and answered questions",
+      "user_role": "participant",
+      "confidence": 0.9,
+      "evidence_fact_ids": [],
+      "user_action_signals": [
+        {
+          "subject_entity": "user self",
+          "action_kind": "participation",
+          "action_text": "User self presented the design and answered questions during a requirements review",
+          "evidence_basis": "User self actually explained the design and answered participants' questions in the interaction",
+          "source_evidence": [
+            {
+              "unit_index": 1,
+              "entry_index": 1,
+              "quote": "A supporting excerpt from the current input"
+            }
+          ],
+          "confidence": 0.9
+        }
+      ]
+    }
+  ]
+}
 
 Raw source_units:
 {source_units}
@@ -881,13 +915,13 @@ signal_items:
 
 USER_OBSERVED_PATTERN_EXTRACTION_PROMPT_EN = """You conservatively extract user_observed_patterns about the user for a personal world model.
 
-Input is a set of semantically similar user_action_signals, including new and historical signals. Each signal includes its fact, event time, and evidence source. Retrieval only established action similarity; it did not prove that each signal describes a separate event. Decide whether the evidence supports a behavioral pattern and its demonstrated conditions.
+Input is a set of semantically similar user_action_signals, including new and historical signals. source_type + source_id identify the direct source: fact includes factual content; user_activity includes activity content and raw utterance references and requires no fact. For time_scope=source_window, times bound the observation, not the exact action onset/duration; never invent missing bounds. Retrieval only established action similarity; it did not prove that each signal describes a separate event. Decide whether the evidence supports a behavioral pattern and its demonstrated conditions.
 
 A user_observed_pattern describes a behavioral pattern inferred from concrete action evidence. It is not an explicit claim by the user and does not imply endorsement. A habit explicitly stated by the user belongs in explicit user_claims.
 
 Hard rules:
 1. A pattern requires at least three distinct support_signal_ids, each directly supporting it, including at least one new_signal_id.
-2. Repeated mentions of one event in different facts do not count as repeated behavior. A single event, plan, task, or assistant suggestion is insufficient. If repeated behavior is not established, return an empty array.
+2. Repeated mentions of one event in different facts do not count as repeated behavior. Signals from windows of one continuous activity, or its reported and activity-observed accounts, are not independent occurrences. Compare source_unit_refs, observation ranges, objects, and activity continuity; different source objects or signal_id values do not prove independence. Interpret source_id with source_type; equal IDs of different source types are different objects. Repeated discussion of a topic does not prove repeated execution. A single event, plan, task, or assistant suggestion is insufficient. If repeated behavior is not established, return an empty array.
 3. Do not infer preferences from isolated behavior or substitute conversation or recording time for event time.
 4. subject_entity must equal the given user-self subject and `world_owner_entity`.
 5. pattern_text is a complete reader-facing behavioral pattern description with its subject.
@@ -909,7 +943,7 @@ Output:
 Pattern extraction target and new signals:
 {pattern_target}
 
-Similar action signals and their facts:
+Similar action signals and their reported or activity evidence:
 {action_signals}
 """
 
@@ -946,6 +980,8 @@ Existing patterns:
 
 
 USER_OBSERVED_PATTERN_SIGNAL_RELATION_PROMPT_EN = """Determine how each new user_action_signal relates to each retrieved user_observed_pattern. Similarity retrieval provides candidates, not proof. Each pattern includes representative historical action evidence and event times.
+
+Signals may be fact-reported or activity-observed. source_window times bound observations, not exact action duration. Cross-window fragments of a continuous activity and reports/observations of the same event are not new independent support; compare source_unit_refs, times, and objects. Merely discussing a topic is not executing that action.
 
 Classify a signal-pattern pair as:
 - supports: a new behavior instance under the pattern's actual conditions. Similar action words alone, or a retelling of the same event, are not new support.
