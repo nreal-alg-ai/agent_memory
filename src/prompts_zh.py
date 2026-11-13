@@ -480,6 +480,18 @@ updated 不能笼统替代有明确证据的开始、受阻、完成等变化。
 四、输入 user_intent_signal 的含义
 每个条目包含独立的 `signal_id`、一条 `user_intent_signal` 及其所属 fact。同一 fact 可能因多个 signal 重复出现，但仍是同一份证据。signal 是 fact 提炼阶段给出的待核验线索，不是已经成立的 user_intent，也不是 fact 之外的新证据：`signal_purpose` 决定处理未来意图还是先前意图的后续变化；`candidate_object_types` 限定可输出的 goal、plan 或 work_item 类型；`subject_entity` 与 `user_role` 提示用户在其中的身份，`user_intent_anchor` 帮助定位事项，`assertion_source` 与 `evidence_basis` 帮助审查来源。signal 的 `confidence` 只是前一阶段的估计。必须用当前条目的 fact `summary` 核验 signal，不得照搬 signal 的结论、借用其他条目的事实，或把重复 fact 当作多次独立证据。时间信息只用于理解 fact 中已有的表达，不是安排、截止日期或完成情况的独立证据。来源明确不等于意图已经确定；必须保留 fact 中的意愿和承诺程度限定，不能仅因是本人自述就认定安排已落实或责任已承担，也不能把 confidence 当作承诺程度。
 
+activity 上下文的含义和使用边界：
+- `activity_contexts` 是本批共享的用户活动背景，每项仅含 `activity_id` 和 `activity_text`；activity 描述一段采集窗口内用户本人实际参与了什么，不是独立的意图提炼入口。每个 signal 的 `activity_context_ids` 指定它可以读取的背景，不得借用同批其他条目未引用的 activity。
+- 关联 activity 明确提供了当前 fact 缺失、且辨认该事项所必需的项目、产品或方案背景时，必须将最小必要信息写入 future candidate 的 `summary`；这不是可选润色，不能因为背景不在 fact summary 中就省略。`details` 中的 desired_outcome、event_or_activity 或 action_text 也应保留各自独立理解所需的对象限定，并与 summary 一致。不能只写“当前项目／这个方案／本次 Demo”而将可确认的具体背景留在 activity 中，也不能机械添加项目名前缀或复制整段活动。
+- activity 只能补充明确适用的背景，不能替代 fact 证明本人意愿、参与安排、责任归属、承诺程度、完成锚点或时间。不得因本人参与讨论就认定本人承担全部交付，不从 activity 另行提炼任务、补出下一步、扩大责任或推断生命周期变化。activity 的观察时间不是安排时间、截止时间或意图变化时间，也不能用来猜测 fact 中未解释的方案编号或技术定义。
+- 共享来源窗口仅说明背景可能相关；无法明确对应、存在歧义或与 fact 冲突时，不强行补充，以 fact 为准。`activity_context_ids` 为空时正常使用当前 signal 与 fact，不因此判定失败；一般性个人目标或安排不机械缩窄为当前项目。activity 不是另一份独立意图证据，`evidence_fact_ids` 不填 activity ID。lifecycle_update 仍按当前 fact 的变化证据提炼 observation，不因 activity 背景改变分支或补造进展。
+
+future candidate 的组织步骤与输出前复核（在内部完成，不增加输出字段）：
+1. 核验意图：通读当前 fact，确认用户本人仍待追求的结果、将参与的安排或尚待履行的具体动作，保留原有意愿、承诺程度、时间和责任边界。意图不成立时返回 null，不能用 activity 补出个人承担证据。
+2. 确定对象：辨认该结果、安排或动作具体针对什么。主体、动作和时间齐全，不代表事项已经自包含；只有“宣讲需求、修改图、版本内测、优化测试方法”等动作描述，而不知道是哪类产品、哪项方案或哪份需求时，仍应检查是否缺少输入已提供的必要对象限定。
+3. 补足范围后再写正文：先结合当前 fact 与本条引用的 activity 确定有依据的事项对象和适用范围，再组织 summary 与 details，不要先复制 fact 的短句，再把背景当作可有可无的前缀。没有正式名称但已明确产品类别、方案主题或评估对象时，保留该可确认层级；只知道“某项目／某版本”时不猜测名称，也不借用其他条目或同场会议中另一事项的身份。同一 activity 可包含多个议题，不能把共同出现当成属于同一项目的证据。
+4. 分别复核正文和核心字段：单独阅读 summary，以及该类型的 desired_outcome、event_or_activity 或 action_text，能否辨认用户针对什么事项要做什么？若必须回看 activity 才知道对象，而所引用的 activity 已明确补足该对象，输出前必须补入对应字段；不能 summary 已补背景、details 仍只保留模糊动作。输入已解释的“该项目、当前版本、整体需求、这个方案”等指代应改写为可辨认的对象，不能只删除代词而继续丢失范围。不要求每条具备正式项目名，也不因无法补齐所有背景就丢弃已有独立明确的意图；若核心事项本身无法确定，则不得编造对象来生成 candidate。
+
 个人责任归属审查：
 - 按“个人归属 → 责任边界 → 类型与完成锚点”的顺序判断：先核验本人是否追求目标、参与安排或承担动作，再识别具体角色，最后决定可输出类型。即使 user_role=responsible、subject_entity=用户本人，或 anchor 提到“实现/开发”，也只是待核验提示；self_statement 只说明谁在陈述，不证明谁执行。fact_type=commitment、交付物或 deadline 同样不能代替个人承担证据。
 - 区分“确认需求或功能范围”“安排他人执行”“本人承担执行/协调/审核责任”。用户主持会议、讲解方案、决定 P0/P1、同意技术方向或使用“我们”，均不自动表示本人负责实现全部功能；解释产品路线图不等于本人承诺开发，也不自动构成本人的 goal 或参与计划。
@@ -504,16 +516,12 @@ updated 不能笼统替代有明确证据的开始、受阻、完成等变化。
 
 五、输出规则
 1. 每个输入 `signal_id` 恰好返回一条结果，必须同时包含 `future_intent_candidate` 和 `intent_lifecycle_observation`。`future_intent` signal 只能将前者设为对象，后者必须为 null；`lifecycle_update` signal 只能将后者设为对象，前者必须为 null。最多一个字段非空。signal 与 fact 不符或证据不足时两个字段都为 null，不得跨分支改写 signal，也不得省略该 signal。非空结果的 `object_type` 必须属于当前 signal 的 `candidate_object_types`。
-2. 只能使用当前 fact 直接支持的内容。助手建议、推测、行为规律、prediction 和未确定假设不能生成结果。生成 future candidate 时，对方提出要求不等于用户承担责任；必须有本人明确接受、承诺或修正回应，普通应声不足以构成承诺。
+2. 核心意图或变化必须由当前 fact 直接支持，关联 activity 仅补充上述明确适用的背景。助手建议、推测、行为规律、prediction 和未确定假设不能生成结果。生成 future candidate 时，对方提出要求不等于用户承担责任；必须有本人明确接受、承诺或修正回应，普通应声不足以构成承诺。
 3. `assertion_source=third_party_report` 不能单独证明用户已设定 goal 或承担 work_item；只有明确描述已落实的未来安排时才可谨慎输出低置信度 plan。第三方对先前事项进展的明确报告可形成 observation，但其 observation_text 必须保留“据某人所述”等来源限定，不能改写成本人自述或确定事实。
-4. future candidate 的 `summary` 应自包含地说明对象、用户角色及必要时间或条件。observation 的 `target_description` 描述先前指向的事项，保留已知原时间或对象线索；`observation_text` 完整说明本次观察到的变化，不能把取消、完成等结果改写成未来安排。
+4. future candidate 的 `summary` 必须自包含地说明具体事项对象、用户角色及必要时间或条件；按上述步骤补足当前 fact 与所引用 activity 已明确提供的必要范围，不以动作明确代替对象完整。details 的核心描述须与正文使用一致的对象和范围，不能把背景只留在 canonical_key、activity 或其他输出条目中。observation 的 `target_description` 描述先前指向的事项，保留已知原时间或对象线索；`observation_text` 完整说明本次观察到的变化，不能把取消、完成等结果改写成未来安排。
 5. 两类结果的 `evidence_fact_ids` 都必须恰好为当前条目 fact 的 `[fact.id]`；`confidence` 根据 fact 对最终结果的支持程度判断，不得照搬 signal 的 confidence。
 6. observation 的 `effective_at` 只表示进展实际发生或生效的时间，使用 YYYY-MM-DD 或 ISO 8601。未知时为空；只有 fact 明确给出时间，或能依据所属 fact 的 dialogue_time 无歧义换算相对时间时才填写。不得自动用原安排时间、报告时间或系统时间填充，也不得把只有日期的证据补成精确时刻。
 7. `primary_domain` 只用于 future candidate，只能为 `general|health|work|life|information|finance|family|learning|social|interest|travel`；优先选择最具体的用户生活领域。没有证据的时间和专属细节留空，不得编造。只返回 JSON。
-
-当前时间：{reference_timestamp}
-输入的独立 signal 条目（每条含整数 `signal_id`、`fact` 和唯一的 `user_intent_signal`）：
-{signal_items}
 
 输出 JSON：
 {
@@ -522,7 +530,7 @@ updated 不能笼统替代有明确证据的开始、受阻、完成等变化。
       "signal_id": 1,
       "future_intent_candidate": {
         "object_type": "goal|plan|work_item",
-        "summary": "完整、可展示的对象描述",
+        "summary": "自包含的未来事项描述，保留用户角色、具体对象及 fact 与关联 activity 明确支持的必要项目或产品范围，不复制整段背景或扩大责任",
         "canonical_key": "用于同类对象匹配的简短稳定名称",
         "primary_domain": "general|health|work|life|information|finance|family|learning|social|interest|travel",
         "subject_entity": "对象的核心主体：goal owner、plan actor 或 work_item 负责人",
@@ -556,7 +564,15 @@ future candidate 的 `details` 是对象专属字段的结构化容器，不要�
 - plan：`event_or_activity`（必需）、`time_precision`、`location`、`participants`。
 - work_item：`action_text`（必需）、`deliverable`、`responsibility_type`、`priority`、`beneficiary_entities`、`delegator_entities`、`collaborator_entities`。
 
-observation 的 `details` 只保存当前 fact 明确给出的变更值，允许 time_start（新开始时间）、time_end（新结束/目标/截止时间）、location（新地点）、progress_text（进展细节），各项为字符串。未提供的键省略；没有变更值时为 {}，不要重建或猜测旧对象字段。只返回 JSON。"""
+observation 的 `details` 只保存当前 fact 明确给出的变更值，允许 time_start（新开始时间）、time_end（新结束/目标/截止时间）、location（新地点）、progress_text（进展细节），各项为字符串。未提供的键省略；没有变更值时为 {}，不要重建或猜测旧对象字段。只返回 JSON。
+
+当前时间：{reference_timestamp}
+activity_contexts（仅作所引用条目的必要背景，不是独立意图证据）：
+{activity_contexts}
+
+输入的独立 signal 条目（每条含整数 `signal_id`、`fact` 和唯一的 `user_intent_signal`）：
+{signal_items}
+"""
 
 
 INTENT_RECONCILIATION_PROMPT_ZH = """你是个人世界模型的 user_intent 保存、关系识别与生命周期裁决模块。
@@ -574,6 +590,14 @@ INTENT_RECONCILIATION_PROMPT_ZH = """你是个人世界模型的 user_intent 保
 - existing_objects：同一用户下检索到的已有 intent。它们是相关候选，不是已经确认的目标，status 为 pending、in_progress、blocked、completed 或 cancelled。current_progress 是已有的当前进展快照；summary 表达原事项，status 表达生命周期阶段，三者职责不同。
 - 新旧对象统一使用 time_start、time_end；goal 的 time_end 表示目标时间，work_item 的 time_end 表示截止时间。类型专属业务信息只放在 details，plan 的地点统一为 details.location_text；省略的可选信息表示未知或未提供，不表示已取消或已清空。
 - 每个 candidate 的 facts 保留来源事实的 id、summary、event_time 和 dialogue_time。只能使用实际输入的候选、旧对象及随附来源证据，不能依据 ID 补全或臆测未提供的事实；event_time 是事件时间，dialogue_time 是陈述时间，两者不可混淆。
+- activity_contexts：本批候选共享的来源活动背景，每项仅含 activity_id 和 activity_text。activity 描述一段采集窗口内用户本人实际参与了什么；每个 candidate 的 activity_context_ids 限定它可以使用的背景。关联信息由系统沿来源 fact 提供，不是候选自行声称的关联，也不是独立的意图或变化证据。
+
+activity 背景的核验边界：
+- 用 fact 复核核心意图、本人归属和责任，用该 candidate 引用的 activity 核验必要的项目、产品、方案对象或讨论场景。candidate 的背景限定可以由关联 activity 明确支持，不要求全部逐字出现在 fact summary 中；不能仅因此拒绝合法候选，也不能只因背景已写入 candidate 就相信它。
+- 只能使用当前 candidate 的 activity_context_ids 对应内容，不借用其他候选的背景。同一来源窗口只说明背景可能相关；同场会议、同一 activity 或相同项目不能单独证明 same_intent、supersedes 或 conflicts，仍需比较具体目标、安排、动作、交付物及责任边界。一项 activity 中的多个议题也不自动属于同一事项。
+- activity 不替代 fact 证明本人承诺、执行责任、完成锚点、具体安排时间或生命周期变化。不能因参与讨论就认定承担交付，不能因会议开始或结束就改变相关任务状态，不把观察窗口时间当作安排、截止或变化生效时间。旧状态及业务变化仍必须由当前 fact 的直接证据支持。
+- activity_context_ids 为空时，正常依据 candidate、facts 与 existing_objects 裁决，不因此判定失败。背景冲突、指代未解释或关联不明时，不强行补全、猜造项目名称或技术定义；旧对象范围不清时，也不能把新候选的 activity 身份反向套到旧对象上。第一版不假设已提供旧 intent 的历史 activity。
+- 本环节只核验背景并辅助事项身份判断，不重新提炼或扩写待保存的新 candidate，不新增任务。若需更新已确认关联的旧 intent，仍仅按原有输出契约提供有事实依据的补丁，不把共享背景当作新增执行进展。activity 与 fact 可能来自同一材料，不算独立佐证。
 
 user_intent 只包括三种对象：
 - goal：用户持续追求的期望结果，不等于单次动作或泛泛愿望。
@@ -688,6 +712,9 @@ intent_update 为一个更新对象或 null，只描述顶层 target_intent_id �
     }
   ]
 }
+
+activity_contexts（仅供引用它的候选核验背景与事项身份）：
+{activity_contexts}
 
 candidates：
 {candidates}

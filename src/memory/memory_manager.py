@@ -2827,6 +2827,9 @@ class MemoryNodeManager:
             for fact in facts
             if str(fact.get("id") or "").strip().isdigit()
         }
+        activity_contexts_by_fact = self._db.get_user_activity_contexts_for_facts(
+            list(facts_by_id),
+        )
         signal_items: List[Dict[str, Any]] = []
         for signal in pending_signals:
             if signal["source_type"] != "fact":
@@ -2840,6 +2843,7 @@ class MemoryNodeManager:
                 "fact_id": fact_id,
                 "fact": fact,
                 "signal": signal,
+                "activity_contexts": activity_contexts_by_fact.get(fact_id, []),
             })
         self._log_user_intent_signals_loaded(signal_items, reference_timestamp)
         available_signal_ids = {item["signal_id"] for item in signal_items}
@@ -2875,6 +2879,10 @@ class MemoryNodeManager:
             try:
                 prompt = (
                     prompt_template.replace("{reference_timestamp}", str(reference_timestamp))
+                    .replace(
+                        "{activity_contexts}",
+                        self._format_activity_contexts_for_signal_prompt(batch),
+                    )
                     .replace(
                         "{signal_items}",
                         self._format_signal_view_for_user_intent_prompt(batch),
@@ -3024,6 +3032,9 @@ class MemoryNodeManager:
                     )
                 },
                 "fact": self._format_fact_view_for_user_intent_prompt(item["fact"]),
+                "activity_context_ids": [
+                    int(activity["activity_id"]) for activity in item.get("activity_contexts") or []
+                ],
             }, ensure_ascii=False, separators=(",", ":")))
         return "[\n" + ",\n".join(lines) + "\n]"
 
@@ -3311,6 +3322,8 @@ class MemoryNodeManager:
                         world_owner_id=world_owner_id,
                     )
                     candidate["signal_id"] = signal_id
+                    # Carry trusted source context, never model-supplied activity references.
+                    candidate["activity_contexts"] = item.get("activity_contexts") or []
                     candidates.append(candidate)
             except sqlite3.Error:
                 raise
@@ -3675,6 +3688,9 @@ class MemoryNodeManager:
                     }
                     for fact_id in candidate["evidence_fact_ids"] if fact_id in facts_by_id
                 ],
+                "activity_context_ids": [
+                    int(activity["activity_id"]) for activity in candidate.get("activity_contexts") or []
+                ],
             }, ensure_ascii=False, separators=(",", ":"))
             for index, candidate in enumerate(candidates)
         ) + "\n]"
@@ -3717,6 +3733,9 @@ class MemoryNodeManager:
         try:
             prompt = (
                 prompt_template.replace(
+                    "{activity_contexts}",
+                    self._format_activity_contexts_for_signal_prompt(candidates),
+                ).replace(
                     "{candidates}",
                     self._format_intent_candidates_view_for_future_intent_reconciliation_prompt(
                         candidates,
@@ -4592,7 +4611,7 @@ class MemoryNodeManager:
         return "[\n" + ",\n".join(lines) + "\n]"
 
     @staticmethod
-    def _format_activity_contexts_for_explicit_claim_prompt(
+    def _format_activity_contexts_for_signal_prompt(
         signal_items: Sequence[Dict[str, Any]],
     ) -> str:
         """Share only this LLM batch's activities, with one context per line."""
@@ -5068,9 +5087,10 @@ class MemoryNodeManager:
             if str(decision.get("existing_claim_id") or "").strip().isdigit()
             and int(decision["existing_claim_id"]) > 0
         )
-        self._sync_user_claim_recall_documents(
-            sorted(recall_document_claim_ids)
-        )
+        # Temporarily disable claim recall projection while recall is out of scope.
+        # self._sync_user_claim_recall_documents(
+        #     sorted(recall_document_claim_ids)
+        # )
         return applied
 
     def _update_explicit_user_claims_from_signals(
@@ -5173,7 +5193,7 @@ class MemoryNodeManager:
                 })
                 prompt = prompt_template.replace(
                     "{activity_contexts}",
-                    self._format_activity_contexts_for_explicit_claim_prompt(batch_signal_items),
+                    self._format_activity_contexts_for_signal_prompt(batch_signal_items),
                 ).replace(
                     "{signal_items}",
                     self._format_signal_view_for_explicit_claim_prompt(batch_signal_items),
@@ -5632,10 +5652,11 @@ class MemoryNodeManager:
                 })
             report["created"] += int(item.get("created") or 0)
             report["updated"] += 1
-        if persisted_derived_ids:
-            self._sync_user_claim_recall_documents(
-                sorted(set(persisted_derived_ids))
-            )
+        # Temporarily disable claim recall projection while recall is out of scope.
+        # if persisted_derived_ids:
+        #     self._sync_user_claim_recall_documents(
+        #         sorted(set(persisted_derived_ids))
+        #     )
         report["new_claim_ids"] = sorted(set(report["new_claim_ids"]))
         return report
 
