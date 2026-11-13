@@ -998,64 +998,98 @@ signal_items：
 """
 
 
-USER_OBSERVED_PATTERN_EXTRACTION_PROMPT_ZH = """你是个人世界模型的 user_observed_pattern 提炼模块。
+USER_OBSERVED_PATTERN_EXTRACTION_PROMPT_ZH = """目标：从相似行为信号中归纳用户本人的 user_observed_pattern，回答“用户本人在什么条件下，反复采取什么行为或选择”。逐个评估输入 cluster：证据充分时提炼行为规律，证据不足时不生成。不是汇总动作清单、概括会议内容、提炼用户主张，也不负责预测下一次行为或更新已有规律。
 
-输入是一组语义相近的 user_action_signal，包含本批新增信号与历史信号。source_type + source_id 标识直接来源：fact 来源附有事实内容；user_activity 来源附有活动内容及原始发言引用，不要求 fact。time_scope=source_window 的时间只是观察范围，不是动作精确起止时间；缺少边界时不得猜测。检索只说明动作相似，不证明它们是不同次事件。你需要判断这些证据是否足以支持用户本人的行为规律，以及规律成立的前提或情境。
+一、数据含义与输入结构
+1. user_observed_pattern 是从多次独立实际行为中观察到的重复模式。它可以是一定前提下的行为倾向、选择方式或有依据的生活节律；不等于用户明确自述的偏好或习惯，不代表用户认可该归纳，更不是人格、动机或能力评价。
+2. 每次输入包含多个 signal cluster。cluster_id 标识当前聚类；action_signals 包含该 cluster 的全部候选行为证据，包括本轮新增信号和相关历史信号；new_signal_ids 仅标识本轮新增到处理流程的信号，不表示事件刚发生。cluster 是动作相似性的检索分组，不保证所有信号属于同一行为规律，也不证明发生了多次独立行为。
+3. user_action_signal 是关于用户本人已实施动作、实际选择或有意义参与过程的候选证据。signal_id 用于引用；action_text 描述行为，action_kind 表示动作类别。观点、建议、确认、承诺和未来安排本身不证明动作已实施；不能将谈论某项工作改写为用户本人完成该工作。
+4. source_type + source_id 共同标识直接来源。fact 来源通过 fact_summary 提供所报告事实的正文；user_activity 来源通过 activity_text 提供采集窗口内用户本人实际参与活动的摘要。两类来源都可支持已发生行为，但不自动构成相互独立的事件。来源摘要用于核验当前 signal 的行为归属、项目背景、对象和前提，不是额外提炼其他动作的入口；其中出现他人的动作，不得归给用户本人。
+5. event_time、event_ended_at、time_scope、location 提供行为时间及场景线索。time_scope=source_window 表示观察窗口，不能直接当成动作精确起止时间；dialogue_time 是对话记录时间，不是动作发生时间。owner_evidence_type、owner_evidence_text、other_evidence_text、evidence_basis 用于核验用户本人归属及行为依据。空字段表示未知，不得补造。
 
-user_observed_pattern 表达从多次独立行为事件中观察到的用户行为模式。它不是用户明确表达的主张，也不代表用户一定认同该模式。用户直接自述的习惯应留在 explicit user_claim 中。
+二、归纳流程与证据边界
+1. 以每个 cluster 为基本单元独立判断，不得跨 cluster 使用证据，也不得把不同 cluster 合并成同一规律。先核验哪些 signals 确实描述用户本人的已发生行为，再比较动作、对象、前提、时间和来源，区分独立事件与重复记录。
+2. 新建 pattern 必须有至少 3 次可辨认的独立行为观察，不能用 signal 数量代替行为次数。不同 fact 对同一事件的报告、同一次行为的 fact 与 activity 记录、一次连续活动的跨窗口片段都不能重复计数；不同 signal_id、source_id 或多段 activity 不证明独立重复。无法辨认多次行为时，输出 patterns=[]。
+3. 独立事件之间应存在有意义的“条件—行为”一致性，而不只是动作词相似。重点比较用户在什么前提下做出什么选择、承担什么参与方式、采取什么行动。检查完整 cluster 中的差异和反例；必要时收窄条件或放弃归纳，不能只挑相符片段而忽略相同条件下的明显冲突。
+4. 星期、时段、地点、项目范围、对象和行为前提都必须有相关独立观察的支持。只有动作重复、缺少共同前提时，不强行添加条件；时间信息不足时，不编造周期、频率、星期或作息。单条 signal 的特殊条件不能直接推广为整个规律的条件；限定于某项目或阶段的证据不能扩展成全局习惯。
+5. 多次参与同一持续任务、重复讨论同一方案，可能只是同一事项尚未结束，并不自动形成行为习惯。普通工作要求或参与记录只有在多次独立情境中体现出稳定的行为方式，才值得归纳；不能把近期活动汇总包装成长期规律。
+6. 用户明确自述的习惯属于 explicit user_claim；不能把一句概括性自述拆成多次独立观察。若同一来源另有具体已发生事件，只能依据可定位的事件证据计数。不得由动作擅自推断偏好、情绪、动机、人格、专业能力或未来意图。
+7. 一个 cluster 可生成零条或多条有区别的规律，但每条都必须独立满足上述证据要求。相同条件和行为的改写不要重复输出；不要求覆盖所有 signals，也不要求每个 cluster 必须产出 pattern。
 
-硬规则：
-1. 一条 pattern 至少需要 3 个不同的 support_signal_ids，且每个信号都必须直接支持当前模式；其中至少一个必须属于 new_signal_ids。
-2. 不同 fact 对同一事件的重复提及不能算作多次行为。同一次活动跨窗口形成的 signals、同一事件的报告与 activity 观察都不能重复计数；结合 source_unit_refs、观察范围、对象和活动连续性判断，不以来源对象或 signal_id 不同证明独立次数。source_id 必须结合 source_type 理解，不同来源类型的相同 ID 不代表同一对象。普通交谈或反复讨论某主题不证明反复执行主题中的动作。单次表达、一次事件、计划、任务、助手建议不能归纳为规律；无法确认重复行为时返回空数组。
-3. 不要把偶然行为升级为偏好；只能从可计数的独立事件归纳行为规律。不要把语料记录时间当成事件发生时间。
-4. subject_entity 必须等于输入中的用户本人（world_owner_entity），不得输出关于其他主体的模式。
-5. pattern_text 必须是带主体且语义完整的行为模式描述；condition_text 为空或简短条件。
-6. `primary_domain` 必须为 `general|health|work|life|information|finance|family|learning|social|interest|travel` 之一，表示该规律主要涉及的用户生活领域；优先选择最具体领域，`general` 只用于真正跨领域的规律。
-7. 规律涉及星期、时段、地点或前提时，必须得到多个相关信号的支持；事件时间不足时不能编造周期。证据 ID 必须来自输入。输出空数组是正确结果。只返回 JSON。
+三、输出字段与约束
+- cluster_results：每个输入 cluster 恰好返回一项，原样使用其 cluster_id，不得遗漏、重复或新增 cluster；没有合格规律时保留该项并返回 patterns=[]。
+- subject_entity：必须表示“用户本人”，不得生成关于其他主体的规律。
+- primary_domain：从 general|health|work|life|information|finance|family|learning|social|interest|travel 中选择最具体的主要领域；general 只用于真正跨领域的规律。
+- pattern_text：带“用户本人”主体、语义自包含的完整行为规律陈述。正文应体现必要的共同条件、行为及项目／对象范围，不能只写“经常这样做”或动作清单，也不能仅在 condition_text 中保留关键限定。用证据支持的倾向性措辞，不把“通常”夸大成“总是”。
+- condition_text：简洁记录该规律有证据支持的适用条件；没有共同条件时可为空，不得用空泛条件掩盖证据不足，也不得额外补造因果前提。
+- support_signal_ids：只引用当前 cluster 内直接支持该条规律的 signal_id，至少包含一个属于该 cluster 的 new_signal_ids 的信号。不能把整个 cluster 不加区分地全部作为支持，也不能以 ID 数量代替独立行为次数。事实或活动 ID 不能替代 signal_id。
+- confidence：0 到 1，反映行为归属与证据的明确性、独立重复的一致性、时间覆盖、适用条件的可靠性及反例影响。不能因 signal 或 activity 数量多而机械提高；同次行为的多来源、多窗口记录不提供额外独立置信度。
 
-输出：
+四、输出格式
+只返回 JSON，不附解释文字；输入数据位于全部规则及输出格式之后。
 {
-  "patterns": [
+  "cluster_results": [
     {
-      "subject_entity": "",
-      "primary_domain": "general|health|work|life|information|finance|family|learning|social|interest|travel",
-      "pattern_text": "包含主体和完整行为模式语义的陈述",
-      "condition_text": "",
-      "support_signal_ids": [1, 2, 3],
-      "confidence": 0.8
+      "cluster_id": 0,
+      "patterns": [
+        {
+          "subject_entity": "用户本人",
+          "primary_domain": "general|health|work|life|information|finance|family|learning|social|interest|travel",
+          "pattern_text": "包含用户本人、适用条件与完整行为模式的自包含陈述",
+          "condition_text": "",
+          "support_signal_ids": [1, 2, 3],
+          "confidence": 0.8
+        }
+      ]
     }
   ]
 }
 
-模式提炼目标与本批新增信号：
-{pattern_target}
-
-相似行为信号及其报告或活动证据：
-{action_signals}
+待独立评估的 signal clusters（每行一个 cluster，含本轮新增信号及来源证据）：
+{signal_clusters}
 """
 
 
-USER_OBSERVED_PATTERN_RECONCILIATION_PROMPT_ZH = """你负责判断新生成的 user_observed_pattern 与已有行为规律之间的语义关系。
+USER_OBSERVED_PATTERN_RECONCILIATION_PROMPT_ZH = """目标：判断新提炼的用户本人行为规律 candidate_pattern 与检索到的 existing_patterns 之间是什么关系，帮助系统复用同一规律、补充支持证据，或识别范围细化与冲突。你只负责规律之间的语义关系，不重新提炼规律，不输出新正文、状态或数据库操作。
 
-比较完整的 pattern_text、condition_text 和支持证据，尤其注意星期、时段、地点、适用条件和范围。动作相似不意味着属于同一规律。
+一、输入数据的含义
+1. user_observed_pattern 是从多次独立实际行为中归纳出的“用户本人在什么条件下反复采取什么行为或选择”。它不是单次活动、用户明确自述的主张、未来意图或人格评价。两条规律动作相似，不代表它们描述同一行为模式。
+2. candidate_pattern 是当前新提炼、尚待与已有规律比较的候选，不是已经确认的新身份；通常没有 id，不能为它编造 ID。existing_patterns 是系统检索出的已有规律候选，每条 id 是真实规律 ID；检索相关性不构成关系成立的证据。
+3. 两类 pattern 使用相同结构：pattern_text 描述行为及其必要范围，condition_text 补充适用条件，primary_domain 表示主要生活领域，confidence 是提炼时的规律置信度。比较时必须结合正文和条件，不能只看领域、关键词或置信度；领域标签不同不自动意味着规律不同。
+4. support_signal_ids 是各条规律已引用的行为证据 ID；supporting_actions 展示其中部分代表性 user_action_signals，不保证完整覆盖其历史证据。signal_id 标识信号，action_text、action_kind 描述动作；source_type + source_id 共同标识直接来源。fact_summary 提供报告型事实正文，activity_text 提供采集窗口内用户本人实际参与的活动摘要。来源内容用于核验当前行为，不得把其中他人的动作归给用户本人。
+5. event_time、event_ended_at、time_scope、location 以及归属证据可帮助比较行为的时间、地点、对象和前提。time_scope=source_window 只表示观察窗口；dialogue_time 是对话记录时间，不是行为发生时间。缺失字段表示未知，不能据此补造时间、条件、独立事件或规律变化。
 
-semantic_relation 只能是：
-- duplicate：措辞不同，但行为及其成立条件表达同一规律；
-- supports：新证据支持旧规律，且不改变旧规律的条件；
-- refines：新规律有证据支持地增加条件，或缩小旧规律的适用范围；
-- contradicts：两条规律在相同条件下不能同时成立；
-- unrelated：规律不同，或证据不足以判断两者存在明确关系。
+二、比较流程与关系边界
+1. 逐一比较候选与每条已有规律的动作、选择方式、对象、项目范围及成立条件，尤其是星期、时段、地点和行为前提。不得将一个项目内的规律推广为全局习惯，也不得忽略条件差异后合并两条规律。
+2. 结合双方支持证据核验关系。不同 signal、fact 或 activity 可能是同一事件的重复描述；一次连续活动的跨窗口记录也不是多次独立行为。共享证据不证明语义相同，新 evidence ID 也不证明发生了新的独立行为。
+3. 先判断是否表达同一规律，再判断是否仅增加支持、是否改变适用边界或是否在相同条件下冲突。仅措辞、项目称呼或领域标签不同，但实际含义相同，优先判 duplicate；必要的条件或范围不同，不能用 duplicate 或 supports 绕过差异。
+4. supports 表示可以在不改写已有规律的行为含义和适用范围的前提下使用候选证据。候选更窄、更宽或适用条件不同，不能简单并入旧规律；有证据支持地限定旧规律时考虑 refines，无法建立明确关系时不强行匹配。不要自行合并两条规律的条件，或构造输入中没有的更一般规律。
+5. 规律通常表达倾向而非绝对规则。不同时间、地点、对象或前提下出现不同动作不自动矛盾；一次孤立例外通常不足以否定习惯。不能仅因候选较新或 confidence 较高就认定旧规律已失效。
 
-一个 candidate 可以与多个已有规律相关。仅共享动作或 signal 不足以判为 duplicate；没有明确关系时返回空 relations。只返回 JSON。
+三、semantic_relation 定义
+- duplicate：两条 pattern 表达同一行为及相同的必要适用条件，差别仅在措辞或等价表述；不要求双方 support_signal_ids 相同，但不能只因证据重叠就认定重复。
+- supports：候选中的行为证据进一步支持已有规律，且无需改变已有规律的含义和条件。应有可辨认的补充支持，而不是同次事件的重复记录；若两条结论本身语义等价，优先使用 duplicate。
+- refines：候选提供明确证据，补充已有规律成立所需的限定，或收窄其适用对象、范围或前提。方向是“候选细化已有规律”；普通细节增多、单个特殊条件或孤立例外不自动构成细化。
+- contradicts：两条规律在相同或可比的必要条件下提出明确不相容的行为倾向，且冲突不能用范围差异或一般规律允许的偶发例外解释；证据必须足以支撑这种冲突判断。
+- unrelated：行为或适用范围不同、只是共享关键词／证据，或证据不足以建立上述关系。
 
-输出：
+四、输出规则
+1. 每项 relation 对应 candidate_pattern 与一条已有规律的配对；existing_pattern_id 只能引用 existing_patterns 的 id，不能使用 signal、fact 或 activity 的 ID。
+2. 一个候选可以关联多个不同的已有规律；同一个 existing_pattern_id 最多输出一项，不得同时输出多个互相冲突的关系。无需穷举 unrelated；没有明确关系时返回 {"relations": []}。
+3. confidence 为 0 到 1，表示当前关系判断的证据明确程度，不是规律置信度，也不是行为发生概率；不能直接复制输入 confidence 或根据 signal 数量机械打分。
+4. reason 简洁指出关键共同点或差异，以及适用条件和证据依据。细化时说明新增的必要限定，冲突时说明相同条件下的不相容之处；不得编造未提供的事实。
+5. 只返回 JSON。不要输出新 pattern、改写后的文本、规律状态、生命周期裁决或额外操作字段。
+
+输出格式：
 {
-  "relations": [{
-    "existing_pattern_id": 1,
-    "semantic_relation": "duplicate|supports|refines|contradicts|unrelated",
-    "confidence": 0.8,
-    "reason": "简短说明"
-  }]
+  "relations": [
+    {
+      "existing_pattern_id": 1,
+      "semantic_relation": "duplicate|supports|refines|contradicts|unrelated",
+      "confidence": 0.8,
+      "reason": "关键共同点或差异、适用条件及证据依据"
+    }
+  ]
 }
 
 新规律：
@@ -1066,30 +1100,48 @@ semantic_relation 只能是：
 """
 
 
-USER_OBSERVED_PATTERN_SIGNAL_RELATION_PROMPT_ZH = """判断每条新的 user_action_signal 与检索到的每条 user_observed_pattern 的关系。相似性检索只提供候选，不构成支持证据；每条已有规律附有代表性的历史行为证据和事件时间。
+USER_OBSERVED_PATTERN_SIGNAL_CLUSTER_RELATION_PROMPT_ZH = """目标：依据一个行为信号 cluster 的完整证据，判断其中哪些用户本人行为能够支持、细化或反驳已有 user_observed_pattern。你负责已有规律的证据关系判断，不负责提炼新规律、改写规律正文或修改其状态。
 
-信号可能来自 fact 报告或 activity 观察。source_window 的时间只表示观察范围，不是动作精确持续时间。同一连续活动的跨窗口片段、同一事件的报告与观察都不是新增独立支持；结合 source_unit_refs、时间和对象判断。反复讨论某主题不能证明反复执行该动作。
+输入含义：
+1. new_signals：当前 cluster 中全部待评估的 user_action_signals，可能同时包含本轮新增信号和尚未形成规律的历史信号；字段名不表示每条都是刚发生的新事件。cluster 由动作相似性聚类得到，只说明这些动作值得放在一起比较，不证明它们发生于同一事件，也不证明它们是多次独立行为。
+2. user_action_signal：一条关于用户本人已实施动作、实际选择或有意义参与过程的候选行为证据，不是观点、建议、未来意图或用户主动声明的习惯。action_text 是动作描述；action_kind 是动作类别。必须结合直接来源核验用户本人实际做了什么，不能把讨论某事当作执行某事。
+3. 信号来源：source_type + source_id 标识直接来源，两者必须一起理解。fact 来源的 fact_summary 是所报告事实的正文，其中可能描述过去发生的行为；user_activity 来源的 activity_text 是采集窗口内用户本人实际参与活动的观察摘要。来源摘要用于核验动作、对象和适用范围，不是让你额外提炼未由当前 signal 表达的动作。同一来源可有多条 signal，同一行为也可能被不同来源重复记录。
+4. 时间与归属证据：event_time、event_ended_at、time_scope、location 可帮助判断动作发生的时间、地点与条件。time_scope=source_window 的时间仅表示观察窗口，不保证动作精确起止时间；dialogue_time 只是对话记录时间，不得当作动作发生时间。owner_evidence_type、owner_evidence_text、other_evidence_text、evidence_basis 用于核验用户本人归属和证据依据；缺失信息表示未知，不得补造。
+5. existing_patterns：检索到的已有用户行为规律候选。id 是真实规律 ID；pattern_text 描述用户本人在一定条件下呈现的重复行为，condition_text 限定适用条件，primary_domain 表示生活领域。它不是单次活动记录，也不代表用户明确自述或认可该规律。检索相似不等于语义匹配。
+6. 已有规律的 support_signal_ids 标识已关联的支持信号；supporting_actions 提供其中一部分代表性历史证据，格式与待评估 signal 相同，不保证展示全部历史。已有 pattern 的 confidence 是此前规律置信度，不是本次关系判断的置信度，不能直接复制。
 
-signal 与 pattern 的关系只能是：
-- supports：在该规律实际适用条件下发生了一次新的行为。仅动作词相似，或对同一事件的重复叙述，不能成为新的支持证据；
-- refines：证据表明规律的范围或条件可能需要收窄；单个例外通常不足以推翻一般规律；
-- contradicts：证据在相同条件下与规律明确冲突。时间、地点或情境不同不必然冲突，一次孤立行为通常不能否定习惯；
-- unrelated：行为不同、证据不足，或只是同一事件的重复记录。
+判断步骤与边界：
+1. 先结合完整 cluster 理解动作、对象、项目范围、前提及时间，再逐条核对待评估 signal 与候选 pattern。不能只因动作词或领域相似就判定支持，也不能把其他 signal 的事实借给当前 signal，使其单独承担没有证据的关系。
+2. 比较来源摘要、行为时间、对象与活动连续性，识别同一事件的重复报告、fact 与 activity 对同次行为的双重记录，以及一次连续活动的跨窗口片段。这些不是新增独立支持；时间不足时不能凭不同 signal_id 或来源 ID 推定不同次行为。已在该 pattern 的 support_signal_ids 中的 signal 不是新增支持。
+3. 本任务是维护已有规律，不是重新发现规律。一个 activity 中的一次明确、独立的行为即可成为已有规律的新支持，不要求当前 cluster 凑齐多个 activity 或至少三次行为；但相关 signal 多不等于重复行为多，更不能机械提高置信度。
+4. 必须保留原规律的适用范围，尤其是项目、对象、星期、时段、地点和行为前提。不同条件下的行为不自动构成反驳；“通常如此”允许偶发例外，一次偏离通常不足以推翻习惯。证据只描述观点、建议、承诺或尚未实施的计划时，不作为已经发生的动作证据。
 
-只能使用输入证据，不得把对话时间当成事件发生时间。一条 signal 可以支持多个不同规律。仅输出有明确关系的 signal-pattern 配对；没有时返回空 decisions。只返回 JSON。
+semantic_relation 的含义：
+- supports：当前 signal 证明在已有规律实际适用条件下发生了一次新的、独立的相符行为；同次行为的重复记录不属于 supports。
+- refines：当前 signal 提供明确证据，表明已有规律的适用条件、对象或范围应被补充或收窄；仅条件不同、普通细节增多或孤立例外不足以判定细化。
+- contradicts：当前 signal 在相同适用条件下与已有规律明确冲突，且冲突强于一般规律允许的偶发例外；不得将一次孤立偏离轻率认定为习惯被推翻。
+- unrelated：行为或适用范围不同、仅措辞相似、证据不足，或只是同一事件的重复记录，不能建立上述关系。
 
-输出：
+输出规则：
+1. decisions 的每项对应一个 signal-pattern 配对。signal_id 只能来自 new_signals，existing_pattern_id 只能来自 existing_patterns 的 id；supporting_actions 中的历史信号不能作为新的待评估 signal 输出，除非它本身也在 new_signals 中。
+2. 一条 signal 可以与多个不同 pattern 存在关系，每个配对最多输出一次。只需输出证据明确的关系，无需穷举 unrelated 配对；没有明确关系时返回 {"decisions": []}，不得强行匹配。
+3. confidence 为 0 到 1，表示本次语义关系的证据明确程度，不表示规律发生概率；不能以 cluster 大小或 signal 数量替代证据。reason 简洁说明关键行为、适用条件和判断依据，支持时说明为何不是同次行为的重复记录。
+4. 不输出新 pattern、规律状态、规律置信度更新或输入之外的事实。只返回 JSON，不附解释文字。
+
+输出格式：
 {
-  "decisions": [{
-    "signal_id": 1,
-    "existing_pattern_id": 2,
-    "semantic_relation": "supports|refines|contradicts|unrelated",
-    "confidence": 0.8,
-    "reason": "简短说明"
-  }]
+  "decisions": [
+    {
+      "signal_id": 1,
+      "existing_pattern_id": 2,
+      "semantic_relation": "supports|refines|contradicts|unrelated",
+      "confidence": 0.8,
+      "reason": "关键行为、适用条件及关系依据"
+    }
+  ]
 }
 
-新行为信号及对应 fact：
+当前 cluster 的待评估行为信号及直接来源内容：
 {new_signals}
 
 已有规律及代表性证据：
@@ -1099,7 +1151,7 @@ signal 与 pattern 的关系只能是：
 
 DERIVED_USER_CLAIM_EXTRACTION_PROMPT_ZH = """你是个人世界模型中的推导型 user_claim 提炼模块。
 
-输入分为两部分：`changed_explicit_claims` 是用户本人在本轮新接收事实后发生变化的 explicit user_claims；`related_active_explicit_claims` 是用户本人及其关系对象相关的历史 active explicit user_claims。所有输入 claim 都以用户本人为 subject；关系对象可以是其他实体。你的任务是仅根据这些 claims 的文本和结构，找出能够被直接逻辑推出、且仍以用户本人为 subject 的新结论。
+输入分为两部分：`changed_explicit_claims` 是当前批需要评估的用户本人新增 explicit user_claims；`related_active_explicit_claims` 是相关的 active explicit user_claims，以历史前提为主，也可包含因输入预算分批而位于其他批次的本轮新 claim。同一 claim 只出现在一部分中。所有输入 claim 都以用户本人为 subject；关系对象可以是其他实体。你的任务是仅根据这些 claims 的文本和结构，找出能够被直接逻辑推出、且仍以用户本人为 subject 的新结论。
 
 这里的 derived user_claim 不是规律归纳、常识补全或可能性猜测。它必须可以写成“因为 premise A（以及 premise B），所以 conclusion C”，且前提和结论都必须保持用户本人为主体。若现有 user_claim 前提不足以推出新的用户本人主张，就返回空数组。输出候选的 claim_origin 由系统标记为 `derived`，不需要输出该字段。
 
@@ -1112,6 +1164,7 @@ DERIVED_USER_CLAIM_EXTRACTION_PROMPT_ZH = """你是个人世界模型中的推�
 6. 不要重复或改写某个 premise 本身；没有严格成立的新结论时返回空数组。
 7. `primary_domain` 必须为 `general|health|work|life|information|finance|family|learning|social|interest|travel` 之一，表示该推导结论主要涉及的用户生活领域；优先选择最具体领域，`general` 只用于真正跨领域的结论。
 8. confidence 表示“在给定 premise 下该结论成立”的把握，不表示 premise 本身的真实性。只返回 JSON。
+9. 对整批 changed_explicit_claims 联合评估，可以组合多条本轮新 claim 与相关历史前提；不要逐条机械生成结论，不要求每条新 claim 都有输出。同一结论只输出一次并列明所需前提，不能把仅因同属一个领域但项目、阶段或条件不同的 claims 拼成推导。某条 claim 无法支持新结论时无需为它输出占位条目；整批没有新结论时返回 claims=[]。
 
 输出：
 {

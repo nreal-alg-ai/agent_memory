@@ -953,62 +953,98 @@ signal_items:
 """
 
 
-USER_OBSERVED_PATTERN_EXTRACTION_PROMPT_EN = """You conservatively extract user_observed_patterns about the user for a personal world model.
+USER_OBSERVED_PATTERN_EXTRACTION_PROMPT_EN = """Goal: infer user_observed_patterns about user self from similar action signals, answering "under what conditions does user self repeatedly take a particular action or make a particular choice?" Evaluate each input cluster separately: extract a behavioral pattern when evidence is sufficient, otherwise produce none. This is not an action-list summary, meeting summary, user-claim extraction, next-action prediction, or update of existing patterns.
 
-Input is a set of semantically similar user_action_signals, including new and historical signals. source_type + source_id identify the direct source: fact includes factual content; user_activity includes activity content and raw utterance references and requires no fact. For time_scope=source_window, times bound the observation, not the exact action onset/duration; never invent missing bounds. Retrieval only established action similarity; it did not prove that each signal describes a separate event. Decide whether the evidence supports a behavioral pattern and its demonstrated conditions.
+1. Data meanings and input structure
+1. A user_observed_pattern is a repeated pattern observed across independent instances of actual behavior. It may describe a conditional behavioral tendency, a way of choosing, or an evidenced life rhythm. It is not an explicitly self-reported preference or habit, does not imply user endorsement, and is not a judgment of personality, motivation, or ability.
+2. Each input contains multiple signal clusters. cluster_id identifies the cluster; action_signals contains all candidate behavioral evidence in that cluster, including newly received signals and related historical signals. new_signal_ids identifies signals newly entering this processing round, not necessarily newly occurring events. A cluster is a retrieval group based on action similarity; its members need not express one pattern or prove independent repetition.
+3. A user_action_signal is candidate evidence of an action user self performed, a choice actually made, or a meaningful participation process. signal_id is its reference ID; action_text describes the behavior and action_kind identifies its category. Opinions, suggestions, confirmations, commitments, and future arrangements alone do not prove execution. Never rewrite discussion of work as user self completing that work.
+4. source_type + source_id jointly identify the direct source. A fact source supplies the reported fact in fact_summary; a user_activity source supplies an observation summary of user self's actual participation during a capture window in activity_text. Both can support past behavior, but do not automatically represent independent events. Use source summaries to verify the current signal's actor, project background, object, and preconditions, not to extract additional actions. Never attribute other people's actions in a source summary to user self.
+5. event_time, event_ended_at, time_scope, and location provide temporal and situational clues. time_scope=source_window bounds an observation rather than exact action onset and end; dialogue_time is a conversation-record time, not the action time. owner_evidence_type, owner_evidence_text, other_evidence_text, and evidence_basis help verify user-self attribution and behavioral grounding. Empty fields mean unknown; do not invent missing information.
 
-A user_observed_pattern describes a behavioral pattern inferred from concrete action evidence. It is not an explicit claim by the user and does not imply endorsement. A habit explicitly stated by the user belongs in explicit user_claims.
+2. Induction process and evidence boundaries
+1. Evaluate each cluster as an independent unit. Never merge clusters into one pattern or use evidence across clusters. First verify which signals describe actions user self actually performed, then compare actions, objects, preconditions, times, and sources to distinguish independent instances from repeated records.
+2. A new pattern requires at least three identifiable independent behavioral observations; signal count cannot substitute for behavior-instance count. Different facts reporting one event, fact/activity accounts of the same behavior, and cross-window fragments of one continuous activity must not be counted repeatedly. Different signal_id or source_id values, or multiple activity records, do not establish independence. Return patterns=[] when independent repetitions cannot be identified.
+3. Independent instances should exhibit meaningful condition-behavior consistency, not just similar action words. Focus on under what preconditions user self makes which choices, participates in what way, or takes which actions. Examine differences and counterexamples throughout the complete cluster. Narrow the conditions or decline induction when appropriate; do not cherry-pick matching fragments while ignoring clear conflicts under the same conditions.
+4. Weekdays, times of day, places, project scope, objects, and behavioral preconditions all require relevant independent observations. Do not force a condition when only the action repeats and no shared precondition is established. Never invent periodicity, frequency, weekdays, or routines from insufficient time evidence. A special condition appearing in one signal cannot be generalized to the whole pattern, and project- or phase-specific evidence cannot be expanded into a global habit.
+5. Repeated involvement in one ongoing task or discussion of the same proposal may simply mean the matter remains unfinished, not a habit. Ordinary job requirements or participation records warrant induction only when they reveal a consistent behavioral approach across independent situations. Do not package a summary of recent activities as a long-term pattern.
+6. Explicitly self-reported habits belong in explicit user_claims; one general statement cannot be split into multiple independent observations. If the same source also provides concrete past events, count only identifiable event evidence. Do not infer preferences, emotions, motivations, personality, professional ability, or future intentions from actions without evidence.
+7. A cluster may yield zero or multiple distinct patterns, each independently satisfying these evidence requirements. Do not output paraphrases of the same conditions and behavior as separate patterns. Covering every signal or producing a pattern for every cluster is not required.
 
-Hard rules:
-1. A pattern requires at least three distinct support_signal_ids, each directly supporting it, including at least one new_signal_id.
-2. Repeated mentions of one event in different facts do not count as repeated behavior. Signals from windows of one continuous activity, or its reported and activity-observed accounts, are not independent occurrences. Compare source_unit_refs, observation ranges, objects, and activity continuity; different source objects or signal_id values do not prove independence. Interpret source_id with source_type; equal IDs of different source types are different objects. Repeated discussion of a topic does not prove repeated execution. A single event, plan, task, or assistant suggestion is insufficient. If repeated behavior is not established, return an empty array.
-3. Do not infer preferences from isolated behavior or substitute conversation or recording time for event time.
-4. subject_entity must equal the given user-self subject and `world_owner_entity`.
-5. pattern_text is a complete reader-facing behavioral pattern description with its subject.
-6. `primary_domain` must be one of `general|health|work|life|information|finance|family|learning|social|interest|travel`; choose the most specific user-life domain, and use `general` only for genuinely cross-domain patterns.
-7. Day-of-week, time-of-day, place, and other conditions require support from multiple relevant signals. Do not invent a periodic schedule when event times are insufficient. Evidence IDs must be input IDs. An empty list is correct. Return JSON only.
+3. Output fields and constraints
+- cluster_results: return exactly one entry per input cluster using its original cluster_id; no missing, duplicate, or invented clusters. Keep the entry with patterns=[] when no pattern qualifies.
+- subject_entity: must identify user self ("用户本人"); never generate patterns about other people.
+- primary_domain: choose the most specific main domain from general|health|work|life|information|finance|family|learning|social|interest|travel. Use general only for genuinely cross-domain patterns.
+- pattern_text: a complete, self-contained behavioral-pattern statement with user self as its subject. Include necessary shared conditions, behavior, and project/object scope in the text itself, rather than a vague "often does this" or an action list. Do not leave essential qualifications only in condition_text. Use evidence-backed tendency language; never exaggerate "usually" into "always".
+- condition_text: briefly record evidenced applicability conditions. It may be empty when no shared condition is established. Do not hide weak evidence behind vague conditions or invent causal preconditions.
+- support_signal_ids: cite only signal_id values within the current cluster that directly support this pattern, including at least one from that cluster's new_signal_ids. Do not indiscriminately attach the entire cluster or substitute ID count for independent behavior count. Fact or activity IDs cannot replace signal IDs.
+- confidence: 0 to 1, reflecting clarity of attribution and evidence, consistency across independent repetitions, time coverage, reliability of applicable conditions, and counterexamples. More signals or activities must not mechanically increase confidence; multiple sources or windows describing one instance provide no extra independent confidence.
 
-Output:
+4. Output format
+Return JSON only, without commentary. Input data follows all rules and the output format.
 {
-  "patterns": [{
-    "subject_entity": "",
-    "primary_domain": "general|health|work|life|information|finance|family|learning|social|interest|travel",
-    "pattern_text": "complete behavioral pattern description with its subject",
-    "condition_text": "",
-    "support_signal_ids": [1, 2, 3],
-    "confidence": 0.8
-  }]
+  "cluster_results": [
+    {
+      "cluster_id": 0,
+      "patterns": [
+        {
+          "subject_entity": "用户本人",
+          "primary_domain": "general|health|work|life|information|finance|family|learning|social|interest|travel",
+          "pattern_text": "self-contained statement of user self, applicable conditions, and the complete behavioral pattern",
+          "condition_text": "",
+          "support_signal_ids": [1, 2, 3],
+          "confidence": 0.8
+        }
+      ]
+    }
+  ]
 }
 
-Pattern extraction target and new signals:
-{pattern_target}
-
-Similar action signals and their reported or activity evidence:
-{action_signals}
+Signal clusters to evaluate independently (one cluster per line, with its new signals and source evidence):
+{signal_clusters}
 """
 
 
-USER_OBSERVED_PATTERN_RECONCILIATION_PROMPT_EN = """You classify the semantic relationship between a new user_observed_pattern and existing patterns.
+USER_OBSERVED_PATTERN_RECONCILIATION_PROMPT_EN = """Goal: determine the relationship between a newly inferred behavioral candidate_pattern about user self and retrieved existing_patterns, helping the system reuse equivalent patterns, add support, or recognize scope refinements and conflicts. Classify pattern-to-pattern semantics only. Do not extract patterns again or output rewritten text, statuses, or database operations.
 
-Compare the complete pattern_text, condition_text, and supporting evidence. Pay close attention to weekday, time of day, location, conditions, and scope. Similar actions are not necessarily the same pattern.
+1. Input meanings
+1. A user_observed_pattern describes "under what conditions user self repeatedly takes an action or makes a choice," inferred from independent actual behaviors. It is not a single activity, an explicit user claim, a future intention, or a personality judgment. Similar actions do not necessarily describe the same behavioral pattern.
+2. candidate_pattern is a newly inferred candidate awaiting comparison, not an already confirmed new identity. It usually has no id; never invent one. existing_patterns contains retrieved persisted candidates, each with its actual id. Retrieval relevance is not evidence of a semantic relation.
+3. Both use the same structure: pattern_text describes behavior and necessary scope, condition_text adds applicable conditions, primary_domain identifies the main life domain, and confidence is the pattern's extraction confidence. Compare text and conditions together, not just domains, keywords, or confidence. Different domain labels do not automatically imply distinct patterns.
+4. support_signal_ids identifies each pattern's cited behavioral evidence; supporting_actions shows a representative subset of user_action_signals, not necessarily the full history. signal_id identifies the signal; action_text and action_kind describe the action; source_type + source_id jointly identify the direct source. fact_summary supplies reported factual content; activity_text supplies an observation summary of user self's actual participation during a capture window. Use source content to verify the behavior, never to attribute other people's actions to user self.
+5. event_time, event_ended_at, time_scope, location, and attribution evidence help compare times, places, objects, and preconditions. time_scope=source_window bounds observations; dialogue_time is conversation-record time, not action time. Missing fields mean unknown. Do not invent times, conditions, independent events, or pattern changes.
 
-semantic_relation must be:
-- duplicate: the same behavioral pattern under the same conditions despite different wording;
-- supports: new evidence supports the existing pattern without changing its conditions;
-- refines: the new pattern adds a supported condition or narrows the existing scope;
-- contradicts: the patterns cannot both hold under the same conditions;
-- unrelated: different patterns or insufficient evidence to determine a relation.
+2. Comparison process and boundaries
+1. Compare the candidate with each existing pattern by action, choice process, object, project scope, and applicability, especially weekday, time of day, place, and behavioral preconditions. Never expand a project-specific pattern into a global habit or merge patterns by ignoring condition differences.
+2. Check both sets of evidence. Different signals, facts, or activities may describe the same event; cross-window records of one continuous activity are not independent repetitions. Shared evidence does not prove semantic equivalence, and new evidence IDs do not prove new independent behavior.
+3. First determine equivalence, then whether the candidate merely adds support, changes applicability, or conflicts under the same conditions. Prefer duplicate when wording, project naming, or domain labels differ but meanings are equivalent. Do not use duplicate or supports to bypass differences in necessary conditions or scope.
+4. supports means candidate evidence can be used without rewriting the existing pattern's behavioral meaning or scope. Narrower, broader, or differently conditioned candidates must not be merged automatically. Consider refines when evidence qualifies the existing pattern; do not force a match when no clear relation exists. Never combine their conditions or invent a more general pattern absent from the input.
+5. Patterns usually describe tendencies, not absolute rules. Different behavior at different times, places, objects, or preconditions does not automatically contradict a pattern. One isolated exception rarely refutes a habit. A newer candidate or higher confidence alone does not establish that an existing pattern is invalid.
 
-The candidate may relate to more than one existing pattern. A shared action or signal is not enough for duplicate. Return an empty relations list when no clear relation exists. Return JSON only.
+3. semantic_relation definitions
+- duplicate: both patterns express the same behavior under the same necessary conditions, differing only in wording or equivalent expressions. Their support_signal_ids need not match, but overlapping evidence alone cannot establish duplication.
+- supports: the candidate's behavior evidence adds support for the existing pattern without changing its meaning or conditions. There must be identifiable additional support, not a duplicate account of the same event. Prefer duplicate when the conclusions themselves are semantically equivalent.
+- refines: clear candidate evidence adds a necessary qualification or narrows the existing pattern's objects, scope, or preconditions. Direction is "candidate refines existing pattern." Additional ordinary details, one special condition, or an isolated exception do not automatically establish refinement.
+- contradicts: the patterns assert clearly incompatible behavioral tendencies under the same or comparable necessary conditions, not explainable by scope differences or occasional exceptions allowed by a general tendency. Evidence must substantiate this conflict.
+- unrelated: different behavior or scope, shared keywords/evidence alone, or insufficient evidence prevents establishing the relations above.
 
-Output:
+4. Output rules
+1. Each relation pairs candidate_pattern with one existing pattern. existing_pattern_id must come from existing_patterns ids, never signal, fact, or activity IDs.
+2. The candidate may relate to multiple distinct existing patterns. Output at most one entry per existing_pattern_id, without conflicting labels for the same pair. Do not exhaustively enumerate unrelated pairs. Return {"relations": []} when no clear relation exists.
+3. confidence ranges from 0 to 1 and measures evidence strength for this relation, not pattern confidence or behavioral probability. Never copy input confidence or mechanically score by signal count.
+4. reason briefly identifies the key commonality or difference, applicable conditions, and grounding. For refinement, identify the necessary qualification; for conflict, identify the incompatibility under the same conditions. Never invent evidence.
+5. Return JSON only. Do not output new patterns, rewritten text, pattern statuses, lifecycle decisions, or extra operation fields.
+
+Output format:
 {
-  "relations": [{
-    "existing_pattern_id": 1,
-    "semantic_relation": "duplicate|supports|refines|contradicts|unrelated",
-    "confidence": 0.8,
-    "reason": "brief explanation"
-  }]
+  "relations": [
+    {
+      "existing_pattern_id": 1,
+      "semantic_relation": "duplicate|supports|refines|contradicts|unrelated",
+      "confidence": 0.8,
+      "reason": "key commonality or difference, applicable conditions, and grounding"
+    }
+  ]
 }
 
 New pattern:
@@ -1019,30 +1055,48 @@ Existing patterns:
 """
 
 
-USER_OBSERVED_PATTERN_SIGNAL_RELATION_PROMPT_EN = """Determine how each new user_action_signal relates to each retrieved user_observed_pattern. Similarity retrieval provides candidates, not proof. Each pattern includes representative historical action evidence and event times.
+USER_OBSERVED_PATTERN_SIGNAL_CLUSTER_RELATION_PROMPT_EN = """Goal: use the complete evidence in one action-signal cluster to determine which behaviors of user self support, refine, or contradict existing user_observed_patterns. Your responsibility is evidence-to-existing-pattern relations, not extracting new patterns, rewriting pattern text, or changing pattern status.
 
-Signals may be fact-reported or activity-observed. source_window times bound observations, not exact action duration. Cross-window fragments of a continuous activity and reports/observations of the same event are not new independent support; compare source_unit_refs, times, and objects. Merely discussing a topic is not executing that action.
+Input meanings:
+1. new_signals: all candidate user_action_signals in the current cluster, potentially including both newly received signals and historical signals not yet assigned to a pattern. The field name does not mean every signal describes a newly occurring event. The cluster was formed by action similarity: its members deserve comparison, but are not necessarily one event or multiple independent events.
+2. user_action_signal: candidate evidence of an action user self performed, a choice actually made, or a meaningful participation process. It is not an opinion, suggestion, future intention, or explicitly self-reported habit. action_text describes the behavior; action_kind gives its category. Check the direct source for what user self actually did; discussing an action is not performing it.
+3. Signal sources: source_type + source_id jointly identify the direct source. A fact source provides the reported fact in fact_summary, potentially describing a past action; a user_activity source provides an observation summary of user self's actual participation during a capture window in activity_text. Use source content to verify the signal's action, object, and scope, not to extract additional actions absent from that signal. One source can produce multiple signals, and different sources can repeat the same behavior instance.
+4. Time and attribution evidence: event_time, event_ended_at, time_scope, and location help establish when, where, and under what conditions an action occurred. time_scope=source_window bounds an observation, not necessarily the exact action duration. dialogue_time is a conversation-record time, never a substitute for action time. owner_evidence_type, owner_evidence_text, other_evidence_text, and evidence_basis support user-self attribution and grounding. Missing information is unknown; do not invent it.
+5. existing_patterns: retrieved candidates representing established behavioral patterns of user self. id is the persisted pattern ID; pattern_text describes repeated behavior, condition_text limits its applicability, and primary_domain identifies the life domain. A pattern is neither a single activity record nor necessarily a statement the user made or endorsed. Retrieval similarity does not prove a semantic match.
+6. A pattern's support_signal_ids identify evidence already linked to it; supporting_actions shows a representative subset of historical evidence, using the same signal format, not necessarily the full history. Pattern confidence is its previous confidence, not the confidence of this relation decision; never copy it automatically.
 
-Classify a signal-pattern pair as:
-- supports: a new behavior instance under the pattern's actual conditions. Similar action words alone, or a retelling of the same event, are not new support.
-- refines: evidence suggests the pattern's scope or conditions may need narrowing. A single exception rarely overturns a general pattern.
-- contradicts: evidence clearly conflicts under the same conditions. Different times, places, or circumstances need not conflict; one isolated action usually does not refute a habit.
-- unrelated: different behavior, insufficient evidence, or a duplicate account of one event.
+Judgment process and boundaries:
+1. Use the complete cluster to understand actions, objects, project scope, preconditions, and times, then assess each candidate signal against relevant patterns. Similar action words or domains alone do not establish support. Do not transfer facts from other signals to make the current signal support a relation its own evidence does not establish.
+2. Compare source summaries, action times, objects, and activity continuity to recognize repeated reports of one event, fact/activity accounts of the same behavior, and cross-window fragments of one continuous activity. These are not new independent support. Different signal IDs or source IDs do not prove independence when times are unclear. A signal already in that pattern's support_signal_ids is not new support.
+3. This task maintains existing patterns rather than discovering them again. One clear, independent behavior instance from one activity can support an established pattern; multiple activities or at least three behavior instances are not required in the current cluster. More related signals do not prove more independent repetitions and must not mechanically increase confidence.
+4. Preserve the existing pattern's scope, particularly project, object, weekday, time of day, place, and preconditions. Different conditions do not automatically contradict a pattern. A tendency described as usual permits occasional exceptions; one deviation rarely overturns a habit. Opinions, suggestions, commitments, and unexecuted plans are not evidence of an action already performed.
 
-Use only the supplied evidence. Never infer event time from conversation time. One signal may support multiple distinct patterns. Include only pairs with a meaningful relation; an empty list is valid. Return JSON only.
+semantic_relation meanings:
+- supports: the candidate signal establishes a new, independent, matching behavior instance under the existing pattern's actual conditions. A repeated record of the same instance is not supports.
+- refines: the signal supplies clear evidence that the pattern's applicability, objects, or scope should be qualified or narrowed. Merely different conditions, additional ordinary details, or an isolated exception do not establish refinement.
+- contradicts: the signal clearly conflicts under the same applicable conditions, beyond an occasional exception allowed by a general tendency. Do not lightly treat one isolated deviation as refuting a habit.
+- unrelated: different behavior or scope, wording similarity alone, insufficient evidence, or a duplicate record of the same event prevents establishing the relations above.
 
-Output:
+Output rules:
+1. Each decisions entry represents one signal-pattern pair. signal_id must come from new_signals and existing_pattern_id from an existing_patterns id. Historical signals in supporting_actions cannot be output as candidate signals unless also present in new_signals.
+2. One signal may relate to multiple distinct patterns; output each pair at most once. Include evidence-backed relations without exhaustively listing unrelated pairs. Return {"decisions": []} when no clear relation exists; never force a match.
+3. confidence ranges from 0 to 1 and measures evidence strength for this semantic relation, not behavioral probability. Cluster size or signal count cannot replace evidence. reason briefly identifies the behavior, applicable conditions, and grounding; for support, explain why it is not a duplicate account of the same instance.
+4. Do not output new patterns, pattern statuses, pattern-confidence updates, or facts absent from the input. Return JSON only, without commentary.
+
+Output format:
 {
-  "decisions": [{
-    "signal_id": 1,
-    "existing_pattern_id": 2,
-    "semantic_relation": "supports|refines|contradicts|unrelated",
-    "confidence": 0.8,
-    "reason": "brief explanation"
-  }]
+  "decisions": [
+    {
+      "signal_id": 1,
+      "existing_pattern_id": 2,
+      "semantic_relation": "supports|refines|contradicts|unrelated",
+      "confidence": 0.8,
+      "reason": "key behavior, applicable conditions, and relation evidence"
+    }
+  ]
 }
 
-New action signals and their facts:
+Candidate action signals in the current cluster and their direct source content:
 {new_signals}
 
 Existing patterns and representative evidence:
@@ -1052,7 +1106,7 @@ Existing patterns and representative evidence:
 
 DERIVED_USER_CLAIM_EXTRACTION_PROMPT_EN = """You produce directly derived user_claims about user self for a personal world model.
 
-The input has two sections. `changed_explicit_claims` are explicit user_claims for the current subject that changed after this incoming fact batch. `related_active_explicit_claims` are historical active explicit user_claims loaded from the database because they concern this subject or its directly linked entities. Produce only conclusions that follow directly and necessarily from those claims.
+The input has two sections. `changed_explicit_claims` are the new explicit user_claims about user self being evaluated in this batch. `related_active_explicit_claims` are relevant active explicit premises, mainly historical claims; they may also include new claims assigned to other batches to respect the input budget. Each claim appears in only one section. Produce only conclusions that follow directly and necessarily from those claims.
 
 A derived user_claim is not pattern induction, common-sense completion, or a plausible guess. It must be explainable as “because premise A (and premise B), conclusion C,” while keeping user self as the subject of both premises and conclusion. If the available user_claim premises do not entail a new user-self claim, return an empty list. The system assigns `claim_origin=derived`; do not include that field in the output.
 
@@ -1065,6 +1119,7 @@ Rules:
 6. Do not repeat or merely paraphrase a premise. Return an empty list when no strictly entailed new conclusion exists.
 7. `primary_domain` must be one of `general|health|work|life|information|finance|family|learning|social|interest|travel`; choose the most specific user-life domain, and use `general` only for genuinely cross-domain conclusions.
 8. confidence is confidence that the conclusion follows given the premises, not confidence that the premises are true. Return JSON only.
+9. Evaluate changed_explicit_claims jointly as a batch, combining multiple new claims with relevant historical premises when warranted. Do not mechanically generate a conclusion per claim or require every new claim to produce output. Return each conclusion only once with its necessary premises. Sharing a domain does not justify combining claims from incompatible projects, phases, or conditions. Do not emit placeholders for claims with no new conclusion; return claims=[] when the entire batch yields none.
 
 Output:
 {

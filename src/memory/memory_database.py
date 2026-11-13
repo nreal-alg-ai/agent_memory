@@ -427,6 +427,7 @@ class UserMemoryDB:
                 action_kind TEXT NOT NULL CHECK(action_kind IN ('action', 'choice', 'participation')),
                 action_text TEXT NOT NULL CHECK(length(trim(action_text)) > 0),
                 action_text_embedding BLOB,
+                has_observed_pattern INTEGER NOT NULL DEFAULT 0 CHECK(has_observed_pattern IN (0, 1)),
                 event_time_key TEXT NOT NULL DEFAULT '',
                 event_ended_at TEXT NOT NULL DEFAULT '',
                 time_scope TEXT NOT NULL DEFAULT 'reported_event',
@@ -1626,10 +1627,17 @@ class UserMemoryDB:
         return self.get_user_signals_by_ids("action", signal_ids)
 
     def get_user_action_signals(self) -> List[Dict[str, Any]]:
-        """Read all user-self actions before semantic neighborhood selection."""
+        """Read all persisted user action signals."""
+        rows = self._conn.execute(
+            "SELECT * FROM memory_user_action_signals ORDER BY signal_id DESC",
+        ).fetchall()
+        return [self._row_to_dict(row) for row in rows]
+
+    def get_unassigned_user_action_signals(self) -> List[Dict[str, Any]]:
+        """Read historical discovery evidence that has not supported a saved pattern."""
         rows = self._conn.execute(
             "SELECT * FROM memory_user_action_signals "
-            "ORDER BY signal_id DESC",
+            "WHERE has_observed_pattern = 0 ORDER BY signal_id DESC",
         ).fetchall()
         return [self._row_to_dict(row) for row in rows]
 
@@ -2024,17 +2032,21 @@ class UserMemoryDB:
     def add_user_observed_pattern_signals(
         self, *, pattern_id: int, signal_ids: Sequence[int],
     ) -> int:
-        """Attach fact-grounded action signals to an observed pattern."""
+        """Atomically attach support and remove those signals from discovery."""
         now = local_now_text()
         changed = 0
-        for signal_id in sorted({int(value) for value in signal_ids if int(value) > 0}):
-            self._conn.execute(
-                "INSERT OR IGNORE INTO memory_user_observed_pattern_signals "
-                "(pattern_id, signal_id, created_at) VALUES (?, ?, ?)",
-                (int(pattern_id), signal_id, now),
-            )
-            changed += int(self._conn.execute("SELECT changes()").fetchone()[0] > 0)
-        self._commit_if_needed()
+        with self.transaction():
+            for signal_id in sorted({int(value) for value in signal_ids if int(value) > 0}):
+                self._conn.execute(
+                    "INSERT OR IGNORE INTO memory_user_observed_pattern_signals "
+                    "(pattern_id, signal_id, created_at) VALUES (?, ?, ?)",
+                    (int(pattern_id), signal_id, now),
+                )
+                changed += int(self._conn.execute("SELECT changes()").fetchone()[0] > 0)
+                self._conn.execute(
+                    "UPDATE memory_user_action_signals SET has_observed_pattern=1 "
+                    "WHERE signal_id=?", (signal_id,),
+                )
         return changed
 
     def refresh_user_observed_pattern(
@@ -2121,6 +2133,12 @@ class UserMemoryDB:
             ).fetchall()
             pattern["support_signal_ids"] = [int(row["signal_id"]) for row in evidence]
         return patterns
+
+    def get_user_observed_pattern_event_cursor(self) -> int:
+        """Snapshot the append-only event position on the shared writer queue."""
+        return int(self._conn.execute(
+            "SELECT COALESCE(MAX(id), 0) FROM memory_user_observed_pattern_events",
+        ).fetchone()[0])
 
     def get_user_observed_pattern_events_for_signal_ids(
         self, signal_ids: Sequence[int],

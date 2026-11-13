@@ -248,9 +248,12 @@ personal_world_model:
     user_thread_event_context_limit: 16
     user_claim_explicit_min_confidence: 0.72
     user_claim_derived_min_confidence: 0.75
+    user_claim_derived_batch_size: 16
+    # Rendered prompt target; keep an indivisible oversized seed + premises intact and log it.
+    user_claim_derived_prompt_char_budget: 24000
     user_claim_signal_max_per_fact: 3
-    user_observed_pattern_min_support_signals: 3
-    user_observed_pattern_signal_limit: 32
+    # Discovery gate only; activity windows do not prove independent occurrences.
+    user_observed_pattern_min_activities: 2
 
     recall:  
       recall_top_k: 8
