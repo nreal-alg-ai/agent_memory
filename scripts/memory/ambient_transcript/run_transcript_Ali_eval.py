@@ -208,9 +208,9 @@ def main() -> None:
         raise RuntimeError("Timed out while draining queued memory tasks")
 
     followup_dispatch_result = (
-        operation_reporter.latest_report("memory_flush_fact_followups") or {}
+        operation_reporter.latest_report("memory_flush_signal_updates") or {}
     )
-    followup_tasks = followup_dispatch_result.get("fact_followup_tasks") or {}
+    followup_tasks = followup_dispatch_result.get("signal_update_tasks") or {}
     store_operation_report = operation_reporter.operation_report("memory_fact_extraction")
     user_claim_result = (
         operation_reporter.latest_report("memory_user_claim_update")

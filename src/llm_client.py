@@ -198,6 +198,11 @@ class LLMClient:
                 stage_name, len(str(text)), type(data).__name__,
             )
             return None
+        if self._logger.isEnabledFor(logging.DEBUG):
+            self._logger.debug(
+                "LLM JSON output stage_name=%s\n%s",
+                stage_name, json.dumps(data, ensure_ascii=False, indent=2),
+            )
         return data
 
     @staticmethod

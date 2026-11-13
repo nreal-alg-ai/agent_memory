@@ -216,37 +216,21 @@ personal_world_model:
     user_prediction_horizon_hours: 6
     # Failed due-defer reassessments stay scheduled; avoid retrying on every tick.
     user_prediction_reassessment_retry_seconds: 300
+    # Each completed activity source window submits its unprocessed claim,
+    # action and intent signals; no additional batch/fact-count thresholds.
     enable_memory_user_claim_update: true
     enable_memory_user_observed_pattern_update: true
     enable_memory_user_intent_update: true
     # New activities can observe progress of existing intents; no intent-triggered activity backscan.
     enable_memory_user_intent_update_from_activities: true
-    # Claim/intent follow-ups (including flush) only select pending evidence
-    # within this many hours of the task's logical reference time.
+    # Manual/flush claim and intent updates select pending evidence within this
+    # lookback. Automatic updates use the completed activity's source window.
     user_claim_signal_lookback_hours: 6
     user_intent_signal_lookback_hours: 6
     enable_memory_user_thread_update: true
     enable_memory_user_state_update: true
     # 接收并处理外部 Agent 的服务执行和用户反馈（共享任务队列）
     enable_proactive_service_feedback: true
-    # Interaction batches remain more responsive than ambient input, but a
-    # fact follow-up task still needs multiple committed batches and signal-bearing
-    # facts. Signal counts themselves are diagnostic only: one fact may emit
-    # several signals in a single extraction result.
-    user_claim_min_signal_batches: 4
-    user_claim_min_signal_facts: 8
-    interaction_user_claim_min_signal_batches: 3
-    interaction_user_claim_min_signal_facts: 5
-    user_intent_min_signal_batches: 4
-    user_intent_min_signal_facts: 5
-    interaction_user_intent_min_signal_batches: 3
-    interaction_user_intent_min_signal_facts: 3
-    # Action signals are grouped into independent occurrences only when this
-    # separate observed-pattern follow-up task runs.
-    user_action_min_signal_batches: 4
-    user_action_min_signal_facts: 8
-    interaction_user_action_min_signal_batches: 3
-    interaction_user_action_min_signal_facts: 5
     # The host supplies periodic signals; PWM only checks and processes pending claims.
     user_state_claim_batch_limit: 80
 

@@ -240,7 +240,7 @@ class TaskOperationReporter:
                 not in failure_statuses
             )
         if operation_type in {
-            "memory_flush_fact_followups",
+            "memory_flush_signal_updates",
             "memory_user_activity_extraction",
             "memory_user_thread_update",
             "memory_user_claim_update",
@@ -301,7 +301,7 @@ class TaskOperationReporter:
 class TaskScheduler:
     """Own queued tasks on one worker, with FIFO within each priority."""
 
-    _FACT_FOLLOWUP_TASK_KINDS = (
+    _SIGNAL_UPDATE_TASK_KINDS = (
         "memory_user_claim_update",
         "memory_user_observed_pattern_update",
         "memory_user_intent_update",
@@ -421,51 +421,10 @@ class TaskScheduler:
         self._claim_state_lock = threading.Lock()
         self._claim_state_task_pending = False
         self._claim_state_force_requested = False
-        self._fact_followup_thresholds = {
-            "memory_user_claim_update": {
-                "default": {
-                    "batches": max(1, int(settings.get("user_claim_min_signal_batches", 4) or 4)),
-                    "facts": max(1, int(settings.get("user_claim_min_signal_facts", 8) or 8)),
-                },
-                "interaction": {
-                    "batches": max(1, int(settings.get("interaction_user_claim_min_signal_batches", 3) or 3)),
-                    "facts": max(1, int(settings.get("interaction_user_claim_min_signal_facts", 5) or 5)),
-                },
-            },
-            "memory_user_intent_update": {
-                "default": {
-                    "batches": max(1, int(settings.get("user_intent_min_signal_batches", 4) or 4)),
-                    "facts": max(1, int(settings.get("user_intent_min_signal_facts", 5) or 5)),
-                },
-                "interaction": {
-                    "batches": max(1, int(settings.get("interaction_user_intent_min_signal_batches", 3) or 3)),
-                    "facts": max(1, int(settings.get("interaction_user_intent_min_signal_facts", 3) or 3)),
-                },
-            },
-            "memory_user_observed_pattern_update": {
-                "default": {
-                    "batches": max(1, int(settings.get("user_action_min_signal_batches", 4) or 4)),
-                    "facts": max(1, int(settings.get("user_action_min_signal_facts", 8) or 8)),
-                },
-                "interaction": {
-                    "batches": max(1, int(settings.get("interaction_user_action_min_signal_batches", 3) or 3)),
-                    "facts": max(1, int(settings.get("interaction_user_action_min_signal_facts", 5) or 5)),
-                },
-            },
-        }
-        self._fact_followup_state = {
-            task_kind: {
-                "generation": 0,
-                "unscheduled_signal_batches": 0,
-                "unscheduled_signal_facts": 0,
-                "unscheduled_contains_interaction": False,
-            }
-            for task_kind in self._FACT_FOLLOWUP_TASK_KINDS
-        }
         self._latest_input_time_end = ""
         self.register_handler(
-            "memory_flush_fact_followups",
-            self._process_flush_fact_followup_tasks,
+            "memory_flush_signal_updates",
+            self._process_flush_signal_update_tasks,
         )
 
     @property
@@ -1086,37 +1045,37 @@ class TaskScheduler:
         """Explicitly process successive batches; never start a periodic clock."""
         return self.trigger_user_state_update(drain=True)
 
-    def submit_flush_fact_followup_tasks(self) -> Dict[str, Any]:
+    def submit_flush_signal_update_tasks(self) -> Dict[str, Any]:
         """Queue a normal-priority boundary; resolve signals when it executes."""
-        return self.submit("memory_flush_fact_followups", {})
+        return self.submit("memory_flush_signal_updates", {})
 
-    def _process_flush_fact_followup_tasks(self) -> Dict[str, Any]:
-        """Submit unreserved signals produced by preceding fact tasks."""
-        followup_reports = self._submit_final_fact_followup_tasks()
+    def _process_flush_signal_update_tasks(self) -> Dict[str, Any]:
+        """Drain unreserved signals after preceding fact and activity tasks."""
+        signal_reports = self._submit_final_signal_update_tasks()
         failed_task_kinds = [
             task_kind
-            for task_kind, report in followup_reports.items()
+            for task_kind, report in signal_reports.items()
             if not report.get("queued")
             and report.get("reason") not in {"no_pending_signals", "task_disabled"}
         ]
         self._logger.info(
-            "final memory follow-ups submitted claim_queued=%s "
+            "final signal updates submitted claim_queued=%s "
             "observed_pattern_queued=%s intent_queued=%s",
-            bool(followup_reports["memory_user_claim_update"].get("queued")),
-            bool(followup_reports["memory_user_observed_pattern_update"].get("queued")),
-            bool(followup_reports["memory_user_intent_update"].get("queued")),
+            bool(signal_reports["memory_user_claim_update"].get("queued")),
+            bool(signal_reports["memory_user_observed_pattern_update"].get("queued")),
+            bool(signal_reports["memory_user_intent_update"].get("queued")),
         )
         return {
             "status": "failed" if failed_task_kinds else "ok",
-            "fact_followup_tasks": followup_reports,
+            "signal_update_tasks": signal_reports,
             "failed_task_kinds": failed_task_kinds,
         }
 
-    def _submit_final_fact_followup_tasks(self) -> Dict[str, Dict[str, Any]]:
+    def _submit_final_signal_update_tasks(self) -> Dict[str, Dict[str, Any]]:
         with self._worker_lock:
             resolved_timestamp = self._latest_input_time_end
         reports: Dict[str, Dict[str, Any]] = {}
-        for task_kind in self._FACT_FOLLOWUP_TASK_KINDS:
+        for task_kind in self._SIGNAL_UPDATE_TASK_KINDS:
             payload: Dict[str, Any] = {
                 "reference_timestamp": resolved_timestamp or None,
             }
@@ -1135,8 +1094,8 @@ class TaskScheduler:
             "memory_user_activity_extraction": self._postprocess_user_activity_task,
             "memory_user_thread_update": self._postprocess_user_thread_update_task,
             "memory_user_claim_update": self._postprocess_user_claim_update_task,
-            "memory_user_observed_pattern_update": self._postprocess_fact_followup_task,
-            "memory_user_intent_update": self._postprocess_fact_followup_task,
+            "memory_user_observed_pattern_update": self._postprocess_signal_update_task,
+            "memory_user_intent_update": self._postprocess_signal_update_task,
             "user_state_update_from_user_claims": (
                 self._postprocess_user_state_update_from_user_claims_task
             ),
@@ -1156,8 +1115,6 @@ class TaskScheduler:
     ) -> None:
         task_kind = str(event.get("task_kind") or "")
         schedulers = {
-            "memory_fact_extraction": self._schedule_after_fact_extraction_task,
-            "proactive_service_feedback": self._schedule_after_fact_extraction_task,
             "memory_user_activity_extraction": self._schedule_after_user_activity_task,
             "memory_user_thread_update": self._schedule_after_user_thread_update_task,
             "memory_user_observed_pattern_update": (
@@ -1202,14 +1159,6 @@ class TaskScheduler:
                 result, completion_context=context,
             )
 
-    def _schedule_after_fact_extraction_task(
-        self, event: Dict[str, Any], completion: Dict[str, Any],
-    ) -> None:
-        if (completion["postprocessed"] and event.get("succeeded")
-                and isinstance(event.get("result"), dict)):
-            for task_kind in self._FACT_FOLLOWUP_TASK_KINDS:
-                self._schedule_fact_followup_if_eligible(task_kind)
-
     def _postprocess_user_activity_task(self, event: Dict[str, Any]) -> None:
         result = event.get("result")
         if event.get("succeeded") and isinstance(result, dict) and self._task_execution_db:
@@ -1223,15 +1172,6 @@ class TaskScheduler:
                     source_task_id=str(event.get("task_id") or ""),
                     source_time_end=result.get("reference_timestamp") or "",
                 )
-                if added:
-                    state = self._fact_followup_state["memory_user_observed_pattern_update"]
-                    state["generation"] += 1
-                    state["unscheduled_signal_batches"] += 1
-                    # The existing threshold counts evidence-bearing source
-                    # items; here they are activities rather than facts.
-                    state["unscheduled_signal_facts"] += int(
-                        result.get("user_action_signal_activity_count") or 1
-                    )
                 self._logger.info(
                     "activity action signals registered task_id=%s signal_ids=%s added=%s",
                     event.get("task_id"), signal_ids, added,
@@ -1254,8 +1194,9 @@ class TaskScheduler:
         result = event.get("result")
         if not event.get("succeeded") or not isinstance(result, dict):
             return
-        if result.get("user_action_signal_ids"):
-            self._schedule_fact_followup_if_eligible("memory_user_observed_pattern_update")
+        # Use the processed source window, even when no activity was extracted.
+        # Do not mix in pending signals from unrelated or later windows.
+        self._schedule_signal_updates_for_activity_window(result)
         activity_ids = result.get("user_activity_item_ids") or []
         if not activity_ids:
             return
@@ -1386,7 +1327,7 @@ class TaskScheduler:
                 or completion.get("force_requested"))):
             self.drain_pending_user_state_claims()
 
-    def _postprocess_fact_followup_task(
+    def _postprocess_signal_update_task(
         self, event: Dict[str, Any],
     ) -> None:
         """Acknowledge the signal IDs completed by this task's handler."""
@@ -1413,7 +1354,7 @@ class TaskScheduler:
                 result["_completed_signal_ids"] = []
             raise
         finally:
-            self._postprocess_fact_followup_task(event)
+            self._postprocess_signal_update_task(event)
 
     def _schedule_after_user_observed_pattern_update_task(
         self, event: Dict[str, Any], completion: Dict[str, Any],
@@ -1501,55 +1442,39 @@ class TaskScheduler:
             contains_interaction,
             context.get("input_time_end") or "",
         )
-        for kind, stats in signal_stats.items():
-            if stats["signal_count"] <= 0 or stats["signal_fact_count"] <= 0:
-                continue
-            state = self._fact_followup_state[kind]
-            state["generation"] += 1
-            state["unscheduled_signal_batches"] += 1
-            state["unscheduled_signal_facts"] += stats["signal_fact_count"]
-            state["unscheduled_contains_interaction"] = bool(
-                state["unscheduled_contains_interaction"] or contains_interaction
-            )
 
-    def _schedule_fact_followup_if_eligible(self, kind: str) -> None:
-        state = self._fact_followup_state[kind]
-        mode = "interaction" if state["unscheduled_contains_interaction"] else "default"
-        threshold = self._fact_followup_thresholds[kind][mode]
-        if (
-            state["unscheduled_signal_batches"] < threshold["batches"]
-            or state["unscheduled_signal_facts"] < threshold["facts"]
-        ):
+    def _schedule_signal_updates_for_activity_window(self, result: Dict[str, Any]) -> None:
+        """Freeze unreserved signal IDs belonging to this completed window."""
+        if self._user_memory_db is None or self._task_execution_db is None:
             return
-        target_generation = int(state["generation"])
-        with self._worker_lock:
-            reference_timestamp = self._latest_input_time_end
-        followup_payload: Dict[str, Any] = {
-            "reference_timestamp": reference_timestamp or None,
+        source_ids = result.get("source_segment_ids") or []
+        activity_ids = result.get("user_activity_item_ids") or []
+        signals = self._user_memory_db.get_user_signal_batches_for_activity_window(
+            source_segment_ids=source_ids, activity_ids=activity_ids,
+        )
+        reference_timestamp = result.get("reference_timestamp") or self._latest_input_time_end or None
+        signal_keys = {
+            "memory_user_claim_update": "claim_signal_ids",
+            "memory_user_observed_pattern_update": "action_signal_ids",
+            "memory_user_intent_update": "intent_signal_ids",
         }
-        report = self.submit(
-            kind,
-            followup_payload,
-            report_payload=followup_payload,
-        )
-        if report.get("queued"):
-            state["unscheduled_signal_batches"] = 0
-            state["unscheduled_signal_facts"] = 0
-            state["unscheduled_contains_interaction"] = False
+        for kind in self._SIGNAL_UPDATE_TASK_KINDS:
+            if not self._task_enabled[kind]:
+                continue
+            pending_ids = set(self._task_execution_db.pending_signal_ids(self._SIGNAL_TASK_TARGETS[kind]))
+            selected_ids = sorted(set(signals[signal_keys[kind]]) & pending_ids)
+            if not selected_ids:
+                continue
+            payload = {"signal_ids": selected_ids, "reference_timestamp": reference_timestamp}
+            report = self.submit(kind, payload)
             self._logger.info(
-                "memory fact follow-up task scheduled kind=%s target_generation=%s "
-                "reference_timestamp=%s", kind, target_generation,
-                reference_timestamp or "",
+                "activity-window signal update kind=%s signal_ids=%s "
+                "source_segment_ids=%s activity_ids=%s reference_timestamp=%s queued=%s reason=%s",
+                kind, selected_ids, source_ids, activity_ids, reference_timestamp,
+                bool(report.get("queued")), report.get("reason") or "",
             )
-            return
-        if report.get("reason") == "no_pending_signals":
-            state["unscheduled_signal_batches"] = 0
-            state["unscheduled_signal_facts"] = 0
-            state["unscheduled_contains_interaction"] = False
-        self._logger.warning(
-            "memory fact follow-up task rejected kind=%s reason=%s",
-            kind, report.get("reason"),
-        )
+            if not report.get("queued"):
+                self._logger.warning("Activity-window signal update not queued: %s", report)
 
     def _record_input_time_end(self, value: Any) -> None:
         """Advance the input watermark while submit() holds _worker_lock."""

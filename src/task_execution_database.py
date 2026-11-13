@@ -402,8 +402,9 @@ class TaskExecutionDB:
     ) -> List[int]:
         """Read pending IDs, optionally bounded by the producer's input time.
 
-        An unbounded read is for diagnostics. Scheduling supplies a reference
-        clock for claim/intent; undated batches cannot enter that window.
+        Activity-window scheduling intersects an unbounded read with explicit
+        source IDs. Manual/flush selection supplies a reference clock instead;
+        undated claim/intent batches cannot enter that lookback window.
         """
         try:
             table, pending_column, processed_column = self._SIGNAL_BATCHES[target]

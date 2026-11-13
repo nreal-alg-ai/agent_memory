@@ -642,6 +642,7 @@ class MemoryNodeManager:
                 "new_user_activity_count": 0,
                 "fact_count": 0,
                 "source_unit_count": 0,
+                "source_segment_ids": [],
             }
         source_row_ids = list(dict.fromkeys(
             int(unit.source_unit_row_id)
@@ -701,6 +702,7 @@ class MemoryNodeManager:
             "user_action_signal_count": sum(len(item.get("user_action_signals") or []) for item in activity_items),
             "user_action_signal_activity_count": sum(bool(item.get("user_action_signals")) for item in activity_items),
             "reference_timestamp": source_ended_at,
+            "source_segment_ids": source_row_ids,
             "fact_count": len(facts),
             "source_unit_count": len(source_units),
             "source_unit_row_count": processed_rows,
@@ -4480,7 +4482,7 @@ class MemoryNodeManager:
     @staticmethod
     def _user_claim_types() -> set[str]:
         return {
-            "identity_profile", "affiliation", "relationship", "preference",
+            "identity_profile", "affiliation", "relationship", "judgment", "preference",
             "constraint", "behavior_pattern",
         }
 
@@ -4498,9 +4500,12 @@ class MemoryNodeManager:
             int(signal["source_id"]) for signal in signals if signal["source_type"] == "fact"
         }))
         facts_by_id = {int(fact["id"]): fact for fact in explicit_facts}
+        activity_contexts_by_fact = self._db.get_user_activity_contexts_for_facts(
+            list(facts_by_id),
+        )
         signal_items = [
             {"signal_id": int(row["signal_id"]), "fact": facts_by_id[int(row["source_id"])],
-             "signal": row}
+             "signal": row, "activity_contexts": activity_contexts_by_fact.get(int(row["source_id"]), [])}
             for row in signals
             if row["source_type"] == "fact" and int(row["source_id"]) in facts_by_id
         ]
@@ -4580,8 +4585,30 @@ class MemoryNodeManager:
                     "confidence": float(signal.get("confidence") or 0.0),
                 },
                 "fact": self._format_fact_view_for_explicit_claim_prompt(item["fact"]),
+                "activity_context_ids": [
+                    int(activity["activity_id"]) for activity in item.get("activity_contexts") or []
+                ],
             }, ensure_ascii=False, separators=(",", ":")))
         return "[\n" + ",\n".join(lines) + "\n]"
+
+    @staticmethod
+    def _format_activity_contexts_for_explicit_claim_prompt(
+        signal_items: Sequence[Dict[str, Any]],
+    ) -> str:
+        """Share only this LLM batch's activities, with one context per line."""
+        contexts = {
+            int(activity["activity_id"]): {
+                "activity_id": int(activity["activity_id"]),
+                "activity_text": activity["activity_text"],
+            }
+            for item in signal_items for activity in item.get("activity_contexts") or []
+        }
+        if not contexts:
+            return "[]"
+        return "[\n" + ",\n".join(
+            json.dumps(contexts[key], ensure_ascii=False, separators=(",", ":"))
+            for key in sorted(contexts)
+        ) + "\n]"
 
     def _sync_user_claim_recall_documents(
         self,
@@ -5136,7 +5163,18 @@ class MemoryNodeManager:
                 if prompt_language == "en" else EXPLICIT_USER_CLAIM_EXTRACTION_PROMPT_ZH
             )
             try:
+                activity_ids_by_signal = {
+                    item["signal_id"]: [int(activity["activity_id"])
+                                        for activity in item.get("activity_contexts") or []]
+                    for item in batch_signal_items
+                }
+                self._logger.log_json_format("memory_user_claim", "explicit_claim_activity_contexts", {
+                    "signal_activity_context_ids": activity_ids_by_signal,
+                })
                 prompt = prompt_template.replace(
+                    "{activity_contexts}",
+                    self._format_activity_contexts_for_explicit_claim_prompt(batch_signal_items),
+                ).replace(
                     "{signal_items}",
                     self._format_signal_view_for_explicit_claim_prompt(batch_signal_items),
                 )

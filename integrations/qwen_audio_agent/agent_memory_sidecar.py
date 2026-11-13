@@ -512,7 +512,7 @@ class AgentMemoryRuntime:
         holder.active_ambient_recording_ids.discard(recording_id)
         input_flush = dict(finalization.get("input_flush") or {})
         user_activity = dict(finalization.get("user_activity") or {})
-        followup_dispatch = dict(finalization.get("fact_followup_dispatch") or {})
+        followup_dispatch = dict(finalization.get("signal_update_dispatch") or {})
         result = {
             "finalized": bool(user_activity.get("queued")),
             "recordingId": recording_id,
@@ -524,7 +524,7 @@ class AgentMemoryRuntime:
         }
         self._logger.info(
             "finalize_transcript_recording owner=%s recording=%s input_flushed=%s "
-            "user_activity_queued=%s fact_followup_dispatch_queued=%s "
+            "user_activity_queued=%s signal_update_dispatch_queued=%s "
             "active_ambient_recordings=%s",
             _owner_key(owner_id)[:12],
             recording_id[:80],
@@ -559,14 +559,14 @@ class AgentMemoryRuntime:
             )
             input_flush = dict(finalization.get("input_flush") or {})
             user_activity = dict(finalization.get("user_activity") or {})
-            followup_dispatch = dict(finalization.get("fact_followup_dispatch") or {})
+            followup_dispatch = dict(finalization.get("signal_update_dispatch") or {})
         else:
             flush_report = holder.pwm.finalize_memory_session(
                 reason="qwen_audio_agent_transport_checkpoint",
             )
             input_flush = dict(flush_report.get("input_flush") or {})
             user_activity = None
-            followup_dispatch = dict(flush_report.get("fact_followup_dispatch") or {})
+            followup_dispatch = dict(flush_report.get("signal_update_dispatch") or {})
         result = {
             "finalized": boundary == "session_end" and bool((user_activity or {}).get("queued")),
             "boundary": boundary,
@@ -579,7 +579,7 @@ class AgentMemoryRuntime:
         }
         self._logger.info(
             "finalize owner=%s boundary=%s session=%s input_flushed=%s "
-            "user_activity_queued=%s fact_followup_dispatch_queued=%s reason=%s",
+            "user_activity_queued=%s signal_update_dispatch_queued=%s reason=%s",
             _owner_key(owner_id)[:12],
             boundary,
             session_id[:80],

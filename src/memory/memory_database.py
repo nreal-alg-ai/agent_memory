@@ -956,6 +956,49 @@ class UserMemoryDB:
         self._commit_if_needed()
         return int(cur.lastrowid)
 
+    def get_user_activity_contexts_for_facts(
+        self, fact_ids: Sequence[int],
+    ) -> Dict[int, List[Dict[str, Any]]]:
+        """Prefer activities citing each fact; otherwise use its source window."""
+        ids = sorted({int(value) for value in fact_ids if int(value) > 0})
+        if not ids:
+            return {}
+        rows = self._conn.execute(
+            """
+            WITH requested_facts AS (
+                SELECT CAST(value AS INTEGER) AS fact_id FROM json_each(?)
+            )
+            SELECT requested.fact_id, activity.id AS activity_id, activity.activity_text,
+                   EXISTS (
+                       SELECT 1 FROM json_each(activity.evidence_fact_ids) AS evidence
+                       WHERE evidence.value = requested.fact_id
+                   ) AS direct_match
+            FROM requested_facts AS requested
+            JOIN memory_user_activity_items AS activity ON
+                EXISTS (
+                    SELECT 1 FROM json_each(activity.evidence_fact_ids) AS evidence
+                    WHERE evidence.value = requested.fact_id
+                ) OR EXISTS (
+                    SELECT 1 FROM memory_fact_source_mapping AS mapping
+                    JOIN json_each(activity.source_segment_ids) AS source
+                      ON source.value = mapping.source_segment_id
+                    WHERE mapping.fact_id = requested.fact_id
+                )
+            WHERE TRIM(activity.activity_text) <> ''
+            ORDER BY requested.fact_id, activity.id
+            """,
+            (json_dumps(ids),),
+        ).fetchall()
+        direct: Dict[int, List[Dict[str, Any]]] = {}
+        window: Dict[int, List[Dict[str, Any]]] = {}
+        for row in rows:
+            matches = direct if row["direct_match"] else window
+            matches.setdefault(int(row["fact_id"]), []).append({
+                "activity_id": int(row["activity_id"]),
+                "activity_text": row["activity_text"],
+            })
+        return {fact_id: direct.get(fact_id) or window.get(fact_id, []) for fact_id in ids}
+
     def get_user_activity_items_by_ids(
         self,
         activity_ids: Sequence[int],
@@ -1417,6 +1460,35 @@ class UserMemoryDB:
             "intent_signal_ids": [int(row["signal_id"]) for row in intent_rows],
             "action_signal_ids": [int(row["signal_id"]) for row in action_rows],
         }
+
+    def get_user_signal_batches_for_activity_window(
+        self, *, source_segment_ids: Sequence[int], activity_ids: Sequence[int],
+    ) -> Dict[str, List[int]]:
+        """Resolve window-local signals without the activity prompt's fact limit."""
+        source_ids = sorted({int(value) for value in source_segment_ids if int(value) > 0})
+        fact_ids: set[int] = set()
+        for offset in range(0, len(source_ids), 500):
+            chunk = source_ids[offset:offset + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            fact_ids.update(int(row[0]) for row in self._conn.execute(
+                "SELECT DISTINCT fact_id FROM memory_fact_source_mapping "
+                f"WHERE source_segment_id IN ({placeholders})", chunk,
+            ))
+        signals = {"claim_signal_ids": [], "intent_signal_ids": [], "action_signal_ids": []}
+        ordered_fact_ids = sorted(fact_ids)
+        for offset in range(0, len(ordered_fact_ids), 500):
+            batch = self.get_user_signal_batches(
+                source_type="fact", source_ids=ordered_fact_ids[offset:offset + 500],
+            )
+            for key in signals:
+                signals[key].extend(batch[key])
+        ordered_activity_ids = sorted({int(value) for value in activity_ids if int(value) > 0})
+        for offset in range(0, len(ordered_activity_ids), 500):
+            batch = self.get_user_signal_batches(
+                source_type="user_activity", source_ids=ordered_activity_ids[offset:offset + 500],
+            )
+            signals["action_signal_ids"].extend(batch["action_signal_ids"])
+        return {key: sorted(set(ids)) for key, ids in signals.items()}
 
     def get_user_signals_by_ids(
         self, signal_type: str, signal_ids: Sequence[int],

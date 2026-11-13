@@ -233,7 +233,7 @@ class PersonWorldModel:
         subreports = [
             input_flush,
             input_flush.get("user_activity") or {},
-            input_flush.get("fact_followup_dispatch") or {},
+            input_flush.get("signal_update_dispatch") or {},
         ]
         if bool(report.get("accepted", False)) and not any(
             item.get("reason") in {

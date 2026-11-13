@@ -486,11 +486,11 @@ class MemoryRuntime:
             reason=reason,
             tags=tags,
         )
-        fact_followup_dispatch = self._task_scheduler.submit_flush_fact_followup_tasks()
+        signal_update_dispatch = self._task_scheduler.submit_flush_signal_update_tasks()
         submission_reports = [
             store_report,
             user_activity_report,
-            fact_followup_dispatch,
+            signal_update_dispatch,
         ]
         rejected_reasons = {
             "queue_rejected",
@@ -512,11 +512,11 @@ class MemoryRuntime:
                 bool(store_report.get("queued"))
                 or queued
                 or bool(user_activity_report.get("queued"))
-                or bool(fact_followup_dispatch.get("queued"))
+                or bool(signal_update_dispatch.get("queued"))
             ),
             "reason": str(store_report.get("reason") or ""),
             "user_activity": user_activity_report,
-            "fact_followup_dispatch": fact_followup_dispatch,
+            "signal_update_dispatch": signal_update_dispatch,
         }
 
     def _trigger_memory_fact_extraction_task_for_pending_units(
@@ -641,8 +641,8 @@ class MemoryRuntime:
             "accepted": bool(input_flush_report.get("accepted", True)),
             "input_flush": input_flush_report,
             "user_activity": dict(input_flush_report.get("user_activity") or {}),
-            "fact_followup_dispatch": dict(
-                input_flush_report.get("fact_followup_dispatch") or {}
+            "signal_update_dispatch": dict(
+                input_flush_report.get("signal_update_dispatch") or {}
             ),
         }
 
