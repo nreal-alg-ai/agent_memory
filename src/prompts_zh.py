@@ -1555,7 +1555,7 @@ USER_PREDICTION_REASSESSMENT_PROMPT_ZH = """你的目标是重新评估个人世
   ]
 }}
 
-参考时间：{as_of}
+参考时间：{evaluation_time}
 预测窗口：{horizon_start} 至 {horizon_end}
 到期延期评估 cases（每行一个）：
 {assessment_cases}
@@ -1619,7 +1619,7 @@ prediction_results 为扁平列表，每个元素只评估一个行为方向，�
   ]
 }}
 
-参考时间：{as_of}
+参考时间：{evaluation_time}
 预测窗口：{horizon_start} 至 {horizon_end}
 新建 intent cases：
 {intent_cases}
@@ -1704,7 +1704,7 @@ related_facts 仅来自该 intent 的直接事实证据关联，不是全量历�
   ]
 }}
 
-参考时间：{as_of}
+参考时间：{evaluation_time}
 预测窗口：{horizon_start} 至 {horizon_end}
 更新 intent cases：
 {intent_cases}
@@ -1807,7 +1807,7 @@ suppress：service、expires_at、next_evaluate_at 为 null，recheck_condition=
   ]
 }}
 
-评估时间：{as_of}
+评估时间：{evaluation_time}
 服务评估 cases（每项一行）：
 {evaluation_cases}
 实时情境：{runtime_context}

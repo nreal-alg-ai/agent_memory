@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence
 
 from pwm_logging import as_pwm_logger
+from storage_utils import local_now_text
 from intent_lifecycle import (
     ACTIVE_USER_INTENT_STATUSES,
     CLOSED_USER_INTENT_STATUSES,
@@ -84,13 +85,13 @@ class UserPrediction:
         return result.astimezone(reference.tzinfo)
 
     @staticmethod
-    def _now(as_of: Optional[datetime]) -> datetime:
-        local = datetime.now().astimezone()
-        if as_of is None:
+    def _now(evaluation_time: Optional[datetime]) -> datetime:
+        local = datetime.fromisoformat(local_now_text())
+        if evaluation_time is None:
             return local
-        if as_of.tzinfo is None:
-            return as_of.replace(tzinfo=local.tzinfo)
-        return as_of
+        if evaluation_time.tzinfo is None:
+            return evaluation_time.replace(tzinfo=local.tzinfo)
+        return evaluation_time
 
     @staticmethod
     def _text_list(value: Any) -> List[str]:
@@ -112,7 +113,7 @@ class UserPrediction:
         }
 
     def _build_user_prediction_prediction_inputs_using_intents(
-        self, *, owner_id: int, as_of: datetime,
+        self, *, owner_id: int, evaluation_time: datetime,
         horizon_end: datetime, intent_event_ids: Sequence[int],
     ) -> Dict[str, Any]:
         events = self._user_memory_db.get_user_intent_events(event_ids=intent_event_ids)
@@ -150,7 +151,7 @@ class UserPrediction:
             )
             existing_predictions = [prediction for prediction in existing
                 if prediction["id"] in links.get(intent["id"], set())
-                and (self._as_datetime(prediction.get("window_end"), as_of) or as_of) > as_of]
+                and (self._as_datetime(prediction.get("window_end"), evaluation_time) or evaluation_time) > evaluation_time]
             deferred = [schedule for schedule in schedules if schedule["intent_id"] == intent["id"]]
             if intent["status"] in CLOSED_USER_INTENT_STATUSES:
                 path = "ruling_cleanup"
@@ -181,11 +182,11 @@ class UserPrediction:
             })
 
         return {"intent_cases": cases, "recurring_states": self._get_prediction_recurring_states(
-            as_of=as_of, horizon_end=horizon_end,
+            evaluation_time=evaluation_time, horizon_end=horizon_end,
         ) if any(case["processing_path"] != "ruling_cleanup" for case in cases) else []}
 
     def _get_prediction_recurring_states(
-        self, *, as_of: datetime, horizon_end: datetime,
+        self, *, evaluation_time: datetime, horizon_end: datetime,
     ) -> List[Dict[str, Any]]:
         states = self._model_db.get_user_states(
             state_types=["recurring_state"],
@@ -193,11 +194,11 @@ class UserPrediction:
         )
         active_states = []
         for state in states:
-            valid_from = self._as_datetime(state.get("valid_from"), as_of)
-            valid_to = self._as_datetime(state.get("valid_to"), as_of)
+            valid_from = self._as_datetime(state.get("valid_from"), evaluation_time)
+            valid_to = self._as_datetime(state.get("valid_to"), evaluation_time)
             if valid_from and valid_from >= horizon_end:
                 continue
-            if valid_to and valid_to <= as_of:
+            if valid_to and valid_to <= evaluation_time:
                 continue
             active_states.append({
                 "id": int(state["id"]), "state_text": state.get("state_text") or "",
@@ -220,16 +221,17 @@ class UserPrediction:
             if parsed is None:
                 raise ValueError("Invalid prediction expiration reference_timestamp")
             reference = parsed
+        reference_timestamp = reference.isoformat()
         self._logger.log_json_format(self.WINDOW_EXPIRATION_TASK_NAME, "window_expiration_start", {
-            "as_of": reference.isoformat(), "owner_id": self._world_owner_entity_id,
+            "evaluation_time": reference.isoformat(), "owner_id": self._world_owner_entity_id,
         })
         try:
             expired = self._model_db.expire_user_predictions(
-                user_entity_id=self._world_owner_entity_id, as_of=reference.isoformat(),
+                user_entity_id=self._world_owner_entity_id, evaluation_time=reference_timestamp,
             )
         except Exception:
             self._logger.exception(
-                "Prediction window expiration failed as_of=%s transaction_rolled_back=True",
+                "Prediction window expiration failed evaluation_time=%s transaction_rolled_back=True",
                 reference.isoformat(),
             )
             raise
@@ -253,12 +255,13 @@ class UserPrediction:
             if parsed_time is None:
                 raise ValueError("Invalid prediction reassessment reference_timestamp")
             now = parsed_time
+        reference_timestamp = now.isoformat()
         end = now + timedelta(hours=max(0.1, float(horizon_hours)))
         report: Dict[str, Any] = {
             "status": "empty", "predictions": [], "prediction_assessments": [],
             "invalidated_prediction_ids": [], "processed_assessment_ids": [],
             "prediction_context": {
-                "as_of": now.isoformat(), "horizon_start": now.isoformat(),
+                "evaluation_time": now.isoformat(), "horizon_start": now.isoformat(),
                 "horizon_end": end.isoformat(), "trigger_source": "time_tick",
                 "predictor_version": self.MODEL_VERSION,
             },
@@ -268,7 +271,7 @@ class UserPrediction:
             user_entity_id=owner_id, due_at=now.isoformat(),
         )
         self._logger.log_json_format(self.TIME_TICK_TRIGGERED_TASK_NAME, "reassessment_start", {
-            "as_of": now.isoformat(), "horizon_end": end.isoformat(), "due_count": len(due),
+            "evaluation_time": now.isoformat(), "horizon_end": end.isoformat(), "due_count": len(due),
             "assessment_ids": [item["id"] for item in due],
         })
         if not due:
@@ -305,12 +308,12 @@ class UserPrediction:
                     "existing_predictions": [item for item in existing
                         if (self._as_datetime(item.get("window_end"), now) or now) > now],
                 })
-            states = self._get_prediction_recurring_states(as_of=now, horizon_end=end) if cases else []
+            states = self._get_prediction_recurring_states(evaluation_time=now, horizon_end=end) if cases else []
             self._logger.log_json_format(self.TIME_TICK_TRIGGERED_TASK_NAME, "reassessment_inputs_loaded", {
                 "cases": cases, "recurring_states": states,
             })
             predictions, assessments = self._reassess_predictions_with_llm(
-                cases, states=states, as_of=now, horizon_end=end,
+                cases, states=states, evaluation_time=now, horizon_end=end,
             ) if cases else ([], [])
             # No event is fabricated or re-consumed. Only the selected schedules
             # are replaced; unrelated predictions and future schedules stay intact.
@@ -319,7 +322,7 @@ class UserPrediction:
                 for item in predictions:
                     prediction_id, action = self._model_db.save_user_prediction({
                         **item, "user_entity_id": owner_id,
-                    })
+                    }, reference_timestamp=reference_timestamp)
                     committed = (self._model_db.get_user_predictions_by_ids([prediction_id])[0]
                                  if action == "reused" else {"id": prediction_id, **item})
                     saved.append({**committed, "save_action": action})
@@ -332,6 +335,7 @@ class UserPrediction:
                                 "intent_id", "assessment_id", "next_evaluate_at", "reason",
                                 "evaluated_at", "intent_event_ids",
                             )},
+                            reference_timestamp=reference_timestamp,
                         )
                     else:
                         self._model_db.delete_user_prediction_reassessment_schedule(
@@ -343,7 +347,7 @@ class UserPrediction:
                 obsolete_assessment_ids=[item["id"] for item in obsolete],
             )
         except Exception as exc:
-            self._logger.exception("Prediction reassessment failed as_of=%s schedules_preserved=True", now.isoformat())
+            self._logger.exception("Prediction reassessment failed evaluation_time=%s schedules_preserved=True", now.isoformat())
             report.update(status="error", error=f"{type(exc).__name__}: {exc}")
         self._logger.log_json_format(self.TIME_TICK_TRIGGERED_TASK_NAME, "reassessment_finish", {
             **report, "elapsed_ms": round((time.monotonic() - started_at) * 1000, 2),
@@ -352,12 +356,12 @@ class UserPrediction:
 
     def _reassess_predictions_with_llm(
         self, cases: Sequence[Dict[str, Any]], *, states: Sequence[Dict[str, Any]],
-        as_of: datetime, horizon_end: datetime,
+        evaluation_time: datetime, horizon_end: datetime,
     ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         chinese = bool(re.search(r"[\u4e00-\u9fff]", " ".join(case["current_intent"]["summary"] for case in cases)))
         template = USER_PREDICTION_REASSESSMENT_PROMPT_ZH if chinese else USER_PREDICTION_REASSESSMENT_PROMPT_EN
         prompt = template.format(
-            as_of=as_of.isoformat(), horizon_start=as_of.isoformat(), horizon_end=horizon_end.isoformat(),
+            evaluation_time=evaluation_time.isoformat(), horizon_start=evaluation_time.isoformat(), horizon_end=horizon_end.isoformat(),
             assessment_cases="\n".join(json.dumps(case, ensure_ascii=False) for case in cases),
             states="\n".join(json.dumps(state, ensure_ascii=False) for state in states),
         )
@@ -385,7 +389,7 @@ class UserPrediction:
                 generated, assessed = self._normalize_prediction_results(
                     [{"intent_id": case["current_intent"]["id"], **{
                         name: value for name, value in result.items() if name != "assessment_id"
-                    }}], cases=[case], states=states, as_of=as_of, horizon_end=horizon_end,
+                    }}], cases=[case], states=states, evaluation_time=evaluation_time, horizon_end=horizon_end,
                 )
                 existing_behaviors = {self._normalize_behavior_text(item["behavior_text"])
                                       for item in case["existing_predictions"]}
@@ -405,7 +409,7 @@ class UserPrediction:
         except Exception as exc:
             self._log_prediction_response_failure(
                 "reassessment", raw=raw, error=exc, cases=cases, states=states,
-                as_of=as_of, horizon_end=horizon_end,
+                evaluation_time=evaluation_time, horizon_end=horizon_end,
             )
             raise
 
@@ -429,26 +433,26 @@ class UserPrediction:
             return {"status": "empty", "predictions": [], "prediction_assessments": [],
                     "retained_prediction_ids": [], "invalidated_prediction_ids": [],
                     "processed_intent_event_ids": []}
-        now = self._now(None)
-        if reference_timestamp is not None:
-            parsed_time = self._as_datetime(reference_timestamp, now)
-            if parsed_time is None:
-                raise ValueError("Invalid intent-event prediction reference_timestamp")
-            now = parsed_time
-        end = now + timedelta(hours=max(0.1, float(horizon_hours)))
+        reference_timestamp = (
+            self._now(None) if reference_timestamp is None
+            else self._as_datetime(reference_timestamp, self._now(None))
+        )
+        if reference_timestamp is None:
+            raise ValueError("Invalid intent-event prediction reference_timestamp")
+        end = reference_timestamp + timedelta(hours=max(0.1, float(horizon_hours)))
         owner_id = self._world_owner_entity_id
         try:
             snapshot = self._build_user_prediction_prediction_inputs_using_intents(
-                owner_id=owner_id, as_of=now, horizon_end=end, intent_event_ids=event_ids,
+                owner_id=owner_id, evaluation_time=reference_timestamp, horizon_end=end, intent_event_ids=event_ids,
             )
         except Exception:
-            self._logger.exception("Prediction input loading failed intent_event_ids=%s as_of=%s",
-                                   event_ids, now.isoformat())
+            self._logger.exception("Prediction input loading failed intent_event_ids=%s evaluation_time=%s",
+                                   event_ids, reference_timestamp.isoformat())
             raise
         states = snapshot["recurring_states"]
         self._logger.log_json_format(self.NEW_INTENT_TRIGGERED_TASK_NAME, "inputs_loaded", {
             "intent_event_ids": event_ids, "owner_id": owner_id,
-            "horizon_start": now.isoformat(), "horizon_end": end.isoformat(),
+            "horizon_start": reference_timestamp.isoformat(), "horizon_end": end.isoformat(),
             "intent_cases": [{
                 "event_type": case["event_type"], "processing_path": case["processing_path"],
                 "current_intent": case["current_intent"],
@@ -460,7 +464,9 @@ class UserPrediction:
         })
         # Window expiration is independent of intent adjudication, and is never
         # rolled back because another intent's LLM evaluation fails.
-        expired = self._model_db.expire_user_predictions(user_entity_id=owner_id, as_of=now.isoformat())
+        expired = self._model_db.expire_user_predictions(
+            user_entity_id=owner_id, evaluation_time=reference_timestamp.isoformat(),
+        )
         saved, retained_prediction_ids, assessments = [], [], []
         invalidated_prediction_ids, closed_service_ids, processed_event_ids, failures = [], [], [], []
         groups = [[case] for case in snapshot["intent_cases"] if case["processing_path"] == "ruling_cleanup"]
@@ -475,19 +481,19 @@ class UserPrediction:
                 retained = []
                 if path == "ruling_cleanup":
                     generated, assessed = [], []
-                    committed = self._cleanup_predictions_for_closed_intents(cases, as_of=now)
+                    committed = self._cleanup_predictions_for_closed_intents(cases, evaluation_time=reference_timestamp)
                 else:
                     if path == "LLM_create":
                         generated, assessed = self._generate_predictions_for_created_intents_with_llm(
-                            cases, states=states, as_of=now, horizon_end=end,
+                            cases, states=states, evaluation_time=reference_timestamp, horizon_end=end,
                         )
                     else:
                         generated, retained, assessed = self._update_predictions_for_updated_intents_with_llm(
-                            cases, states=states, as_of=now, horizon_end=end,
+                            cases, states=states, evaluation_time=reference_timestamp, horizon_end=end,
                         )
                     committed = self._save_intent_prediction_results(
                         cases, predictions=generated, retained_prediction_ids=retained,
-                        assessments=assessed, as_of=now,
+                        assessments=assessed, evaluation_time=reference_timestamp,
                     )
                 saved.extend(committed["predictions"])
                 invalidated_prediction_ids.extend(committed["invalidated_prediction_ids"])
@@ -507,8 +513,8 @@ class UserPrediction:
                     "error": f"{type(exc).__name__}: {exc}",
                 })
                 self._logger.exception(
-                    "Prediction path failed path=%s intent_event_ids=%s as_of=%s "
-                    "other_committed_paths_preserved=True", path, selected_events, now.isoformat(),
+                    "Prediction path failed path=%s intent_event_ids=%s evaluation_time=%s "
+                    "other_committed_paths_preserved=True", path, selected_events, reference_timestamp.isoformat(),
                 )
         status = ("partial" if processed_event_ids else "error") if failures else (
             "ok" if saved or retained_prediction_ids or invalidated_prediction_ids or closed_service_ids
@@ -530,7 +536,7 @@ class UserPrediction:
                 "closed_service_ids": closed_service_ids, **expired,
                 "prediction_assessments": assessments,
                 "prediction_context": {
-                    "as_of": now.isoformat(), "horizon_start": now.isoformat(),
+                    "evaluation_time": reference_timestamp.isoformat(), "horizon_start": reference_timestamp.isoformat(),
                     "horizon_end": end.isoformat(), "predictor_version": self.MODEL_VERSION,
                     "intent_event_ids": event_ids,
                 },
@@ -540,7 +546,7 @@ class UserPrediction:
                 "error": error}
 
     def _cleanup_predictions_for_closed_intents(
-        self, cases: Sequence[Dict[str, Any]], *, as_of: datetime,
+        self, cases: Sequence[Dict[str, Any]], *, evaluation_time: datetime,
     ) -> Dict[str, Any]:
         """Invalidate pending forecasts, close open services, and remove defers atomically."""
         if any(case["current_intent"]["status"] not in CLOSED_USER_INTENT_STATUSES for case in cases):
@@ -552,13 +558,13 @@ class UserPrediction:
                 intent = case["current_intent"]
                 prediction_ids = self._model_db.invalidate_user_predictions(
                     [item["id"] for item in case["existing_predictions"]], user_entity_id=owner_id,
-                    as_of=as_of.isoformat(),
+                    evaluation_time=evaluation_time.isoformat(),
                 )
                 invalidated.extend(prediction_ids)
                 for prediction_id in prediction_ids:
                     closed.extend(self._model_db.close_user_proactive_services(
                         prediction_id=prediction_id, user_entity_id=owner_id, status="cancelled",
-                        reason=f"Source intent {intent['status']}", as_of=as_of.isoformat(),
+                        reason=f"Source intent {intent['status']}", evaluation_time=evaluation_time.isoformat(),
                     ))
             self._model_db.delete_user_prediction_reassessment_schedules(
                 [case["current_intent"]["id"] for case in cases], user_entity_id=owner_id,
@@ -567,7 +573,7 @@ class UserPrediction:
 
     def _save_intent_prediction_results(
         self, cases: Sequence[Dict[str, Any]], *, predictions: Sequence[Dict[str, Any]],
-        retained_prediction_ids: Sequence[int], assessments: Sequence[Dict[str, Any]], as_of: datetime,
+        retained_prediction_ids: Sequence[int], assessments: Sequence[Dict[str, Any]], evaluation_time: datetime,
     ) -> Dict[str, Any]:
         """Commit an active intent evaluation, including service cleanup and defer replacement."""
         owner_id = self._world_owner_entity_id
@@ -578,17 +584,19 @@ class UserPrediction:
         with self._model_db.transaction():
             invalidated = self._model_db.invalidate_user_predictions(
                 sorted(provided - set(retained_prediction_ids) - reused_ids), user_entity_id=owner_id,
-                as_of=as_of.isoformat(),
+                evaluation_time=evaluation_time.isoformat(),
             )
             closed = []
             for prediction_id in invalidated:
                 closed.extend(self._model_db.close_user_proactive_services(
                     prediction_id=prediction_id, user_entity_id=owner_id, status="cancelled",
-                    reason="Source intent changed; prediction no longer applies", as_of=as_of.isoformat(),
+                    reason="Source intent changed; prediction no longer applies", evaluation_time=evaluation_time.isoformat(),
                 ))
             saved = []
             for item in predictions:
-                prediction_id, action = self._model_db.save_user_prediction({**item, "user_entity_id": owner_id})
+                prediction_id, action = self._model_db.save_user_prediction(
+                    {**item, "user_entity_id": owner_id}, reference_timestamp=evaluation_time.isoformat(),
+                )
                 committed = (self._model_db.get_user_predictions_by_ids([prediction_id])[0]
                              if action == "reused" else {"id": prediction_id, **item})
                 saved.append({**committed, "save_action": action})
@@ -601,6 +609,7 @@ class UserPrediction:
                         user_entity_id=owner_id, **{key: assessment[key] for key in (
                             "intent_id", "next_evaluate_at", "reason", "evaluated_at", "intent_event_ids",
                         )},
+                        reference_timestamp=evaluation_time.isoformat(),
                     )
         return {"predictions": saved, "invalidated_prediction_ids": invalidated, "closed_service_ids": closed}
 
@@ -637,7 +646,7 @@ class UserPrediction:
 
     def _generate_predictions_for_created_intents_with_llm(
         self, cases: Sequence[Dict[str, Any]], *, states: Sequence[Dict[str, Any]],
-        as_of: datetime, horizon_end: datetime,
+        evaluation_time: datetime, horizon_end: datetime,
     ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         """Assess individual behavior directions for newly created intents."""
         source = " ".join(case["current_intent"]["summary"] for case in cases)
@@ -645,7 +654,7 @@ class UserPrediction:
         template = (USER_PREDICTION_GENERATED_FROM_NEW_INTENTS_PROMPT_ZH if chinese
                     else USER_PREDICTION_GENERATED_FROM_NEW_INTENTS_PROMPT_EN)
         prompt = template.format(
-            as_of=as_of.isoformat(), horizon_start=as_of.isoformat(), horizon_end=horizon_end.isoformat(),
+            evaluation_time=evaluation_time.isoformat(), horizon_start=evaluation_time.isoformat(), horizon_end=horizon_end.isoformat(),
             intent_cases=self._format_intent_cases_view_for_new_intent_prediction_prompt(cases),
             states=json.dumps(states, ensure_ascii=False),
         )
@@ -654,7 +663,7 @@ class UserPrediction:
             "stage": "created", "intent_ids": [case["current_intent"]["id"] for case in cases],
             "prompt_language": "zh" if chinese else "en", "prompt_chars": len(prompt),
             "state_ids": [state["id"] for state in states],
-            "horizon_start": as_of.isoformat(), "horizon_end": horizon_end.isoformat(),
+            "horizon_start": evaluation_time.isoformat(), "horizon_end": horizon_end.isoformat(),
         })
         raw = None
         try:
@@ -663,25 +672,25 @@ class UserPrediction:
             if not isinstance(parsed, dict) or set(parsed) != {"prediction_results"}:
                 raise ValueError("Created-intent response must contain only prediction_results")
             predictions, assessments = self._normalize_prediction_results(
-                parsed["prediction_results"], cases=cases, states=states, as_of=as_of, horizon_end=horizon_end,
+                parsed["prediction_results"], cases=cases, states=states, evaluation_time=evaluation_time, horizon_end=horizon_end,
             )
             return predictions, assessments
         except Exception as exc:
             self._log_prediction_response_failure(
                 "created", raw=raw, error=exc, cases=cases, states=states,
-                as_of=as_of, horizon_end=horizon_end,
+                evaluation_time=evaluation_time, horizon_end=horizon_end,
             )
             raise
 
     def _log_prediction_response_failure(
         self, stage: str, *, raw: Any, error: Exception,
         cases: Sequence[Dict[str, Any]], states: Sequence[Dict[str, Any]],
-        as_of: datetime, horizon_end: datetime,
+        evaluation_time: datetime, horizon_end: datetime,
     ) -> None:
         """Keep model output and validation scope together, only on failure."""
         payload = {
             "stage": stage, "error": f"{type(error).__name__}: {error}",
-            "horizon_start": as_of.isoformat(), "horizon_end": horizon_end.isoformat(),
+            "horizon_start": evaluation_time.isoformat(), "horizon_end": horizon_end.isoformat(),
             "intent_cases": [{
                 "current_intent": case["current_intent"],
                 "intent_event_ids": [event["id"] for event in case["intent_events"]],
@@ -697,7 +706,7 @@ class UserPrediction:
 
     def _normalize_prediction_results(
         self, results: Any, *, cases: Sequence[Dict[str, Any]], states: Sequence[Dict[str, Any]],
-        as_of: datetime, horizon_end: datetime,
+        evaluation_time: datetime, horizon_end: datetime,
     ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         """Normalize one assessment per behavior, allowing several per intent."""
         if not isinstance(results, list):
@@ -731,7 +740,7 @@ class UserPrediction:
                 try:
                     new = self._normalize_case_predictions(
                         [{**prediction, "intent_id": intent_id}], cases=[case], states=states,
-                        as_of=as_of, horizon_end=horizon_end,
+                        evaluation_time=evaluation_time, horizon_end=horizon_end,
                     )
                 except ValueError as exc:
                     raise ValueError(f"prediction_results[{index}]: {exc}") from exc
@@ -748,11 +757,11 @@ class UserPrediction:
             next_evaluate_at = None
             if decision == "defer":
                 value = result.get("next_evaluate_at")
-                next_time = self._as_datetime(value, as_of)
+                next_time = self._as_datetime(value, evaluation_time)
                 if (not isinstance(value, str) or not re.search(r"[T\s]\d{2}:\d{2}", value)
                         or next_time is None or next_time.tzinfo is None
                         or not re.search(r"(?:Z|[+-]\d{2}:\d{2})$", value)
-                        or next_time <= as_of):
+                        or next_time <= evaluation_time):
                     raise ValueError("Deferred assessment requires a future evaluation datetime")
                 if current["status"] not in ACTIVE_USER_INTENT_STATUSES:
                     raise ValueError("Closed intents cannot be deferred for preparation prediction")
@@ -766,14 +775,14 @@ class UserPrediction:
             seen_assessments.add(identity)
             assessments.append({
                 "intent_id": intent_id, "decision": decision, "reason": reason,
-                "next_evaluate_at": next_evaluate_at, "evaluated_at": as_of.isoformat(),
+                "next_evaluate_at": next_evaluate_at, "evaluated_at": evaluation_time.isoformat(),
                 "intent_event_ids": sorted({int(event["id"]) for event in case["intent_events"]}),
             })
         return generated, assessments
 
     def _update_predictions_for_updated_intents_with_llm(
         self, cases: Sequence[Dict[str, Any]], *, states: Sequence[Dict[str, Any]],
-        as_of: datetime, horizon_end: datetime,
+        evaluation_time: datetime, horizon_end: datetime,
     ) -> tuple[List[Dict[str, Any]], List[int], List[Dict[str, Any]]]:
         """Reconcile retained IDs and per-behavior assessments in one LLM call."""
         source = " ".join(case["current_intent"]["summary"] for case in cases)
@@ -781,7 +790,7 @@ class UserPrediction:
         template = (USER_PREDICTION_UPDATED_FROM_CHANGED_INTENTS_PROMPT_ZH if chinese
                     else USER_PREDICTION_UPDATED_FROM_CHANGED_INTENTS_PROMPT_EN)
         prompt = template.format(
-            as_of=as_of.isoformat(), horizon_start=as_of.isoformat(), horizon_end=horizon_end.isoformat(),
+            evaluation_time=evaluation_time.isoformat(), horizon_start=evaluation_time.isoformat(), horizon_end=horizon_end.isoformat(),
             intent_cases="\n".join(json.dumps(case, ensure_ascii=False) for case in cases),
             states=json.dumps(states, ensure_ascii=False),
         )
@@ -791,7 +800,7 @@ class UserPrediction:
             "existing_prediction_ids": [item["id"] for case in cases for item in case["existing_predictions"]],
             "prompt_language": "zh" if chinese else "en", "prompt_chars": len(prompt),
             "state_ids": [state["id"] for state in states],
-            "horizon_start": as_of.isoformat(), "horizon_end": horizon_end.isoformat(),
+            "horizon_start": evaluation_time.isoformat(), "horizon_end": horizon_end.isoformat(),
         })
         self._logger.debug("user_prediction_from_updated_intents llm_request prompt=%s", prompt)
         raw = None
@@ -804,7 +813,7 @@ class UserPrediction:
             predictions, retained, assessments = self._normalize_updated_intent_prediction_results(
                 parsed["prediction_results"], retained_prediction_ids=parsed["retained_prediction_ids"],
                 cases=cases, states=states,
-                as_of=as_of, horizon_end=horizon_end,
+                evaluation_time=evaluation_time, horizon_end=horizon_end,
             )
             self._logger.log_json_format(self.NEW_INTENT_TRIGGERED_TASK_NAME, "llm_finished", {
                 "stage": "updated", "intent_ids": [case["current_intent"]["id"] for case in cases],
@@ -819,14 +828,14 @@ class UserPrediction:
         except Exception as exc:
             self._log_prediction_response_failure(
                 "updated", raw=raw, error=exc, cases=cases, states=states,
-                as_of=as_of, horizon_end=horizon_end,
+                evaluation_time=evaluation_time, horizon_end=horizon_end,
             )
             raise
 
     def _normalize_updated_intent_prediction_results(
         self, results: Any, *, retained_prediction_ids: Any,
         cases: Sequence[Dict[str, Any]], states: Sequence[Dict[str, Any]],
-        as_of: datetime, horizon_end: datetime,
+        evaluation_time: datetime, horizon_end: datetime,
     ) -> tuple[List[Dict[str, Any]], List[int], List[Dict[str, Any]]]:
         if (not isinstance(retained_prediction_ids, list)
                 or any(type(value) is not int or value <= 0 for value in retained_prediction_ids)
@@ -837,7 +846,7 @@ class UserPrediction:
         if retained - provided:
             raise ValueError(f"Unknown retained prediction IDs: {sorted(retained - provided)}")
         generated, assessments = self._normalize_prediction_results(
-            results, cases=cases, states=states, as_of=as_of, horizon_end=horizon_end,
+            results, cases=cases, states=states, evaluation_time=evaluation_time, horizon_end=horizon_end,
         )
         for case in cases:
             current = case["current_intent"]
@@ -858,7 +867,7 @@ class UserPrediction:
 
     def _normalize_case_predictions(
         self, raw: Any, *, cases: Sequence[Dict[str, Any]], states: Sequence[Dict[str, Any]],
-        as_of: datetime, horizon_end: datetime,
+        evaluation_time: datetime, horizon_end: datetime,
     ) -> List[Dict[str, Any]]:
         if not isinstance(raw, list) or len(raw) > 5:
             raise ValueError("Expected at most five predictions")
@@ -869,7 +878,7 @@ class UserPrediction:
         for index, candidate in enumerate(raw):
             try:
                 accepted = self._validate_predictions(
-                    [candidate], intents=intents, states=states, as_of=as_of, horizon_end=horizon_end,
+                    [candidate], intents=intents, states=states, evaluation_time=evaluation_time, horizon_end=horizon_end,
                     intent_events=[event for case in cases for event in case["intent_events"]],
                     source_assessment_id=cases[0].get("assessment_id") if len(cases) == 1 else None,
                 )
@@ -888,7 +897,7 @@ class UserPrediction:
 
     def _validate_predictions(
         self, raw: Sequence[Any], *, intents: Sequence[Dict[str, Any]],
-        states: Sequence[Dict[str, Any]], as_of: datetime,
+        states: Sequence[Dict[str, Any]], evaluation_time: datetime,
         horizon_end: datetime, intent_events: Sequence[Dict[str, Any]],
         source_assessment_id: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
@@ -923,8 +932,8 @@ class UserPrediction:
             ).casefold():
                 raise ValueError("behavior_restates_intent_summary")
             band = str(candidate.get("likelihood_band") or "").lower().strip()
-            beginning = self._as_datetime(candidate.get("window_start"), as_of)
-            ending = self._as_datetime(candidate.get("window_end"), as_of)
+            beginning = self._as_datetime(candidate.get("window_start"), evaluation_time)
+            ending = self._as_datetime(candidate.get("window_end"), evaluation_time)
             anchor_text = str(intent.get("time_start" if intent_type == "plan" else "time_end") or "")
             precise_anchor = bool(re.search(r"[T\s]\d{2}:\d{2}", anchor_text))
             if intent["object_type"] == "plan" and intent.get("time_precision") in {
@@ -932,14 +941,14 @@ class UserPrediction:
             }:
                 precise_anchor = False
             # Keep coarse or unknown anchors as uncertainty, never midnight deadlines.
-            intent_anchor = self._as_datetime(anchor_text, as_of) if precise_anchor else None
+            intent_anchor = self._as_datetime(anchor_text, evaluation_time) if precise_anchor else None
             reasons = []
             if band not in {"low", "medium", "high"}:
                 reasons.append(f"invalid_likelihood_band: {band!r}")
             if beginning is None:
                 reasons.append(f"invalid_window_start: {candidate.get('window_start')!r}")
-            elif beginning < as_of:
-                reasons.append(f"window_start_before_horizon: {beginning.isoformat()} < {as_of.isoformat()}")
+            elif beginning < evaluation_time:
+                reasons.append(f"window_start_before_horizon: {beginning.isoformat()} < {evaluation_time.isoformat()}")
             if ending is None:
                 reasons.append(f"invalid_window_end: {candidate.get('window_end')!r}")
             else:
@@ -955,7 +964,7 @@ class UserPrediction:
                 "intent": intent,
                 "recurring_states": [state_by_id[value] for value in state_ids],
                 "prediction_context": {
-                    "as_of": as_of.isoformat(), "horizon_start": as_of.isoformat(),
+                    "evaluation_time": evaluation_time.isoformat(), "horizon_start": evaluation_time.isoformat(),
                     "horizon_end": horizon_end.isoformat(), "predictor_version": self.MODEL_VERSION,
                     "intent_event_ids": sorted({int(event["id"]) for event in intent_events
                                                 if int(event["intent_id"]) == intent_id}),
@@ -983,15 +992,15 @@ class UserPrediction:
         return accepted
 
     def get_active_predictions(
-        self, *, as_of: Optional[datetime] = None,
+        self, *, evaluation_time: Optional[datetime] = None,
         prediction_ids: Optional[Sequence[int]] = None,
     ) -> List[Dict[str, Any]]:
         """Read unexpired, unresolved hypotheses; no delivery decision here."""
         owner_id = self._world_owner_entity_id
-        reference = self._now(as_of)
+        reference = self._now(evaluation_time)
         if prediction_ids is None:
             rows = self._model_db.get_active_user_predictions(
-                user_entity_id=owner_id, as_of=reference.isoformat(),
+                user_entity_id=owner_id, evaluation_time=reference.isoformat(),
             )
         else:
             rows = self._model_db.get_user_predictions_by_ids(prediction_ids)
@@ -1002,7 +1011,7 @@ class UserPrediction:
                     or ending is None or ending <= reference):
                 self._logger.debug(
                     "active_prediction_skipped prediction_id=%s reason=owner_status_or_window_invalid "
-                    "status=%s window_end=%s as_of=%s",
+                    "status=%s window_end=%s evaluation_time=%s",
                     row["id"], row.get("status"), row.get("window_end"), reference.isoformat(),
                 )
                 continue
@@ -1031,7 +1040,10 @@ class UserPrediction:
             if any(
                 state_id not in states
                 or states[state_id].get("status") != "active"
-                or states[state_id].get("updated_at") != source.get("updated_at")
+                or any(
+                    states[state_id].get(key) != source.get(key)
+                    for key in ("state_text", "state_domain", "state_kind", "conditions", "confidence")
+                )
                 or (
                     self._as_datetime(states[state_id].get("valid_to"), reference) is not None
                     and self._as_datetime(states[state_id].get("valid_to"), reference) <= reference
@@ -1046,7 +1058,7 @@ class UserPrediction:
                 continue
             current.append(row)
         self._logger.debug(
-            "active_predictions_read as_of=%s requested_prediction_ids=%s loaded_count=%s active_prediction_ids=%s",
+            "active_predictions_read evaluation_time=%s requested_prediction_ids=%s loaded_count=%s active_prediction_ids=%s",
             reference.isoformat(), prediction_ids, len(rows), [row["id"] for row in current],
         )
         return current

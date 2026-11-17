@@ -11,6 +11,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from pwm_logging import as_pwm_logger
+from storage_utils import local_now_text
 
 if TYPE_CHECKING:
     from llm_client import LLMClient
@@ -60,24 +61,24 @@ class UserProactiveService:
 
     @classmethod
     def _active_user_states(
-        cls, *, as_of: datetime, model_db: UserModelDB,
+        cls, *, evaluation_time: datetime, model_db: UserModelDB,
     ) -> List[Dict[str, Any]]:
         states = model_db.get_user_states(
             statuses=["active"], limit=500,
         )
         active = []
         for state in states:
-            valid_from = cls._as_datetime(state.get("valid_from"), as_of)
-            valid_to = cls._as_datetime(state.get("valid_to"), as_of)
-            if valid_from and valid_from > as_of:
+            valid_from = cls._as_datetime(state.get("valid_from"), evaluation_time)
+            valid_to = cls._as_datetime(state.get("valid_to"), evaluation_time)
+            if valid_from and valid_from > evaluation_time:
                 continue
-            if valid_to and valid_to <= as_of:
+            if valid_to and valid_to <= evaluation_time:
                 continue
             active.append(state)
         return active
 
     def _build_service_evaluation_input(
-        self, predictions: Sequence[Dict[str, Any]], *, states: Sequence[Dict[str, Any]], as_of: datetime,
+        self, predictions: Sequence[Dict[str, Any]], *, states: Sequence[Dict[str, Any]], evaluation_time: datetime,
     ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         """Build the round's cases in order, isolating individual input failures."""
         prediction_cases, failures = [], []
@@ -93,8 +94,8 @@ class UserProactiveService:
                 fact_ids = self._memory_db.get_intent_evidence_fact_ids([key], limit=20).get(key, [])
                 facts, excluded_future_fact_ids = [], []
                 for fact in self._memory_db.get_memory_facts_by_ids(fact_ids):
-                    observed = self._as_datetime(fact.get("dialogue_time_key"), as_of)
-                    if observed and observed > as_of:
+                    observed = self._as_datetime(fact.get("dialogue_time_key"), evaluation_time)
+                    if observed and observed > evaluation_time:
                         excluded_future_fact_ids.append(fact["id"])
                         continue
                     facts.append({name: fact.get(name) for name in (
@@ -118,7 +119,7 @@ class UserProactiveService:
                     ),
                     "recent_service_feedback": self._model_db.get_user_proactive_service_feedback(
                         user_entity_id=int(prediction["user_entity_id"]),
-                        prediction_id=int(prediction["id"]), observed_before=as_of.isoformat(), limit=20,
+                        prediction_id=int(prediction["id"]), observed_before=evaluation_time.isoformat(), limit=20,
                     ),
                 }
                 self._logger.log_json_format(self.TASK_KIND, "inputs_loaded", {
@@ -133,7 +134,7 @@ class UserProactiveService:
                         "id", "service_type", "objective", "status", "reason",
                         "next_evaluate_at", "recheck_condition", "expires_at",
                     )} for item in case["existing_services"]],
-                    "as_of": as_of.isoformat(),
+                    "evaluation_time": evaluation_time.isoformat(),
                 })
                 reason = "waiting_service_reassessment" if any(
                     service["status"] == "waiting" for service in case["existing_services"]
@@ -191,8 +192,8 @@ class UserProactiveService:
             if "recurring_states" in basis:
                 basis_view["recurring_states"] = [select(item, state_fields) for item in basis["recurring_states"]]
             context = basis.get("prediction_context") or {}
-            if "as_of" in context:
-                basis_view["prediction_context"] = {"as_of": context["as_of"]}
+            if "evaluation_time" in context:
+                basis_view["prediction_context"] = {"evaluation_time": context["evaluation_time"]}
             prediction_view["basis"] = basis_view
         view = {"prediction": prediction_view, "current_intent": intent_view(case["current_intent"])}
         if "related_facts" in case:
@@ -218,6 +219,7 @@ class UserProactiveService:
         user_response: str = "unknown", user_feedback: str = "",
         execution_result: Optional[Dict[str, Any]] = None,
         agent_note: str = "", observed_at: Optional[Any] = None,
+        reference_timestamp: Any = None,
     ) -> Dict[str, Any]:
         """Persist execution reports independently of the service proposal status.
 
@@ -244,8 +246,10 @@ class UserProactiveService:
         # Reject unserializable reports before any write. A report is structured
         # data, never executable content or a source of tool authorization.
         json.dumps(result, ensure_ascii=False, allow_nan=False)
-        now = datetime.now().astimezone()
-        observed = self._as_datetime(observed_at, now) if observed_at is not None else now
+        observed = (
+            datetime.fromisoformat(local_now_text()) if observed_at is None
+            else self._as_datetime(observed_at, datetime.fromisoformat(local_now_text()))
+        )
         if observed is None:
             raise ValueError("Invalid feedback observed_at")
         service = self._model_db.get_user_proactive_service(service_id)
@@ -278,7 +282,9 @@ class UserProactiveService:
             "user_feedback": user_feedback, "execution_result": result,
             "agent_note": agent_note, "observed_at": observed.isoformat(), "context": context,
         }
-        payload["id"] = self._model_db.insert_user_proactive_service_feedback(payload)
+        payload["id"] = self._model_db.insert_user_proactive_service_feedback(
+            payload, reference_timestamp=reference_timestamp or observed.isoformat(),
+        )
         self._logger.log_json_format("proactive_service_feedback", "service_feedback_recorded", {
             "feedback_id": payload["id"], "service_id": service_id,
             "execution_id": payload["execution_id"], "execution_status": execution_status,
@@ -295,7 +301,7 @@ class UserProactiveService:
             user_entity_id=self._owner_entity_id, service_id=service_id, limit=limit,
         )
 
-    def _evaluate_with_llm(self, cases: Sequence[Dict[str, Any]], *, as_of: datetime,
+    def _evaluate_with_llm(self, cases: Sequence[Dict[str, Any]], *, evaluation_time: datetime,
                            runtime_context: Dict[str, Any], agent_capabilities: Dict[str, Any]) -> Any:
         source_text = "\n".join(self._format_evaluation_case_for_prompt(case) for case in cases)
         chinese = bool(re.search(r"[\u4e00-\u9fff]", source_text))
@@ -305,7 +311,7 @@ class UserProactiveService:
             else USER_PROACTIVE_POLICY_EVALUATION_PROMPT_EN
         )
         prompt = prompt_template.format(
-            as_of=as_of.isoformat(),
+            evaluation_time=evaluation_time.isoformat(),
             evaluation_cases=source_text,
             runtime_context=json.dumps(runtime_context, ensure_ascii=False),
             agent_capabilities=json.dumps(agent_capabilities, ensure_ascii=False),
@@ -313,7 +319,7 @@ class UserProactiveService:
         started_at = time.monotonic()
         prediction_ids = [case["prediction"]["id"] for case in cases]
         self._logger.log_json_format(self.TASK_KIND, "llm_started", {
-            "prediction_ids": prediction_ids, "as_of": as_of.isoformat(),
+            "prediction_ids": prediction_ids, "evaluation_time": evaluation_time.isoformat(),
             "prompt_language": "zh" if chinese else "en", "prompt_chars": len(prompt),
             "runtime_context": runtime_context, "agent_capabilities": agent_capabilities,
         })
@@ -334,7 +340,7 @@ class UserProactiveService:
             raise
 
     def _normalize_service_results(
-        self, response: Any, *, case: Dict[str, Any], as_of: datetime,
+        self, response: Any, *, case: Dict[str, Any], evaluation_time: datetime,
         runtime_context: Dict[str, Any], agent_capabilities: Dict[str, Any],
     ) -> List[Dict[str, Any]]:
         if not isinstance(response, dict) or not isinstance(response.get("service_results"), list):
@@ -347,9 +353,9 @@ class UserProactiveService:
             if not isinstance(value, str):
                 raise ValueError("Service time must be a timezone-aware ISO timestamp")
             parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-            if parsed.tzinfo is None or parsed <= as_of:
+            if parsed.tzinfo is None or parsed <= evaluation_time:
                 raise ValueError(f"Service time must be after evaluation time: {value!r}")
-            return parsed.astimezone(as_of.tzinfo)
+            return parsed.astimezone(evaluation_time.tzinfo)
 
         for raw in response["service_results"]:
             fields = {"service_id", "prediction_id", "decision", "reason", "service",
@@ -434,7 +440,7 @@ class UserProactiveService:
         return results
 
     def _normalize_round_service_results(
-        self, response: Any, *, cases: Sequence[Dict[str, Any]], as_of: datetime,
+        self, response: Any, *, cases: Sequence[Dict[str, Any]], evaluation_time: datetime,
         runtime_context: Dict[str, Any], agent_capabilities: Dict[str, Any],
     ) -> Dict[int, List[Dict[str, Any]]]:
         """Validate the complete joint decision before writing any services."""
@@ -451,7 +457,7 @@ class UserProactiveService:
         for case in cases:
             prediction_id = case["prediction"]["id"]
             results = self._normalize_service_results(
-                {"service_results": grouped[prediction_id]}, case=case, as_of=as_of,
+                {"service_results": grouped[prediction_id]}, case=case, evaluation_time=evaluation_time,
                 runtime_context=runtime_context, agent_capabilities=agent_capabilities,
             )
             recommendation_count += sum(item["decision"] == "recommend_service" for item in results)
@@ -461,7 +467,7 @@ class UserProactiveService:
         return normalized
 
     def _save_service_results(
-        self, results: Sequence[Dict[str, Any]], *, case: Dict[str, Any], as_of: datetime,
+        self, results: Sequence[Dict[str, Any]], *, case: Dict[str, Any], evaluation_time: datetime,
     ) -> List[Dict[str, Any]]:
         existing = {int(item["id"]): item for item in case["existing_services"]}
         saved = []
@@ -484,15 +490,17 @@ class UserProactiveService:
                 payload.update(
                     prediction_id=case["prediction"]["id"],
                     user_entity_id=case["prediction"]["user_entity_id"],
-                    policy_version=self.POLICY_VERSION, evaluated_at=as_of.isoformat(),
+                    policy_version=self.POLICY_VERSION, evaluated_at=evaluation_time.isoformat(),
                 )
-                service_id, action = self._model_db.save_user_proactive_service(payload)
+                service_id, action = self._model_db.save_user_proactive_service(
+                    payload, reference_timestamp=evaluation_time.isoformat(),
+                )
                 saved.append({**item, "service_id": service_id, "status": payload["status"],
                               "save_action": action})
             self._model_db.mark_user_prediction_proactive_service_evaluated(
                 prediction_id=case["prediction"]["id"],
                 user_entity_id=case["prediction"]["user_entity_id"],
-                evaluated_at=as_of.isoformat(),
+                evaluated_at=evaluation_time.isoformat(),
             )
         self._logger.log_json_format(self.TASK_KIND, "services_saved", {
             "prediction_id": case["prediction"]["id"],
@@ -509,12 +517,12 @@ class UserProactiveService:
         Prediction reads here are limited to sources of open services.
         Like generation, this write operation belongs on the shared worker.
         """
-        now = datetime.now().astimezone()
-        if reference_timestamp is not None:
-            reference = self._as_datetime(reference_timestamp, now)
-            if reference is None:
-                raise ValueError("Invalid service cleanup reference_timestamp")
-            now = reference
+        reference_timestamp = (
+            datetime.fromisoformat(local_now_text()) if reference_timestamp is None
+            else self._as_datetime(reference_timestamp, datetime.fromisoformat(local_now_text()))
+        )
+        if reference_timestamp is None:
+            raise ValueError("Invalid service cleanup reference_timestamp")
         if self._owner_entity_id is None:
             return {"closed_service_ids": []}
         open_services = self._model_db.get_user_proactive_services(
@@ -522,16 +530,16 @@ class UserProactiveService:
         )
         source_ids = sorted({service["prediction_id"] for service in open_services})
         active = {
-            int(row["id"]): row for row in self._prediction_reader(as_of=now, prediction_ids=source_ids)
+            int(row["id"]): row for row in self._prediction_reader(evaluation_time=reference_timestamp, prediction_ids=source_ids)
         } if source_ids else {}
         closed_ids = self._cleanup_proactive_service_lifecycle(
-            open_services=open_services, active_predictions=active, as_of=now,
+            open_services=open_services, active_predictions=active, evaluation_time=reference_timestamp,
         )
         return {"closed_service_ids": closed_ids}
 
     def _cleanup_proactive_service_lifecycle(
         self, *, open_services: Sequence[Dict[str, Any]],
-        active_predictions: Dict[int, Dict[str, Any]], as_of: datetime,
+        active_predictions: Dict[int, Dict[str, Any]], evaluation_time: datetime,
     ) -> List[int]:
         """Close services with ineffective sources or expired service windows.
 
@@ -549,29 +557,29 @@ class UserProactiveService:
                 })
                 continue
             if prediction_id not in active_predictions:
-                ending = self._as_datetime(prediction.get("window_end"), as_of)
+                ending = self._as_datetime(prediction.get("window_end"), evaluation_time)
                 status = "expired" if prediction["status"] == "expired" or (
-                    prediction["status"] == "pending" and ending and ending <= as_of
+                    prediction["status"] == "pending" and ending and ending <= evaluation_time
                 ) else "cancelled"
                 closed = self._model_db.close_user_proactive_services(
                     prediction_id=prediction_id, user_entity_id=self._owner_entity_id, status=status,
-                    reason="Source prediction is no longer effective", as_of=as_of.isoformat(),
+                    reason="Source prediction is no longer effective", evaluation_time=evaluation_time.isoformat(),
                 )
                 closed_ids.extend(closed)
                 self._logger.log_json_format(self.TASK_KIND, "services_closed_for_inactive_prediction", {
                     "prediction_id": prediction_id, "prediction_status": prediction["status"],
                     "closed_service_ids": closed, "closed_service_status": status,
-                    "as_of": as_of.isoformat(),
+                    "evaluation_time": evaluation_time.isoformat(),
                 })
                 continue
             expired = self._model_db.close_user_proactive_services(
                 prediction_id=prediction_id, user_entity_id=self._owner_entity_id, status="expired",
-                reason="Service validity period ended", as_of=as_of.isoformat(), expired_only=True,
+                reason="Service validity period ended", evaluation_time=evaluation_time.isoformat(), expired_only=True,
             )
             closed_ids.extend(expired)
             if expired:
                 self._logger.log_json_format(self.TASK_KIND, "services_expired", {
-                    "prediction_id": prediction_id, "expired_service_ids": expired, "as_of": as_of.isoformat(),
+                    "prediction_id": prediction_id, "expired_service_ids": expired, "evaluation_time": evaluation_time.isoformat(),
                 })
         return closed_ids
 
@@ -593,12 +601,12 @@ class UserProactiveService:
             "reference_timestamp": reference_timestamp,
             "runtime_context": runtime_context, "agent_capabilities": agent_capabilities,
         })
-        now = datetime.now().astimezone()
-        if reference_timestamp is not None:
-            reference = self._as_datetime(reference_timestamp, now)
-            if reference is None:
-                raise ValueError("Invalid proactive policy reference_timestamp")
-            now = reference
+        reference_timestamp = (
+            datetime.fromisoformat(local_now_text()) if reference_timestamp is None
+            else self._as_datetime(reference_timestamp, datetime.fromisoformat(local_now_text()))
+        )
+        if reference_timestamp is None:
+            raise ValueError("Invalid proactive policy reference_timestamp")
         if runtime_context is not None and not isinstance(runtime_context, dict):
             raise ValueError("runtime_context must be an object")
         context = dict(runtime_context or {})
@@ -616,20 +624,20 @@ class UserProactiveService:
             raise ValueError("max_predictions must be a positive integer")
         if self._owner_entity_id is None:
             return {"status": "empty", "assistance_items": [], "failed_predictions": []}
-        cleanup = self.cleanup_proactive_services(reference_timestamp=now)
+        cleanup = self.cleanup_proactive_services(reference_timestamp=reference_timestamp)
         closed_ids = cleanup["closed_service_ids"]
         candidate_ids = self._model_db.get_pending_proactive_prediction_ids(user_entity_id=self._owner_entity_id)
         active = {
-            int(row["id"]): row for row in self._prediction_reader(as_of=now, prediction_ids=candidate_ids)
+            int(row["id"]): row for row in self._prediction_reader(evaluation_time=reference_timestamp, prediction_ids=candidate_ids)
         } if candidate_ids else {}
         # Preserve the pending query's waiting-first, nearer-window ordering.
         ids = [prediction_id for prediction_id in candidate_ids if prediction_id in active]
-        states = self._active_user_states(as_of=now, model_db=self._model_db) if ids else []
+        states = self._active_user_states(evaluation_time=reference_timestamp, model_db=self._model_db) if ids else []
         self._logger.log_json_format(self.TASK_KIND, "predictions_loaded", {
             "candidate_prediction_ids": ids,
             "pending_prediction_ids": candidate_ids,
             "active_prediction_ids": sorted(active), "owner_id": self._owner_entity_id,
-            "active_state_count": len(states), "as_of": now.isoformat(),
+            "active_state_count": len(states), "evaluation_time": reference_timestamp.isoformat(),
         })
         results, failures, skipped, processed, assistance, prediction_cases = [], [], [], [], [], []
         predictions = []
@@ -645,7 +653,7 @@ class UserProactiveService:
             predictions.append(prediction)
 
         if predictions:
-            prediction_cases, input_failures = self._build_service_evaluation_input(predictions, states=states, as_of=now)
+            prediction_cases, input_failures = self._build_service_evaluation_input(predictions, states=states, evaluation_time=reference_timestamp)
             failures.extend(input_failures)
 
         normalized = {}
@@ -654,11 +662,11 @@ class UserProactiveService:
             stage = "llm_evaluation"
             try:
                 response = self._evaluate_with_llm(
-                    prediction_cases, as_of=now, runtime_context=context, agent_capabilities=capabilities,
+                    prediction_cases, evaluation_time=reference_timestamp, runtime_context=context, agent_capabilities=capabilities,
                 )
                 stage = "normalize_response"
                 normalized = self._normalize_round_service_results(
-                    response, cases=prediction_cases, as_of=now,
+                    response, cases=prediction_cases, evaluation_time=reference_timestamp,
                     runtime_context=context, agent_capabilities=capabilities,
                 )
                 self._logger.log_json_format(self.TASK_KIND, "round_evaluated", {
@@ -680,7 +688,7 @@ class UserProactiveService:
             prediction_id = case["prediction"]["id"]
             try:
                 saved = self._save_service_results(
-                    normalized[prediction_id], case=case, as_of=now,
+                    normalized[prediction_id], case=case, evaluation_time=reference_timestamp,
                 )
                 results.extend(saved)
                 previous_ready = {item["id"] for item in case["existing_services"] if item["status"] == "ready"}

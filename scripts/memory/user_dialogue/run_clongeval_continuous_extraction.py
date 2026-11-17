@@ -278,16 +278,16 @@ def _validate_prediction_timeline(contexts: Sequence[Dict[str, Any]], timezone_n
             previous = turn["timestamp"]
 
 
-def _prediction_checkpoint(pwm: PersonWorldModel, *, as_of: datetime) -> Dict[str, Any]:
+def _prediction_checkpoint(pwm: PersonWorldModel, *, evaluation_time: datetime) -> Dict[str, Any]:
     """Freeze prefix-only outputs before the next record's feedback is ingested."""
     with pwm.task_scheduler.execution_lock:
         ids = [int(row["id"]) for row in pwm.user_model_database._conn.execute(
             "SELECT id FROM user_predictions ORDER BY id"
         )]
         return {
-            "as_of": as_of.isoformat(),
+            "evaluation_time": evaluation_time.isoformat(),
             "predictions": pwm.user_model_database.get_user_predictions_by_ids(ids),
-            "active_prediction_ids": [int(row["id"]) for row in pwm.get_active_predictions(as_of=as_of)],
+            "active_prediction_ids": [int(row["id"]) for row in pwm.get_active_predictions(evaluation_time=evaluation_time)],
             "reassessment_schedules": pwm.user_model_database.get_user_prediction_reassessment_schedules(),
             "proactive_services": pwm.get_proactive_services(limit=1000),
             "latest_prediction_task": pwm.operation_reporter.snapshot().get("latest_reports", {}).get(
@@ -445,7 +445,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if args.prediction_eval:
                 result["prediction_test"] = context_item["prediction_test"]
                 result["prediction_checkpoint"] = _prediction_checkpoint(
-                    pwm, as_of=datetime.fromisoformat(replay["last_turn_timestamp"]),
+                    pwm, evaluation_time=datetime.fromisoformat(replay["last_turn_timestamp"]),
                 )
             results.append(result)
             _write_json(output_dir / "context_progress.json", results)

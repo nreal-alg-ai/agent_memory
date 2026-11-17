@@ -2,6 +2,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 import re
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
+from storage_utils import latest_timestamp
 
 from .memory_types import MemoryUnit
 from .memory_manager import (
@@ -561,7 +562,7 @@ class MemoryContextManager:
             if token_count <= 0:
                 continue
             started_at = self._parse_timestamp(unit.start_time)
-            ended_at = self._parse_timestamp(unit.end_time)
+            ended_at = self._parse_timestamp(latest_timestamp(entry["ended_at"] for entry in unit.entries()))
             if self._user_activity_started_at is None and started_at is not None:
                 self._user_activity_started_at = started_at
             latest_at = ended_at or started_at
@@ -570,6 +571,10 @@ class MemoryContextManager:
             ):
                 self._user_activity_latest_at = latest_at
             self._user_activity_token_count += token_count
+
+    @property
+    def user_activity_reference_timestamp(self) -> Optional[str]:
+        return self._user_activity_latest_at.isoformat() if self._user_activity_latest_at is not None else None
 
     def reset_user_activity_window(self) -> None:
         self._user_activity_started_at = None

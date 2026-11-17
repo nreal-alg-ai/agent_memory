@@ -26,6 +26,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
+from storage_utils import local_now_text, latest_timestamp
 
 try:
     import jieba
@@ -168,7 +169,7 @@ _AMBIGUOUS_USER_ENTITY_ALIASES = {
 
 
 def _now_text() -> str:
-    return datetime.now().astimezone().isoformat()
+    return local_now_text()
 
 
 def _to_timestamp_text(value: Any) -> str:
@@ -622,9 +623,11 @@ class MemoryNodeManager:
         self,
         *,
         tags: List[str],
+        reference_timestamp: Any = None,
     ) -> Dict[str, Any]:
         source_units = self._db.get_unprocessed_memory_source_segments_for_user_activity(
             limit=240,
+            reference_timestamp=reference_timestamp,
         )
         if not source_units:
             return {
@@ -646,11 +649,14 @@ class MemoryNodeManager:
         activity_items = self._extract_user_activity_from_source_units(
             source_units=source_units,
             facts=facts,
+            reference_timestamp=reference_timestamp,
         )
         if activity_items is None:
             return {"status": "failed", "reason": "invalid_user_activity_response"}
         source_started_at = _compact_whitespace(source_units[0].start_time) or _now_text()
-        source_ended_at = _compact_whitespace(source_units[-1].end_time) or source_started_at
+        source_ended_at = latest_timestamp(
+            entry["ended_at"] for unit in source_units for entry in unit.entries()
+        ) or source_started_at
         fact_ids = {int(fact["id"]) for fact in facts}
         activity_ids: List[int] = []
         with self._db.transaction():
@@ -668,15 +674,16 @@ class MemoryNodeManager:
                     evidence_fact_ids=supported_fact_ids,
                     source_segment_ids=source_row_ids,
                     metadata={"tags": list(tags or []), "time_scope": "source_window"},
+                    reference_timestamp=reference_timestamp,
                 )
                 activity_ids.append(activity_id)
                 if item.get("user_action_signals"):
-                    owner_entity_id = self._intent_world_owner_entity_id()
+                    owner_entity_id = self._intent_world_owner_entity_id(reference_timestamp=reference_timestamp)
                     self._db.upsert_user_action_signals([
                         {**signal, "source_type": "user_activity", "source_id": activity_id,
                          "subject_entity_id": owner_entity_id}
                         for signal in item["user_action_signals"]
-                    ])
+                    ], reference_timestamp=reference_timestamp)
             processed_rows = self._db.mark_memory_source_segments_processed_for_user_activity(
                 source_segment_ids=source_row_ids,
             )
@@ -692,7 +699,7 @@ class MemoryNodeManager:
             ],
             "user_action_signal_count": sum(len(item.get("user_action_signals") or []) for item in activity_items),
             "user_action_signal_activity_count": sum(bool(item.get("user_action_signals")) for item in activity_items),
-            "reference_timestamp": source_ended_at,
+            "reference_timestamp": reference_timestamp or source_ended_at,
             "source_segment_ids": source_row_ids,
             "fact_count": len(facts),
             "source_unit_count": len(source_units),
@@ -708,6 +715,7 @@ class MemoryNodeManager:
         preceding_context_units: Optional[List[MemoryUnit]] = None,
         tags: List[str],
         feedback_context: Optional[Dict[str, Any]] = None,
+        reference_timestamp: Any = None,
     ) -> Dict[str, Any]:
         store_started_at = time.monotonic()
         stage_name = (
@@ -736,11 +744,12 @@ class MemoryNodeManager:
         source_unit_row_ids = []
         if feedback_context is None:
             with self._db.transaction():
-                source_unit_row_ids = self._db.insert_memory_source_segments(units=units)
+                source_unit_row_ids = self._db.insert_memory_source_segments(units=units, reference_timestamp=reference_timestamp)
         fact_info = self._extract_memory_fact_from_units(
             units,
             preceding_context_units=preceding_units,
             **({"feedback_context": feedback_context} if feedback_context is not None else {}),
+            reference_timestamp=reference_timestamp,
         )
         if fact_info["status"] != "ok":
             report = {
@@ -774,6 +783,7 @@ class MemoryNodeManager:
             save_fact_info = self._store_extracted_memory_facts_into_db(
                 prepared_facts=prepared_facts,
                 tags=tags,
+                reference_timestamp=reference_timestamp,
             )
             self._db.insert_fact_source_mappings(
                 fact_ids=save_fact_info.get("fact_ids") or [],
@@ -847,7 +857,7 @@ class MemoryNodeManager:
             **feedback["context"],
         }
         return self._process_memory_fact_extraction_task(
-            units=units, tags=tags, feedback_context=context,
+            units=units, tags=tags, feedback_context=context, reference_timestamp=timestamp,
         )
 
     @staticmethod
@@ -878,6 +888,7 @@ class MemoryNodeManager:
         confidence: float = 0.0,
         importance: float = 0.0,
         metadata: Optional[Dict[str, Any]] = None,
+        reference_timestamp: Any = None,
     ) -> int:
         """Write one canonical retrieval projection without ranking it.
 
@@ -900,6 +911,7 @@ class MemoryNodeManager:
             confidence=confidence,
             importance=importance,
             metadata=metadata,
+            reference_timestamp=reference_timestamp,
         )
 
     @staticmethod
@@ -1031,6 +1043,7 @@ class MemoryNodeManager:
         *,
         preceding_context_units: Optional[Sequence[MemoryUnit]] = None,
         feedback_context: Optional[Dict[str, Any]] = None,
+        reference_timestamp: Any = None,
     ) -> Dict[str, Any]:
         """Return ok/empty/failed, facts, a reason and the extraction attempt count."""
         current_units = self._valid_memory_units(units)
@@ -1058,7 +1071,7 @@ class MemoryNodeManager:
         known_world_owner_aliases = [
             item["alias_name"]
             for item in self._db.get_owner_entity_aliases(
-                self._intent_world_owner_entity_id(),
+                self._intent_world_owner_entity_id(reference_timestamp=reference_timestamp),
                 status="confirmed",
                 limit=128,
             )
@@ -1144,6 +1157,7 @@ class MemoryNodeManager:
         *,
         source_units: Sequence[MemoryUnit],
         facts: Sequence[Dict[str, Any]],
+        reference_timestamp: Any = None,
     ) -> Optional[List[Dict[str, Any]]]:
         """Observe what the user is doing across a source window.
 
@@ -1217,6 +1231,7 @@ class MemoryNodeManager:
                     )),
                     "user_action_signals": self._normalize_activity_user_action_signals(
                         raw.get("user_action_signals"), source_units=unit_list,
+                        reference_timestamp=reference_timestamp,
                     ),
                 })
             return activities
@@ -1224,6 +1239,7 @@ class MemoryNodeManager:
 
     def _normalize_activity_user_action_signals(
         self, value: Any, *, source_units: Sequence[MemoryUnit],
+        reference_timestamp: Any = None,
     ) -> List[Dict[str, Any]]:
         """Validate window observations against exact, attributed source excerpts.
 
@@ -1235,7 +1251,7 @@ class MemoryNodeManager:
         owner_name = self._world_owner_entity_name
         aliases = [owner_name]
         aliases.extend(row["alias_name"] for row in self._db.get_owner_entity_aliases(
-            self._intent_world_owner_entity_id(), status="confirmed", limit=128,
+            self._intent_world_owner_entity_id(reference_timestamp=reference_timestamp), status="confirmed", limit=128,
         ))
         signals: List[Dict[str, Any]] = []
         seen: set[str] = set()
@@ -2346,6 +2362,7 @@ class MemoryNodeManager:
         *,
         prepared_facts: Sequence[Dict[str, Any]],
         tags: List[str],
+        reference_timestamp: Any = None,
     ) -> Dict[str, Any]:
         fact_ids: List[int] = []
         user_claim_signal_mapping_updates: List[Dict[str, Any]] = []
@@ -2354,7 +2371,7 @@ class MemoryNodeManager:
         user_claim_signal_fact_ids: List[int] = []
         user_action_signal_fact_ids: List[int] = []
         user_intent_signal_fact_ids: List[int] = []
-        owner_entity_id = self._intent_world_owner_entity_id()
+        owner_entity_id = self._intent_world_owner_entity_id(reference_timestamp=reference_timestamp)
         stored_confirmed_alias_keys = {
             str(row["alias_key"])
             for row in self._db.get_owner_entity_aliases(
@@ -2378,7 +2395,7 @@ class MemoryNodeManager:
                 descriptor for descriptor in entity_descriptors
                 if self._db.normalize_owner_alias_key(descriptor.get("name") or "")
                 not in owner_alias_keys
-            ])
+            ], reference_timestamp=reference_timestamp)
             if owner_alias_keys:
                 for descriptor in entity_descriptors:
                     name = str(descriptor.get("name") or "")
@@ -2406,6 +2423,7 @@ class MemoryNodeManager:
                 confidence=fact["confidence"],
                 importance=fact["importance"],
                 metadata=fact_metadata,
+                reference_timestamp=reference_timestamp,
             )
             confirmed_candidates_by_key = {
                 self._db.normalize_owner_alias_key(alias["alias_name"]): alias
@@ -2428,16 +2446,18 @@ class MemoryNodeManager:
                     evidence_type=alias["evidence_type"],
                     evidence_text=alias["evidence_text"],
                     source_speaker=alias["source_speaker"],
+                    reference_timestamp=reference_timestamp,
                 )
                 stored_confirmed_alias_keys.add(alias_key)
             self._db.upsert_memory_recall_document(
                 **prepared["recall_document"],
                 object_id=fact_id,
                 entity_ids=entity_ids,
+                reference_timestamp=reference_timestamp,
             )
             fact_ids.append(fact_id)
             user_claim_updates = (
-                self._fact_user_claim_signal_mapping_updates(fact_id, fact)
+                self._fact_user_claim_signal_mapping_updates(fact_id, fact, reference_timestamp=reference_timestamp)
             )
             user_claim_signal_mapping_updates.extend(user_claim_updates)
             if user_claim_updates:
@@ -2451,17 +2471,19 @@ class MemoryNodeManager:
             if action_updates:
                 user_action_signal_fact_ids.append(fact_id)
             user_intent_updates = (
-                self._fact_user_intent_signal_mapping_updates(fact_id, fact)
+                self._fact_user_intent_signal_mapping_updates(fact_id, fact, reference_timestamp=reference_timestamp)
             )
             user_intent_signal_mapping_updates.extend(user_intent_updates)
             if user_intent_updates:
                 user_intent_signal_fact_ids.append(fact_id)
         self._db.upsert_user_claim_signals(
-            user_claim_signal_mapping_updates
+            user_claim_signal_mapping_updates,
+            reference_timestamp=reference_timestamp,
         )
-        self._db.upsert_user_action_signals(user_action_signal_updates)
+        self._db.upsert_user_action_signals(user_action_signal_updates, reference_timestamp=reference_timestamp)
         self._db.upsert_user_intent_signals(
-            user_intent_signal_mapping_updates
+            user_intent_signal_mapping_updates,
+            reference_timestamp=reference_timestamp,
         )
         return {
             "fact_ids": fact_ids,
@@ -2491,6 +2513,7 @@ class MemoryNodeManager:
         started_at = time.monotonic()
         update = self._update_user_observed_patterns_from_action_signals(
             selected_ids,
+            reference_timestamp=reference_timestamp,
         )
         completed = bool(update.get("completed"))
         report = {
@@ -2651,7 +2674,7 @@ class MemoryNodeManager:
                 eligible.append(activity)
             except (ValueError, TypeError):
                 report["failed_activity_ids"].append(activity["id"])
-        owner_id = self._intent_world_owner_entity_id()
+        owner_id = self._intent_world_owner_entity_id(reference_timestamp=reference_timestamp)
         batch_size = max(1, int(self._memory_cfg.get("activity_intent_batch_size") or 4))
         for offset in range(0, len(eligible), batch_size):
             batch = eligible[offset:offset + batch_size]
@@ -2763,6 +2786,7 @@ class MemoryNodeManager:
                 decisions = self._normalize_intent_lifecycle_decisions(validation_cases, raw_decisions, scope=scope)
                 saved = self._save_intent_lifecycle_observations(
                     observations, decisions, world_owner_id=owner_id, scope=scope,
+                    reference_timestamp=reference_timestamp,
                 )
                 report["intent_event_ids"].extend(saved["intent_event_ids"])
                 report["processed_activity_ids"].extend(saved["completed_activity_ids"])
@@ -2846,7 +2870,7 @@ class MemoryNodeManager:
             self._logger.log_json_format("memory_user_intent_update", "finish", report)
             return report
 
-        world_owner_id = self._intent_world_owner_entity_id()
+        world_owner_id = self._intent_world_owner_entity_id(reference_timestamp=reference_timestamp)
         batch_size = max(
             1,
             int(self._memory_cfg.get("user_intent_signal_batch_size") or 8),
@@ -2896,6 +2920,7 @@ class MemoryNodeManager:
                     parsed["results"],
                     signal_items=batch,
                     world_owner_id=world_owner_id,
+                    reference_timestamp=reference_timestamp,
                 )
             except sqlite3.Error:
                 raise
@@ -2951,6 +2976,7 @@ class MemoryNodeManager:
                 phase = "lifecycle_save"
                 saved = self._save_intent_lifecycle_observations(
                     observations, lifecycle_decisions, world_owner_id=world_owner_id,
+                    reference_timestamp=reference_timestamp,
                 )
             except sqlite3.Error:
                 raise
@@ -3157,8 +3183,8 @@ class MemoryNodeManager:
             6,
         )
 
-    def _intent_world_owner_entity_id(self) -> int:
-        mapping = self._db.add_entity_names([self._world_owner_entity_name])
+    def _intent_world_owner_entity_id(self, *, reference_timestamp: Any = None) -> int:
+        mapping = self._db.add_entity_names([self._world_owner_entity_name], reference_timestamp=reference_timestamp)
         return int(mapping[self._world_owner_entity_name])
 
     def _format_fact_view_for_user_intent_prompt(self, fact: Dict[str, Any]) -> Dict[str, Any]:
@@ -3175,6 +3201,7 @@ class MemoryNodeManager:
         *,
         signal_items: Sequence[Dict[str, Any]],
         world_owner_id: int,
+        reference_timestamp: Any = None,
     ) -> Dict[str, Any]:
         """Validate and route batch results by signal purpose before normalizing each output."""
         results_by_id: Dict[int, List[Dict[str, Any]]] = {}
@@ -3306,6 +3333,7 @@ class MemoryNodeManager:
                         facts_by_id={fact_id: fact},
                         entity_ids=entity_ids_by_name,
                         world_owner_id=world_owner_id,
+                        reference_timestamp=reference_timestamp,
                     )
                     candidate["signal_id"] = signal_id
                     # Carry trusted source context, never model-supplied activity references.
@@ -3402,6 +3430,7 @@ class MemoryNodeManager:
         facts_by_id: Dict[int, Dict[str, Any]],
         entity_ids: Dict[str, int],
         world_owner_id: int,
+        reference_timestamp: Any = None,
     ) -> Dict[str, Any]:
         if not isinstance(raw, dict):
             raise ValueError(f"field=candidate reason=invalid_type actual={raw!r} expected=object")
@@ -3529,7 +3558,7 @@ class MemoryNodeManager:
                 )
             location = _compact_whitespace(details.get("location") or "")[:160]
             if location and location not in entity_ids:
-                entity_ids.update(self._db.add_entity_names([location]))
+                entity_ids.update(self._db.add_entity_names([location], reference_timestamp=reference_timestamp))
             start_at = _compact_whitespace(raw.get("time_start") or "")[:80]
             end_at = _compact_whitespace(raw.get("time_end") or "")[:80]
             candidate.update(actor_entity_id=actor_id, actor_name=actor_name, event_or_activity=event,
@@ -3889,6 +3918,7 @@ class MemoryNodeManager:
         *,
         object_type: str,
         item: Dict[str, Any],
+        reference_timestamp: Any = None,
     ) -> None:
         """Refresh the retrieval projection for one goal, plan, or work item."""
         normalized_type = str(object_type or "").strip().lower()
@@ -3964,6 +3994,7 @@ class MemoryNodeManager:
                 "primary_domain": item.get("primary_domain") or "",
                 "projection_version": "v1",
             },
+            reference_timestamp=reference_timestamp,
         )
 
     def _retrieve_intent_lifecycle_observation_cases(
@@ -4167,6 +4198,7 @@ class MemoryNodeManager:
     def _save_intent_lifecycle_observations(
         self, observations: Sequence[Dict[str, Any]], decisions: Dict[int, Dict[str, Any]], *,
         world_owner_id: int, scope: str = "memory_user_intent_update",
+        reference_timestamp: Any = None,
     ) -> Dict[str, Any]:
         """Atomically save either source's observation, applied changes and evidence."""
         report: Dict[str, Any] = {
@@ -4215,7 +4247,7 @@ class MemoryNodeManager:
                 update = decision["intent_update"]
                 event_id = None
                 with self._db.transaction():
-                    observation_id = self._db.upsert_user_intent_lifecycle_observation(observation)
+                    observation_id = self._db.upsert_user_intent_lifecycle_observation(observation, reference_timestamp=reference_timestamp)
                     if target_id is not None:
                         object_type = observation["object_type"]
                         target = self._db.get_intent_object(object_type=object_type, object_id=target_id)
@@ -4264,6 +4296,7 @@ class MemoryNodeManager:
                             if any(payload[key] != target.get(key) for key in payload):
                                 if not self._db.update_intent_object(
                                     object_type=object_type, object_id=target_id, payload=payload,
+                                    reference_timestamp=reference_timestamp,
                                 ):
                                     raise ValueError("lifecycle_intent_update_failed")
                                 updated_target = self._db.get_intent_object(
@@ -4279,6 +4312,7 @@ class MemoryNodeManager:
                                     source_activity_id=activity_id,
                                     lifecycle_observation_id=observation_id,
                                     effective_at=update["effective_at"],
+                                    reference_timestamp=reference_timestamp,
                                 )
                         facts = self._db.get_memory_facts_by_ids(observation["evidence_fact_ids"])
                         if len(facts) != len(observation["evidence_fact_ids"]):
@@ -4288,14 +4322,14 @@ class MemoryNodeManager:
                             "evidence_type": "fact", "evidence_id": fact["id"],
                             "role": observation["lifecycle_evidence"],
                             "observed_at": str(fact.get("dialogue_time_key") or fact.get("event_time_key") or ""),
-                        } for fact in facts])
+                        } for fact in facts], reference_timestamp=reference_timestamp)
                         if activity_id is not None:
                             self._db.upsert_intent_evidence([{
                                 "object_type": object_type, "object_id": target_id,
                                 "evidence_type": "user_activity", "evidence_id": activity_id,
                                 "role": observation["lifecycle_evidence"],
                                 "observed_at": observation.get("observed_at") or "",
-                            }])
+                            }], reference_timestamp=reference_timestamp)
             except Exception as exc:
                 report[failed_key].append(source_id)
                 self._logger.log_json_format(scope, "signal_error", {
@@ -4362,6 +4396,7 @@ class MemoryNodeManager:
                         object_id = self._db.create_intent_object(
                             object_type=object_type,
                             payload=self._intent_storage_payload(candidate, status="pending"),
+                            reference_timestamp=reference_timestamp,
                         )
                         stored_object = self._db.get_intent_object(
                             object_type=object_type, object_id=object_id,
@@ -4372,12 +4407,13 @@ class MemoryNodeManager:
                             "object_type": object_type, "object_id": object_id,
                             "evidence_type": "fact", "evidence_id": fact_id,
                             "role": "creation", "observed_at": observed_at,
-                        } for fact_id in candidate["evidence_fact_ids"]])
+                        } for fact_id in candidate["evidence_fact_ids"]], reference_timestamp=reference_timestamp)
                         signal_event_ids.append(self._db.insert_user_intent_event(
                             intent_id=object_id,
                             event_type="created",
                             new_payload=stored_object,
                             source_signal_id=signal_id,
+                            reference_timestamp=reference_timestamp,
                         ))
                     if target:
                         if update:
@@ -4404,6 +4440,7 @@ class MemoryNodeManager:
                             if any(payload[key] != target.get(key) for key in payload):
                                 if not self._db.update_intent_object(
                                     object_type=object_type, object_id=target_id, payload=payload,
+                                    reference_timestamp=reference_timestamp,
                                 ):
                                     raise ValueError("future_intent_update_failed")
                                 updated_target = self._db.get_intent_object(
@@ -4417,12 +4454,13 @@ class MemoryNodeManager:
                                     new_payload=updated_target,
                                     source_signal_id=signal_id,
                                     effective_at=update["effective_at"],
+                                    reference_timestamp=reference_timestamp,
                                 ))
                         self._db.upsert_intent_evidence([{
                             "object_type": object_type, "object_id": target_id,
                             "evidence_type": "fact", "evidence_id": fact_id,
                             "role": decision["relation"], "observed_at": observed_at,
-                        } for fact_id in candidate["evidence_fact_ids"]])
+                        } for fact_id in candidate["evidence_fact_ids"]], reference_timestamp=reference_timestamp)
             except Exception as exc:
                 report["failed_signal_ids"].append(signal_id)
                 self._logger.log_json_format("memory_user_intent_update", "signal_error", {
@@ -4495,7 +4533,7 @@ class MemoryNodeManager:
         self,
         *,
         signal_ids: Sequence[int],
-        reference_timestamp: Any,
+        reference_timestamp: Any = None,
     ) -> Dict[str, Any]:
         """Review selected claim signals against their facts and persist claims."""
         signals = self._db.get_user_signals_by_ids(
@@ -4517,7 +4555,7 @@ class MemoryNodeManager:
         # Commit explicit results independently: a later derivation failure must
         # neither roll them back nor make their source signals pending again.
         with self._db.transaction():
-            explicit_report = self._update_explicit_user_claims_from_signals(signal_items)
+            explicit_report = self._update_explicit_user_claims_from_signals(signal_items, reference_timestamp=reference_timestamp)
         missing_signal_count = len(signals) - len(signal_items)
         if missing_signal_count:
             explicit_report["failed_signal_count"] += missing_signal_count
@@ -4527,6 +4565,7 @@ class MemoryNodeManager:
         new_claim_ids = list(explicit_report.get("new_claim_ids") or [])
         derived_report = self._update_derived_user_claims_from_explicit_claims(
             new_explicit_claim_ids=new_claim_ids,
+            reference_timestamp=reference_timestamp,
         )
         all_new_claim_ids = sorted(
             set(new_claim_ids) | set(derived_report.get("new_claim_ids") or [])
@@ -4618,6 +4657,7 @@ class MemoryNodeManager:
     def _sync_user_claim_recall_documents(
         self,
         claim_ids: Sequence[int],
+        *, reference_timestamp: Any = None,
     ) -> None:
         """Refresh projections for claims created, merged, or transitioned."""
         claims = self._db.get_user_claims_by_ids(claim_ids)
@@ -4672,6 +4712,7 @@ class MemoryNodeManager:
                     "predicate": str(claim.get("predicate") or ""),
                     "projection_version": "v1",
                 },
+                reference_timestamp=reference_timestamp,
             )
 
     @staticmethod
@@ -4858,6 +4899,7 @@ class MemoryNodeManager:
         support_ids: Sequence[int],
         facts_by_id: Dict[int, Dict[str, Any]],
         confidence: float,
+        reference_timestamp: Any = None,
     ) -> None:
         evidence: List[Dict[str, Any]] = []
         for fact_id in support_ids:
@@ -4873,7 +4915,7 @@ class MemoryNodeManager:
                 "observed_at": fact.get("event_time_key")
                 or fact.get("dialogue_time_key") or "",
             })
-        self._db.upsert_user_claim_evidence(evidence)
+        self._db.upsert_user_claim_evidence(evidence, reference_timestamp=reference_timestamp)
 
     @staticmethod
     def _user_claim_transition_effective_at(
@@ -4904,6 +4946,7 @@ class MemoryNodeManager:
         candidate: Dict[str, Any],
         decision: Dict[str, Any],
         effective_at: str,
+        reference_timestamp: Any = None,
     ) -> Optional[int]:
         """Persist semantic claim history without resolving effective state."""
         details = {
@@ -4931,6 +4974,7 @@ class MemoryNodeManager:
             ),
             semantic_reason=_compact_whitespace(decision.get("reason") or "")[:240],
             details=details,
+            reference_timestamp=reference_timestamp,
         )
 
     def _reconcile_user_claims(
@@ -4938,6 +4982,7 @@ class MemoryNodeManager:
         candidates: Sequence[Dict[str, Any]],
         *,
         facts_by_id: Dict[int, Dict[str, Any]],
+        reference_timestamp: Any = None,
     ) -> List[Dict[str, Any]]:
         """Save claims with their own facts and record relations without changing old evidence."""
         candidate_subject_ids = [
@@ -4990,12 +5035,13 @@ class MemoryNodeManager:
                 )
 
             storage_payload = self._user_claim_storage_payload(candidate)
-            claim_id, created = self._db.upsert_user_claim(**storage_payload)
+            claim_id, created = self._db.upsert_user_claim(**storage_payload, reference_timestamp=reference_timestamp)
             self._write_user_claim_evidence(
                 claim_id=claim_id,
                 support_ids=support_ids,
                 facts_by_id=facts_by_id,
                 confidence=float(candidate.get("confidence") or 0.0),
+                reference_timestamp=reference_timestamp,
             )
             persisted_relations: List[Dict[str, Any]] = []
             for decision in candidate_decisions:
@@ -5008,6 +5054,7 @@ class MemoryNodeManager:
                     candidate=candidate,
                     decision=decision,
                     effective_at=effective_at,
+                    reference_timestamp=reference_timestamp,
                 )
                 if relation_event_id:
                     persisted_relations.append({
@@ -5059,6 +5106,7 @@ class MemoryNodeManager:
     def _update_explicit_user_claims_from_signals(
         self,
         signal_items: Sequence[Dict[str, Any]],
+        *, reference_timestamp: Any = None,
     ) -> Dict[str, Any]:
         """Review each signal against its own fact before reconciling claims."""
         report: Dict[str, Any] = {
@@ -5089,6 +5137,7 @@ class MemoryNodeManager:
         facts_by_id = {int(item["fact"]["id"]): item["fact"] for item in signal_items}
         applied = self._reconcile_user_claims(
             claim_candidates, facts_by_id=facts_by_id,
+            reference_timestamp=reference_timestamp,
         ) if claim_candidates else []
         report["updated"] = len(applied)
         report["created"] = sum(int(item["created"]) for item in applied)
@@ -5333,6 +5382,7 @@ class MemoryNodeManager:
         self,
         *,
         new_explicit_claim_ids: Sequence[int],
+        reference_timestamp: Any = None,
     ) -> Dict[str, Any]:
         """Derive local conclusions from this batch's explicit-claim changes.
 
@@ -5369,7 +5419,7 @@ class MemoryNodeManager:
         if not explicit_claim_ids:
             return report
         changed_claims = self._db.get_user_claims_by_ids(explicit_claim_ids)
-        world_owner_entity_id = self._intent_world_owner_entity_id()
+        world_owner_entity_id = self._intent_world_owner_entity_id(reference_timestamp=reference_timestamp)
         seed_claims = [
             claim
             for claim in changed_claims
@@ -5413,6 +5463,7 @@ class MemoryNodeManager:
                             raw_candidates=outcome,
                             changed_claims=changed_claims,
                             related_claims=related_claims,
+                            reference_timestamp=reference_timestamp,
                         )
             except sqlite3.Error:
                 # Storage/infrastructure failures are not invalid LLM outputs.
@@ -5592,6 +5643,7 @@ class MemoryNodeManager:
         raw_candidates: Sequence[Dict[str, Any]],
         changed_claims: Sequence[Dict[str, Any]],
         related_claims: Sequence[Dict[str, Any]],
+        reference_timestamp: Any = None,
     ) -> Dict[str, Any]:
         """Validate, deduplicate, reconcile, and record a batch's conclusions."""
         report: Dict[str, Any] = {
@@ -5643,7 +5695,7 @@ class MemoryNodeManager:
             for fact in self._db.get_memory_facts_by_ids(evidence_fact_ids)
             if str(fact.get("id") or "").strip().isdigit()
         }
-        applied = self._reconcile_user_claims(candidates, facts_by_id=facts_by_id)
+        applied = self._reconcile_user_claims(candidates, facts_by_id=facts_by_id, reference_timestamp=reference_timestamp)
         persisted_claims = {
             int(claim["id"]): claim
             for item in applied
@@ -5672,10 +5724,12 @@ class MemoryNodeManager:
                     "premise_claim_ids": premise_ids,
                     "generator": "derived_user_claim_extraction",
                 },
+                reference_timestamp=reference_timestamp,
             )
             self._db.replace_user_claim_derivation_premises(
                 derivation_id=derivation_id,
                 premise_claim_ids=premise_ids,
+                reference_timestamp=reference_timestamp,
             )
             persisted_derived_ids.append(claim_id)
             report["new_claim_ids"].append(claim_id)
@@ -5915,6 +5969,7 @@ class MemoryNodeManager:
 
     def _update_user_observed_patterns_from_action_signals(
         self, signal_ids: Sequence[int],
+        *, reference_timestamp: Any = None,
     ) -> Dict[str, Any]:
         """Cluster unassigned evidence, then maintain or discover patterns per cluster."""
         report: Dict[str, Any] = {
@@ -5956,6 +6011,7 @@ class MemoryNodeManager:
             if related:
                 direct_update = self._update_observed_patterns_from_new_action_signals(
                     new_signals=cluster, existing_patterns=related,
+                    reference_timestamp=reference_timestamp,
                 )
                 if direct_update is None:
                     report.update(completed=False, error="invalid_action_pattern_relation_response")
@@ -6002,6 +6058,7 @@ class MemoryNodeManager:
                 for pattern in cluster_result["patterns"]:
                     applied = self._reconcile_user_observed_pattern(
                         pattern, subject_entity_id=subject_id, existing_patterns=list(existing_by_id.values()),
+                        reference_timestamp=reference_timestamp,
                     )
                     if applied is None:
                         report.update(completed=False, error="invalid_pattern_reconciliation")
@@ -6022,6 +6079,7 @@ class MemoryNodeManager:
     def _update_observed_patterns_from_new_action_signals(
         self, *, new_signals: Sequence[Dict[str, Any]],
         existing_patterns: Sequence[Dict[str, Any]],
+        reference_timestamp: Any = None,
     ) -> Optional[Dict[str, Any]]:
         """Classify a cluster's unassigned evidence against existing patterns."""
         result: Dict[str, Any] = {
@@ -6132,11 +6190,13 @@ class MemoryNodeManager:
                 if decision["semantic_relation"] == "supports":
                     added = self._db.add_user_observed_pattern_signals(
                         pattern_id=pattern_id, signal_ids=[signal_id],
+                        reference_timestamp=reference_timestamp,
                     )
                     if added:
                         self._db.refresh_user_observed_pattern(
                             pattern_id=pattern_id,
                             confidence=float(pattern_by_id[pattern_id]["confidence"]),
+                            reference_timestamp=reference_timestamp,
                         )
                         result["updated_pattern_ids"].add(pattern_id)
                     result["supported_signal_ids"].add(signal_id)
@@ -6149,6 +6209,7 @@ class MemoryNodeManager:
                     candidate_snapshot=snapshot,
                     semantic_confidence=decision["confidence"],
                     semantic_reason=decision["reason"],
+                    reference_timestamp=reference_timestamp,
                 )
                 if event_id is not None:
                     result["relations_recorded"] += 1
@@ -6278,6 +6339,7 @@ class MemoryNodeManager:
         self,
         fact_id: int,
         fact: Dict[str, Any],
+        *, reference_timestamp: Any = None,
     ) -> List[Dict[str, Any]]:
         """Persist every normalized user-claim signal for one fact."""
         updates: List[Dict[str, Any]] = []
@@ -6298,7 +6360,7 @@ class MemoryNodeManager:
             entity_mapping = self._db.upsert_entity_nodes([{
                 "name": subject_entity,
                 "type": "PERSON",
-            }])
+            }], reference_timestamp=reference_timestamp)
             if subject_entity not in entity_mapping:
                 continue
             claim_anchor = _compact_whitespace(signal.get("claim_anchor") or "")
@@ -6391,6 +6453,7 @@ class MemoryNodeManager:
         self,
         fact_id: int,
         fact: Dict[str, Any],
+        *, reference_timestamp: Any = None,
     ) -> List[Dict[str, Any]]:
         """Project one fact's normalized prospective signals into DB rows."""
         updates: List[Dict[str, Any]] = []
@@ -6414,7 +6477,7 @@ class MemoryNodeManager:
             if entity_descriptor is None:
                 continue
             subject_name = str(entity_descriptor["name"])
-            entity_mapping = self._db.upsert_entity_nodes([entity_descriptor])
+            entity_mapping = self._db.upsert_entity_nodes([entity_descriptor], reference_timestamp=reference_timestamp)
             if subject_name not in entity_mapping:
                 continue
             user_intent_anchor = _compact_whitespace(
@@ -6632,10 +6695,10 @@ class MemoryNodeManager:
             "support_signal_ids": signal_ids,
         }
 
-    def _record_user_observed_pattern_event(self, **event: Any) -> Optional[int]:
+    def _record_user_observed_pattern_event(self, reference_timestamp: Any = None, **event: Any) -> Optional[int]:
         """Capture a new event ID in the FIFO writer's transaction; duplicates return None."""
         with self._db.transaction():
-            if not self._db.record_user_observed_pattern_event(**event):
+            if not self._db.record_user_observed_pattern_event(**event, reference_timestamp=reference_timestamp):
                 return None
             # The DB write API returns bool. Read the inserted ID immediately,
             # before another event can be committed, without scanning signal history.
@@ -6644,6 +6707,7 @@ class MemoryNodeManager:
     def _reconcile_user_observed_pattern(
         self, pattern: Dict[str, Any], *, subject_entity_id: int,
         existing_patterns: Optional[Sequence[Dict[str, Any]]] = None,
+        reference_timestamp: Any = None,
     ) -> Optional[Dict[str, Any]]:
         """Preserve semantic changes, then apply each candidate-to-pattern relation."""
         existing = list(existing_patterns) if existing_patterns is not None else self._db.get_user_observed_patterns(
@@ -6684,9 +6748,11 @@ class MemoryNodeManager:
                     condition_text=pattern["condition_text"],
                     primary_domain=pattern["primary_domain"],
                     confidence=pattern["confidence"],
+                    reference_timestamp=reference_timestamp,
                 )
                 added = self._db.add_user_observed_pattern_signals(
                     pattern_id=candidate_id, signal_ids=pattern["support_signal_ids"],
+                    reference_timestamp=reference_timestamp,
                 )
                 if created:
                     event_id = self._record_user_observed_pattern_event(
@@ -6695,6 +6761,7 @@ class MemoryNodeManager:
                         support_signal_ids=pattern["support_signal_ids"],
                         candidate_snapshot={}, semantic_confidence=0.0,
                         semantic_reason="",
+                        reference_timestamp=reference_timestamp,
                     )
                     if event_id is not None:
                         pattern_event_ids.append(event_id)
@@ -6706,6 +6773,7 @@ class MemoryNodeManager:
                         support_signal_ids=pattern["support_signal_ids"],
                         candidate_snapshot=pattern, semantic_confidence=pattern["confidence"],
                         semantic_reason="New action signals supported the existing pattern key.",
+                        reference_timestamp=reference_timestamp,
                     )
                     if event_id is not None:
                         recorded_count += 1
@@ -6716,12 +6784,14 @@ class MemoryNodeManager:
                 if relation_type in {"duplicate", "supports"}:
                     added = self._db.add_user_observed_pattern_signals(
                         pattern_id=target_id, signal_ids=pattern["support_signal_ids"],
+                        reference_timestamp=reference_timestamp,
                     )
                     if added:
                         updated_pattern_ids.add(target_id)
                         self._db.refresh_user_observed_pattern(
                             pattern_id=target_id,
                             confidence=float(existing_by_id[target_id]["confidence"]),
+                            reference_timestamp=reference_timestamp,
                         )
                 # The source is C, never one of its merge targets. An unpersisted
                 # C is represented by its candidate snapshot without inventing an ID.
@@ -6733,6 +6803,7 @@ class MemoryNodeManager:
                     candidate_snapshot=pattern,
                     semantic_confidence=relation["confidence"],
                     semantic_reason=relation["reason"],
+                    reference_timestamp=reference_timestamp,
                 )
                 if event_id is not None:
                     recorded_count += 1

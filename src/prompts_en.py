@@ -1503,7 +1503,7 @@ Return JSON only (prediction must be null for defer or wait_for_change):
   ]
 }}
 
-Reference time: {as_of}
+Reference time: {evaluation_time}
 Forecast window: {horizon_start} to {horizon_end}
 Due assessment cases (one per line):
 {assessment_cases}
@@ -1567,7 +1567,7 @@ Return JSON only:
   ]
 }}
 
-Reference time: {as_of}
+Reference time: {evaluation_time}
 Forecast window: {horizon_start} to {horizon_end}
 Created intent cases:
 {intent_cases}
@@ -1651,7 +1651,7 @@ Return JSON only:
   ]
 }}
 
-Reference time: {as_of}
+Reference time: {evaluation_time}
 Forecast window: {horizon_start} to {horizon_end}
 Updated intent cases:
 {intent_cases}
@@ -1754,7 +1754,7 @@ Return JSON only:
   ]
 }}
 
-Evaluation time: {as_of}
+Evaluation time: {evaluation_time}
 Service evaluation cases (one per line):
 {evaluation_cases}
 Runtime context: {runtime_context}

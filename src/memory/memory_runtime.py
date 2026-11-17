@@ -27,6 +27,7 @@ from .memory_manager import (
 from llm_client import LLMClient
 from pwm_logging import CompactLogValue, as_pwm_logger
 from task_scheduler import TaskScheduler
+from storage_utils import latest_timestamp
 from .memory_context_manager import (
     FactExtractionTaskDecision,
     MemoryContextManager,
@@ -333,7 +334,10 @@ class MemoryRuntime:
             }
         report = self._task_scheduler.submit(
             "memory_user_activity_extraction",
-            {"tags": resolved_tags},
+            {
+                "tags": resolved_tags,
+                "reference_timestamp": self._memory_context_manager.user_activity_reference_timestamp,
+            },
         )
         if bool(report.get("queued")):
             self._user_activity_tags = []
@@ -548,11 +552,13 @@ class MemoryRuntime:
                 for tag in unit.tags
                 if tag is not None and str(tag).strip()
             }
+            store_completion_context = self._memory_store_completion_context(canonical_units)
             self._logger.log_json_format(
                 "memory_runtime",
                 "memory_input_batch_detail",
                 {
                     "tags": sorted(tags),
+                    "reference_timestamp": store_completion_context["input_time_end"],
                     "original_unit_entry_count": deduplication_report[
                         "original_unit_entry_count"
                     ],
@@ -570,15 +576,13 @@ class MemoryRuntime:
                     "units": self._memory_units_log_view(canonical_units),
                 },
             )
-            store_completion_context = self._memory_store_completion_context(
-                canonical_units,
-            )
             queue_report = self._task_scheduler.submit(
                 "memory_fact_extraction",
                 {
                     "units": canonical_units,
                     "preceding_context_units": preceding_context_units,
                     "tags": sorted(tags),
+                    "reference_timestamp": store_completion_context["input_time_end"],
                 },
                 completion_context=store_completion_context,
                 report_payload={"tags": sorted(tags)},
@@ -710,24 +714,15 @@ class MemoryRuntime:
             for unit in unit_list
             if unit.start_time
         ]
-        end_timestamps = [
-            unit.end_time
-            for unit in unit_list
-            if unit.end_time
-        ]
         return {
             "contains_interaction_turn": any(
                 unit.unit_type == "interaction"
                 for unit in unit_list
             ),
             "input_time_start": timestamps[0] if timestamps else "",
-            "input_time_end": (
-                end_timestamps[-1]
-                if end_timestamps
-                else timestamps[-1]
-                if timestamps
-                else ""
-            ),
+            "input_time_end": latest_timestamp(
+                entry["ended_at"] for unit in unit_list for entry in unit.entries()
+            ) or "",
         }
 
     def _deduplicate_memory_input_units(

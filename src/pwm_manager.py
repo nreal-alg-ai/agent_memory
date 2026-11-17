@@ -295,10 +295,10 @@ class PersonWorldModel:
             )
 
     def get_active_predictions(
-        self, *, as_of: Optional[datetime] = None,
+        self, *, evaluation_time: Optional[datetime] = None,
     ) -> List[Dict[str, Any]]:
         with self._task_scheduler.execution_lock:
-            return self._user_prediction.get_active_predictions(as_of=as_of)
+            return self._user_prediction.get_active_predictions(evaluation_time=evaluation_time)
 
     def accept_proactive_service_feedback(
         self, *, service_id: int, execution_id: str, execution_status: str,
@@ -332,9 +332,13 @@ class PersonWorldModel:
             self._memory_inputs_need_flush = True
         return report
 
-    def _process_proactive_service_feedback_task(self, **payload: Any) -> Dict[str, Any]:
+    def _process_proactive_service_feedback_task(
+        self, *, reference_timestamp: Any = None, **payload: Any,
+    ) -> Dict[str, Any]:
         """Coordinate service records and memory extraction, not domain decisions."""
-        feedback = self._user_proactive_service.record_service_feedback(**payload)
+        if reference_timestamp is not None:
+            payload["observed_at"] = reference_timestamp
+        feedback = self._user_proactive_service.record_service_feedback(**payload, reference_timestamp=reference_timestamp)
         try:
             memory = self.memory_manager.extract_memory_from_proactive_service_feedback(feedback)
         except Exception as exc:

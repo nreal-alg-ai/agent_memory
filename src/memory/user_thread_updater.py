@@ -5,6 +5,7 @@ serializes its reads and writes with other memory tasks.
 """
 
 from __future__ import annotations
+from storage_utils import local_now_text
 
 import hashlib
 import json
@@ -228,6 +229,7 @@ class UserThreadUpdater:
 
     def _save_updates(
         self, cases: List[Dict[str, Any]], updates: List[Dict[str, Any]],
+        *, reference_timestamp: Any = None,
     ) -> Dict[str, Any]:
         report = {
             'new_thread_ids': [], 'updated_thread_ids': [],
@@ -249,10 +251,12 @@ class UserThreadUpdater:
                     **{field: update[field] for field in (
                         'title', 'identity_description', 'current_summary', 'status',
                     )},
+                    reference_timestamp=reference_timestamp,
                 )
                 report['updated_thread_ids' if old else 'new_thread_ids'].append(thread_id)
                 self._db.link_user_thread_evidence(
                     thread_id, activity_ids=activities, fact_ids=facts,
+                    reference_timestamp=reference_timestamp,
                 )
                 known_at = str(case['reference_time'])
                 event_ids = []
@@ -263,6 +267,7 @@ class UserThreadUpdater:
                             'event_type', 'summary', 'evidence_activity_ids',
                             'evidence_fact_ids', 'occurred_at',
                         )},
+                        reference_timestamp=reference_timestamp,
                     )
                     if event_id is not None:
                         report['thread_event_ids'].append(event_id)
@@ -295,7 +300,7 @@ class UserThreadUpdater:
         report: Dict[str, Any] = {
             'status': 'ok' if ids else 'empty', 'processed_activity_ids': [],
             'new_thread_ids': [], 'updated_thread_ids': [], 'thread_event_ids': [],
-            'thread_changes': [],
+            'thread_changes': [], 'reference_timestamp': reference_timestamp,
         }
         for offset in range(0, len(ids), self._batch_size):
             batch_ids = ids[offset:offset + self._batch_size]
@@ -307,7 +312,7 @@ class UserThreadUpdater:
                 clock = reference_timestamp or max(
                     (value for value in source_times if value), default=None,
                     key=lambda value: datetime.fromisoformat(value.replace('Z', '+00:00')).astimezone(),
-                ) or datetime.now().astimezone().isoformat()
+                ) or local_now_text()
                 membership_text = '[\n' + ',\n'.join(
                     json.dumps(case, ensure_ascii=False, separators=(',', ':'), default=str)
                     for case in cases
@@ -355,7 +360,7 @@ class UserThreadUpdater:
                     if not isinstance(result, dict):
                         raise ValueError('Invalid user thread update response')
                     updates = self._validate_updates(thread_cases, result)
-                    saved = self._save_updates(thread_cases, updates)
+                    saved = self._save_updates(thread_cases, updates, reference_timestamp=reference_timestamp)
                     for key, values in saved.items():
                         report[key].extend(values)
                 report['processed_activity_ids'].extend(batch_ids)

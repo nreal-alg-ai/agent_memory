@@ -23,7 +23,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from storage_utils import json_dumps, json_loads, local_now_text
+from storage_utils import local_now_text, normalize_reference_timestamp, json_dumps, json_loads, latest_timestamp
 from intent_lifecycle import USER_INTENT_STATUSES
 from .memory_types import MemoryUnit
 
@@ -809,6 +809,7 @@ class UserMemoryDB:
         confidence: float = 0.0,
         importance: float = 0.0,
         metadata: Optional[Dict[str, Any]] = None,
+        reference_timestamp: Any = None,
     ) -> int:
         """Create or refresh one derived retrieval document.
 
@@ -821,7 +822,7 @@ class UserMemoryDB:
         normalized_id = int(object_id or 0)
         if not normalized_type or normalized_id <= 0:
             raise ValueError("object_type and a positive object_id are required")
-        now = local_now_text()
+        now = local_now_text() if reference_timestamp is None else normalize_reference_timestamp(reference_timestamp)
         normalized_entity_ids = list(dict.fromkeys(
             int(value)
             for value in entity_ids or []
@@ -932,8 +933,9 @@ class UserMemoryDB:
         evidence_fact_ids: Sequence[int],
         source_segment_ids: Sequence[int],
         metadata: Optional[Dict[str, Any]] = None,
+        reference_timestamp: Any = None,
     ) -> int:
-        now = local_now_text()
+        now = local_now_text() if reference_timestamp is None else normalize_reference_timestamp(reference_timestamp)
         cur = self._conn.execute(
             """
             INSERT INTO memory_user_activity_items (
@@ -1105,8 +1107,9 @@ class UserMemoryDB:
     def save_user_thread(
         self, *, thread_id: Optional[int], creation_key: str,
         title: str, identity_description: str, current_summary: str, status: str,
+        reference_timestamp: Any = None,
     ) -> int:
-        now = local_now_text()
+        now = local_now_text() if reference_timestamp is None else normalize_reference_timestamp(reference_timestamp)
         if thread_id is None:
             self._conn.execute(
                 "INSERT INTO memory_user_threads "
@@ -1130,8 +1133,9 @@ class UserMemoryDB:
 
     def link_user_thread_evidence(
         self, thread_id: int, *, activity_ids: Sequence[int], fact_ids: Sequence[int],
+        reference_timestamp: Any = None,
     ) -> None:
-        now = local_now_text()
+        now = local_now_text() if reference_timestamp is None else normalize_reference_timestamp(reference_timestamp)
         self._conn.executemany(
             "INSERT OR IGNORE INTO memory_user_thread_links "
             "(thread_id,object_type,object_id,created_at) VALUES (?,?,?,?)",
@@ -1145,8 +1149,10 @@ class UserMemoryDB:
         self, thread_id: int, *, event_type: str, summary: str,
         evidence_activity_ids: Sequence[int], evidence_fact_ids: Sequence[int],
         occurred_at: Optional[str], known_at: str,
+        reference_timestamp: Any = None,
     ) -> Optional[int]:
         # Retry-safe for the same grounded delta; different evidence remains auditable.
+        now = local_now_text() if reference_timestamp is None else normalize_reference_timestamp(reference_timestamp)
         activity_ids = sorted(set(evidence_activity_ids))
         fact_ids = sorted(set(evidence_fact_ids))
         event_key = hashlib.sha256(json_dumps([
@@ -1157,7 +1163,7 @@ class UserMemoryDB:
             "(thread_id,event_key,event_type,summary,evidence_activity_ids,evidence_fact_ids,"
             "occurred_at,known_at,created_at) VALUES (?,?,?,?,?,?,?,?,?)",
             (thread_id, event_key, event_type, summary.strip(), json_dumps(activity_ids),
-             json_dumps(fact_ids), occurred_at, known_at, local_now_text()),
+             json_dumps(fact_ids), occurred_at, known_at, now),
         )
         self._commit_if_needed()
         return int(cursor.lastrowid) if cursor.rowcount else None
@@ -1166,6 +1172,7 @@ class UserMemoryDB:
         self,
         *,
         units: Sequence[MemoryUnit],
+        reference_timestamp: Any = None,
     ) -> List[int]:
         """Persist one submitted source-unit batch as one physical row.
 
@@ -1174,7 +1181,7 @@ class UserMemoryDB:
         activity extraction. Returning a one-item list preserves the existing
         caller contract of ``source_segment_ids``.
         """
-        now = local_now_text()
+        now = local_now_text() if reference_timestamp is None else normalize_reference_timestamp(reference_timestamp)
         normalized_units: List[Dict[str, Any]] = []
         for unit in units or []:
             if not isinstance(unit, MemoryUnit):
@@ -1213,18 +1220,10 @@ class UserMemoryDB:
             ),
             "",
         )
-        batch_ended_at = next(
-            (
-                ended_at or started_at
-                for item in reversed(normalized_units)
-                for started_at, ended_at in zip(
-                    reversed(item["started_ats"]),
-                    reversed(item["ended_ats"]),
-                )
-                if ended_at or started_at
-            ),
-            batch_started_at,
-        )
+        batch_ended_at = latest_timestamp(
+            ended_at or started_at for item in normalized_units
+            for started_at, ended_at in zip(item["started_ats"], item["ended_ats"])
+        ) or batch_started_at
         cur = self._conn.execute(
             """
             INSERT INTO memory_source_segments (
@@ -1260,6 +1259,7 @@ class UserMemoryDB:
         self,
         *,
         limit: int = 240,
+        reference_timestamp: Any = None,
     ) -> List[MemoryUnit]:
         """Return typed source units waiting for activity observation.
 
@@ -1271,10 +1271,11 @@ class UserMemoryDB:
             SELECT *
             FROM memory_source_segments
             WHERE processed_for_user_activity = 0
+              AND (? IS NULL OR julianday(ended_at) <= julianday(?))
             ORDER BY id ASC
             LIMIT ?
             """,
-            (max(1, int(limit or 240)),),
+            (reference_timestamp, reference_timestamp, max(1, int(limit or 240))),
         ).fetchall()
         return self._memory_source_rows_to_units(rows)
 
@@ -1380,10 +1381,10 @@ class UserMemoryDB:
         cur = self._conn.execute(
             f"""
             UPDATE memory_source_segments
-            SET processed_for_user_activity = 1, updated_at = ?
+            SET processed_for_user_activity = 1
             WHERE id IN ({placeholders})
             """,
-            (local_now_text(), *normalized_ids),
+            normalized_ids,
         )
         self._commit_if_needed()
         return int(cur.rowcount or 0)
@@ -1566,10 +1567,11 @@ class UserMemoryDB:
     def upsert_user_action_signals(
         self,
         signals: Sequence[Dict[str, Any]],
+        *, reference_timestamp: Any = None,
     ) -> int:
         """Persist reported or activity-grounded actions in the same signal store."""
         sources = [self._validate_user_signal_source("action", signal) for signal in signals or []]
-        now = local_now_text()
+        now = local_now_text() if reference_timestamp is None else normalize_reference_timestamp(reference_timestamp)
         changed = 0
         for signal, (source_type, source_id) in zip(signals or [], sources):
             self._conn.execute(
@@ -1657,10 +1659,11 @@ class UserMemoryDB:
     def upsert_user_claim_signals(
         self,
         mappings: Sequence[Dict[str, Any]],
+        *, reference_timestamp: Any = None,
     ) -> int:
         """Persist fact-level signals for explicit user-claim extraction."""
         sources = [self._validate_user_signal_source("claim", mapping) for mapping in mappings or []]
-        now = local_now_text()
+        now = local_now_text() if reference_timestamp is None else normalize_reference_timestamp(reference_timestamp)
         changed = 0
         for mapping, (source_type, source_id) in zip(mappings or [], sources):
             signal_key = str(mapping.get("signal_key") or "").strip()
@@ -1729,10 +1732,11 @@ class UserMemoryDB:
     def upsert_user_intent_signals(
         self,
         mappings: Sequence[Dict[str, Any]],
+        *, reference_timestamp: Any = None,
     ) -> int:
         """Persist normalized intent and lifecycle evidence signals for one fact."""
         sources = [self._validate_user_signal_source("intent", mapping) for mapping in mappings or []]
-        now = local_now_text()
+        now = local_now_text() if reference_timestamp is None else normalize_reference_timestamp(reference_timestamp)
         changed = 0
         for mapping, (source_type, source_id) in zip(mappings or [], sources):
             signal_key = str(mapping.get("signal_key") or "").strip()
@@ -1820,6 +1824,7 @@ class UserMemoryDB:
 
     def upsert_user_intent_lifecycle_observation(
         self, observation: Dict[str, Any],
+        *, reference_timestamp: Any = None,
     ) -> int:
         """Save signal observations or an activity/intent pair without synthetic signals."""
         signal_id = observation.get("signal_id")
@@ -1844,7 +1849,7 @@ class UserMemoryDB:
             if not activity or not target:
                 raise ValueError("Activity observation requires a real activity and same-type intent")
             identity_field, identity_values = "source_activity_id, target_intent_id", (int(activity_id), int(target_id))
-        now = local_now_text()
+        now = local_now_text() if reference_timestamp is None else normalize_reference_timestamp(reference_timestamp)
         self._conn.execute(
             f"""
             INSERT INTO memory_user_intent_lifecycle_observations (
@@ -1927,9 +1932,10 @@ class UserMemoryDB:
         extractor_version: str = "",
         prompt_version: str = "",
         metadata: Optional[Dict[str, Any]] = None,
+        reference_timestamp: Any = None,
     ) -> tuple[int, bool]:
         """Insert a semantic claim or refresh its confidence and payload."""
-        now = local_now_text()
+        now = local_now_text() if reference_timestamp is None else normalize_reference_timestamp(reference_timestamp)
         object_id = int(object_entity_id or 0)
         subject_id = int(subject_entity_id)
         origin = str(claim_origin or "").strip().lower()
@@ -1987,9 +1993,10 @@ class UserMemoryDB:
         self, *, subject_entity_id: int, pattern_key: str, pattern_text: str,
         condition_text: str = "", primary_domain: str = "",
         confidence: float = 0.7, metadata: Optional[Dict[str, Any]] = None,
+        reference_timestamp: Any = None,
     ) -> tuple[int, bool]:
         """Create or refresh a repeated-behavior pattern for the user."""
-        now = local_now_text()
+        now = local_now_text() if reference_timestamp is None else normalize_reference_timestamp(reference_timestamp)
         subject_id = int(subject_entity_id)
         normalized_key = re.sub(r"\s+", " ", str(pattern_key or "")).strip().lower()
         text = re.sub(r"\s+", " ", str(pattern_text or "")).strip()
@@ -2032,9 +2039,10 @@ class UserMemoryDB:
 
     def add_user_observed_pattern_signals(
         self, *, pattern_id: int, signal_ids: Sequence[int],
+        reference_timestamp: Any = None,
     ) -> int:
         """Atomically attach support and remove those signals from discovery."""
-        now = local_now_text()
+        now = local_now_text() if reference_timestamp is None else normalize_reference_timestamp(reference_timestamp)
         changed = 0
         with self.transaction():
             for signal_id in sorted({int(value) for value in signal_ids if int(value) > 0}):
@@ -2052,12 +2060,14 @@ class UserMemoryDB:
 
     def refresh_user_observed_pattern(
         self, *, pattern_id: int, confidence: float,
+        reference_timestamp: Any = None,
     ) -> None:
         """Keep the established wording when new evidence supports a pattern."""
+        now = local_now_text() if reference_timestamp is None else normalize_reference_timestamp(reference_timestamp)
         self._conn.execute(
             "UPDATE memory_user_observed_patterns SET confidence = MAX(confidence, ?), "
             "updated_at = ? WHERE id = ?",
-            (float(confidence), local_now_text(), int(pattern_id)),
+            (float(confidence), now, int(pattern_id)),
         )
         self._commit_if_needed()
 
@@ -2066,8 +2076,10 @@ class UserMemoryDB:
         semantic_relation: str, support_signal_ids: Sequence[int],
         candidate_snapshot: Dict[str, Any], semantic_confidence: float,
         semantic_reason: str, event_type: str = "relation_recorded",
+        reference_timestamp: Any = None,
     ) -> bool:
         """Record pattern creation or a newly established evidence relation."""
+        now = local_now_text() if reference_timestamp is None else normalize_reference_timestamp(reference_timestamp)
         if event_type not in {"created", "relation_recorded"}:
             raise ValueError("Invalid observed pattern event type")
         if event_type == "created":
@@ -2087,7 +2099,7 @@ class UserMemoryDB:
                 int(trigger_pattern_id) if trigger_pattern_id else None,
                 str(semantic_relation), json_dumps(ids),
                 json_dumps(candidate_snapshot), float(semantic_confidence),
-                str(semantic_reason), local_now_text(),
+                str(semantic_reason), now,
             ),
         )
         self._commit_if_needed()
@@ -2216,8 +2228,10 @@ class UserMemoryDB:
         semantic_confidence: Optional[float] = None,
         semantic_reason: str = "",
         details: Optional[Dict[str, Any]] = None,
+        reference_timestamp: Any = None,
     ) -> Optional[int]:
         """Return the persisted relation event ID without changing claim status."""
+        now = local_now_text() if reference_timestamp is None else normalize_reference_timestamp(reference_timestamp)
         target_id = int(target_claim_id)
         trigger_id = int(trigger_claim_id)
         if target_id <= 0 or trigger_id <= 0 or target_id == trigger_id:
@@ -2265,7 +2279,7 @@ class UserMemoryDB:
                 float(semantic_confidence) if semantic_confidence is not None else None,
                 str(semantic_reason or ""),
                 json_dumps(details or {}),
-                local_now_text(),
+                now,
             ),
         )
         self._commit_if_needed()
@@ -2381,11 +2395,11 @@ class UserMemoryDB:
             )
         return item
 
-    def create_intent_object(self, *, object_type: str, payload: Dict[str, Any]) -> int:
+    def create_intent_object(self, *, object_type: str, payload: Dict[str, Any], reference_timestamp: Any = None) -> int:
         """Persist one normalized Goal, Plan, or Work item candidate."""
         table, columns = self._intent_object_spec(object_type)
         normalized_payload = self._intent_payload_to_row(object_type, payload)
-        now = local_now_text()
+        now = local_now_text() if reference_timestamp is None else normalize_reference_timestamp(reference_timestamp)
         values: List[Any] = []
         for column in columns:
             value = normalized_payload.get(column)
@@ -2410,9 +2424,11 @@ class UserMemoryDB:
         return int(cur.lastrowid)
 
     def update_intent_object(
-        self, *, object_type: str, object_id: int, payload: Dict[str, Any]
+        self, *, object_type: str, object_id: int, payload: Dict[str, Any],
+        reference_timestamp: Any = None,
     ) -> bool:
         """Update a known object without erasing fields absent from an event."""
+        now = local_now_text() if reference_timestamp is None else normalize_reference_timestamp(reference_timestamp)
         table, allowed_columns = self._intent_object_spec(object_type)
         normalized_payload = self._intent_payload_to_row(object_type, payload)
         existing_row = self._conn.execute(
@@ -2483,7 +2499,7 @@ class UserMemoryDB:
         if not assignments:
             return False
         assignments.append("updated_at = ?")
-        values.extend([local_now_text(), int(object_id)])
+        values.extend([now, int(object_id)])
         cur = self._conn.execute(
             f"UPDATE {table} SET {', '.join(assignments)} WHERE id = ?", values
         )
@@ -2587,8 +2603,10 @@ class UserMemoryDB:
         previous_payload: Optional[Dict[str, Any]] = None,
         lifecycle_observation_id: Optional[int] = None,
         effective_at: str = "",
+        reference_timestamp: Any = None,
     ) -> int:
         """Infer and record an applied mutation; an explicit type must match it."""
+        now = local_now_text() if reference_timestamp is None else normalize_reference_timestamp(reference_timestamp)
         if (event_type == "created" and previous_payload) or (
             event_type is not None and event_type != "created" and not previous_payload
         ):
@@ -2642,7 +2660,7 @@ class UserMemoryDB:
             (
                 int(intent_id), event_type, json_dumps(previous), json_dumps(updated),
                 source_signal_id, source_activity_id, lifecycle_observation_id,
-                str(effective_at or ""), local_now_text(),
+                str(effective_at or ""), now,
             ),
         )
         self._commit_if_needed()
@@ -2709,8 +2727,8 @@ class UserMemoryDB:
         return int(row["id"]) if row else None
 
 
-    def upsert_intent_evidence(self, evidence: Sequence[Dict[str, Any]]) -> int:
-        now = local_now_text()
+    def upsert_intent_evidence(self, evidence: Sequence[Dict[str, Any]], *, reference_timestamp: Any = None) -> int:
+        now = local_now_text() if reference_timestamp is None else normalize_reference_timestamp(reference_timestamp)
         changed = 0
         for item in evidence or []:
             object_type = str(item.get("object_type") or "").strip().lower()
@@ -3177,8 +3195,8 @@ class UserMemoryDB:
                 result[key].append(fact_id)
         return result
 
-    def upsert_user_claim_evidence(self, evidence: Sequence[Dict[str, Any]]) -> int:
-        now = local_now_text()
+    def upsert_user_claim_evidence(self, evidence: Sequence[Dict[str, Any]], *, reference_timestamp: Any = None) -> int:
+        now = local_now_text() if reference_timestamp is None else normalize_reference_timestamp(reference_timestamp)
         changed = 0
         for item in evidence or []:
             try:
@@ -3215,9 +3233,10 @@ class UserMemoryDB:
         rule_version: str,
         derivation_key: str,
         metadata: Optional[Dict[str, Any]] = None,
+        reference_timestamp: Any = None,
     ) -> int:
         """Create or reactivate one auditable proof for a derived claim."""
-        now = local_now_text()
+        now = local_now_text() if reference_timestamp is None else normalize_reference_timestamp(reference_timestamp)
         self._conn.execute(
             """
             INSERT INTO memory_user_claim_derivations (
@@ -3254,6 +3273,7 @@ class UserMemoryDB:
         derivation_id: int,
         premise_claim_ids: Sequence[int],
         premise_role: str = "support",
+        reference_timestamp: Any = None,
     ) -> int:
         """Replace one derivation's exact premise set atomically."""
         normalized = list(dict.fromkeys(
@@ -3263,7 +3283,7 @@ class UserMemoryDB:
         ))
         if int(derivation_id or 0) <= 0:
             return 0
-        now = local_now_text()
+        now = local_now_text() if reference_timestamp is None else normalize_reference_timestamp(reference_timestamp)
         self._conn.execute(
             "DELETE FROM memory_user_claim_premises WHERE derivation_id = ?",
             (int(derivation_id),),
@@ -3285,6 +3305,7 @@ class UserMemoryDB:
     def invalidate_user_claim_derivations_for_premises(
         self,
         premise_claim_ids: Sequence[int],
+        *, reference_timestamp: Any = None,
     ) -> List[int]:
         """Invalidate proofs whose changed premise is no longer active.
 
@@ -3315,7 +3336,7 @@ class UserMemoryDB:
         ).fetchall()
         if not rows:
             return []
-        now = local_now_text()
+        now = local_now_text() if reference_timestamp is None else normalize_reference_timestamp(reference_timestamp)
         derivation_ids = [int(row["id"]) for row in rows]
         derivation_placeholders = ",".join("?" for _ in derivation_ids)
         self._conn.execute(
@@ -3374,8 +3395,9 @@ class UserMemoryDB:
         confidence: float,
         importance: float,
         metadata: Optional[Dict[str, Any]],
+        reference_timestamp: Any = None,
     ) -> int:
-        now = local_now_text()
+        now = local_now_text() if reference_timestamp is None else normalize_reference_timestamp(reference_timestamp)
         keyword_values = (
             [
                 value
@@ -3421,13 +3443,14 @@ class UserMemoryDB:
                 "fact_id": [fact_id],
             }
             for entity_id in entity_ids or []
-        ])
+        ], reference_timestamp=reference_timestamp)
         self._commit_if_needed()
         return fact_id
 
     def upsert_entity_nodes(
         self,
         entities: Iterable[Any],
+        *, reference_timestamp: Any = None,
     ) -> Dict[str, int]:
         """Create entity nodes and conservatively promote their node types.
 
@@ -3437,7 +3460,7 @@ class UserMemoryDB:
         type.  That avoids a later weak observation silently relabelling an
         entity while still allowing the fact-store path to repair old nodes.
         """
-        now = local_now_text()
+        now = local_now_text() if reference_timestamp is None else normalize_reference_timestamp(reference_timestamp)
         allowed_types = {
             "PERSON", "ORGANIZATION", "LOCATION", "PRODUCT", "PROJECT",
             "TECHNOLOGY", "CONCEPT", "TOPIC", "PREFERENCE", "OTHER",
@@ -3481,9 +3504,9 @@ class UserMemoryDB:
         ).fetchall()
         return {str(row["name"]): int(row["id"]) for row in rows}
 
-    def add_entity_names(self, names: Iterable[str]) -> Dict[str, int]:
+    def add_entity_names(self, names: Iterable[str], *, reference_timestamp: Any = None) -> Dict[str, int]:
         """Compatibility wrapper for legacy name-only callers."""
-        return self.upsert_entity_nodes(names)
+        return self.upsert_entity_nodes(names, reference_timestamp=reference_timestamp)
 
     @staticmethod
     def normalize_owner_alias_key(value: str) -> str:
@@ -3520,13 +3543,14 @@ class UserMemoryDB:
         evidence_type: str,
         evidence_text: str,
         source_speaker: str,
+        reference_timestamp: Any = None,
     ) -> int:
         """Keep the strongest observed evidence without downgrading a confirmed alias."""
         alias_name = str(alias_name or "").strip()
         alias_key = self.normalize_owner_alias_key(alias_name)
         if not alias_key or status not in {"candidate", "confirmed"}:
             raise ValueError("invalid owner alias")
-        now = local_now_text()
+        now = local_now_text() if reference_timestamp is None else normalize_reference_timestamp(reference_timestamp)
         self._conn.execute(
             """
             INSERT INTO memory_owner_entity_aliases (
@@ -3640,6 +3664,7 @@ class UserMemoryDB:
     def insert_entity_memory_mappings(
         self,
         mappings: Sequence[Dict[str, Any]],
+        *, reference_timestamp: Any = None,
     ) -> int:
         """Merge fact links into one row per entity."""
         if not mappings:
@@ -3685,7 +3710,7 @@ class UserMemoryDB:
         if not grouped:
             return 0
 
-        now = local_now_text()
+        now = local_now_text() if reference_timestamp is None else normalize_reference_timestamp(reference_timestamp)
         changed_count = 0
         for entity_id, mapping in grouped.items():
             existing = self._conn.execute(

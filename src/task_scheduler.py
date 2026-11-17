@@ -12,6 +12,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence
 
 from task_execution_database import TaskExecutionDB
+from storage_utils import latest_timestamp
 
 if TYPE_CHECKING:
     from memory.memory_database import UserMemoryDB
@@ -487,13 +488,13 @@ class TaskScheduler:
             if "signal_ids" not in prepared:
                 prepared["signal_ids"] = self._select_pending_signal_ids(
                     "user_claim_signal",
-                    reference_timestamp=prepared["reference_timestamp"],
+                    reference_timestamp=prepared.get("reference_timestamp"),
                 )
         elif task_kind == "memory_user_intent_update":
             if "signal_ids" not in prepared:
                 prepared["signal_ids"] = self._select_pending_signal_ids(
                     "user_intent_signal",
-                    reference_timestamp=prepared["reference_timestamp"],
+                    reference_timestamp=prepared.get("reference_timestamp"),
                 )
         elif task_kind == "memory_user_observed_pattern_update":
             if "signal_ids" not in prepared:
@@ -575,12 +576,17 @@ class TaskScheduler:
     ) -> Dict[str, Any]:
         """Enqueue a non-preemptive task; lower priority numbers run first.
 
-        Proactive service defaults to 0 (highest), other tasks to 10. Tasks
-        with equal priority execute in submission order.
+        Proactive service defaults to 0 (highest), intent-event prediction to
+        5, and other tasks to 10. Equal priorities execute in submission order.
         """
         resolved_priority = priority
         if resolved_priority is None:
-            resolved_priority = 0 if task_kind == "user_proactive_policy_evaluation" else 10
+            if task_kind == "user_proactive_policy_evaluation":
+                resolved_priority = 0
+            elif task_kind == "user_prediction_update_from_intent_events":
+                resolved_priority = 5
+            else:
+                resolved_priority = 10
         if type(resolved_priority) is not int or resolved_priority < 0:
             raise ValueError("priority must be a nonnegative integer")
         # Enqueueing must not wait for the worker's long-running LLM handler.
@@ -600,7 +606,7 @@ class TaskScheduler:
                 reason = None
             if reason is not None:
                 return self._reject_locked(task_kind, task_id, reason)
-            task_payload = self._prepare_signal_task_payload(task_kind, payload)
+            task_payload = self._prepare_signal_task_payload(task_kind, dict(payload))
             task_completion_context = dict(completion_context or {})
             task = {
                 "kind": task_kind,
@@ -826,8 +832,8 @@ class TaskScheduler:
         error: Optional[BaseException] = None
         handler_started_at = time.monotonic()
         self._logger.info(
-            "scheduled task started task_kind=%s task_id=%s priority=%s queue_wait_ms=%.1f",
-            task_kind, task_id, task.get("priority"),
+            "scheduled task started task_kind=%s task_id=%s reference_timestamp=%s priority=%s queue_wait_ms=%.1f",
+            task_kind, task_id, task["payload"].get("reference_timestamp"), task.get("priority"),
             (handler_started_at - float(task["started_at"])) * 1000,
         )
         try:
@@ -944,7 +950,7 @@ class TaskScheduler:
                     "queued": False, "status": "skipped", "reason": "reassessment_retry_cooldown",
                 }
             else:
-                # Resolve real time at execution; preserve an explicit replay clock.
+                # Explicit replay time is forwarded; live tasks resolve their execution time.
                 reassessment_report = self.submit("user_prediction_reassessment", {
                     "reference_timestamp": timestamp,
                     "horizon_hours": self._user_prediction_horizon_hours,
@@ -998,11 +1004,12 @@ class TaskScheduler:
                 )
                 return {"status": "empty", "queued": False, "reason": "no_changed_claims"}
             versions = [(int(item["claim_id"]), int(item["generation"])) for item in items]
-            newest = max(items, key=lambda item: item["last_detected_at"])
             with self._worker_lock:
                 latest_input_time_end = self._latest_input_time_end
             # This is evidence time, not the time the host sent its signal.
-            reference_timestamp = newest["reference_timestamp"] or latest_input_time_end or None
+            reference_timestamp = latest_timestamp(
+                item["reference_timestamp"] for item in items
+            ) or latest_input_time_end or None
             self._logger.info(
                 "trigger_user_state_update submitting drain=%s pending_claims=%s "
                 "selected_claims=%s relation_events=%s",
@@ -1049,9 +1056,9 @@ class TaskScheduler:
         """Queue a normal-priority boundary; resolve signals when it executes."""
         return self.submit("memory_flush_signal_updates", {})
 
-    def _process_flush_signal_update_tasks(self) -> Dict[str, Any]:
+    def _process_flush_signal_update_tasks(self, *, reference_timestamp: Any = None) -> Dict[str, Any]:
         """Drain unreserved signals after preceding fact and activity tasks."""
-        signal_reports = self._submit_final_signal_update_tasks()
+        signal_reports = self._submit_final_signal_update_tasks(reference_timestamp=reference_timestamp)
         failed_task_kinds = [
             task_kind
             for task_kind, report in signal_reports.items()
@@ -1071,9 +1078,8 @@ class TaskScheduler:
             "failed_task_kinds": failed_task_kinds,
         }
 
-    def _submit_final_signal_update_tasks(self) -> Dict[str, Dict[str, Any]]:
-        with self._worker_lock:
-            resolved_timestamp = self._latest_input_time_end
+    def _submit_final_signal_update_tasks(self, *, reference_timestamp: Any = None) -> Dict[str, Dict[str, Any]]:
+        resolved_timestamp = reference_timestamp or self._latest_input_time_end
         reports: Dict[str, Dict[str, Any]] = {}
         for task_kind in self._SIGNAL_UPDATE_TASK_KINDS:
             payload: Dict[str, Any] = {
@@ -1211,7 +1217,10 @@ class TaskScheduler:
             if not report.get("queued"):
                 self._logger.warning("Activity intent lifecycle update not queued: %s", report)
         if self._task_enabled["memory_user_thread_update"]:
-            report = self.submit("memory_user_thread_update", {})
+            report = self.submit("memory_user_thread_update", {
+                "activity_ids": list(activity_ids),
+                "reference_timestamp": result.get("reference_timestamp"),
+            })
             if not report.get("queued"):
                 self._logger.warning("User thread update not queued: %s", report)
 
@@ -1230,7 +1239,8 @@ class TaskScheduler:
         # completed batches also need their state projection.
         report = self.submit(
             "user_state_update_from_user_threads",
-            {"thread_changes": changes, "runtime_context": {}},
+            {"thread_changes": changes, "runtime_context": {},
+             "reference_timestamp": result.get("reference_timestamp")},
             report_payload={
                 "thread_ids": [change["thread"]["id"] for change in changes],
                 "thread_event_ids": result.get("thread_event_ids") or [],

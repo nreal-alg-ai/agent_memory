@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from storage_utils import json_dumps, json_loads, local_now_text
+from storage_utils import local_now_text, normalize_reference_timestamp, json_dumps, json_loads
 
 
 class UserModelDB:
@@ -224,6 +224,7 @@ class UserModelDB:
         self, *, intent_id: int, user_entity_id: int, next_evaluate_at: str,
         reason: str, evaluated_at: str, intent_event_ids: Sequence[int],
         assessment_id: Optional[int] = None,
+        reference_timestamp: Any = None,
     ) -> int:
         """Create a deferred direction, or update the same record by its stable ID."""
         event_ids = sorted({int(value) for value in intent_event_ids})
@@ -238,7 +239,7 @@ class UserModelDB:
             ).fetchone()
             if existing and existing["user_entity_id"] != int(user_entity_id):
                 raise ValueError("Cannot replace another user's reassessment schedule")
-            now = local_now_text()
+            now = local_now_text() if reference_timestamp is None else normalize_reference_timestamp(reference_timestamp)
             if assessment_id is not None:
                 cursor = self._conn.execute(
                     """UPDATE user_prediction_reassessment_schedule SET next_evaluate_at = ?, reason = ?,
@@ -321,8 +322,9 @@ class UserModelDB:
         self._commit_if_needed()
         return cursor.rowcount
 
-    def save_user_prediction(self, payload: Dict[str, Any]) -> Tuple[int, str]:
+    def save_user_prediction(self, payload: Dict[str, Any], *, reference_timestamp: Any = None) -> Tuple[int, str]:
         """Deduplicate an exact write across all statuses; never refresh an existing forecast."""
+        now = local_now_text() if reference_timestamp is None else normalize_reference_timestamp(reference_timestamp)
         owner_id = int(payload["user_entity_id"])
         prediction_key = str(payload["prediction_key"])
         basis = payload.get("basis") or {}
@@ -363,7 +365,7 @@ class UserModelDB:
                         str(payload["likelihood_band"]),
                         json_dumps(payload.get("uncertainties") or []),
                         str(payload.get("rationale") or ""),
-                        json_dumps(payload.get("basis") or {}), local_now_text(),
+                        json_dumps(payload.get("basis") or {}), now,
                     ),
                 )
                 prediction_id, save_action = int(cursor.lastrowid), "created"
@@ -375,11 +377,12 @@ class UserModelDB:
             if intent is not None:
                 self.upsert_user_prediction_evidence([{
                     "prediction_id": prediction_id, "intent_id": intent["id"],
-                }])
+                }], reference_timestamp=reference_timestamp)
         return prediction_id, save_action
 
-    def upsert_user_prediction_evidence(self, evidence: Sequence[Dict[str, Any]]) -> int:
+    def upsert_user_prediction_evidence(self, evidence: Sequence[Dict[str, Any]], *, reference_timestamp: Any = None) -> int:
         """Link predictions to memory-db intents through logical IDs, without duplicates."""
+        now = local_now_text() if reference_timestamp is None else normalize_reference_timestamp(reference_timestamp)
         added = 0
         with self.transaction():
             for item in evidence:
@@ -389,7 +392,7 @@ class UserModelDB:
                 cursor = self._conn.execute(
                     """INSERT OR IGNORE INTO user_prediction_evidence
                     (prediction_id, intent_id, created_at) VALUES (?, ?, ?)""",
-                    (prediction_id, intent_id, local_now_text()),
+                    (prediction_id, intent_id, now),
                 )
                 added += cursor.rowcount
         return added
@@ -437,7 +440,7 @@ class UserModelDB:
         return [predictions[prediction_id] for prediction_id in sorted(predictions)]
 
     def expire_user_predictions(
-        self, *, user_entity_id: int, as_of: str,
+        self, *, user_entity_id: int, evaluation_time: str,
     ) -> Dict[str, List[int]]:
         """Expire ended forecasts and close their unprovided services atomically.
 
@@ -446,9 +449,10 @@ class UserModelDB:
         """
         owner_id = int(user_entity_id)
         if owner_id <= 0 or self._conn.execute(
-            "SELECT julianday(?)", (as_of,),
+            "SELECT julianday(?)", (evaluation_time,),
         ).fetchone()[0] is None:
             raise ValueError("Invalid prediction expiration owner or reference time")
+        evaluation_time = normalize_reference_timestamp(evaluation_time)
         due_query = """SELECT id FROM user_predictions
             WHERE user_entity_id = ? AND status = 'pending'
               AND julianday(window_end) <= julianday(?)"""
@@ -459,10 +463,10 @@ class UserModelDB:
             )"""
         service_filter = f"""user_entity_id = ? AND status IN ('ready', 'waiting')
             AND prediction_id IN ({service_source_query})"""
-        service_params = (owner_id, owner_id, as_of)
+        service_params = (owner_id, owner_id, evaluation_time)
         with self.transaction():
             prediction_ids = [int(row["id"]) for row in self._conn.execute(
-                f"{due_query} ORDER BY id", (owner_id, as_of),
+                f"{due_query} ORDER BY id", (owner_id, evaluation_time),
             ).fetchall()]
             service_ids = [int(row["id"]) for row in self._conn.execute(
                 f"SELECT id FROM user_proactive_services WHERE {service_filter} ORDER BY id",
@@ -474,19 +478,20 @@ class UserModelDB:
                 "UPDATE user_proactive_services SET status = 'expired', "
                 "reason = ?, next_evaluate_at = NULL, recheck_condition = '', "
                 f"evaluated_at = ?, updated_at = ? WHERE {service_filter}",
-                ("Source prediction window ended", as_of, local_now_text(), *service_params),
+                ("Source prediction window ended", evaluation_time, evaluation_time, *service_params),
             )
             self._conn.execute(
                 "UPDATE user_predictions SET status = 'expired', resolved_at = ? "
                 f"WHERE id IN ({due_query})",
-                (as_of, owner_id, as_of),
+                (evaluation_time, owner_id, evaluation_time),
             )
         return {"expired_prediction_ids": prediction_ids, "expired_service_ids": service_ids}
 
     def invalidate_user_predictions(
-        self, prediction_ids: Sequence[int], *, user_entity_id: int, as_of: Optional[str] = None,
+        self, prediction_ids: Sequence[int], *, user_entity_id: int, evaluation_time: Optional[str] = None,
     ) -> List[int]:
         """Invalidate only specified pending forecasts, preserving content and basis."""
+        evaluation_time = local_now_text() if evaluation_time is None else normalize_reference_timestamp(evaluation_time)
         ids = sorted({int(value) for value in prediction_ids if int(value) > 0})
         invalidated = []
         with self.transaction():
@@ -502,7 +507,7 @@ class UserModelDB:
                 self._conn.execute(
                     "UPDATE user_predictions SET status = 'invalidated', resolved_at = ? "
                     f"WHERE user_entity_id = ? AND id IN ({placeholders}) AND status = 'pending'",
-                    [as_of or local_now_text(), *params],
+                    [evaluation_time, *params],
                 )
                 invalidated.extend(int(row["id"]) for row in rows)
         return invalidated
@@ -515,14 +520,14 @@ class UserModelDB:
         return item
 
     def get_active_user_predictions(
-        self, *, user_entity_id: int, as_of: str, limit: int = 100,
+        self, *, user_entity_id: int, evaluation_time: str, limit: int = 100,
     ) -> List[Dict[str, Any]]:
         rows = self._conn.execute(
             """SELECT * FROM user_predictions
             WHERE user_entity_id = ? AND status = 'pending'
               AND julianday(window_end) > julianday(?)
             ORDER BY window_start, id LIMIT ?""",
-            (int(user_entity_id), str(as_of), max(1, int(limit))),
+            (int(user_entity_id), str(evaluation_time), max(1, int(limit))),
         ).fetchall()
         return [self._prediction_row_to_api(row) for row in rows]
 
@@ -597,6 +602,7 @@ class UserModelDB:
 
     def save_user_proactive_service(
         self, payload: Dict[str, Any],
+        *, reference_timestamp: Any = None,
     ) -> Tuple[int, str]:
         """Create or update a service, never a delivery or execution record."""
         prediction_id, owner_id = int(payload["prediction_id"]), int(payload["user_entity_id"])
@@ -627,7 +633,7 @@ class UserModelDB:
                 )
             }
             fields["constraints"] = json_dumps(payload["constraints"])
-            now = local_now_text()
+            now = local_now_text() if reference_timestamp is None else normalize_reference_timestamp(reference_timestamp)
             if existing:
                 if existing["status"] in {"cancelled", "expired"}:
                     raise ValueError("Closed services cannot be silently reactivated")
@@ -671,8 +677,9 @@ class UserModelDB:
         item["constraints"] = json_loads(item["constraints"], [])
         return item
 
-    def insert_user_proactive_service_feedback(self, payload: Dict[str, Any]) -> int:
+    def insert_user_proactive_service_feedback(self, payload: Dict[str, Any], *, reference_timestamp: Any = None) -> int:
         """Append a report, not a prediction verdict or an intent completion."""
+        now = local_now_text() if reference_timestamp is None else normalize_reference_timestamp(reference_timestamp)
         cursor = self._conn.execute(
             """INSERT INTO user_proactive_service_feedback_events (
                 service_id, execution_id, execution_status, user_response,
@@ -681,7 +688,7 @@ class UserModelDB:
             (payload["service_id"], payload["execution_id"], payload["execution_status"],
              payload["user_response"], payload["user_feedback"],
              json_dumps(payload["execution_result"]), payload["agent_note"],
-             json_dumps(payload["context"]), payload["observed_at"], local_now_text()),
+             json_dumps(payload["context"]), payload["observed_at"], now),
         )
         self._commit_if_needed()
         return int(cursor.lastrowid)
@@ -749,23 +756,24 @@ class UserModelDB:
 
     def close_user_proactive_services(
         self, *, prediction_id: int, user_entity_id: int, status: str, reason: str,
-        as_of: str, expired_only: bool = False,
+        evaluation_time: str, expired_only: bool = False,
     ) -> List[int]:
         """Close unprovided services without rewriting their original content."""
+        evaluation_time = normalize_reference_timestamp(evaluation_time)
         if status not in {"cancelled", "expired"}:
             raise ValueError("Unsupported closed service status")
         clauses = ["prediction_id = ?", "user_entity_id = ?", "status IN ('ready', 'waiting')"]
         params: List[Any] = [int(prediction_id), int(user_entity_id)]
         if expired_only:
             clauses.append("julianday(expires_at) <= julianday(?)")
-            params.append(str(as_of))
+            params.append(str(evaluation_time))
         where = " AND ".join(clauses)
         with self.transaction():
             rows = self._conn.execute(f"SELECT id FROM user_proactive_services WHERE {where}", params).fetchall()
             self._conn.execute(
                 "UPDATE user_proactive_services SET status = ?, reason = ?, next_evaluate_at = NULL, recheck_condition = '', "
                 f"evaluated_at = ?, updated_at = ? WHERE {where}",
-                [status, str(reason), str(as_of), local_now_text(), *params],
+                [status, str(reason), evaluation_time, evaluation_time, *params],
             )
         return [int(row["id"]) for row in rows]
 
@@ -923,6 +931,7 @@ class UserModelDB:
 
     def replace_user_state_claim_evidence(
         self, *, state_id: int, evidence: Sequence[Dict[str, Any]],
+        reference_timestamp: Any = None,
     ) -> None:
         """Replace claim evidence after a full claim-only state resolution."""
         self._conn.execute(
@@ -931,7 +940,7 @@ class UserModelDB:
         )
         self.upsert_user_state_evidence([
             {**item, "state_id": int(state_id)} for item in evidence
-        ])
+        ], reference_timestamp=reference_timestamp)
         self._commit_if_needed()
 
     def upsert_user_state(
@@ -950,9 +959,10 @@ class UserModelDB:
         last_observed_at: str = "",
         metadata: Optional[Dict[str, Any]] = None,
         target_state_id: Optional[int] = None,
+        reference_timestamp: Any = None,
     ) -> tuple[int, bool, Optional[Dict[str, Any]]]:
         """Create or incrementally update one state and return its old value."""
-        now = local_now_text()
+        now = local_now_text() if reference_timestamp is None else normalize_reference_timestamp(reference_timestamp)
         target_id = int(target_state_id or 0)
         topic = str(state_topic or "").strip()
         if not topic:
@@ -1032,8 +1042,8 @@ class UserModelDB:
         self._commit_if_needed()
         return int(cur.lastrowid), True, None
 
-    def upsert_user_state_evidence(self, evidence: Sequence[Dict[str, Any]]) -> int:
-        now = local_now_text()
+    def upsert_user_state_evidence(self, evidence: Sequence[Dict[str, Any]], *, reference_timestamp: Any = None) -> int:
+        now = local_now_text() if reference_timestamp is None else normalize_reference_timestamp(reference_timestamp)
         changed = 0
         for item in evidence or []:
             try:
@@ -1081,7 +1091,9 @@ class UserModelDB:
         decision_source: str,
         confidence: float,
         reason: str,
+        reference_timestamp: Any = None,
     ) -> int:
+        now = local_now_text() if reference_timestamp is None else normalize_reference_timestamp(reference_timestamp)
         normalized_claim_ids: List[int] = []
         for value in trigger_claim_ids or []:
             try:
@@ -1104,7 +1116,7 @@ class UserModelDB:
                 json_dumps(sorted(set(normalized_claim_ids))),
                 json_dumps(list(trigger_intent_objects or [])), str(effective_at or ""),
                 str(decision_source or ""), float(confidence), str(reason or ""),
-                local_now_text(),
+                now,
             ),
         )
         self._commit_if_needed()

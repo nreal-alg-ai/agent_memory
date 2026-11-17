@@ -14,6 +14,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Sequence
 
 from semantic_domains import SEMANTIC_DOMAINS
+from storage_utils import local_now_text
 from prompts_en import (
     USER_STATE_UPDATE_FROM_USER_THREAD_PROMPT_EN,
     USER_STATE_UPDATE_FROM_USER_CLAIM_PROMPT_EN,
@@ -448,6 +449,7 @@ class UserStateResolver:
                     report.update(self.save_user_state_update_operations(
                         operations=operations, reference_time=update_input["reference_time"],
                         decision_source="user_thread_situational_state_v1",
+                        reference_timestamp=reference_timestamp,
                     ))
         self._log_update(report, task_kind=task_kind)
         return report
@@ -608,6 +610,7 @@ class UserStateResolver:
                         operations=operations,
                         reference_time=update_input["reference_time"],
                         decision_source="user_observed_pattern_state_v1",
+                        reference_timestamp=reference_timestamp,
                     )
                 for key in ("operation_count", "created", "reinforced", "revised", "weakened", "expired"):
                     report[key] += int(applied.get(key) or 0)
@@ -1262,6 +1265,7 @@ class UserStateResolver:
                     reference_time=update_input["reference_time"],
                     merge_claim_evidence=True,
                     decision_source=self.CLAIM_RESOLVER_VERSION,
+                    reference_timestamp=reference_timestamp,
                 )
             for key in ("operation_count", "created", "reinforced", "revised", "weakened", "expired"):
                 report[key] += int(applied.get(key) or 0)
@@ -1292,6 +1296,7 @@ class UserStateResolver:
         reference_time: Optional[Any] = None,
         merge_claim_evidence: bool = False,
         decision_source: Optional[str] = None,
+        reference_timestamp: Any = None,
     ) -> Dict[str, Any]:
         """Persist validated operations and their evidence/event trail."""
         effective_at = self._timestamp_text(reference_time)
@@ -1331,6 +1336,7 @@ class UserStateResolver:
                     "last_operation": action,
                     "state_domain": str(operation["state_domain"]),
                 },
+                reference_timestamp=reference_timestamp,
             )
             current = self._user_model_db.get_user_states_by_ids([state_id])[0]
             evidence = [
@@ -1343,9 +1349,10 @@ class UserStateResolver:
                 )
                 self._user_model_db.replace_user_state_claim_evidence(
                     state_id=state_id, evidence=claim_evidence,
+                    reference_timestamp=reference_timestamp,
                 )
             else:
-                self._user_model_db.upsert_user_state_evidence(evidence)
+                self._user_model_db.upsert_user_state_evidence(evidence, reference_timestamp=reference_timestamp)
             self._user_model_db.record_user_state_event(
                 state_id=state_id,
                 operation=action,
@@ -1370,6 +1377,7 @@ class UserStateResolver:
                 decision_source=decision_source or self.RESOLVER_VERSION,
                 confidence=float(operation["confidence"]),
                 reason=str(operation.get("reason") or ""),
+                reference_timestamp=reference_timestamp,
             )
             report["operation_count"] += 1
             report["state_ids"].append(state_id)
@@ -1681,4 +1689,4 @@ class UserStateResolver:
     def _timestamp_text(value: Optional[Any]) -> str:
         if isinstance(value, datetime):
             return value.isoformat()
-        return str(value or "").strip() or datetime.now().astimezone().isoformat()
+        return str(value or "").strip() or local_now_text()
