@@ -2486,23 +2486,13 @@ class MemoryNodeManager:
         ))
         if not selected_ids:
             return {"status": "empty", "signal_count": 0,
-                    "new_pattern_ids": [], "pattern_relation_event_ids": [],
+                    "pattern_event_ids": [],
                     "_completed_signal_ids": []}
         started_at = time.monotonic()
-        event_cursor = self._db.get_user_observed_pattern_event_cursor()
         update = self._update_user_observed_patterns_from_action_signals(
             selected_ids,
         )
         completed = bool(update.get("completed"))
-        pattern_relation_event_ids = [int(event["id"])
-            for event in self._db.get_user_observed_pattern_events_for_signal_ids(
-                update.get("reviewed_signal_ids") or []
-            )
-            # Old unassigned evidence can have past refines/contradicts events.
-            # Forward fresh cluster events or replay events for this task's own
-            # inputs, not unrelated historical events from the discovery pool.
-            if int(event["id"]) > event_cursor or set(selected_ids).intersection(event["support_signal_ids"])
-        ] if completed else []
         report = {
             "status": "ok" if completed else "failed",
             "signal_count": len(selected_ids),
@@ -2514,8 +2504,7 @@ class MemoryNodeManager:
             ),
             "user_observed_patterns_created": int(update.get("created") or 0),
             "user_observed_patterns_updated": int(update.get("updated") or 0),
-            "new_pattern_ids": update.get("new_pattern_ids") or [],
-            "pattern_relation_event_ids": pattern_relation_event_ids,
+            "pattern_event_ids": update["pattern_event_ids"] if completed else [],
             "reference_timestamp": reference_timestamp,
             "total_elapsed_ms": round((time.monotonic() - started_at) * 1000, 2),
             "_completed_signal_ids": update.get("processed_signal_ids", []) if completed else [],
@@ -4716,7 +4705,30 @@ class MemoryNodeManager:
         self,
         candidate: Dict[str, Any],
     ) -> List[Dict[str, Any]]:
-        """Bound relation candidates to one entity and compatible claim type."""
+        """Retrieve text-related claims before using metadata as tie-breakers."""
+        ignored_terms = _STOPWORDS | {
+            "用户", "本人", "认为", "表示", "说明", "指出", "主张", "提出",
+            "觉得", "希望", "倾向", "关于", "针对", "当前", "本次", "这个",
+            "那个", "这些", "那些", "可以", "需要", "应该", "比较",
+            "user", "self", "think", "thinks", "believe", "believes",
+            "say", "says", "said", "state", "states", "stated", "prefer", "prefers",
+        }
+
+        def content_terms(text: Any) -> set[str]:
+            clean = re.sub(
+                r"speaker_用户本人|用户本人|\buser[ _]self\b|\bthe user\b",
+                " ", str(text or ""), flags=re.IGNORECASE,
+            )
+            return {
+                term for term in self._lexical_search_terms_for_text(
+                    clean, limit=max(32, len(clean)), preserve_phrase=False,
+                )
+                if len(term) > 1 and term not in ignored_terms and not term.isdecimal()
+            }
+
+        candidate_terms = content_terms(candidate.get("claim_text"))
+        if not candidate_terms:
+            return []
         rows = self._db.get_user_claims(
             subject_entity_id=int(candidate["subject_entity_id"]),
             claim_type=str(candidate["claim_type"]),
@@ -4725,45 +4737,28 @@ class MemoryNodeManager:
         )
         predicate = str(candidate.get("predicate") or "")
         object_entity_id = int(candidate.get("object_entity_id") or 0)
-        rows.sort(
-            key=lambda row: (
-                str(row.get("predicate") or "") != predicate,
-                int(row.get("object_entity_id") or 0) != object_entity_id,
-                -self._user_claim_origin_priority(row.get("claim_origin")),
-                -float(row.get("confidence") or 0.0),
+        ranked: List[Tuple[float, Dict[str, Any]]] = []
+        for row in rows:
+            existing_terms = content_terms(row.get("claim_text"))
+            shared_count = len(candidate_terms & existing_terms)
+            if not shared_count:
+                continue
+            # A short claim may refine one part of a longer claim. Require
+            # overlap within the shorter text, not similarity of full lengths.
+            if shared_count / min(len(candidate_terms), len(existing_terms)) < 0.2:
+                continue
+            text_score = 2.0 * shared_count / (len(candidate_terms) + len(existing_terms))
+            ranked.append((text_score, row))
+        ranked.sort(
+            key=lambda pair: (
+                -pair[0],
+                str(pair[1].get("predicate") or "") != predicate,
+                int(pair[1].get("object_entity_id") or 0) != object_entity_id,
+                -self._user_claim_origin_priority(pair[1].get("claim_origin")),
+                -float(pair[1].get("confidence") or 0.0),
             )
         )
-        return rows[:24]
-
-    def _finalize_user_claim_relation_decision(
-        self,
-        candidate: Dict[str, Any],
-        target: Optional[Dict[str, Any]],
-        semantic_decision: Dict[str, Any],
-    ) -> Dict[str, Any]:
-        """Translate text-only claim semantics into audit/evidence actions.
-
-        This layer deliberately does not decide which claim is currently true.
-        The UserStateResolver applies origin, freshness, and context weights at
-        read time; reconciliation only records the semantic relation.
-        """
-        semantic_relation = str(
-            semantic_decision.get("semantic_relation")
-            or semantic_decision.get("relation")
-            or "unrelated"
-        )
-        decision = {
-            **semantic_decision,
-            "semantic_relation": semantic_relation,
-            "target_evidence_role": "",
-        }
-        if not target:
-            return decision
-        if semantic_relation in {"duplicate", "supports", "refines"}:
-            decision["target_evidence_role"] = "support"
-        elif semantic_relation in {"contradicts", "supersedes"}:
-            decision["target_evidence_role"] = "counterexample"
-        return decision
+        return [row for _, row in ranked[:24]]
 
     def _classify_user_claim_relations(
         self,
@@ -4783,6 +4778,7 @@ class MemoryNodeManager:
             {
                 "candidate_claim_index": index,
                 "candidate_claim": {
+                    "claim_type": candidate["claim_type"],
                     "claim_text": candidate.get("claim_text") or "",
                 },
                 "related_existing_claims": [
@@ -4795,19 +4791,17 @@ class MemoryNodeManager:
             }
             for index, candidate in enumerate(candidates)
         ]
+        prompt = prompt_template.replace("{candidate_claim_groups}", "[\n" + ",\n".join(
+            json.dumps(group, ensure_ascii=False, separators=(",", ":"))
+            for group in candidate_claim_groups
+        ) + "\n]")
         raw = self._llm_client.call_llm(
-            prompt_template.replace("{candidate_claim_groups}", json.dumps(
-                candidate_claim_groups,
-                ensure_ascii=False, indent=2,
-            )), stage_name='memory_user_claim_reconciliation'
+            prompt, stage_name='memory_user_claim_reconciliation',
         )
         parsed = self._llm_client.parse_json_object_from_llm_text(raw or "", stage_name='memory_user_claim_reconciliation')
         if not parsed or not isinstance(parsed.get("decisions"), list):
             return [[] for _candidate in candidates]
         else:
-            allowed_relations = {
-                "duplicate", "supports", "contradicts", "refines", "supersedes",
-            }
             semantic_resolved: List[List[Dict[str, Any]]] = [
                 [] for _candidate in candidates
             ]
@@ -4820,6 +4814,9 @@ class MemoryNodeManager:
                     continue
                 if index < 0 or index >= len(candidates):
                     continue
+                allowed_relations = {"contradicts", "refines", "supersedes"}
+                if candidates[index]["claim_type"] != "judgment":
+                    allowed_relations.update({"duplicate", "supports"})
                 raw_relations = raw_decision.get("relations")
                 if not isinstance(raw_relations, list):
                     continue
@@ -4852,26 +4849,7 @@ class MemoryNodeManager:
                         )[:240],
                     }
                 semantic_resolved[index] = list(parsed_by_id.values())
-        finalized: List[List[Dict[str, Any]]] = []
-        for index, candidate in enumerate(candidates):
-            candidate_decisions: List[Dict[str, Any]] = []
-            for semantic_decision in semantic_resolved[index]:
-                target_id = semantic_decision.get("existing_claim_id")
-                target = next(
-                    (
-                        claim for claim in related_by_index.get(index, [])
-                        if int(claim.get("id") or 0) == int(target_id or 0)
-                    ),
-                    None,
-                )
-                if target:
-                    candidate_decisions.append(
-                        self._finalize_user_claim_relation_decision(
-                            candidate, target, semantic_decision,
-                        )
-                    )
-            finalized.append(candidate_decisions)
-        return finalized
+        return semantic_resolved
 
     def _write_user_claim_evidence(
         self,
@@ -4880,7 +4858,6 @@ class MemoryNodeManager:
         support_ids: Sequence[int],
         facts_by_id: Dict[int, Dict[str, Any]],
         confidence: float,
-        support_role: str = "support",
     ) -> None:
         evidence: List[Dict[str, Any]] = []
         for fact_id in support_ids:
@@ -4891,7 +4868,7 @@ class MemoryNodeManager:
                 "claim_id": claim_id,
                 "evidence_type": "fact",
                 "evidence_id": int(fact_id),
-                "role": support_role,
+                "role": "support",
                 "weight": confidence,
                 "observed_at": fact.get("event_time_key")
                 or fact.get("dialogue_time_key") or "",
@@ -4962,7 +4939,7 @@ class MemoryNodeManager:
         *,
         facts_by_id: Dict[int, Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
-        """Resolve new candidate claims before they become durable claims."""
+        """Save claims with their own facts and record relations without changing old evidence."""
         candidate_subject_ids = [
             candidate.get("subject_entity_id") for candidate in candidates or []
         ]
@@ -5025,9 +5002,6 @@ class MemoryNodeManager:
                 target = target_for(decision)
                 if not target:
                     continue
-                target_evidence_role = str(
-                    decision.get("target_evidence_role") or ""
-                )
                 relation_event_id = self._record_user_claim_relation(
                     target=target,
                     trigger_claim_id=claim_id,
@@ -5040,14 +5014,6 @@ class MemoryNodeManager:
                         **decision,
                         "relation_event_id": int(relation_event_id),
                     })
-                if target_evidence_role:
-                    self._write_user_claim_evidence(
-                        claim_id=int(target["id"]),
-                        support_ids=support_ids,
-                        facts_by_id=facts_by_id,
-                        confidence=float(candidate.get("confidence") or 0.0),
-                        support_role=target_evidence_role,
-                    )
             applied.append({
                 "claim": candidate, "claim_id": claim_id, "created": created,
                 "effective_origin": candidate_origin,
@@ -5953,10 +5919,10 @@ class MemoryNodeManager:
         """Cluster unassigned evidence, then maintain or discover patterns per cluster."""
         report: Dict[str, Any] = {
             "candidate_count": 0, "updated": 0, "created": 0,
-            "new_pattern_ids": [], "completed": True,
+            "completed": True,
             "similar_action_batches": 0, "relations_recorded": 0,
             "direct_support_signal_count": 0, "processed_signal_ids": [],
-            "reviewed_signal_ids": [], "skipped_activity_gate_count": 0,
+            "pattern_event_ids": [], "skipped_activity_gate_count": 0,
         }
         unassigned_signals = self._db.get_unassigned_user_action_signals()
         seed_signals = self._db.get_user_action_signals_by_ids(signal_ids)
@@ -5979,11 +5945,9 @@ class MemoryNodeManager:
         )
         report["similar_action_batches"] = len(clusters)
         supported_signal_ids: set[int] = set()
-        reviewed_ids: set[int] = set()
         discovery_clusters: List[Dict[str, Any]] = []
         for cluster_id, (cluster, new_signal_ids) in enumerate(clusters):
             contexts = self._user_action_signal_activity_contexts(cluster)
-            reviewed_ids.update(int(row["signal_id"]) for row in cluster)
             related = self._retrieve_similar_user_observed_patterns(
                 signals=cluster, signals_by_id=pool,
                 vectors=vectors,
@@ -5999,6 +5963,7 @@ class MemoryNodeManager:
                 supported_signal_ids.update(direct_update["supported_signal_ids"])
                 report["updated"] += len(direct_update["updated_pattern_ids"])
                 report["relations_recorded"] += direct_update["relations_recorded"]
+                report["pattern_event_ids"].extend(direct_update.get("pattern_event_ids") or [])
                 cluster_matched = bool(direct_update["supported_signal_ids"])
             activity_count = self._user_action_cluster_activity_count(cluster, contexts)
             self._logger.log_json_format("memory_user_observed_pattern_update", "cluster_evaluated", {
@@ -6042,15 +6007,16 @@ class MemoryNodeManager:
                         report.update(completed=False, error="invalid_pattern_reconciliation")
                         return report
                     report["created"] += int(applied["created"])
-                    report["updated"] += int(not applied["created"])
+                    report["updated"] += len(applied["updated_pattern_ids"])
                     report["relations_recorded"] += int(applied["relations_recorded"])
-                    if applied["created"]:
-                        report["new_pattern_ids"].append(int(applied["pattern_id"]))
+                    report["pattern_event_ids"].extend(applied["pattern_event_ids"])
+                    changed_ids = set(applied["updated_pattern_ids"])
+                    if applied["pattern_id"] is not None:
+                        changed_ids.add(int(applied["pattern_id"]))
                     existing_by_id.update({int(row["id"]): row for row in
-                        self._db.get_user_observed_patterns_by_ids([applied["pattern_id"]])})
+                        self._db.get_user_observed_patterns_by_ids(sorted(changed_ids))})
         report["direct_support_signal_count"] = len(supported_signal_ids)
-        report["reviewed_signal_ids"] = sorted(reviewed_ids)
-        report["new_pattern_ids"] = sorted(set(report["new_pattern_ids"]))
+        report["pattern_event_ids"] = sorted(set(report["pattern_event_ids"]))
         return report
 
     def _update_observed_patterns_from_new_action_signals(
@@ -6060,7 +6026,7 @@ class MemoryNodeManager:
         """Classify a cluster's unassigned evidence against existing patterns."""
         result: Dict[str, Any] = {
             "supported_signal_ids": set(), "updated_pattern_ids": set(),
-            "relations_recorded": 0,
+            "relations_recorded": 0, "pattern_event_ids": [],
         }
         if not new_signals or not existing_patterns:
             return result
@@ -6176,16 +6142,17 @@ class MemoryNodeManager:
                     result["supported_signal_ids"].add(signal_id)
                     if not added:
                         continue
-                result["relations_recorded"] += int(
-                    self._db.record_user_observed_pattern_relation(
-                        target_pattern_id=pattern_id, trigger_pattern_id=None,
-                        semantic_relation=decision["semantic_relation"],
-                        support_signal_ids=[signal_id],
-                        candidate_snapshot=snapshot,
-                        semantic_confidence=decision["confidence"],
-                        semantic_reason=decision["reason"],
-                    )
+                event_id = self._record_user_observed_pattern_event(
+                    target_pattern_id=pattern_id, trigger_pattern_id=None,
+                    semantic_relation=decision["semantic_relation"],
+                    support_signal_ids=[signal_id],
+                    candidate_snapshot=snapshot,
+                    semantic_confidence=decision["confidence"],
+                    semantic_reason=decision["reason"],
                 )
+                if event_id is not None:
+                    result["relations_recorded"] += 1
+                    result["pattern_event_ids"].append(event_id)
         return result
 
     def _user_action_vectors_for_signals(
@@ -6296,10 +6263,16 @@ class MemoryNodeManager:
     def _user_action_cluster_activity_count(
         signals: Sequence[Dict[str, Any]], contexts: Dict[int, List[Dict[str, Any]]],
     ) -> int:
-        """An ambiguity spanning activities must not turn one signal into many observations."""
-        associations = [contexts.get(int(row["signal_id"]), []) for row in signals]
-        activity_ids = {int(activity["id"]) for group in associations for activity in group}
-        return min(len(activity_ids), sum(bool(group) for group in associations))
+        """Count activity windows by ID, excluding ambiguous signal associations."""
+        activity_ids: Set[int] = set()
+        for signal in signals:
+            associated_ids = {
+                int(activity["id"])
+                for activity in contexts.get(int(signal["signal_id"]), [])
+            }
+            if len(associated_ids) == 1:
+                activity_ids.update(associated_ids)
+        return len(activity_ids)
 
     def _fact_user_claim_signal_mapping_updates(
         self,
@@ -6659,11 +6632,20 @@ class MemoryNodeManager:
             "support_signal_ids": signal_ids,
         }
 
+    def _record_user_observed_pattern_event(self, **event: Any) -> Optional[int]:
+        """Capture a new event ID in the FIFO writer's transaction; duplicates return None."""
+        with self._db.transaction():
+            if not self._db.record_user_observed_pattern_event(**event):
+                return None
+            # The DB write API returns bool. Read the inserted ID immediately,
+            # before another event can be committed, without scanning signal history.
+            return self._db.get_user_observed_pattern_event_cursor()
+
     def _reconcile_user_observed_pattern(
         self, pattern: Dict[str, Any], *, subject_entity_id: int,
         existing_patterns: Optional[Sequence[Dict[str, Any]]] = None,
     ) -> Optional[Dict[str, Any]]:
-        """Reuse an equivalent pattern or create a new one with relation events."""
+        """Preserve semantic changes, then apply each candidate-to-pattern relation."""
         existing = list(existing_patterns) if existing_patterns is not None else self._db.get_user_observed_patterns(
             subject_entity_id=subject_entity_id, limit=200,
         )
@@ -6680,86 +6662,84 @@ class MemoryNodeManager:
         if relations is None:
             return None
         existing_by_id = {int(row["id"]): row for row in related}
-        merge_relations = [
-            item for item in relations
-            if item["semantic_relation"] in {"duplicate", "supports"}
-        ]
-        if merge_relations:
-            selected = max(merge_relations, key=lambda item: (
-                item["confidence"],
-                float(existing_by_id[item["existing_pattern_id"]].get("confidence") or 0.0),
-            ))
-            pattern_id = selected["existing_pattern_id"]
-            with self._db.transaction():
-                added = self._db.add_user_observed_pattern_signals(
-                    pattern_id=pattern_id, signal_ids=pattern["support_signal_ids"],
-                )
-                self._db.refresh_user_observed_pattern(
-                    pattern_id=pattern_id, confidence=pattern["confidence"],
-                )
-                recorded_count = 0
-                for relation in relations:
-                    relation_type = relation["semantic_relation"]
-                    target_id = relation["existing_pattern_id"]
-                    if relation_type == "unrelated" or (
-                        relation_type in {"duplicate", "supports"}
-                        and (target_id != pattern_id or not added)
-                    ):
-                        continue
-                    recorded_count += int(self._db.record_user_observed_pattern_relation(
-                        target_pattern_id=target_id,
-                        trigger_pattern_id=(pattern_id if target_id != pattern_id else None),
-                        semantic_relation=relation_type,
-                        support_signal_ids=pattern["support_signal_ids"],
-                        candidate_snapshot=pattern,
-                        semantic_confidence=relation["confidence"],
-                        semantic_reason=relation["reason"],
-                    ))
-            return {"pattern_id": pattern_id, "created": False,
-                    "relations_recorded": recorded_count}
-
-        pattern_key = hashlib.sha256(json.dumps({
-            "pattern_text": pattern["pattern_text"].casefold(),
-            "condition_text": pattern["condition_text"].casefold(),
-            "primary_domain": pattern["primary_domain"],
-        }, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+        relation_types = {item["semantic_relation"] for item in relations}
+        save_candidate = bool(relation_types & {"refines", "contradicts", "unrelated"}) or not (
+            relation_types & {"duplicate", "supports"}
+        )
+        candidate_id = None
+        created = False
+        updated_pattern_ids: Set[int] = set()
+        pattern_event_ids: List[int] = []
+        recorded_count = 0
         with self._db.transaction():
-            pattern_id, created = self._db.upsert_user_observed_pattern(
-                subject_entity_id=subject_entity_id, pattern_key=pattern_key,
-                pattern_text=pattern["pattern_text"],
-                condition_text=pattern["condition_text"],
-                primary_domain=pattern["primary_domain"],
-                confidence=pattern["confidence"],
-            )
-            added = self._db.add_user_observed_pattern_signals(
-                pattern_id=pattern_id, signal_ids=pattern["support_signal_ids"],
-            )
-            recorded_count = 0
-            if not created and added:
-                recorded_count += int(self._db.record_user_observed_pattern_relation(
-                    target_pattern_id=pattern_id,
-                    trigger_pattern_id=None,
-                    semantic_relation="supports",
-                    support_signal_ids=pattern["support_signal_ids"],
-                    candidate_snapshot=pattern,
-                    semantic_confidence=pattern["confidence"],
-                    semantic_reason="New action signals supported the existing pattern key.",
-                ))
+            if save_candidate:
+                pattern_key = hashlib.sha256(json.dumps({
+                    "pattern_text": pattern["pattern_text"].casefold(),
+                    "condition_text": pattern["condition_text"].casefold(),
+                    "primary_domain": pattern["primary_domain"],
+                }, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+                candidate_id, created = self._db.upsert_user_observed_pattern(
+                    subject_entity_id=subject_entity_id, pattern_key=pattern_key,
+                    pattern_text=pattern["pattern_text"],
+                    condition_text=pattern["condition_text"],
+                    primary_domain=pattern["primary_domain"],
+                    confidence=pattern["confidence"],
+                )
+                added = self._db.add_user_observed_pattern_signals(
+                    pattern_id=candidate_id, signal_ids=pattern["support_signal_ids"],
+                )
+                if created:
+                    event_id = self._record_user_observed_pattern_event(
+                        event_type="created", target_pattern_id=candidate_id,
+                        trigger_pattern_id=None, semantic_relation="",
+                        support_signal_ids=pattern["support_signal_ids"],
+                        candidate_snapshot={}, semantic_confidence=0.0,
+                        semantic_reason="",
+                    )
+                    if event_id is not None:
+                        pattern_event_ids.append(event_id)
+                elif added:
+                    updated_pattern_ids.add(candidate_id)
+                    event_id = self._record_user_observed_pattern_event(
+                        target_pattern_id=candidate_id, trigger_pattern_id=None,
+                        semantic_relation="supports",
+                        support_signal_ids=pattern["support_signal_ids"],
+                        candidate_snapshot=pattern, semantic_confidence=pattern["confidence"],
+                        semantic_reason="New action signals supported the existing pattern key.",
+                    )
+                    if event_id is not None:
+                        recorded_count += 1
+                        pattern_event_ids.append(event_id)
             for relation in relations:
-                if relation["semantic_relation"] not in {"refines", "contradicts"}:
-                    continue
-                if relation["existing_pattern_id"] == pattern_id:
-                    continue
-                recorded_count += int(self._db.record_user_observed_pattern_relation(
-                    target_pattern_id=relation["existing_pattern_id"],
-                    trigger_pattern_id=pattern_id,
-                    semantic_relation=relation["semantic_relation"],
+                relation_type = relation["semantic_relation"]
+                target_id = relation["existing_pattern_id"]
+                if relation_type in {"duplicate", "supports"}:
+                    added = self._db.add_user_observed_pattern_signals(
+                        pattern_id=target_id, signal_ids=pattern["support_signal_ids"],
+                    )
+                    if added:
+                        updated_pattern_ids.add(target_id)
+                        self._db.refresh_user_observed_pattern(
+                            pattern_id=target_id,
+                            confidence=float(existing_by_id[target_id]["confidence"]),
+                        )
+                # The source is C, never one of its merge targets. An unpersisted
+                # C is represented by its candidate snapshot without inventing an ID.
+                event_id = self._record_user_observed_pattern_event(
+                    target_pattern_id=target_id,
+                    trigger_pattern_id=candidate_id if candidate_id != target_id else None,
+                    semantic_relation=relation_type,
                     support_signal_ids=pattern["support_signal_ids"],
                     candidate_snapshot=pattern,
                     semantic_confidence=relation["confidence"],
                     semantic_reason=relation["reason"],
-                ))
-        return {"pattern_id": pattern_id, "created": created,
+                )
+                if event_id is not None:
+                    recorded_count += 1
+                    pattern_event_ids.append(event_id)
+        return {"pattern_id": candidate_id, "created": created,
+                "updated_pattern_ids": sorted(updated_pattern_ids),
+                "pattern_event_ids": pattern_event_ids,
                 "relations_recorded": recorded_count}
 
     def _classify_user_observed_pattern_relations(

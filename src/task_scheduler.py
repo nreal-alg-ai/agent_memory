@@ -1361,21 +1361,16 @@ class TaskScheduler:
     ) -> None:
         result = event.get("result")
         if (event.get("succeeded") and isinstance(result, dict)):
-            new_pattern_ids = list(result.get("new_pattern_ids") or [])
-            pattern_relation_event_ids = list(
-                result.get("pattern_relation_event_ids") or []
-            )
-            if new_pattern_ids or pattern_relation_event_ids:
+            pattern_event_ids = list(result.get("pattern_event_ids") or [])
+            if pattern_event_ids:
                 payload = {
-                    "new_pattern_ids": new_pattern_ids,
-                    "pattern_relation_event_ids": pattern_relation_event_ids,
+                    "pattern_event_ids": pattern_event_ids,
                     "reference_timestamp": result.get("reference_timestamp"),
                 }
                 self.submit(
                     "user_state_update_from_user_observed_patterns", payload,
                     report_payload={
-                        "new_pattern_ids": new_pattern_ids,
-                        "pattern_relation_event_ids": pattern_relation_event_ids,
+                        "pattern_event_ids": pattern_event_ids,
                     },
                 )
 

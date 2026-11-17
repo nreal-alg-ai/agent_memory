@@ -578,15 +578,16 @@ class UserMemoryDB:
             );
             CREATE TABLE IF NOT EXISTS memory_user_observed_pattern_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_type TEXT NOT NULL CHECK(event_type IN ('created', 'relation_recorded')),
                 target_pattern_id INTEGER NOT NULL,
                 trigger_pattern_id INTEGER,
-                semantic_relation TEXT NOT NULL,
+                semantic_relation TEXT NOT NULL DEFAULT '',
                 support_signal_ids TEXT NOT NULL DEFAULT '[]',
                 candidate_snapshot TEXT NOT NULL DEFAULT '{}',
                 semantic_confidence REAL NOT NULL DEFAULT 0.0,
                 semantic_reason TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
-                UNIQUE(target_pattern_id, semantic_relation, support_signal_ids),
+                UNIQUE(target_pattern_id, event_type, semantic_relation, support_signal_ids),
                 FOREIGN KEY(target_pattern_id) REFERENCES memory_user_observed_patterns(id) ON DELETE CASCADE,
                 FOREIGN KEY(trigger_pattern_id) REFERENCES memory_user_observed_patterns(id) ON DELETE SET NULL
             );
@@ -2060,20 +2061,28 @@ class UserMemoryDB:
         )
         self._commit_if_needed()
 
-    def record_user_observed_pattern_relation(
+    def record_user_observed_pattern_event(
         self, *, target_pattern_id: int, trigger_pattern_id: Optional[int],
         semantic_relation: str, support_signal_ids: Sequence[int],
         candidate_snapshot: Dict[str, Any], semantic_confidence: float,
-        semantic_reason: str,
+        semantic_reason: str, event_type: str = "relation_recorded",
     ) -> bool:
-        """Keep a deduplicated audit event for pattern reconciliation."""
+        """Record pattern creation or a newly established evidence relation."""
+        if event_type not in {"created", "relation_recorded"}:
+            raise ValueError("Invalid observed pattern event type")
+        if event_type == "created":
+            if semantic_relation or trigger_pattern_id:
+                raise ValueError("A created event cannot carry a semantic relation")
+        elif semantic_relation not in {"supports", "duplicate", "refines", "contradicts", "unrelated"}:
+            raise ValueError("Invalid observed pattern semantic relation")
         ids = sorted({int(value) for value in support_signal_ids if int(value) > 0})
         cursor = self._conn.execute(
             "INSERT OR IGNORE INTO memory_user_observed_pattern_events "
-            "(target_pattern_id, trigger_pattern_id, semantic_relation, "
+            "(event_type, target_pattern_id, trigger_pattern_id, semantic_relation, "
             "support_signal_ids, candidate_snapshot, semantic_confidence, "
-            "semantic_reason, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "semantic_reason, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
+                event_type,
                 int(target_pattern_id),
                 int(trigger_pattern_id) if trigger_pattern_id else None,
                 str(semantic_relation), json_dumps(ids),
@@ -2143,7 +2152,7 @@ class UserMemoryDB:
     def get_user_observed_pattern_events_for_signal_ids(
         self, signal_ids: Sequence[int],
     ) -> List[Dict[str, Any]]:
-        """Read relation events created from a task's action-signal snapshot."""
+        """Read creation and relation events associated with selected signals."""
         selected = {int(value) for value in signal_ids if int(value) > 0}
         if not selected:
             return []
@@ -2171,10 +2180,10 @@ class UserMemoryDB:
             events.append(event)
         return events
 
-    def get_user_observed_pattern_relation_events_by_ids(
+    def get_user_observed_pattern_events_by_ids(
         self, event_ids: Sequence[int],
     ) -> List[Dict[str, Any]]:
-        """Load exact pattern relation events referenced by a state update task."""
+        """Load exact pattern events referenced by a state update task."""
         ids = sorted({int(value) for value in event_ids if int(value) > 0})
         events: List[Dict[str, Any]] = []
         for offset in range(0, len(ids), 500):

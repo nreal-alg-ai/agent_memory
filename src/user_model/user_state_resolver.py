@@ -455,16 +455,14 @@ class UserStateResolver:
     def process_user_state_update_from_user_observed_patterns_task(
         self,
         *,
-        new_pattern_ids: Optional[Sequence[int]] = None,
-        pattern_relation_event_ids: Optional[Sequence[int]] = None,
+        pattern_event_ids: Optional[Sequence[int]] = None,
         reference_timestamp: Optional[Any] = None,
     ) -> Dict[str, Any]:
-        """Project changed observed behavior into recurring states by domain."""
+        """Evaluate compact pattern events together to update recurring states by domain."""
         reference_time = reference_timestamp
         update_inputs = self._build_user_state_update_inputs_using_observed_patterns(
             world_owner_entity_id=self._world_owner_entity_id,
-            new_pattern_ids=new_pattern_ids or [],
-            pattern_relation_event_ids=pattern_relation_event_ids or [],
+            pattern_event_ids=pattern_event_ids or [],
             reference_time=reference_time,
         )
         report: Dict[str, Any] = {
@@ -487,9 +485,8 @@ class UserStateResolver:
             signal_by_id = domain_input["signal_by_id"]
             existing_states = domain_input["existing_states"]
             explicitly_supported_state_ids = domain_input["explicitly_supported_state_ids"]
-            pattern_cases = update_input["pattern_cases"]
             source = "\n".join(
-                item["pattern"]["pattern_text"] for item in pattern_cases
+                pattern["pattern_text"] for pattern in domain_patterns.values()
             )
             template = (
                 USER_STATE_UPDATE_FROM_USER_OBSERVED_PATTERN_PROMPT_EN
@@ -529,11 +526,16 @@ class UserStateResolver:
                 for state in existing_states
             }
             contradicting_signals_by_target: Dict[int, set[int]] = {}
+            contradicting_patterns_by_target: Dict[int, set[int]] = {}
             for item in domain_events:
                 if item["semantic_relation"] == "contradicts":
                     contradicting_signals_by_target.setdefault(
                         int(item["target_pattern_id"]), set(),
                     ).update(int(value) for value in item["support_signal_ids"])
+                    if item.get("trigger_pattern_id"):
+                        contradicting_patterns_by_target.setdefault(
+                            int(item["target_pattern_id"]), set(),
+                        ).add(int(item["trigger_pattern_id"]))
             operations: List[Dict[str, Any]] = []
             seen_targets: set[tuple[Any, ...]] = set()
             for raw in parsed["operations"][:24]:
@@ -548,18 +550,6 @@ class UserStateResolver:
                 if action == "expire":
                     continue
                 evidence = normalized["evidence"]
-                has_changed_pattern = any(
-                    item["evidence_type"] == "user_observed_pattern"
-                    and item["evidence_id"] in domain_changed
-                    for item in evidence
-                )
-                has_trigger_signal = any(
-                    item["evidence_type"] == "user_action_signal"
-                    and item["evidence_id"] in domain_trigger_ids
-                    for item in evidence
-                )
-                if not (has_changed_pattern or has_trigger_signal):
-                    continue
                 if action in {"create", "reinforce", "revise"} and not any(
                     item["evidence_type"] == "user_observed_pattern"
                     and item["evidence_id"] in domain_changed
@@ -567,30 +557,35 @@ class UserStateResolver:
                     for item in evidence
                 ):
                     continue
-                target_counterexample_signal_ids = set().union(*[
-                    contradicting_signals_by_target.get(pattern_id, set())
-                    for pattern_id in linked_patterns_by_state.get(
-                        normalized["target_state_id"], set()
-                    )
-                ])
-                independent_counterexample_times = {
-                    str(signal_by_id[signal_id].get("event_time_key") or "").strip()
-                    for signal_id in target_counterexample_signal_ids
-                    if signal_id in signal_by_id
-                    and str(signal_by_id[signal_id].get("event_time_key") or "").strip()
-                }
-                if action == "weaken" and not (
-                    has_trigger_signal
-                    and normalized["target_state_id"] not in explicitly_supported_state_ids
-                    and len(independent_counterexample_times) >= 2
-                    and any(
-                        item["evidence_type"] == "user_action_signal"
-                        and item["role"] == "counterexample"
-                        and item["evidence_id"] in target_counterexample_signal_ids
-                        for item in evidence
-                    )
-                ):
-                    continue
+                if action == "weaken":
+                    linked_patterns = linked_patterns_by_state.get(normalized["target_state_id"], set())
+                    counter_signals = set().union(*[
+                        contradicting_signals_by_target.get(pattern_id, set())
+                        for pattern_id in linked_patterns
+                    ])
+                    counter_patterns = set().union(*[
+                        contradicting_patterns_by_target.get(pattern_id, set())
+                        for pattern_id in linked_patterns
+                    ])
+                    counter_times = {
+                        str(signal_by_id[value].get("event_time_key") or "").strip()
+                        for value in counter_signals if value in signal_by_id
+                        and str(signal_by_id[value].get("event_time_key") or "").strip()
+                    }
+                    if (
+                        normalized["target_state_id"] in explicitly_supported_state_ids
+                        or len(counter_times) < 2
+                        or not any(
+                            item["role"] == "counterexample" and (
+                                (item["evidence_type"] == "user_action_signal"
+                                 and item["evidence_id"] in counter_signals)
+                                or (item["evidence_type"] == "user_observed_pattern"
+                                    and item["evidence_id"] in counter_patterns)
+                            )
+                            for item in evidence
+                        )
+                    ):
+                        continue
                 if action == "create" and self._user_model_db.user_state_identity_exists(
                     state_domain=domain,
                     state_type="recurring_state",
@@ -647,209 +642,146 @@ class UserStateResolver:
         )
 
     def _build_user_state_update_inputs_using_observed_patterns(
-        self, *, world_owner_entity_id: int, new_pattern_ids: Sequence[int],
-        pattern_relation_event_ids: Sequence[int], reference_time: Optional[Any],
+        self, *, world_owner_entity_id: int, pattern_event_ids: Sequence[int],
+        reference_time: Optional[Any],
     ) -> Dict[str, Any]:
-        new_ids = {int(value) for value in new_pattern_ids if int(value) > 0}
-        relation_event_ids = {int(value) for value in pattern_relation_event_ids}
-        if any(event_id <= 0 for event_id in relation_event_ids):
-            raise ValueError("Pattern relation event IDs must be positive")
-        events = self._user_memory_db.get_user_observed_pattern_relation_events_by_ids(
-            relation_event_ids
-        )
-        if {int(item["id"]) for item in events} != relation_event_ids:
-            raise ValueError("Pattern relation event is missing")
-        changed_ids = new_ids | {
-            int(item["target_pattern_id"]) for item in events
-            if item["semantic_relation"] in {"supports", "duplicate"}
+        event_ids = {int(value) for value in pattern_event_ids}
+        if any(value <= 0 for value in event_ids):
+            raise ValueError("Pattern event IDs must be positive")
+        events = self._user_memory_db.get_user_observed_pattern_events_by_ids(sorted(event_ids))
+        if {int(event["id"]) for event in events} != event_ids:
+            raise ValueError("Pattern event is missing")
+        for event in events:
+            if event["event_type"] == "created":
+                if event["semantic_relation"] or event.get("trigger_pattern_id"):
+                    raise ValueError("A created event cannot carry a semantic relation")
+            elif (
+                event["event_type"] != "relation_recorded"
+                or event["semantic_relation"] not in {
+                    "supports", "duplicate", "refines", "contradicts", "unrelated",
+                }
+            ):
+                raise ValueError("Invalid observed pattern event")
+
+        patterns = {
+            int(pattern["id"]): pattern
+            for pattern in self._user_memory_db.get_user_observed_patterns_by_ids(sorted({
+                int(value) for event in events
+                for value in (event["target_pattern_id"], event.get("trigger_pattern_id"))
+                if value
+            }))
+            if int(pattern.get("subject_entity_id") or 0) == world_owner_entity_id
+            and self._normalize_state_domain(pattern.get("primary_domain"))
         }
-        affected_ids = {
-            int(item["target_pattern_id"]) for item in events
-            if item["semantic_relation"] in {"refines", "contradicts"}
-        }
-        trigger_ids = {
-            int(value) for item in events for value in item["support_signal_ids"]
-        }
-        patterns = self._user_memory_db.get_user_observed_patterns_by_ids(
-            changed_ids | affected_ids
-        )
-        patterns = [
-            item for item in patterns
-            if int(item.get("subject_entity_id") or 0) == world_owner_entity_id
-            and self._normalize_state_domain(item.get("primary_domain"))
-        ]
-        pattern_by_id = {int(item["id"]): item for item in patterns}
-        events = [
-            item for item in events
-            if int(item["target_pattern_id"]) in pattern_by_id
-        ]
-        representative_ids = {
-            int(signal_id)
-            for pattern in patterns
-            for signal_id in (
-                (pattern.get("support_signal_ids") or [])[:1]
-                + (pattern.get("support_signal_ids") or [])[-3:]
-            )
-        }
-        signal_by_id = {
-            int(item["signal_id"]): item
-            for item in self._user_memory_db.get_user_action_signals_by_ids(
-                representative_ids | trigger_ids
-            )
+        signals = {
+            int(signal["signal_id"]): signal
+            for signal in self._user_memory_db.get_user_action_signals_by_ids(sorted({
+                int(value) for pattern in patterns.values()
+                for value in (
+                    (pattern.get("support_signal_ids") or [])[:1]
+                    + (pattern.get("support_signal_ids") or [])[-3:]
+                )
+            } | {
+                int(value) for event in events for value in event["support_signal_ids"]
+            }))
         }
         domains: Dict[str, Dict[str, Any]] = {}
-        for domain in sorted({str(item["primary_domain"]) for item in patterns}):
-            domain_patterns = {
-                int(item["id"]): item for item in patterns
-                if item["primary_domain"] == domain
-            }
-            domain_changed = changed_ids & domain_patterns.keys()
-            domain_affected = affected_ids & domain_patterns.keys()
-            domain_events = [
-                item for item in events
-                if int(item["target_pattern_id"]) in domain_patterns
-            ]
-            domain_trigger_ids = {
-                int(signal_id)
-                for event in domain_events
-                for signal_id in event["support_signal_ids"]
-                if int(signal_id) in trigger_ids and int(signal_id) in signal_by_id
-            }
-            events_by_pattern: Dict[int, List[Dict[str, Any]]] = {}
-            for event in domain_events:
-                trigger_id = int(event.get("trigger_pattern_id") or 0)
-                case_id = (
-                    trigger_id if trigger_id in domain_changed
-                    else int(event["target_pattern_id"])
-                )
-                events_by_pattern.setdefault(case_id, []).append(event)
-            pattern_cases = []
-            for pattern_id in sorted(domain_changed | events_by_pattern.keys()):
-                pattern_cases.append({
-                    "pattern": self._user_observed_pattern_prompt_view(
-                        domain_patterns[pattern_id], signal_by_id,
-                    ),
-                    "update_kind": (
-                        "new" if pattern_id in new_ids
-                        else "supported" if pattern_id in domain_changed
-                        else "relation_only"
-                    ),
-                    "related_patterns": [
-                        {
-                            "relation_event": {
-                                key: event.get(key) for key in (
-                                    "id", "target_pattern_id", "trigger_pattern_id",
-                                    "semantic_relation", "support_signal_ids",
-                                    "candidate_snapshot", "semantic_reason",
-                                )
-                            },
-                            "existing_pattern": self._user_observed_pattern_prompt_view(
-                                domain_patterns[int(event["target_pattern_id"])],
-                                signal_by_id,
-                            ),
-                            "trigger_signals": [
-                                self._user_action_signal_prompt_view(signal_by_id[int(value)])
-                                for value in event["support_signal_ids"]
-                                if int(value) in signal_by_id
-                            ],
-                            "linked_state_ids": [],
-                        }
-                        for event in events_by_pattern.get(pattern_id, [])
-                    ],
-                    "related_states": [],
-                })
-            existing_states = self._user_model_db.get_user_states(
-                state_domains=[domain],
-                state_types=["recurring_state"], statuses=["active", "weakened"],
-                limit=self._update_limit,
-                include_evidence=True,
+        for event in events:
+            pattern = patterns.get(int(event["target_pattern_id"]))
+            if pattern is None:
+                continue
+            is_creation = event["event_type"] == "created"
+            trigger_pattern = (
+                pattern if is_creation
+                else patterns.get(int(event.get("trigger_pattern_id") or 0))
             )
-            claim_ids = {
-                int(item["evidence_id"])
-                for state in existing_states
-                for item in state["evidence_items"]
-                if item["evidence_type"] == "user_claim"
-            }
-            claim_by_id = {
-                int(item["id"]): item
-                for item in self._user_memory_db.get_user_claims_by_ids(sorted(claim_ids))
-            }
-            explicitly_supported_state_ids = {
-                int(state["id"])
-                for state in existing_states
-                for item in state["evidence_items"]
-                if item["evidence_type"] == "user_claim"
-                and item["role"] in {"support", "change_trigger"}
-                and (claim := claim_by_id.get(int(item["evidence_id"])))
-                and claim.get("claim_origin") == "explicit"
-                and claim.get("status") == "active"
-            }
-            linked_state_ids_by_pattern: Dict[int, set[int]] = {}
-            for state in existing_states:
-                state_id = int(state["id"])
-                for item in state["evidence_items"]:
-                    if item["evidence_type"] == "user_observed_pattern":
-                        linked_state_ids_by_pattern.setdefault(
-                            int(item["evidence_id"]), set(),
-                        ).add(state_id)
-            detailed_state_ids = set()
-            for case in pattern_cases:
-                related_pattern_ids = {
-                    int(related["existing_pattern"]["id"])
-                    for related in case["related_patterns"]
-                } | {int(case["pattern"]["id"])}
-                related_state_ids = {
-                    state_id for related_id in related_pattern_ids
-                    for state_id in linked_state_ids_by_pattern.get(related_id, set())
-                }
-                detailed_state_ids.update(related_state_ids)
-            state_contexts = {
-                int(state["id"]): self._build_state_context(
-                    state, detailed=int(state["id"]) in detailed_state_ids,
-                    world_owner_entity_id=world_owner_entity_id,
-                )
-                for state in existing_states
-            }
-            for case in pattern_cases:
-                related_pattern_ids = {
-                    int(related["existing_pattern"]["id"])
-                    for related in case["related_patterns"]
-                } | {int(case["pattern"]["id"])}
-                related_state_ids = {
-                    state_id for pattern_id in related_pattern_ids
-                    for state_id in linked_state_ids_by_pattern.get(pattern_id, set())
-                }
-                case["related_states"] = [
-                    state_contexts[value] for value in sorted(related_state_ids)
-                ]
-                for related in case["related_patterns"]:
-                    related["linked_state_ids"] = sorted(
-                        linked_state_ids_by_pattern.get(
-                            int(related["existing_pattern"]["id"]), set(),
-                        ),
-                    )
-            domains[domain] = {
+            if event.get("trigger_pattern_id") and trigger_pattern is None:
+                raise ValueError("Trigger pattern is missing or outside the owner scope")
+            domain = str(pattern["primary_domain"])
+            domain_input = domains.setdefault(domain, {
                 "update_input": {
                     "reference_time": self._timestamp_text(reference_time),
                     "state_domain": domain,
-                    "pattern_cases": pattern_cases,
-                    "existing_states": [
-                        state_contexts[int(item["id"])] for item in existing_states
-                        if int(item["id"]) not in detailed_state_ids
-                    ],
+                    "pattern_event_cases": [],
+                    "existing_states": [],
                 },
-                "domain_patterns": domain_patterns,
-                "domain_changed": domain_changed,
-                "domain_affected": domain_affected,
-                "domain_events": domain_events,
-                "domain_trigger_ids": domain_trigger_ids,
-                "signal_by_id": signal_by_id,
-                "existing_states": existing_states,
-                "explicitly_supported_state_ids": explicitly_supported_state_ids,
+                "domain_patterns": {}, "domain_changed": set(), "domain_affected": set(),
+                "domain_events": [], "domain_trigger_ids": set(),
+                "signal_by_id": signals,
+            })
+            domain_input["domain_patterns"][int(pattern["id"])] = pattern
+            if trigger_pattern is not None:
+                domain_input["domain_patterns"][int(trigger_pattern["id"])] = trigger_pattern
+            if is_creation or event["semantic_relation"] in {"supports", "duplicate"}:
+                domain_input["domain_changed"].add(int(pattern["id"]))
+            elif event["semantic_relation"] in {"refines", "contradicts"}:
+                domain_input["domain_affected"].add(int(pattern["id"]))
+            domain_input["domain_events"].append(event)
+
+            trigger_signals = []
+            if not is_creation and trigger_pattern is None:
+                for value in event["support_signal_ids"]:
+                    signal_id = int(value)
+                    if signal_id in signals:
+                        trigger_signals.append({
+                            "signal_id": signal_id,
+                            **self._user_action_signal_prompt_view(signals[signal_id]),
+                        })
+                        domain_input["domain_trigger_ids"].add(signal_id)
+            domain_input["update_input"]["pattern_event_cases"].append({
+                "event_type": event["event_type"],
+                "semantic_relation": event["semantic_relation"],
+                "target_pattern": (
+                    None if is_creation
+                    else self._user_observed_pattern_prompt_view(pattern, signals)
+                ),
+                "trigger_pattern": (
+                    self._user_observed_pattern_prompt_view(trigger_pattern, signals)
+                    if trigger_pattern is not None else None
+                ),
+                "trigger_action_signals": trigger_signals,
+            })
+
+        for domain, domain_input in domains.items():
+            states = self._user_model_db.get_user_states(
+                state_domains=[domain], state_types=["recurring_state"],
+                statuses=["active", "weakened"], limit=self._update_limit, include_evidence=True,
+            )
+            claims = {
+                int(claim["id"]): claim
+                for claim in self._user_memory_db.get_user_claims_by_ids(sorted({
+                    int(item["evidence_id"]) for state in states for item in state["evidence_items"]
+                    if item["evidence_type"] == "user_claim"
+                }))
             }
+            domain_input["explicitly_supported_state_ids"] = {
+                int(state["id"]) for state in states for item in state["evidence_items"]
+                if item["evidence_type"] == "user_claim"
+                and item["role"] in {"support", "change_trigger"}
+                and (claim := claims.get(int(item["evidence_id"])))
+                and claim.get("claim_origin") == "explicit"
+                and claim.get("status") == "active"
+            }
+            domain_input["existing_states"] = states
+            domain_input["update_input"]["existing_states"] = [
+                self._build_state_context(
+                    state,
+                    detailed=any(
+                        item["evidence_type"] == "user_observed_pattern"
+                        and int(item["evidence_id"]) in domain_input["domain_patterns"]
+                        for item in state["evidence_items"]
+                    ),
+                    world_owner_entity_id=world_owner_entity_id,
+                )
+                for state in states
+            ]
         return {
-            "changed_pattern_count": len(changed_ids),
-            "affected_pattern_count": len(affected_ids),
+            "changed_pattern_count": len({
+                value for item in domains.values() for value in item["domain_changed"]
+            }),
+            "affected_pattern_count": len({
+                value for item in domains.values() for value in item["domain_affected"]
+            }),
             "domains": domains,
         }
 
@@ -1661,16 +1593,8 @@ class UserStateResolver:
         signal: Mapping[str, Any],
     ) -> Dict[str, Any]:
         return {
-            "signal_id": int(signal["signal_id"]),
             "action_text": str(signal.get("action_text") or ""),
             "action_kind": str(signal.get("action_kind") or ""),
-            "event_time": str(signal.get("event_time_key") or ""),
-            "location": str(signal.get("location") or ""),
-            "source_type": str(signal["source_type"]),
-            "source_id": int(signal["source_id"]),
-            "time_scope": str(signal.get("time_scope") or "reported_event"),
-            "event_ended_at": str(signal.get("event_ended_at") or ""),
-            "source_unit_refs": signal.get("source_unit_refs") or [],
         }
 
     @classmethod
@@ -1682,12 +1606,9 @@ class UserStateResolver:
         representative = list(dict.fromkeys(signal_ids[:1] + signal_ids[-3:]))
         return {
             "id": int(pattern["id"]),
-            "primary_domain": str(pattern.get("primary_domain") or ""),
             "pattern_text": str(pattern.get("pattern_text") or ""),
             "condition_text": str(pattern.get("condition_text") or ""),
-            "confidence": float(pattern.get("confidence") or 0.0),
-            "support_signal_count": len(signal_ids),
-            "supporting_actions": [
+            "support_action_signals": [
                 cls._user_action_signal_prompt_view(signals_by_id[int(value)])
                 for value in representative if int(value) in signals_by_id
             ],
