@@ -160,6 +160,7 @@ class UserModelDB:
                 expires_at TEXT NOT NULL,
                 policy_version TEXT NOT NULL,
                 evaluated_at TEXT NOT NULL,
+                evaluation_basis TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 UNIQUE(prediction_id, service_key),
@@ -633,6 +634,10 @@ class UserModelDB:
                 )
             }
             fields["constraints"] = json_dumps(payload["constraints"])
+            basis = payload.get("evaluation_basis", json_loads(existing["evaluation_basis"], {}) if existing else {})
+            if not isinstance(basis, dict):
+                raise ValueError("Service evaluation_basis must be an object")
+            fields["evaluation_basis"] = json_dumps(basis)
             now = local_now_text() if reference_timestamp is None else normalize_reference_timestamp(reference_timestamp)
             if existing:
                 if existing["status"] in {"cancelled", "expired"}:
@@ -675,6 +680,7 @@ class UserModelDB:
             return None
         item = dict(row)
         item["constraints"] = json_loads(item["constraints"], [])
+        item["evaluation_basis"] = json_loads(item["evaluation_basis"], {})
         return item
 
     def insert_user_proactive_service_feedback(self, payload: Dict[str, Any], *, reference_timestamp: Any = None) -> int:
@@ -751,6 +757,7 @@ class UserModelDB:
         for row in rows:
             item = dict(row)
             item["constraints"] = json_loads(item.get("constraints"), [])
+            item["evaluation_basis"] = json_loads(item["evaluation_basis"], {})
             result.append(item)
         return result
 

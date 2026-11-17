@@ -1,13 +1,13 @@
 # 飞书会议记录提炼测试
 
-入口为 `run_feishu_meeting_extraction.py`。读取飞书导出的 Markdown **文字记录**，通过 `PersonWorldModel` 提炼 memory 和 user state，不执行召回或问答评测，也不生成额外的会议纪要页面。
+入口为 `run_feishu_meeting_extraction_with_clock.py`。读取飞书导出的 Markdown **文字记录**，通过 `PersonWorldModel` 提炼 memory 和 user state，不执行召回或问答评测，也不生成额外的会议纪要页面。
 
 ## 运行方式
 
 在工程根目录、已安装项目依赖的 Python 环境中执行。先只检查解析和身份映射，无需模型凭据：
 
 ```bash
-python scripts/memory/ambient_transcript/run_feishu_meeting_extraction.py \
+python scripts/memory/ambient_transcript/run_feishu_meeting_extraction_with_clock.py \
   --meeting-file '/Users/byzhou/Downloads/文字记录：EYE 手势 CES DEMO 沟通 2025年12月24日.md' \
   --owner-name '沈劲阳' \
   --parse-only
@@ -16,7 +16,7 @@ python scripts/memory/ambient_transcript/run_feishu_meeting_extraction.py \
 确认 `parsed_meeting.json` 和 `transcript.txt` 后，移除 `--parse-only` 正式运行：
 
 ```bash
-python scripts/memory/ambient_transcript/run_feishu_meeting_extraction.py \
+python scripts/memory/ambient_transcript/run_feishu_meeting_extraction_with_clock.py \
   --meeting-file '/Users/byzhou/Downloads/文字记录：EYE 手势 CES DEMO 沟通 2025年12月24日.md' \
   --owner-name '沈劲阳'
 ```
@@ -26,7 +26,7 @@ python scripts/memory/ambient_transcript/run_feishu_meeting_extraction.py \
 连续处理多个文件时，在 `--meeting-file` 后依次列出路径，也可以重复使用该参数：
 
 ```bash
-python scripts/memory/ambient_transcript/run_feishu_meeting_extraction.py \
+python scripts/memory/ambient_transcript/run_feishu_meeting_extraction_with_clock.py \
   --meeting-file '/path/to/第一次会议.md' '/path/to/第二次会议.md' \
   --meeting-file '/path/to/第三次会议.md' \
   --owner-name '沈劲阳'

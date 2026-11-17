@@ -3,7 +3,7 @@
 
 Example (run from the repository root)::
 
-    python scripts/memory/ambient_transcript/run_feishu_meeting_extraction.py \
+    python scripts/memory/ambient_transcript/run_feishu_meeting_extraction_with_clock.py \
         --meeting-file '/path/to/文字记录：会议名称 2025年12月24日.md' \
         --owner-name 沈劲阳 --parse-only
 
@@ -24,12 +24,16 @@ are never inferred to be that person. Exported offsets are utterance STARTS,
 not measured speech durations: ends are estimated from text length and capped
 at the next start. The estimate and its rate are recorded in metadata/report;
 use --speech-rate-chars-per-second to change the default engineering assumption.
-Replay a logical clock without real-time sleeps. Deliver only finished speech,
+Replay a fixed-step logical clock without real-time sleeps. Deliver only finished speech,
 finalize at each meeting end, then wait for memory, due state updates, prediction
 maintenance, and proactive evaluation in that order. Between meetings and during
 the configurable post-roll, time keeps advancing without fabricated input.
 Proactive availability is explicitly simulated only outside meetings; no Agent
 tools are executed and no background execution is authorized.
+Periods are anchored to the first meeting start. When a period is not a multiple
+of the clock step, its check runs at the next visited time, without catch-up
+calls at the same timestamp. clock_events.jsonl records each check and its FIFO
+results; report.json includes periodic_summary and lifecycle-count changes.
 """
 
 from __future__ import annotations
@@ -164,7 +168,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument("--parse-only", action="store_true", help="Export normalized inputs only; no models or databases")
     parser.add_argument("--clock-step-minutes", type=int, default=5,
-                        help="Logical clock base step; meeting boundaries and task deadlines are also visited (default: 5)")
+                        help="Fixed logical clock step; exact meeting boundaries are also visited (default: 5)")
     parser.add_argument("--state-interval-minutes", type=int, default=30,
                         help="Periodic claim-to-state check interval; 0 disables (default: 30)")
     parser.add_argument("--prediction-interval-minutes", type=int, default=5,
@@ -243,41 +247,67 @@ def replay_clock_settings(args: argparse.Namespace, meetings: Sequence[Dict[str,
         "post_roll_hours": args.post_roll_hours if not args.clock_end else None,
         "availability_scenario": "simulated_available_outside_meetings",
         "ticks_completed": 0, "failed_tick_count": 0,
+        "periodic_summary": {
+            name: {key: 0 for key in (
+                "checks", "due_checks", "interface_calls", "skipped_during_meeting",
+                "submitted_tasks", "completed_tasks", "failed_tasks", "partial_tasks",
+                "checks_with_lifecycle_count_changes",
+            )}
+            for name in ("state", "prediction", "proactive")
+        },
     }
 
 
 def iter_replay_clock(
     settings: Dict[str, Any], meetings: Sequence[Dict[str, Any]],
 ) -> Iterable[Dict[str, Any]]:
-    """Merge base steps, exact periodic deadlines and exact meeting boundaries."""
+    """Check independent periods at fixed steps and exact meeting boundaries.
+
+    Periods stay anchored to replay start, including after a meeting skip or a
+    slow request. A coarse step performs one check for all missed occurrences;
+    it never replays several checks against the same database and timestamp.
+    """
     start, end = replay_datetime(settings["start"]), replay_datetime(settings["end"])
     intervals = {
-        "step": settings["clock_step_minutes"],
         "state": settings["state_interval_minutes"],
         "prediction": settings["prediction_interval_minutes"],
         "proactive": settings["proactive_interval_minutes"],
     }
     deltas = {name: timedelta(minutes=minutes) for name, minutes in intervals.items() if minutes}
-    next_times = {name: start if name == "step" else start + delta
-                  for name, delta in deltas.items()}
+    next_times = {name: start + delta for name, delta in deltas.items()}
+    step = timedelta(minutes=settings["clock_step_minutes"])
+    next_step = start
     boundaries = sorted({
         replay_datetime(meeting[key])
         for meeting in meetings for key in ("session_start", "last_utterance_end")
     })
     boundary_index = 0
     while True:
-        candidates = [end, *[value for value in next_times.values() if value <= end]]
+        candidates = [end, next_step]
         if boundary_index < len(boundaries):
             candidates.append(boundaries[boundary_index])
         current = min(candidates)
-        due = [name for name in ("state", "prediction", "proactive")
-               if next_times.get(name) == current]
-        yield {"reference_timestamp": current.isoformat(), "due": due}
+        checks = {}
+        for name in ("state", "prediction", "proactive"):
+            scheduled = next_times.get(name)
+            due = scheduled is not None and current >= scheduled
+            check = {"enabled": scheduled is not None, "due": due}
+            if due:
+                # Advance by logical intervals, never by completion/wall time.
+                periods = (current - scheduled) // deltas[name] + 1
+                next_times[name] = scheduled + periods * deltas[name]
+                check.update(scheduled_for=scheduled.isoformat(),
+                             lateness_seconds=(current - scheduled).total_seconds(),
+                             coalesced_periods=periods)
+            check["next_check_at"] = next_times[name].isoformat() if scheduled is not None else None
+            checks[name] = check
+        yield {"reference_timestamp": current.isoformat(),
+               "due": [name for name, check in checks.items() if check["due"]],
+               "periodic_checks": checks}
         if current == end:
             return
-        for name, value in next_times.items():
-            if value == current:
-                next_times[name] = value + deltas[name]
+        if next_step == current:
+            next_step += step
         while boundary_index < len(boundaries) and boundaries[boundary_index] <= current:
             boundary_index += 1
 
@@ -375,6 +405,70 @@ def trigger_periodic_task(pwm: PersonWorldModel, kind: str, reference_timestamp:
     return result
 
 
+def user_model_lifecycle_counts(pwm: PersonWorldModel) -> Dict[str, Any]:
+    """Include status transitions that plain row counts cannot show."""
+    connection = pwm.user_model_database._conn
+    counts = {
+        table: {row[0]: row[1] for row in connection.execute(
+            f'SELECT status, COUNT(*) FROM "{table}" GROUP BY status ORDER BY status'
+        )}
+        for table in ("user_states", "user_predictions", "user_proactive_services")
+    }
+    counts["prediction_reassessment_schedule_count"] = connection.execute(
+        "SELECT COUNT(*) FROM user_prediction_reassessment_schedule"
+    ).fetchone()[0]
+    return counts
+
+
+def run_periodic_check(
+    pwm: PersonWorldModel, reporter: TaskOperationReporter, kind: str,
+    reference_timestamp: str, *, meeting_in_progress: bool,
+) -> Dict[str, Any]:
+    """Record the host call, actual FIFO work, and model changes separately."""
+    before = reporter.snapshot()
+    lifecycle_before = user_model_lifecycle_counts(pwm)
+    interface_called = kind != "proactive" or not meeting_in_progress
+    if kind == "proactive":
+        if interface_called:
+            result = evaluate_proactive_services(pwm, reference_timestamp)
+            if not pwm.wait_for_memory_tasks():
+                raise RuntimeError("Proactive evaluation tasks did not drain")
+        else:
+            result = {
+                "reference_timestamp": reference_timestamp,
+                "result": {"status": "skipped", "reason": "simulated_meeting_in_progress",
+                           "assistance_items": []},
+            }
+    else:
+        result = trigger_periodic_task(pwm, kind, reference_timestamp)
+    return {
+        "triggered_at": reference_timestamp,
+        "interface_called": interface_called,
+        "result": result,
+        **operation_changes(reporter, before),
+        "lifecycle_before": lifecycle_before,
+        "lifecycle_after": user_model_lifecycle_counts(pwm),
+    }
+
+
+def record_periodic_summary(settings: Dict[str, Any], event: Dict[str, Any]) -> None:
+    for kind, check in event["periodic_checks"].items():
+        summary = settings["periodic_summary"][kind]
+        summary["checks"] += int(check["enabled"])
+        summary["due_checks"] += int(check["due"])
+        phase = event["periodic_task_reports"].get(kind)
+        if phase is None:
+            continue
+        summary["interface_calls"] += int(phase["interface_called"])
+        summary["skipped_during_meeting"] += int(not phase["interface_called"])
+        for counter in ("submitted", "completed", "failed"):
+            summary[f"{counter}_tasks"] += sum(
+                int(delta.get(counter, 0)) for delta in phase["operation_delta"].values()
+            )
+        summary["partial_tasks"] += len(phase["partial_tasks"])
+        summary["checks_with_lifecycle_count_changes"] += int(phase["lifecycle_before"] != phase["lifecycle_after"])
+
+
 def replay_meetings(
     pwm: PersonWorldModel, reporter: TaskOperationReporter,
     meetings: Sequence[Dict[str, Any]], meeting_reports: List[Dict[str, Any]],
@@ -387,7 +481,7 @@ def replay_meetings(
         for event in iter_replay_clock(settings, meetings):
             current = replay_datetime(event["reference_timestamp"])
             before = reporter.snapshot()
-            event.update(status="running", input_batches=[], finalized_meetings=[])
+            event.update(status="running", input_batches=[], finalized_meetings=[], periodic_task_reports={})
             ending = []
             try:
                 for index, (meeting, report) in enumerate(zip(meetings, meeting_reports)):
@@ -429,24 +523,21 @@ def replay_meetings(
                         ending.append(index)
                 if not pwm.wait_for_memory_tasks():
                     raise RuntimeError("Memory extraction tasks did not drain")
-                if "state" in event["due"]:
-                    event["state_tick"] = trigger_periodic_task(pwm, "state", current.isoformat())
-                if "prediction" in event["due"]:
-                    event["prediction_tick"] = trigger_periodic_task(pwm, "prediction", current.isoformat())
                 event["active_meeting_indices"] = [
                     index + 1 for index, meeting in enumerate(meetings)
                     if replay_datetime(meeting["session_start"]) <= current
                     < replay_datetime(meeting["last_utterance_end"])
                 ]
-                if "proactive" in event["due"]:
-                    if event["active_meeting_indices"]:
-                        event["proactive_service_evaluation"] = {
-                            "reference_timestamp": current.isoformat(),
-                            "result": {"status": "skipped", "reason": "simulated_meeting_in_progress",
-                                       "assistance_items": []},
-                        }
-                    else:
-                        event["proactive_service_evaluation"] = evaluate_proactive_services(pwm, current.isoformat())
+                for kind in ("state", "prediction", "proactive"):
+                    if kind not in event["due"]:
+                        continue
+                    phase = run_periodic_check(
+                        pwm, reporter, kind, current.isoformat(),
+                        meeting_in_progress=bool(event["active_meeting_indices"]),
+                    )
+                    event["periodic_task_reports"][kind] = phase
+                    result_key = ("proactive_service_evaluation" if kind == "proactive" else f"{kind}_tick")
+                    event[result_key] = phase["result"]
                 event.update(operation_changes(reporter, before))
                 direct_results = [event.get("state_tick", {}), event.get("prediction_tick", {}),
                                   event.get("proactive_service_evaluation", {}).get("result", {})]
@@ -481,6 +572,7 @@ def replay_meetings(
                 raise
             finally:
                 event.update(operation_changes(reporter, before))
+                record_periodic_summary(settings, event)
                 settings["ticks_completed"] += 1
                 settings["failed_tick_count"] += int(event["status"] != "completed")
                 stream.write(json.dumps(event, ensure_ascii=False, default=str) + "\n")
@@ -535,6 +627,7 @@ def run_extraction(args: argparse.Namespace, meetings: Sequence[Dict[str, Any]],
             directory = meeting_output_dir(output_dir, index, len(meetings))
             directory.mkdir(parents=True, exist_ok=True)
         replay_meetings(pwm, reporter, meetings, meeting_reports, output_dir, clock)
+        logging.info("Replay periodic summary=%s", json.dumps(clock["periodic_summary"], ensure_ascii=False))
         report["table_counts"] = table_counts(pwm)
         report["status"] = (
             "completed_with_failures"

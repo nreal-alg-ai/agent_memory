@@ -27,7 +27,7 @@ class UserProactiveService:
     """LLM policy owns service content/timing; execution belongs to a downstream Agent."""
 
     TASK_KIND = "user_proactive_policy_evaluation"
-    POLICY_VERSION = "llm_services_v4"
+    POLICY_VERSION = "llm_services_v5"
     SERVICE_TYPES = {"notify", "suggest", "clarify", "offer_assistance", "prepare", "delegate"}
 
     def __init__(
@@ -121,27 +121,8 @@ class UserProactiveService:
                         user_entity_id=int(prediction["user_entity_id"]),
                         prediction_id=int(prediction["id"]), observed_before=evaluation_time.isoformat(), limit=20,
                     ),
-                }
-                self._logger.log_json_format(self.TASK_KIND, "inputs_loaded", {
-                    "prediction": {key: prediction.get(key) for key in (
-                        "id", "behavior_text", "window_start", "window_end", "conditions",
-                        "likelihood_band", "uncertainties", "rationale",
-                    )},
-                    "current_intent": intent, "related_facts": facts,
                     "future_fact_ids_excluded": excluded_future_fact_ids,
-                    "relevant_user_states": case["relevant_user_states"],
-                    "existing_services": [{key: item.get(key) for key in (
-                        "id", "service_type", "objective", "status", "reason",
-                        "next_evaluate_at", "recheck_condition", "expires_at",
-                    )} for item in case["existing_services"]],
-                    "evaluation_time": evaluation_time.isoformat(),
-                })
-                reason = "waiting_service_reassessment" if any(
-                    service["status"] == "waiting" for service in case["existing_services"]
-                ) else "new_prediction"
-                self._logger.log_json_format(self.TASK_KIND, "evaluation_selected", {
-                    "prediction_id": prediction["id"], "reason": reason,
-                })
+                }
                 prediction_cases.append(case)
             except Exception as exc:
                 self._logger.exception(
@@ -163,7 +144,7 @@ class UserProactiveService:
 
         def intent_view(intent):
             result = select(intent, (
-                "id", "object_type", "summary", "primary_domain", "status", "confidence",
+                "id", "object_type", "summary", "primary_domain", "status", "confidence", "current_progress",
                 "time_start", "time_end", "time_precision",
             ))
             if "details" in intent:
@@ -207,12 +188,88 @@ class UserProactiveService:
                 "id", "service_type", "objective", "agent_guidance", "constraints", "status", "reason",
                 "evaluated_at", "next_evaluate_at", "recheck_condition", "expires_at",
             )) for item in case["existing_services"]]
+        if "review_service_ids" in case:
+            view["review_service_ids"] = case["review_service_ids"]
         if "recent_service_feedback" in case:
             view["recent_service_feedback"] = [select(item, (
                 "id", "service_id", "execution_status", "user_response", "user_feedback",
                 "execution_result", "observed_at",
             )) for item in case["recent_service_feedback"]]
         return json.dumps(view, ensure_ascii=False)
+
+    @staticmethod
+    def _build_service_evaluation_basis(
+        case: Dict[str, Any], *, runtime_context: Dict[str, Any], agent_capabilities: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Compare related business values, not polling/storage timestamps or service writes."""
+        def select(item, fields):
+            return {name: item.get(name) for name in fields}
+
+        intent = case["current_intent"]
+        intent_view = select(intent, (
+            "id", "object_type", "summary", "primary_domain", "status", "current_progress",
+            "time_start", "time_end", "time_precision",
+        ))
+        details = intent.get("details") or {}
+        intent_view["details"] = {name: details[name] for name in (
+            "desired_outcome", "success_criteria", "target_at", "event_or_activity",
+            "time_precision", "location_text", "participants", "action_text", "deliverable",
+            "responsibility_type", "priority", "completed_at", "beneficiary_entities",
+            "delegator_entities", "collaborator_entities",
+        ) if name in details}
+        # Only top-level transport metadata is ignored. Business times such as
+        # a nested activity.started_at remain meaningful inputs.
+        transport_fields = {
+            "request_id", "trace_id", "poll_id", "sampled_at", "captured_at", "received_at",
+            "sample_timestamp", "reference_timestamp", "evaluation_time",
+        }
+        basis = {
+            "intent": intent_view,
+            "facts": sorted([select(item, ("id", "summary", "event_time_key", "dialogue_time_key"))
+                             for item in case.get("related_facts", [])], key=lambda item: item["id"]),
+            "states": sorted([select(item, (
+                "id", "state_domain", "state_type", "state_kind", "state_topic", "state_text",
+                "conditions", "valid_from", "valid_to",
+            )) for item in case.get("relevant_user_states", [])], key=lambda item: item["id"]),
+            "feedback": sorted([select(item, (
+                "id", "service_id", "execution_status", "user_response", "user_feedback",
+                "execution_result", "observed_at",
+            )) for item in case.get("recent_service_feedback", [])], key=lambda item: item["id"]),
+            "runtime_context": {key: value for key, value in runtime_context.items() if key not in transport_fields},
+            "agent_capabilities": {key: value for key, value in agent_capabilities.items() if key not in transport_fields},
+        }
+        for key in ("supported_service_types", "authorized_service_types"):
+            basis["agent_capabilities"][key] = sorted(set(agent_capabilities.get(key, [])))
+        # Persist and compare the same JSON types, including after DB reopen.
+        return json.loads(json.dumps(basis, ensure_ascii=False, allow_nan=False))
+
+    def _select_waiting_services_for_review(
+        self, case: Dict[str, Any], *, evaluation_time: datetime,
+        runtime_context: Dict[str, Any], agent_capabilities: Dict[str, Any],
+    ) -> bool:
+        basis = self._build_service_evaluation_basis(
+            case, runtime_context=runtime_context, agent_capabilities=agent_capabilities,
+        )
+        case["evaluation_basis"] = basis
+        waiting = [item for item in case["existing_services"] if item["status"] == "waiting"]
+        review_ids = []
+        for service in waiting:
+            previous = service.get("evaluation_basis") or {}
+            changed = [key for key, value in basis.items() if previous.get(key) != value]
+            next_at = self._as_datetime(service.get("next_evaluate_at"), evaluation_time)
+            time_due = next_at is not None and next_at <= evaluation_time
+            eligible = time_due or bool(changed)
+            if eligible:
+                review_ids.append(service["id"])
+            self._logger.log_json_format(self.TASK_KIND, "waiting_service_review_checked", {
+                "prediction_id": case["prediction"]["id"], "service_id": service["id"],
+                "evaluation_time": evaluation_time.isoformat(), "eligible": eligible,
+                "time_due": time_due, "changed_sections": changed,
+                "reason": ("time_due" if time_due else "related_inputs_changed" if changed
+                           else "no_reassessment_basis"),
+            })
+        case["review_service_ids"] = sorted(review_ids)
+        return not waiting or bool(review_ids)
 
     def record_service_feedback(
         self, *, service_id: int, execution_id: str, execution_status: str,
@@ -346,7 +403,10 @@ class UserProactiveService:
         if not isinstance(response, dict) or not isinstance(response.get("service_results"), list):
             raise ValueError("Proactive response must contain a service_results list")
         existing = {int(item["id"]): item for item in case["existing_services"]}
-        open_ids = {key for key, item in existing.items() if item["status"] == "waiting"}
+        waiting_ids = {key for key, item in existing.items() if item["status"] == "waiting"}
+        open_ids = set(case.get("review_service_ids", waiting_ids))
+        if not open_ids <= waiting_ids:
+            raise ValueError("Review IDs must reference waiting services of this prediction")
         seen_ids, seen_keys, results = set(), set(), []
 
         def future_time(value: Any) -> datetime:
@@ -373,7 +433,7 @@ class UserProactiveService:
                 raise ValueError("Service decision requires a reason")
             service_id = item["service_id"]
             if service_id is not None and (type(service_id) is not int or service_id not in open_ids):
-                raise ValueError("Service update must reference an open service of this prediction")
+                raise ValueError("Service update must reference a waiting service selected for this round")
             if decision == "suppress":
                 if (item["service"] is not None or item["expires_at"] is not None
                         or item["next_evaluate_at"] is not None or item["recheck_condition"] != ""):
@@ -405,7 +465,7 @@ class UserProactiveService:
                     if match:
                         service_id = int(match["id"])
                         if service_id not in open_ids:
-                            raise ValueError("Closed services cannot be silently reactivated")
+                            raise ValueError("Services outside this round cannot be updated or recreated")
                         item["service_id"] = service_id
                 expiry = future_time(item["expires_at"])
                 item["expires_at"] = expiry.isoformat()
@@ -436,7 +496,7 @@ class UserProactiveService:
                 seen_ids.add(service_id)
             results.append(item)
         if seen_ids != open_ids:
-            raise ValueError("Every waiting service must be explicitly updated or suppressed")
+            raise ValueError("Every selected waiting service must be explicitly updated or suppressed")
         return results
 
     def _normalize_round_service_results(
@@ -491,6 +551,7 @@ class UserProactiveService:
                     prediction_id=case["prediction"]["id"],
                     user_entity_id=case["prediction"]["user_entity_id"],
                     policy_version=self.POLICY_VERSION, evaluated_at=evaluation_time.isoformat(),
+                    evaluation_basis=case.get("evaluation_basis", {}),
                 )
                 service_id, action = self._model_db.save_user_proactive_service(
                     payload, reference_timestamp=evaluation_time.isoformat(),
@@ -593,8 +654,9 @@ class UserProactiveService:
 
         Jointly evaluate eligible forecasts and their waiting services in one LLM call.
         The pending query includes unevaluated forecasts and waiting-service
-        sources, reconsidered on each host trigger. Evaluated forecasts without
-        a waiting service are not reselected. Ready is not proof of delivery.
+        sources. Waiting services are reconsidered only when due or their related
+        business inputs change. Evaluated forecasts without a waiting service
+        are not reselected. Ready is not proof of delivery.
         """
         started_at = time.monotonic()
         self._logger.log_json_format(self.TASK_KIND, "proactive_services_generation_start", {
@@ -647,14 +709,41 @@ class UserProactiveService:
                 skipped.append({"prediction_id": prediction_id, "reason": "missing_or_foreign_prediction"})
                 self._logger.log_json_format(self.TASK_KIND, "prediction_skipped", skipped[-1])
                 continue
-            if len(predictions) >= max_predictions:
-                skipped.append({"prediction_id": prediction_id, "reason": "evaluation_limit"})
-                continue
             predictions.append(prediction)
 
         if predictions:
-            prediction_cases, input_failures = self._build_service_evaluation_input(predictions, states=states, evaluation_time=reference_timestamp)
+            candidates, input_failures = self._build_service_evaluation_input(predictions, states=states, evaluation_time=reference_timestamp)
             failures.extend(input_failures)
+            for case in candidates:
+                prediction_id = case["prediction"]["id"]
+                try:
+                    eligible = self._select_waiting_services_for_review(
+                        case, evaluation_time=reference_timestamp,
+                        runtime_context=context, agent_capabilities=capabilities,
+                    )
+                except Exception as exc:
+                    failures.append({"prediction_id": prediction_id, "stage": "review_inputs",
+                                     "error": f"{type(exc).__name__}: {exc}"})
+                    self._logger.exception("Service review input comparison failed prediction_id=%s", prediction_id)
+                    continue
+                reason = "no_reassessment_basis" if not eligible else (
+                    "evaluation_limit" if len(prediction_cases) >= max_predictions else None
+                )
+                if reason:
+                    skipped.append({"prediction_id": prediction_id, "reason": reason})
+                    self._logger.log_json_format(self.TASK_KIND, "prediction_skipped", skipped[-1])
+                    continue
+                prediction_cases.append(case)
+                self._logger.log_json_format(self.TASK_KIND, "evaluation_selected", {
+                    "prediction_id": prediction_id,
+                    "reason": "waiting_service_reassessment" if case["review_service_ids"] else "new_prediction",
+                    "review_service_ids": case["review_service_ids"],
+                })
+                self._logger.log_json_format(self.TASK_KIND, "inputs_loaded", {
+                    **json.loads(self._format_evaluation_case_for_prompt(case)),
+                    "future_fact_ids_excluded": case.get("future_fact_ids_excluded", []),
+                    "evaluation_time": reference_timestamp.isoformat(),
+                })
 
         normalized = {}
         if prediction_cases:
