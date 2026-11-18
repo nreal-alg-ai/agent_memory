@@ -16,7 +16,7 @@ from typing import Any, Iterator
 from intent_lifecycle import ACTIVE_USER_INTENT_STATUSES, USER_INTENT_STATUSES
 
 
-INTENT_TYPES = {"goal", "plan", "work_item"}
+INTENT_TYPES = {"user_intent"}
 STATE_TYPES = {"enduring_state", "recurring_state", "situational_state"}
 ACTIVITY_ROLES = {"actor", "participant", "contextual"}
 CURRENT_INTENT_STATUSES = ACTIVE_USER_INTENT_STATUSES
@@ -149,8 +149,8 @@ class MemoryInspector:
                 clauses.append("id=?")
                 values.append(item_id)
             else:
-                if object_type:
-                    clauses.append(f"{'object_type' if section == 'intents' else 'state_type'}=?")
+                if object_type and section == "states":
+                    clauses.append("state_type=?")
                     values.append(object_type)
                 if params.get("domain"):
                     clauses.append(f"{'primary_domain' if section == 'intents' else 'state_domain'}=?")
@@ -272,7 +272,7 @@ class MemoryInspector:
     @staticmethod
     def _record(row: dict[str, Any], section: str) -> dict[str, Any]:
         keys = ("id", "status", "confidence", "created_at", "updated_at")
-        extra = ("object_type", "summary", "primary_domain", "world_owner_entity_id", "current_progress", "time_start", "time_end") if section == "intents" else (
+        extra = ("summary", "primary_domain", "world_owner_entity_id", "current_progress", "time_start", "time_end") if section == "intents" else (
             "state_domain", "state_type", "state_kind", "state_topic", "state_text", "valid_from", "valid_to", "last_observed_at",
         )
         item = {key: row.get(key) for key in (*keys, *extra)}
@@ -293,7 +293,7 @@ class MemoryInspector:
         return {"items": [dict(row) for row in rows], "total": total, "page": page, "pageSize": DETAIL_PAGE_SIZE}
 
     def _intent_detail(self, connection, result, row, evidence_page, history_page):
-        result["evidence"] = self._page(connection, "memory_user_intent_evidence", "object_type=? AND object_id=?", (row["object_type"], row["id"]), evidence_page)
+        result["evidence"] = self._page(connection, "memory_user_intent_evidence", "intent_id=?", (row["id"],), evidence_page)
         result["history"] = self._page(connection, "memory_user_intent_events", "intent_id=?", (row["id"],), history_page)
         self._resolve_evidence(connection, result["evidence"]["items"])
         entity = connection.execute("SELECT name FROM memory_entity_nodes WHERE id=?", (row["world_owner_entity_id"],)).fetchone()
@@ -337,7 +337,7 @@ class MemoryInspector:
                 continue
             id_column = "signal_id" if kind == "user_action_signal" else "id"
             row = connection.execute(f"SELECT * FROM {spec[0]} WHERE {id_column}=?", (key,)).fetchone()
-            if row is None or kind in INTENT_TYPES and row["object_type"] != kind:
+            if row is None:
                 continue
             row = dict(row)
             evidence.update(resolved=True, text=_bounded(row.get(spec[1])), occurred_at=row.get("event_time_key") or row.get("last_observed_at") or row.get("updated_at") or "")
@@ -377,7 +377,7 @@ class MemoryInspector:
                     segments.extend(ref.get("source_unit_row_id") for ref in _json(item[0], []) if isinstance(ref, dict))
             if kind in INTENT_TYPES and _table(connection, "memory_user_intent_evidence"):
                 facts = [item[0] for item in connection.execute(
-                    "SELECT evidence_id FROM memory_user_intent_evidence WHERE object_type=? AND object_id=? AND evidence_type='fact' LIMIT 10", (kind, key),
+                    "SELECT evidence_id FROM memory_user_intent_evidence WHERE intent_id=? AND evidence_type='fact' LIMIT 10", (key,),
                 )]
             facts = [value for value in facts if type(value) is int and value > 0][:10]
             if facts and _table(connection, "memory_fact_source_mapping"):

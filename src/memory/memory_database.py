@@ -24,7 +24,11 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 import numpy as np
 
 from storage_utils import local_now_text, normalize_reference_timestamp, json_dumps, json_loads, latest_timestamp
-from intent_lifecycle import USER_INTENT_STATUSES
+from intent_lifecycle import (
+    USER_INTENT_STATUSES,
+    USER_INTENT_FIELDS,
+    normalize_user_intent_details,
+)
 from .memory_types import MemoryUnit
 
 try:
@@ -451,7 +455,6 @@ class UserMemoryDB:
                 signal_key TEXT NOT NULL,
                 subject_entity_id INTEGER,
                 signal_purpose TEXT NOT NULL DEFAULT '',
-                candidate_object_types TEXT NOT NULL DEFAULT '[]',
                 user_role TEXT NOT NULL DEFAULT '',
                 user_intent_anchor TEXT NOT NULL DEFAULT '',
                 user_intent_anchor_key TEXT NOT NULL DEFAULT '',
@@ -594,7 +597,6 @@ class UserMemoryDB:
 
             CREATE TABLE IF NOT EXISTS memory_user_intent_items (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                object_type TEXT NOT NULL CHECK(object_type IN ('goal', 'plan', 'work_item')),
                 world_owner_entity_id INTEGER NOT NULL,
                 canonical_key TEXT NOT NULL,
                 summary TEXT NOT NULL,
@@ -616,7 +618,6 @@ class UserMemoryDB:
                 signal_id INTEGER UNIQUE,
                 source_activity_id INTEGER,
                 target_intent_id INTEGER,
-                object_type TEXT NOT NULL CHECK(object_type IN ('goal', 'plan', 'work_item')),
                 target_description TEXT NOT NULL CHECK(length(trim(target_description)) > 0),
                 observation_text TEXT NOT NULL CHECK(length(trim(observation_text)) > 0),
                 lifecycle_evidence TEXT NOT NULL CHECK(
@@ -664,15 +665,14 @@ class UserMemoryDB:
             );
 
             CREATE TABLE IF NOT EXISTS memory_user_intent_evidence (
-                object_type TEXT NOT NULL,
-                object_id INTEGER NOT NULL,
+                intent_id INTEGER NOT NULL REFERENCES memory_user_intent_items(id) ON DELETE CASCADE,
                 evidence_type TEXT NOT NULL,
                 evidence_id INTEGER NOT NULL,
                 role TEXT NOT NULL DEFAULT 'support',
                 observed_at TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
-                PRIMARY KEY(object_type, object_id, evidence_type, evidence_id, role)
+                PRIMARY KEY(intent_id, evidence_type, evidence_id, role)
             );
 
             CREATE INDEX IF NOT EXISTS idx_user_intent_events_latest
@@ -718,12 +718,12 @@ class UserMemoryDB:
             ON memory_user_claim_events(target_claim_id, effective_at DESC, id DESC);
             CREATE INDEX IF NOT EXISTS idx_memory_user_claim_events_trigger
             ON memory_user_claim_events(trigger_claim_id, id DESC);
-            CREATE INDEX IF NOT EXISTS idx_memory_user_intent_items_owner_type_status
-            ON memory_user_intent_items(world_owner_entity_id, object_type, status, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_memory_user_intent_items_owner_status
+            ON memory_user_intent_items(world_owner_entity_id, status, updated_at DESC);
             CREATE INDEX IF NOT EXISTS idx_memory_user_intent_items_primary_time
-            ON memory_user_intent_items(object_type, world_owner_entity_id, time_start, time_end);
+            ON memory_user_intent_items(world_owner_entity_id, time_start, time_end);
             CREATE INDEX IF NOT EXISTS idx_memory_user_intent_evidence_object
-            ON memory_user_intent_evidence(object_type, object_id, role);
+            ON memory_user_intent_evidence(intent_id, role);
             CREATE INDEX IF NOT EXISTS idx_memory_user_intent_events_intent
             ON memory_user_intent_events(intent_id, id);
 
@@ -1516,7 +1516,6 @@ class UserMemoryDB:
             ).fetchall())
         if signal_type == "intent":
             for row in rows:
-                row["candidate_object_types"] = json_loads(row["candidate_object_types"], [])
                 row["subject_entity"] = str(row.get("subject") or "")
         return rows
 
@@ -1745,20 +1744,14 @@ class UserMemoryDB:
             except (KeyError, TypeError, ValueError):
                 subject_entity_id = 0
             signal_purpose = str(mapping.get("signal_purpose") or "").strip().lower()
-            user_role = str(mapping.get("user_role") or "").strip().lower()
+            user_role = str(mapping.get("user_role") or "").strip()
             user_intent_anchor = str(mapping.get("user_intent_anchor") or "").strip()
             user_intent_anchor_key = str(mapping.get("user_intent_anchor_key") or "").strip()
             assertion_source = str(mapping.get("assertion_source") or "").strip().lower()
-            candidate_object_types = list(dict.fromkeys(
-                str(value).strip().lower()
-                for value in (mapping.get("candidate_object_types") or [])
-                if str(value).strip().lower() in {"goal", "plan", "work_item"}
-            ))
             if (
                 subject_entity_id <= 0
                 or signal_purpose not in {"future_intent", "lifecycle_update"}
-                or not candidate_object_types
-                or user_role not in {"owner", "participant", "responsible"}
+                or not user_role
                 or not user_intent_anchor
                 or not user_intent_anchor_key
                 or assertion_source not in {
@@ -1768,21 +1761,20 @@ class UserMemoryDB:
             ):
                 continue
             if not signal_key:
-                signal_key = (
-                    f"{subject_entity_id}|{signal_purpose}|{user_intent_anchor_key}|"
-                    f"{','.join(sorted(candidate_object_types))}"
-                )
+                signal_key = json_dumps([
+                    subject_entity_id, signal_purpose, user_intent_anchor_key,
+                    user_role, str(mapping.get("evidence_basis") or "").strip(),
+                ])
             self._conn.execute(
                 """
                 INSERT INTO memory_user_intent_signals (
                     source_type, source_id, signal_key, subject_entity_id, signal_purpose,
-                    candidate_object_types, user_role,
+                    user_role,
                     user_intent_anchor, user_intent_anchor_key,
                     assertion_source, evidence_basis,
                     confidence, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(source_type, source_id, signal_key) DO UPDATE SET
-                    candidate_object_types = excluded.candidate_object_types,
                     user_role = excluded.user_role,
                     user_intent_anchor = excluded.user_intent_anchor,
                     assertion_source = excluded.assertion_source,
@@ -1795,7 +1787,7 @@ class UserMemoryDB:
                 """,
                 (
                     source_type, source_id, signal_key, subject_entity_id or None, signal_purpose,
-                    json_dumps(candidate_object_types), user_role,
+                    user_role,
                     user_intent_anchor, user_intent_anchor_key,
                     assertion_source,
                     str(mapping.get("evidence_basis") or "").strip(),
@@ -1830,35 +1822,32 @@ class UserMemoryDB:
         signal_id = observation.get("signal_id")
         activity_id = observation.get("source_activity_id")
         target_id = observation.get("target_intent_id")
-        object_type = str(observation["object_type"])
         if (signal_id is None) == (activity_id is None):
             raise ValueError("Observation requires exactly one signal or activity source")
         if signal_id is not None:
             source = self._conn.execute(
-                "SELECT signal_purpose, candidate_object_types "
+                "SELECT signal_purpose "
                 "FROM memory_user_intent_signals WHERE signal_id = ?",
                 (signal_id,),
             ).fetchone()
-            if (target_id is not None or not source or source["signal_purpose"] != "lifecycle_update"
-                    or object_type not in json_loads(source["candidate_object_types"], [])):
-                raise ValueError("Observation must reference a lifecycle signal of the same object type")
+            if (target_id is not None or not source or source["signal_purpose"] != "lifecycle_update"):
+                raise ValueError("Observation must reference a lifecycle_update signal")
             identity_field, identity_values = "signal_id", (int(signal_id),)
         else:
             activity = self.get_user_activity_items_by_ids([activity_id])
-            target = self.get_intent_object(object_type=object_type, object_id=int(target_id or 0))
+            target = self.get_intent_object(intent_id=int(target_id or 0))
             if not activity or not target:
-                raise ValueError("Activity observation requires a real activity and same-type intent")
+                raise ValueError("Activity observation requires a real activity and intent")
             identity_field, identity_values = "source_activity_id, target_intent_id", (int(activity_id), int(target_id))
         now = local_now_text() if reference_timestamp is None else normalize_reference_timestamp(reference_timestamp)
         self._conn.execute(
             f"""
             INSERT INTO memory_user_intent_lifecycle_observations (
-                signal_id, source_activity_id, target_intent_id, object_type, target_description, observation_text,
+                signal_id, source_activity_id, target_intent_id, target_description, observation_text,
                 lifecycle_evidence, effective_at, confidence, details,
                 created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT({identity_field}) DO UPDATE SET
-                object_type = excluded.object_type,
                 target_description = excluded.target_description,
                 observation_text = excluded.observation_text,
                 lifecycle_evidence = excluded.lifecycle_evidence,
@@ -1868,7 +1857,7 @@ class UserMemoryDB:
                 updated_at = excluded.updated_at
             """,
             (
-                signal_id, activity_id, target_id, object_type, str(observation["target_description"]),
+                signal_id, activity_id, target_id, str(observation["target_description"]),
                 str(observation["observation_text"]), str(observation["lifecycle_evidence"]),
                 str(observation.get("effective_at") or ""),
                 float(observation.get("confidence", 0.7)),
@@ -2285,260 +2274,92 @@ class UserMemoryDB:
         self._commit_if_needed()
         return int(cur.lastrowid)
 
-    @staticmethod
-    def _intent_object_spec(object_type: str) -> tuple[str, tuple[str, ...]]:
-        normalized = str(object_type or "").strip().lower()
-        if normalized not in {"goal", "plan", "work_item"}:
-            raise ValueError("object_type must be goal, plan, or work_item")
-        return "memory_user_intent_items", (
-            "object_type", "world_owner_entity_id",
-            "canonical_key", "summary", "primary_domain", "status", "current_progress",
-            "time_start", "time_end", "confidence", "details", "metadata",
-        )
 
     @staticmethod
-    def _intent_payload_to_row(
-        object_type: str,
-        payload: Dict[str, Any],
-    ) -> Dict[str, Any]:
-        """Map the typed manager payload onto the unified physical row."""
-        normalized = str(object_type or "").strip().lower()
-        if normalized not in {"goal", "plan", "work_item"}:
-            raise ValueError("object_type must be goal, plan, or work_item")
-        status = payload.get("status", "pending")
-        if not isinstance(status, str) or status not in USER_INTENT_STATUSES:
-            raise ValueError("intent status must be pending, in_progress, blocked, completed, or cancelled")
-        details = dict(payload.get("details") or {}) if isinstance(payload.get("details"), dict) else {}
-        if normalized == "goal":
-            details.update({
-                key: payload[key]
-                for key in ("desired_outcome", "success_criteria", "target_at")
-                if key in payload
-            })
-            time_start = str(payload.get("time_start") or "")
-            time_end = str(payload.get("time_end") or payload.get("target_at") or "")
-        elif normalized == "plan":
-            details.update({
-                key: payload[key]
-                for key in (
-                    "event_or_activity", "time_precision", "location_entity_id", "location_text",
-                )
-                if key in payload
-            })
-            time_start = str(payload.get("time_start") or payload.get("start_at") or "")
-            time_end = str(payload.get("time_end") or payload.get("end_at") or "")
-        else:
-            details.update({
-                key: payload[key]
-                for key in (
-                    "action_text", "deliverable", "responsibility_type", "priority",
-                    "completed_at", "extractor_version", "prompt_version",
-                )
-                if key in payload
-            })
-            time_start = str(payload.get("time_start") or payload.get("start_at") or "")
-            time_end = str(payload.get("time_end") or payload.get("due_at") or "")
-        return {
-            "object_type": normalized,
-            "world_owner_entity_id": payload.get("world_owner_entity_id"),
-            "canonical_key": payload.get("canonical_key"),
-            "summary": payload.get("summary"),
-            "primary_domain": payload.get("primary_domain"),
-            "status": status,
-            "current_progress": payload.get("current_progress"),
-            "time_start": time_start,
-            "time_end": time_end,
-            "confidence": payload.get("confidence"),
-            "details": details,
-            "metadata": payload.get("metadata"),
-        }
+    def _intent_payload_to_row(payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Validate one shared intent shape, independent of how it was expressed."""
+        row = {key: payload[key] for key in USER_INTENT_FIELDS if key in payload}
+        if "status" in row and row["status"] not in USER_INTENT_STATUSES:
+            raise ValueError("Invalid intent status")
+        if "details" in row:
+            row["details"] = normalize_user_intent_details(row["details"])
+        return row
 
     @staticmethod
     def _intent_row_to_api(row: sqlite3.Row | Dict[str, Any]) -> Dict[str, Any]:
         item = dict(row)
-        details = json_loads(item.get("details"), {})
-        details = details if isinstance(details, dict) else {}
-        metadata = json_loads(item.get("metadata"), {})
-        item["details"] = details
-        item["metadata"] = metadata if isinstance(metadata, dict) else {}
-        object_type = str(item.get("object_type") or "")
-        item["world_owner_entity_id"] = int(item.get("world_owner_entity_id") or 0)
-        if object_type == "goal":
-            item.update(
-                owner_entity_id=item["world_owner_entity_id"],
-                desired_outcome=details.get("desired_outcome") or "",
-                success_criteria=details.get("success_criteria") or "",
-                target_at=details.get("target_at") or item.get("time_end") or "",
-            )
-        elif object_type == "plan":
-            item.update(
-                actor_entity_id=item["world_owner_entity_id"],
-                event_or_activity=details.get("event_or_activity") or "",
-                start_at=item.get("time_start") or "",
-                end_at=item.get("time_end") or "",
-                time_precision=details.get("time_precision") or "unknown",
-                location_entity_id=details.get("location_entity_id"),
-                location_text=details.get("location_text") or "",
-            )
-        elif object_type == "work_item":
-            item.update(
-                responsible_entity_id=item["world_owner_entity_id"],
-                action_text=details.get("action_text") or "",
-                deliverable=details.get("deliverable") or "",
-                responsibility_type=details.get("responsibility_type") or "personal_action",
-                due_at=item.get("time_end") or "",
-                start_at=item.get("time_start") or "",
-                priority=details.get("priority") or "",
-                completed_at=details.get("completed_at") or "",
-                extractor_version=details.get("extractor_version") or "",
-                prompt_version=details.get("prompt_version") or "",
-            )
+        item["world_owner_entity_id"] = int(item["world_owner_entity_id"])
+        for key in ("details", "metadata"):
+            item[key] = json_loads(item.get(key), {})
         return item
 
-    def create_intent_object(self, *, object_type: str, payload: Dict[str, Any], reference_timestamp: Any = None) -> int:
-        """Persist one normalized Goal, Plan, or Work item candidate."""
-        table, columns = self._intent_object_spec(object_type)
-        normalized_payload = self._intent_payload_to_row(object_type, payload)
+    def create_intent_object(self, *, payload: Dict[str, Any], reference_timestamp: Any = None) -> int:
+        row = self._intent_payload_to_row({"status": "pending", **payload})
+        if not row.get("summary") or not row.get("canonical_key") or not row.get("world_owner_entity_id"):
+            raise ValueError("Intent requires an owner, identity and summary")
         now = local_now_text() if reference_timestamp is None else normalize_reference_timestamp(reference_timestamp)
-        values: List[Any] = []
-        for column in columns:
-            value = normalized_payload.get(column)
-            if column in {"metadata", "details"}:
-                value = json_dumps(value if isinstance(value, dict) else {})
-            elif column == "confidence":
-                value = float(value or 0.0)
-            elif column.endswith("_entity_id"):
-                value = int(value) if value not in (None, "", 0) else None
-            elif column == "object_type":
-                value = str(value or object_type)
-            else:
-                value = str(value or "")
+        values = []
+        for key in USER_INTENT_FIELDS:
+            value = row.get(key)
+            if key in {"details", "metadata"}: value = json_dumps(value or {})
+            elif key == "confidence": value = float(value if value is not None else 0.7)
+            elif key == "world_owner_entity_id": value = int(value)
+            else: value = str(value or "")
             values.append(value)
-        placeholders = ", ".join("?" for _ in columns)
-        cur = self._conn.execute(
-            f"INSERT INTO {table} ({', '.join(columns)}, created_at, updated_at) "
-            f"VALUES ({placeholders}, ?, ?)",
-            (*values, now, now),
+        cursor = self._conn.execute(
+            f"INSERT INTO memory_user_intent_items ({','.join(USER_INTENT_FIELDS)},created_at,updated_at) "
+            f"VALUES ({','.join('?' for _ in USER_INTENT_FIELDS)},?,?)", (*values, now, now),
         )
         self._commit_if_needed()
-        return int(cur.lastrowid)
+        return int(cursor.lastrowid)
 
-    def update_intent_object(
-        self, *, object_type: str, object_id: int, payload: Dict[str, Any],
-        reference_timestamp: Any = None,
-    ) -> bool:
-        """Update a known object without erasing fields absent from an event."""
-        now = local_now_text() if reference_timestamp is None else normalize_reference_timestamp(reference_timestamp)
-        table, allowed_columns = self._intent_object_spec(object_type)
-        normalized_payload = self._intent_payload_to_row(object_type, payload)
-        existing_row = self._conn.execute(
-            f"SELECT * FROM {table} WHERE id = ? AND object_type = ?",
-            (int(object_id), str(object_type).strip().lower()),
-        ).fetchone()
-        if not existing_row:
+    def update_intent_object(self, *, intent_id: int, payload: Dict[str, Any], reference_timestamp: Any = None) -> bool:
+        """Apply a sparse shared patch; omitted business fields remain intact."""
+        existing = self.get_intent_object(intent_id=intent_id)
+        if existing is None:
             return False
-        if "current_progress" not in payload:
-            normalized_payload.pop("current_progress", None)
-        if "status" not in payload:
-            normalized_payload.pop("status", None)
-        existing = dict(existing_row)
-        for json_field in ("details", "metadata"):
-            existing[json_field] = json_loads(existing.get(json_field), {})
-            if not isinstance(existing[json_field], dict):
-                existing[json_field] = {}
-        if "details" in payload or any(
-            key in payload for key in (
-                "desired_outcome", "success_criteria", "target_at", "event_or_activity",
-                "time_precision", "location_entity_id", "location_text", "action_text",
-                "deliverable", "responsibility_type", "priority", "completed_at",
-                "extractor_version", "prompt_version",
-            )
-        ):
-            normalized_payload["details"] = {
-                **existing["details"],
-                **{
-                    key: value
-                    for key, value in (normalized_payload.get("details") or {}).items()
-                    if value not in ("", None, 0, {}, [])
-                },
-            }
-        if "metadata" in payload:
-            normalized_payload["metadata"] = {
-                **existing["metadata"],
-                **(normalized_payload.get("metadata") or {}),
-            }
-        else:
-            normalized_payload.pop("metadata", None)
-        if "details" not in payload and not any(
-            key in payload for key in (
-                "desired_outcome", "success_criteria", "target_at", "event_or_activity",
-                "time_precision", "location_entity_id", "location_text", "action_text",
-                "deliverable", "responsibility_type", "priority", "completed_at",
-                "extractor_version", "prompt_version",
-            )
-        ):
-            normalized_payload.pop("details", None)
-        assignments: List[str] = []
-        values: List[Any] = []
-        for column in allowed_columns:
-            if column not in normalized_payload:
-                continue
-            value = normalized_payload[column]
-            if column in {"metadata", "details"}:
-                value = json_dumps(value if isinstance(value, dict) else {})
-            elif column == "confidence":
-                value = float(value or 0.0)
-            elif column.endswith("_entity_id"):
-                value = int(value) if value not in (None, "", 0) else None
-            elif column == "object_type":
-                value = str(value or object_type)
-            else:
-                value = str(value or "")
-            assignments.append(f"{column} = ?")
+        row = self._intent_payload_to_row(payload)
+        assignments, values = [], []
+        for key, value in row.items():
+            if key in {"details", "metadata"}:
+                value = json_dumps({**existing[key], **value})
+            elif key == "confidence": value = float(value)
+            elif key == "world_owner_entity_id": value = int(value)
+            else: value = str(value or "")
+            assignments.append(f"{key}=?")
             values.append(value)
         if not assignments:
             return False
-        assignments.append("updated_at = ?")
-        values.extend([now, int(object_id)])
-        cur = self._conn.execute(
-            f"UPDATE {table} SET {', '.join(assignments)} WHERE id = ?", values
+        now = local_now_text() if reference_timestamp is None else normalize_reference_timestamp(reference_timestamp)
+        cursor = self._conn.execute(
+            f"UPDATE memory_user_intent_items SET {','.join(assignments)},updated_at=? WHERE id=?",
+            (*values, now, int(intent_id)),
         )
         self._commit_if_needed()
-        return bool(cur.rowcount)
+        return bool(cursor.rowcount)
 
-    def get_intent_objects(
-        self,
-        *,
-        object_type: str,
-        world_owner_entity_id: Optional[int] = None,
-        primary_domain: Optional[str] = None,
-        statuses: Optional[Sequence[str]] = None,
-        limit: int = 120,
-    ) -> List[Dict[str, Any]]:
-        table, _columns = self._intent_object_spec(object_type)
-        clauses: List[str] = ["object_type = ?"]
-        params: List[Any] = [str(object_type).strip().lower()]
-        if world_owner_entity_id is not None:
-            clauses.append("world_owner_entity_id = ?")
-            params.append(int(world_owner_entity_id))
-        if primary_domain is not None:
-            clauses.append("primary_domain = ?")
-            params.append(str(primary_domain))
+    def get_intent_objects(self, *, world_owner_entity_id: Optional[int] = None,
+                           primary_domain: Optional[str] = None, statuses: Optional[Sequence[str]] = None,
+                           limit: int = 120) -> List[Dict[str, Any]]:
+        clauses, params = [], []
+        for key, value in (("world_owner_entity_id", world_owner_entity_id), ("primary_domain", primary_domain)):
+            if value is not None:
+                clauses.append(f"{key}=?")
+                params.append(value)
         if statuses:
-            placeholders = ", ".join("?" for _ in statuses)
-            clauses.append(f"status IN ({placeholders})")
-            params.extend(str(status) for status in statuses)
+            clauses.append(f"status IN ({','.join('?' for _ in statuses)})")
+            params.extend(statuses)
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
         rows = self._conn.execute(
-            f"SELECT * FROM {table}{where} ORDER BY updated_at DESC, id DESC LIMIT ?",
-            (*params, max(1, int(limit or 120))),
+            f"SELECT * FROM memory_user_intent_items{where} ORDER BY updated_at DESC,id DESC LIMIT ?",
+            (*params, max(1, int(limit))),
         ).fetchall()
         return [self._intent_row_to_api(row) for row in rows]
 
     def get_user_intent_items_by_ids(
         self, intent_ids: Sequence[int],
     ) -> List[Dict[str, Any]]:
-        """Read typed intent items by their IDs in the unified table."""
+        """Read intent items by their IDs in the unified table."""
         ids = sorted({int(value) for value in intent_ids if int(value) > 0})
         items: List[Dict[str, Any]] = []
         for offset in range(0, len(ids), 500):
@@ -2630,17 +2451,16 @@ class UserMemoryDB:
             raise ValueError("Activity intent event requires its lifecycle observation")
         if lifecycle_observation_id is not None:
             observation = self._conn.execute(
-                "SELECT signal_id, source_activity_id, target_intent_id, object_type "
+                "SELECT signal_id, source_activity_id, target_intent_id "
                 "FROM memory_user_intent_lifecycle_observations "
                 "WHERE id = ?", (int(lifecycle_observation_id),),
             ).fetchone()
             if (not observation or observation["signal_id"] != source_signal_id
                     or observation["source_activity_id"] != source_activity_id
-                    or (source_activity_id is not None and observation["target_intent_id"] != int(intent_id))
-                    or observation["object_type"] != intent["object_type"]):
-                raise ValueError("Intent event observation does not match its source and type")
-        # Store physical business fields, excluding timestamps and typed API aliases.
-        _, columns = self._intent_object_spec(intent["object_type"])
+                    or (source_activity_id is not None and observation["target_intent_id"] != int(intent_id))):
+                raise ValueError("Intent event observation does not match its source or target")
+        # Store physical business fields, excluding timestamps.
+        columns = USER_INTENT_FIELDS
         current = self._intent_row_to_api(intent)
         previous = {key: previous_payload[key] for key in columns} if previous_payload else {}
         updated = {key: new_payload[key] for key in columns}
@@ -2710,14 +2530,8 @@ class UserMemoryDB:
         ).fetchone()
         return self.get_user_intent_events(event_ids=[row["id"]])[0] if row else None
 
-    def get_intent_object(
-        self, *, object_type: str, object_id: int
-    ) -> Optional[Dict[str, Any]]:
-        table, _columns = self._intent_object_spec(object_type)
-        row = self._conn.execute(
-            f"SELECT * FROM {table} WHERE id = ? AND object_type = ?",
-            (int(object_id), str(object_type).strip().lower()),
-        ).fetchone()
+    def get_intent_object(self, *, intent_id: int) -> Optional[Dict[str, Any]]:
+        row = self._conn.execute("SELECT * FROM memory_user_intent_items WHERE id=?", (int(intent_id),)).fetchone()
         return self._intent_row_to_api(row) if row else None
 
     def get_entity_id_by_name(self, name: str) -> Optional[int]:
@@ -2730,32 +2544,15 @@ class UserMemoryDB:
     def upsert_intent_evidence(self, evidence: Sequence[Dict[str, Any]], *, reference_timestamp: Any = None) -> int:
         now = local_now_text() if reference_timestamp is None else normalize_reference_timestamp(reference_timestamp)
         changed = 0
-        for item in evidence or []:
-            object_type = str(item.get("object_type") or "").strip().lower()
-            evidence_type = str(item.get("evidence_type") or "fact").strip().lower()
-            role = str(item.get("role") or "support").strip().lower()
-            try:
-                object_id = int(item["object_id"])
-                evidence_id = int(item["evidence_id"])
-            except (KeyError, TypeError, ValueError):
-                continue
-            if (
-                object_type not in {"goal", "plan", "work_item"}
-                or evidence_type not in {"fact", "user_activity"}
-                or object_id <= 0 or evidence_id <= 0
-            ):
-                continue
+        for item in evidence:
+            intent_id, evidence_id = int(item["intent_id"]), int(item["evidence_id"])
+            if intent_id <= 0 or evidence_id <= 0 or item["evidence_type"] not in {"fact", "user_activity"}:
+                raise ValueError("Invalid intent evidence")
             self._conn.execute(
-                """
-                INSERT INTO memory_user_intent_evidence (
-                    object_type, object_id, evidence_type, evidence_id, role,
-                    observed_at, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(object_type, object_id, evidence_type, evidence_id, role)
-                DO UPDATE SET observed_at = excluded.observed_at, updated_at = excluded.updated_at
-                """,
-                (object_type, object_id, evidence_type, evidence_id, role,
-                 str(item.get("observed_at") or ""), now, now),
+                "INSERT INTO memory_user_intent_evidence (intent_id,evidence_type,evidence_id,role,observed_at,created_at,updated_at) "
+                "VALUES (?,?,?,?,?,?,?) ON CONFLICT(intent_id,evidence_type,evidence_id,role) "
+                "DO UPDATE SET observed_at=excluded.observed_at,updated_at=excluded.updated_at",
+                (intent_id, item["evidence_type"], evidence_id, item.get("role", "support"), item.get("observed_at", ""), now, now),
             )
             changed += 1
         self._commit_if_needed()
@@ -3142,57 +2939,19 @@ class UserMemoryDB:
                 result[claim_id].append(fact_id)
         return result
 
-    def get_intent_evidence_fact_ids(
-        self,
-        objects: Sequence[Tuple[str, int]],
-        *,
-        limit: int = 120,
-    ) -> Dict[Tuple[str, int], List[int]]:
-        """Return fact evidence for bounded goal, plan, and work-item rows."""
-        normalized: List[Tuple[str, int]] = []
-        seen: set[Tuple[str, int]] = set()
-        for object_type, object_id in objects or []:
-            normalized_type = str(object_type or "").strip().lower()
-            if normalized_type not in {"goal", "plan", "work_item"}:
-                continue
-            try:
-                normalized_id = int(object_id)
-            except (TypeError, ValueError):
-                continue
-            key = (normalized_type, normalized_id)
-            if normalized_id <= 0 or key in seen:
-                continue
-            seen.add(key)
-            normalized.append(key)
-        if not normalized:
-            return {}
-        object_clauses = " OR ".join(
-            "(object_type = ? AND object_id = ?)" for _item in normalized
-        )
-        params: List[Any] = [
-            value
-            for object_type, object_id in normalized
-            for value in (object_type, object_id)
-        ]
+    def get_intent_evidence_fact_ids(self, intent_ids: Sequence[int], *, limit: int = 120) -> Dict[int, List[int]]:
+        ids = list(dict.fromkeys(int(v) for v in intent_ids if int(v) > 0))
+        result = {key: [] for key in ids}
+        if not ids:
+            return result
         rows = self._conn.execute(
-            f"""
-            SELECT object_type, object_id, evidence_id
-            FROM memory_user_intent_evidence
-            WHERE evidence_type = 'fact'
-              AND ({object_clauses})
-            ORDER BY object_type ASC, object_id ASC, observed_at DESC, evidence_id DESC
-            LIMIT ?
-            """,
-            (*params, max(1, int(limit or 120))),
+            f"SELECT intent_id,evidence_id FROM memory_user_intent_evidence WHERE evidence_type='fact' "
+            f"AND intent_id IN ({','.join('?' for _ in ids)}) ORDER BY observed_at DESC,evidence_id DESC LIMIT ?",
+            (*ids, max(1, int(limit))),
         ).fetchall()
-        result: Dict[Tuple[str, int], List[int]] = {
-            item: [] for item in normalized
-        }
         for row in rows:
-            key = (str(row["object_type"]), int(row["object_id"]))
-            fact_id = int(row["evidence_id"])
-            if fact_id not in result.setdefault(key, []):
-                result[key].append(fact_id)
+            if row["evidence_id"] not in result[row["intent_id"]]:
+                result[row["intent_id"]].append(row["evidence_id"])
         return result
 
     def upsert_user_claim_evidence(self, evidence: Sequence[Dict[str, Any]], *, reference_timestamp: Any = None) -> int:

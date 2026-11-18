@@ -72,7 +72,7 @@ class UserStateResolver:
     }
     OPERATIONS = {"create", "reinforce", "revise", "weaken", "expire"}
     EVIDENCE_TYPES = {
-        "user_claim", "goal", "plan", "work_item", "user_activity", "fact",
+        "user_claim", "user_intent", "user_activity", "fact",
         "user_observed_pattern", "user_action_signal", "user_thread", "user_thread_event",
     }
     EVIDENCE_ROLES = {"support", "change_trigger", "counterexample", "context"}
@@ -1371,7 +1371,7 @@ class UserStateResolver:
                 trigger_intent_objects=[
                     {"object_type": item["evidence_type"], "object_id": item["evidence_id"]}
                     for item in evidence
-                    if item["evidence_type"] in {"goal", "plan", "work_item"}
+                    if item["evidence_type"] in {"user_intent"}
                 ],
                 effective_at=effective_at,
                 decision_source=decision_source or self.RESOLVER_VERSION,

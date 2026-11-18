@@ -88,9 +88,9 @@ class UserProactiveService:
                 basis = prediction.get("basis") or {}
                 source = basis.get("intent") or {}
                 intent = self._memory_db.get_intent_object(
-                    object_type=source["object_type"], object_id=int(source["id"]),
+                    intent_id=int(source["id"]),
                 )
-                key = (intent["object_type"], int(intent["id"]))
+                key = int(intent["id"])
                 fact_ids = self._memory_db.get_intent_evidence_fact_ids([key], limit=20).get(key, [])
                 facts, excluded_future_fact_ids = [], []
                 for fact in self._memory_db.get_memory_facts_by_ids(fact_ids):
@@ -144,16 +144,11 @@ class UserProactiveService:
 
         def intent_view(intent):
             result = select(intent, (
-                "id", "object_type", "summary", "primary_domain", "status", "confidence", "current_progress",
-                "time_start", "time_end", "time_precision",
+                "id", "summary", "primary_domain", "status", "confidence", "current_progress",
+                "time_start", "time_end",
             ))
             if "details" in intent:
-                result["details"] = select(intent.get("details") or {}, (
-                    "desired_outcome", "success_criteria", "target_at",
-                    "event_or_activity", "time_precision", "location_text", "participants",
-                    "action_text", "deliverable", "responsibility_type", "priority", "completed_at",
-                    "beneficiary_entities", "delegator_entities", "collaborator_entities",
-                ))
+                result["details"] = dict(intent.get("details") or {})
             return result
 
         state_fields = (
@@ -207,16 +202,11 @@ class UserProactiveService:
 
         intent = case["current_intent"]
         intent_view = select(intent, (
-            "id", "object_type", "summary", "primary_domain", "status", "current_progress",
-            "time_start", "time_end", "time_precision",
+            "id", "summary", "primary_domain", "status", "current_progress",
+            "time_start", "time_end",
         ))
         details = intent.get("details") or {}
-        intent_view["details"] = {name: details[name] for name in (
-            "desired_outcome", "success_criteria", "target_at", "event_or_activity",
-            "time_precision", "location_text", "participants", "action_text", "deliverable",
-            "responsibility_type", "priority", "completed_at", "beneficiary_entities",
-            "delegator_entities", "collaborator_entities",
-        ) if name in details}
+        intent_view["details"] = dict(details)
         # Only top-level transport metadata is ignored. Business times such as
         # a nested activity.started_at remain meaningful inputs.
         transport_fields = {
@@ -318,7 +308,7 @@ class UserProactiveService:
         prediction = predictions[0]
         source = (prediction.get("basis") or {}).get("intent") or {}
         intent = self._memory_db.get_intent_object(
-            object_type=source["object_type"], object_id=int(source["id"]),
+            intent_id=int(source["id"]),
         )
         context = {
             "service": {key: service[key] for key in (
@@ -329,8 +319,8 @@ class UserProactiveService:
                 "id", "behavior_text", "window_start", "window_end", "status",
             )},
             "current_intent": {key: intent.get(key) for key in (
-                "id", "object_type", "summary", "primary_domain", "status",
-                "time_start", "time_end", "time_precision", "details",
+                "id", "summary", "primary_domain", "status",
+                "time_start", "time_end", "details",
             )} if intent else None,
         }
         payload = {

@@ -101,12 +101,11 @@ class UserPrediction:
 
     def _intent_snapshot(self, intent: Dict[str, Any]) -> Dict[str, Any]:
         return {
-            "object_type": intent["object_type"], "id": int(intent["id"]),
+            "id": int(intent["id"]),
             "summary": intent.get("summary") or "",
             "current_progress": intent.get("current_progress") or "",
             "time_start": intent.get("time_start") or "",
             "time_end": intent.get("time_end") or "",
-            "time_precision": intent.get("time_precision") or "unknown",
             "primary_domain": intent.get("primary_domain") or "general",
             "status": intent.get("status") or "", "details": intent.get("details") or {},
             "updated_at": intent.get("updated_at") or "",
@@ -163,8 +162,8 @@ class UserPrediction:
             else:
                 path = "LLM_create"
             fact_ids = self._user_memory_db.get_intent_evidence_fact_ids(
-                [(intent["object_type"], intent["id"])],
-            ).get((intent["object_type"], intent["id"]), []) if path != "ruling_cleanup" else []
+                [intent["id"]],
+            ).get(intent["id"], []) if path != "ruling_cleanup" else []
             cases.append({
                 "event_type": latest["event_type"], "processing_path": path,
                 "current_intent": intent, "intent_events": related_events,
@@ -288,8 +287,8 @@ class UserPrediction:
                     continue
                 snapshot = self._intent_snapshot(intent)
                 fact_ids = self._user_memory_db.get_intent_evidence_fact_ids(
-                    [(intent["object_type"], intent["id"])],
-                ).get((intent["object_type"], intent["id"]), [])
+                    [intent["id"]],
+                ).get(intent["id"], [])
                 existing = self._model_db.get_user_predictions_by_intent_ids(
                     [intent["id"]], statuses=["pending"], user_entity_id=owner_id,
                 )
@@ -613,35 +612,15 @@ class UserPrediction:
                     )
         return {"predictions": saved, "invalidated_prediction_ids": invalidated, "closed_service_ids": closed}
 
-    def _format_intent_cases_view_for_new_intent_prediction_prompt(
-        self, cases: Sequence[Dict[str, Any]],
-    ) -> str:
-        """Keep only prediction evidence in the prompt; leave internal cases intact."""
-        detail_fields = {
-            "goal": ("desired_outcome", "success_criteria", "target_at"),
-            "plan": ("event_or_activity", "time_precision", "location_text", "participants"),
-            "work_item": ("action_text", "deliverable", "responsibility_type", "beneficiary_entities",
-                          "delegator_entities", "collaborator_entities", "priority", "completed_at"),
-        }
+    def _format_intent_cases_view_for_new_intent_prediction_prompt(self, cases: Sequence[Dict[str, Any]]) -> str:
         lines = []
         for case in cases:
-            intent = case["current_intent"]
-            intent_view = {key: intent[key] for key in (
-                "object_type", "id", "summary", "current_progress", "time_start", "time_end", "time_precision", "status",
-            ) if key in intent and intent[key] not in ("", [], {}, None)}
-            details = intent.get("details") or {}
-            detail_view = {key: details[key] for key in detail_fields[intent["object_type"]]
-                           if key in details and details[key] not in ("", [], {}, None)}
-            if detail_view.get("target_at") == intent_view.get("time_end"):
-                detail_view.pop("target_at", None)
-            if detail_view.get("time_precision") == intent_view.get("time_precision"):
-                detail_view.pop("time_precision", None)
-            if detail_view:
-                intent_view["details"] = detail_view
-            fact_views = [{key: fact.get(key) for key in (
-                "fact_id", "summary", "event_time_key", "dialogue_time_key",
-            )} for fact in case["related_facts"]]
-            lines.append(json.dumps({"current_intent": intent_view, "related_facts": fact_views}, ensure_ascii=False))
+            intent_view = {key: case["current_intent"][key] for key in (
+                "id", "summary", "current_progress", "time_start", "time_end", "status", "details",
+            ) if case["current_intent"].get(key) not in ("", [], {}, None)}
+            facts = [{key: fact.get(key) for key in ("fact_id", "summary", "event_time_key", "dialogue_time_key")}
+                     for fact in case["related_facts"]]
+            lines.append(json.dumps({"current_intent": intent_view, "related_facts": facts}, ensure_ascii=False))
         return "\n".join(lines)
 
     def _generate_predictions_for_created_intents_with_llm(
@@ -733,7 +712,7 @@ class UserPrediction:
             if decision == "predict_now":
                 prediction = result["prediction"]
                 if not isinstance(prediction, dict) or set(prediction) != {
-                    "intent_type", "state_ids", "behavior_text", "window_start", "window_end",
+                    "state_ids", "behavior_text", "window_start", "window_end",
                     "conditions", "likelihood_band", "uncertainties", "rationale",
                 }:
                     raise ValueError(f"prediction_results[{index}] requires one prediction object without intent_id")
@@ -901,23 +880,22 @@ class UserPrediction:
         horizon_end: datetime, intent_events: Sequence[Dict[str, Any]],
         source_assessment_id: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
-        intent_by_key = {(item["object_type"], item["id"]): item for item in intents}
+        intent_by_id = {item["id"]: item for item in intents}
         state_by_id = {item["id"]: item for item in states}
         accepted = []
         for candidate in raw[:5]:
             if not isinstance(candidate, dict):
                 raise ValueError("candidate_not_object")
             try:
-                intent_type = str(candidate.get("intent_type") or "")
                 intent_id = int(candidate.get("intent_id"))
                 state_ids = sorted({int(value) for value in candidate.get("state_ids") or []})
             except (TypeError, ValueError) as exc:
                 raise ValueError("invalid_intent_or_state_id_format") from exc
-            intent = intent_by_key.get((intent_type, intent_id))
+            intent = intent_by_id.get(intent_id)
             if intent is None:
                 raise ValueError(
-                    f"unknown_or_inactive_intent_reference: intent_type={intent_type!r}, "
-                    f"intent_id={intent_id}, allowed_intents={sorted(intent_by_key)}"
+                    f"unknown_or_inactive_intent_reference: "
+                    f"intent_id={intent_id}, allowed_intents={sorted(intent_by_id)}"
                 )
             unknown_state_ids = [value for value in state_ids if value not in state_by_id]
             if unknown_state_ids:
@@ -934,12 +912,16 @@ class UserPrediction:
             band = str(candidate.get("likelihood_band") or "").lower().strip()
             beginning = self._as_datetime(candidate.get("window_start"), evaluation_time)
             ending = self._as_datetime(candidate.get("window_end"), evaluation_time)
-            anchor_text = str(intent.get("time_start" if intent_type == "plan" else "time_end") or "")
-            precise_anchor = bool(re.search(r"[T\s]\d{2}:\d{2}", anchor_text))
-            if intent["object_type"] == "plan" and intent.get("time_precision") in {
-                "day", "week", "unknown",
-            }:
-                precise_anchor = False
+            details = intent.get("details") or {}
+            # A preparation boundary is an event start or explicit deadline/target,
+            # never an availability date or an unexplained generic timestamp.
+            if details.get("time_start_meaning") == "start":
+                anchor_text = str(intent.get("time_start") or "")
+            elif details.get("time_end_meaning") in {"deadline", "target"}:
+                anchor_text = str(intent.get("time_end") or "")
+            else:
+                anchor_text = ""
+            precise_anchor = bool(re.search(r"[T\s]\d{2}:\d{2}", anchor_text)) and details.get("time_precision") == "exact"
             # Keep coarse or unknown anchors as uncertainty, never midnight deadlines.
             intent_anchor = self._as_datetime(anchor_text, evaluation_time) if precise_anchor else None
             reasons = []
@@ -982,7 +964,7 @@ class UserPrediction:
                 "rationale": str(candidate.get("rationale") or "").strip(),
             }
             key = hashlib.sha256(json.dumps({
-                "intent_type": intent_type, "intent_id": intent_id,
+                "intent_id": intent_id,
                 "intent_event_ids": basis["prediction_context"]["intent_event_ids"],
                 "source_assessment_id": source_assessment_id, "forecast": forecast,
             }, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
@@ -1018,7 +1000,6 @@ class UserPrediction:
             basis = row.get("basis") or {}
             intent_basis = basis.get("intent") or {}
             try:
-                intent_type = str(intent_basis["object_type"])
                 intent_id = int(intent_basis["id"])
                 state_basis = basis["recurring_states"]
                 state_ids = [int(state["id"]) for state in state_basis]
@@ -1026,7 +1007,7 @@ class UserPrediction:
                 self._logger.debug("active_prediction_skipped prediction_id=%s reason=invalid_basis", row["id"])
                 continue
             intent = self._user_memory_db.get_intent_object(
-                object_type=intent_type, object_id=intent_id,
+                intent_id=intent_id,
             )
             if (not intent or intent.get("status") not in ACTIVE_USER_INTENT_STATUSES
                     or int(intent.get("world_owner_entity_id") or 0) != owner_id):
