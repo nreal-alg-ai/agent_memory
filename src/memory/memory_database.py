@@ -2939,6 +2939,21 @@ class UserMemoryDB:
                 result[claim_id].append(fact_id)
         return result
 
+    def get_intent_ids_created_from_facts(self, fact_ids: Sequence[int]) -> List[int]:
+        """Find intents whose creation evidence includes any supplied fact."""
+        ids = sorted({int(value) for value in fact_ids if int(value) > 0})
+        intent_ids = set()
+        for offset in range(0, len(ids), 500):
+            chunk = ids[offset:offset + 500]
+            rows = self._conn.execute(
+                "SELECT DISTINCT intent_id FROM memory_user_intent_evidence "
+                "WHERE evidence_type='fact' AND role='creation' "
+                f"AND evidence_id IN ({','.join('?' for _ in chunk)})",
+                chunk,
+            ).fetchall()
+            intent_ids.update(int(row["intent_id"]) for row in rows)
+        return sorted(intent_ids)
+
     def get_intent_evidence_fact_ids(self, intent_ids: Sequence[int], *, limit: int = 120) -> Dict[int, List[int]]:
         ids = list(dict.fromkeys(int(v) for v in intent_ids if int(v) > 0))
         result = {key: [] for key in ids}
