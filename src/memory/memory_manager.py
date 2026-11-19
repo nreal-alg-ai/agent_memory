@@ -21,6 +21,7 @@ import math
 import re
 import sqlite3
 import time
+import unicodedata
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -1937,6 +1938,42 @@ class MemoryNodeManager:
             })
         return candidates
 
+    @staticmethod
+    def _split_user_signal_evidence_text(text: str) -> List[str]:
+        """Treat Unicode punctuation as separators between quoted fragments."""
+        separated = "".join(
+            "\n" if unicodedata.category(char).startswith("P") else char
+            for char in text
+        )
+        return [part for part in (
+            _compact_whitespace(value) for value in separated.splitlines()
+        ) if part]
+
+    @staticmethod
+    def _match_user_signal_evidence_fragments(
+        fragments: Sequence[str], source_entries: Sequence[Tuple[int, str]],
+    ) -> Optional[Tuple[int, int]]:
+        """Match all fragments in order without reusing source characters."""
+        if not fragments:
+            return None
+        entry_index, text_offset = 0, 0
+        first_position, last_position = -1, -1
+        for fragment in fragments:
+            while entry_index < len(source_entries):
+                position, text = source_entries[entry_index]
+                match_offset = text.find(fragment, text_offset)
+                if match_offset >= 0:
+                    if first_position < 0:
+                        first_position = position
+                    last_position = position
+                    text_offset = match_offset + len(fragment)
+                    break
+                entry_index += 1
+                text_offset = 0
+            else:
+                return None
+        return first_position, last_position
+
     def _normalize_user_signal_owner_evidence(
         self,
         signal: Dict[str, Any],
@@ -1944,9 +1981,13 @@ class MemoryNodeManager:
         source_units: Optional[Sequence[MemoryUnit]],
         owner_aliases: Sequence[str] = (),
     ) -> Optional[Dict[str, str]]:
-        """Validate the attributed quote, preserving whether it is hearsay."""
+        """Validate ordered quote fragments, preserving speaker and response order."""
         evidence_type = str(signal.get("owner_evidence_type") or "").strip().lower()
         if evidence_type not in {"self_statement", "confirmed_response", "third_party_report"}:
+            return None
+        if any(value is not None and not isinstance(value, str) for value in (
+            signal.get("owner_evidence_text"), signal.get("other_evidence_text"),
+        )):
             return None
         owner_text = _compact_whitespace(
             signal.get("owner_evidence_text") or ""
@@ -1954,57 +1995,65 @@ class MemoryNodeManager:
         other_text = _compact_whitespace(
             signal.get("other_evidence_text") or ""
         ).strip("\"'“”")
+        owner_fragments = self._split_user_signal_evidence_text(owner_text)
+        other_fragments = self._split_user_signal_evidence_text(other_text)
+        source_entries = [
+            (
+                _compact_whitespace(entry.get("speaker") or ""),
+                _compact_whitespace(entry.get("text") or ""),
+            )
+            for unit in source_units or []
+            for entry in unit.entries()
+        ]
         if evidence_type == "third_party_report":
             if (
-                owner_text or not other_text or not any(
+                owner_text or not other_fragments or not any(
                     self._db.normalize_owner_alias_key(alias)
                     in self._db.normalize_owner_alias_key(other_text)
                     for alias in owner_aliases
                 )
             ):
                 return None
-            if source_units is not None and not any(
-                _compact_whitespace(entry.get("speaker") or "")
-                not in {"speaker_用户本人", "speaker_助手"}
-                and other_text in _compact_whitespace(entry.get("text") or "")
-                for unit in source_units for entry in unit.entries()
-            ):
+            if source_units is not None and self._match_user_signal_evidence_fragments(
+                other_fragments, [
+                    (index, text) for index, (speaker, text) in enumerate(source_entries)
+                    if speaker not in {"speaker_用户本人", "speaker_助手"}
+                ],
+            ) is None:
                 return None
             return {
                 "owner_evidence_type": evidence_type,
                 "owner_evidence_text": "",
                 "other_evidence_text": other_text,
             }
-        if not owner_text or (
-            evidence_type == "confirmed_response" and not other_text
+        if not owner_fragments or (
+            evidence_type == "confirmed_response" and not other_fragments
         ) or (
             evidence_type == "self_statement" and other_text
         ):
             return None
-        if evidence_type == "confirmed_response" and owner_text in {
+        if evidence_type == "confirmed_response" and all(fragment in {
             "嗯", "哦", "好", "好的", "知道了", "收到", "明白了",
-        }:
+        } for fragment in owner_fragments):
             return None
         if source_units is not None:
-            source_entries = [
-                (
-                    _compact_whitespace(entry.get("speaker") or ""),
-                    _compact_whitespace(entry.get("text") or ""),
+            response_after = -1
+            if evidence_type == "confirmed_response":
+                other_positions = self._match_user_signal_evidence_fragments(
+                    other_fragments, [
+                        (index, text) for index, (speaker, text) in enumerate(source_entries)
+                        if speaker != "speaker_用户本人"
+                    ],
                 )
-                for unit in source_units
-                for entry in unit.entries()
-            ]
-            owner_positions = [
-                index for index, (speaker, text) in enumerate(source_entries)
-                if speaker == "speaker_用户本人" and owner_text in text
-            ]
-            if not owner_positions:
-                return None
-            if evidence_type == "confirmed_response" and not any(
-                speaker != "speaker_用户本人" and other_text in text
-                for owner_position in owner_positions
-                for speaker, text in source_entries[:owner_position]
-            ):
+                if other_positions is None:
+                    return None
+                response_after = other_positions[1]
+            if self._match_user_signal_evidence_fragments(
+                owner_fragments, [
+                    (index, text) for index, (speaker, text) in enumerate(source_entries)
+                    if speaker == "speaker_用户本人" and index > response_after
+                ],
+            ) is None:
                 return None
         return {
             "owner_evidence_type": evidence_type,
