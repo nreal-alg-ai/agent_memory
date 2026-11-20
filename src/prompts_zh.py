@@ -433,7 +433,7 @@ user_intent_signals 输出规则：
 USER_INTENT_UPDATE_FROM_FUTURE_INTENT_SIGNALS_PROMPT_ZH = """你是个人世界模型的 user_intent 更新模块。
 
 一、目标与两大职责
-依据每条 future_intent signal 及其直接证据，在一次判断中维护用户本人的意图：
+以本轮有 future_intent signals 的完整 facts 为基本单位，结合其信号线索和关联活动背景，在一次判断中维护用户本人的意图：
 1. 创建新 intent：证据支持一条有效、独立的本人未来事项，且无需复用已有事项时，输出完整的 new_intent。
 2. 更新已有 intent：证据指向已有事项时，确认 target_intent_id 与 relation，并仅对确有变化的旧事项输出 existing_intent_update。
 同一事项的再次确认、补充或改期应复用旧 intent；明确的新事项替代旧事项时，可以分别输出新事项和旧事项的必要更新。证据不足、无需新增或无需更新都是正常结果，不为凑齐输出而制造事项或变化。
@@ -441,15 +441,15 @@ user_intent 是用户本人追求的未来结果、将参与的安排或尚待�
 本模块只处理 signal_purpose=future_intent 的输入，输出有证据支持的新增与更新结果；不处理其他来源任务、不预测行为、不生成 user_state，也不执行数据库写入。
 
 二、输入数据及含义
-- signal_cases：每项以一个独立的整数 signal_id 为主体，包含一条 user_intent_signal、它唯一对应的 fact、本条 existing_intents 和 activity_context_ids。同一 fact 可能因多个 signal 重复出现，但仍是同一份证据。
-- user_intent_signal：fact 提炼阶段给出的待核验线索，不是已成立的意图。user_intent_anchor 帮助定位事项，user_role 提示本人角色，assertion_source、evidence_basis 及实际提供的来源原话帮助审查归属。signal 的 confidence 只是前一阶段的估计，不代表承诺程度；即使 subject_entity=用户本人，也必须用 fact 核验。
+- fact_cases：每项以一条完整 fact 为主体，包含 fact、activity_context_ids 和 user_intent_signals 列表，每项单独一行。同一 fact 在本次输入中只展示一次，其列表仅含本次待处理的 signals。一条 fact 可以包含多个独立事项，也可以用多条 signals 描述同一事项，不按 fact 数或 signal 数预设 intent 数量。
+- user_intent_signals：fact 提炼阶段给出的待核验线索列表，不是已成立的意图。每项有独立整数 signal_id 及其 existing_intents；user_intent_anchor 帮助定位事项，user_role 提示本人角色，assertion_source、evidence_basis 及实际提供的来源原话帮助审查归属。signal 的 confidence 只是前一阶段的估计，不代表承诺程度；即使 subject_entity=用户本人，也必须用所属 fact 核验。
 - fact：本条意图或旧事项变化的直接证据。summary 保存陈述及语境，event_time 是事实所述事件时间，dialogue_time 是对话记录时间。它可以同时包含个人意愿、他人职责、已发生动作或团队讨论，必须分清描述谁、谁承担什么。
-- existing_intents：仅为当前 signal 召回的已有事项，不是已确认匹配。id 是可引用的目标 ID；summary 描述事项及本人责任，status 表示阶段，current_progress 是已知进展快照，time_start、time_end 和 details 保存安排、条件及补充信息。只能选择本条列表中的目标，不引用其他 case 的 ID，也不把尚未入库的新事项当作已有目标。
-- activity_contexts：在独立区域提供的共享背景，每项仅含 activity_id、activity_text。activity 描述采集窗口内用户本人参与了什么；本条 activity_context_ids 限定可读取哪些背景。它不是另一份独立意图证据。
+- existing_intents：嵌套于每条 signal，仅为该 signal 召回的已有事项，不是已确认匹配。id 是可引用的目标 ID；summary 描述事项及本人责任，status 表示阶段，current_progress 是已知进展快照，time_start、time_end 和 details 保存安排、条件及补充信息。为该 signal 返回 decision 时只能选择其自身列表中的目标，即使同一 fact 中其他 signal 提供了不同目标，也不得交叉引用；不把尚未入库的新事项当作已有目标。
+- activity_contexts：在独立区域提供的共享背景，每项仅含 activity_id、activity_text。activity 描述采集窗口内用户本人参与了什么；所属 fact case 的 activity_context_ids 限定可读取哪些背景。它不是另一份独立意图证据。
 - reference_timestamp：本次业务评估时点，不是意图开始、截止、完成或变更发生的默认时间。缺失字段表示未知或未提供，不代表相关约束不存在。
 
 三、共同的证据与责任边界
-1. 每条 signal 独立核验。核心意愿、本人责任与旧事项变化必须由本条 fact 支持，不借用其他 case 的事实或未引用的 activity。不照搬 signal 的结论，也不把本轮拟生成的描述当作新的证据。
+1. 先通读完整 fact，理解具体事项、背景、本人责任、时态及先后关系，再综合其 signals 核验创建或更新。signal 仅帮助定位待评估事项，不能只抽取 anchor 对应短语而遗漏 fact 已提供的对象、前提或责任边界。逐 signal 返回结果用于定位和记录处理进度，不要求割裂同一 fact 的上下文；核心意愿、本人责任与旧事项变化仍必须由所属 fact 支持，不借用其他 fact case 的事实或未引用的 activity，不照搬 signal 的结论，也不把本轮拟生成的描述当作新证据。
 2. 先判断“是否属于用户本人”，再确认“具体是什么事项、本人承担到哪一步”。self_statement 只说明谁在陈述，不证明谁执行；user_role、fact_type=commitment、交付物或 deadline 也不能替代本人归属证据。
 3. 区分本人追求的结果、本人参与的安排、本人承担的动作，以及对项目或他人工作的说明。主持会议、讲解方案、确认需求或 P0/P1、认可技术方向、介绍产品路线图、使用“我们”，均不自动表示本人承担实现、测试、交付或协调责任。本人目标可以通过协作实现，但不能因此把他人的执行责任转给本人。
 4. 以“用户本人接下来要追求、参与或履行什么”核对证据。不要求逐字出现“我负责”；明确接受交给自己的任务可以成立。安排他人执行不等于本人执行，也不自动产生本人跟进或验收待办；只有证据明确支持本人尚待履行的安排、协调、审核等动作时，才保留该具体责任。
@@ -505,7 +505,7 @@ details 的可选字段：
 
 五、职责二：更新已有 intent
 （一）先确认事项身份与关系
-target_intent_id 只能是当前 case 的 existing_intents 中某个已有对象的正整数 ID，无可靠目标时为 null。relation 为 same_intent、supersedes、conflicts 之一，无目标时为 null；不是列表。
+target_intent_id 只能是当前 decision 对应 signal 自身的 existing_intents 中某个已有对象的正整数 ID，无可靠目标时为 null。relation 为 same_intent、supersedes、conflicts 之一，无目标时为 null；不是列表。
 - same_intent：当前证据与旧 intent 指向同一个现实事项，包括重复确认、细节补充、改期或其他安排调整。此时 new_intent 必须为 null，不另建同一事项。
 - supersedes：当前证据明确说明一个新的事项替代旧事项；不是仅名称、时间或地点不同。是否创建新事项、是否取消旧事项仍需分别有证据，不由关系标签自动推出。
 - conflicts：当前内容与可定位的旧 intent 冲突，但不能确认替代关系或哪一方当前有效。不自动创建重复事项，没有充分裁决依据时 existing_intent_update=null。
@@ -538,7 +538,7 @@ existing_intent_update 必须且仅包含 status、field_updates、effective_at�
 较晚收到的消息不一定描述较晚发生的变化；明确较早的证据不能覆盖更新的有效状态。时序或冲突无法裁决时保留可靠目标、不给更新，并说明不确定性。
 
 六、输出规则与一致性复核
-1. 每个输入 signal_id 恰好返回一条 decision，原样引用整数 ID，不遗漏、不重复、不新增 ID。每条只包含 signal_id、new_intent、target_intent_id、relation、existing_intent_update、reason。
+1. 对 fact_cases 中全部 user_intent_signals 的每个 signal_id 恰好返回一条 decision，原样引用整数 ID，不遗漏、不重复、不新增 ID。理解和组织事项以完整 fact 为单位，结果仍以 signal_id 定位；每条只包含 signal_id、new_intent、target_intent_id、relation、existing_intent_update、reason。
 2. 新事项仅用 new_intent 对象表达；无需新增时必须为 JSON null，不输出额外布尔字段。旧事项仅用 target_intent_id、relation 和 existing_intent_update 表达，不把修改后的旧事项再次放入 new_intent。
 3. 按实际证据选择组合：
    - 独立新事项：new_intent 为对象，目标、关系和旧事项更新均为 null。
@@ -605,8 +605,8 @@ existing_intent_update 必须且仅包含 status、field_updates、effective_at�
 activity_contexts（独立共享背景；只读取本条 activity_context_ids 指定的项）：
 {activity_contexts}
 
-signal_cases（每个 signal case 单独一行）：
-{signal_cases}
+fact_cases（每个完整 fact 及其待处理 signals 单独一行）：
+{fact_cases}
 """
 
 
@@ -774,7 +774,7 @@ activity_cases（每项一行）：
 USER_INTENT_UPDATE_FROM_INTENT_LIFECYCLE_OBSERVATIONS_PROMPT_ZH = """你是个人世界模型的 user_intent 生命周期更新模块。
 
 一、目标与职责
-依据每条 signal_purpose=lifecycle_update 的 user_intent_signal 及其直接证据，在一次判断中完成三项工作：
+以本轮含 signal_purpose=lifecycle_update 线索的完整 facts 为基本单位，结合其 signals 和关联活动背景，在一次判断中完成三项工作：
 1. 核验变化观察：当前 fact 确实描述用户本人先前意图的后续变化时，输出 intent_lifecycle_observation；没有有效变化时为 null。
 2. 匹配已有事项：确认观察对应的 target_intent_id；没有可靠匹配时为 null，不为保存观察而强行匹配。
 3. 更新已有 intent：仅在匹配成立、当前证据支持实质变化时输出 existing_intent_update。观察成立、匹配成功和需要更新是三个不同判断，不由其中一个自动推出另一个。
@@ -782,15 +782,15 @@ user_intent 是用户本人追求的未来结果、将参与的安排或尚待�
 本模块不创建新 intent，不把未匹配的观察改写为新事项，不预测行为、不生成 user_state，也不执行数据库写入。证据不足、没有匹配或无需更新都是正常结果。
 
 二、输入数据及含义
-- signal_cases：每项以一个独立的整数 signal_id 为主体，包含一条 user_intent_signal、它唯一对应的 fact、本条 existing_intents 和 activity_context_ids。同一 fact 可能因多个 signal 重复出现，但仍是同一份证据。
-- user_intent_signal：fact 提炼阶段给出的待核验变化线索，不是已成立的观察或更新结论。user_intent_anchor 帮助定位原事项，user_role 提示本人角色，assertion_source、evidence_basis 及实际提供的来源原话帮助审查归属。signal 的 confidence 只是前一阶段的估计，不代表完成程度；即使 subject_entity=用户本人，也必须用 fact 核验。
+- fact_cases：每项以一条完整 fact 为主体，包含 fact、activity_context_ids 和 user_intent_signals 列表，每项单独一行。同一 fact 在本次输入中只展示一次，其列表仅含本次待处理的 signals。先整体理解原事项及其变化，再核验各条线索；fact 数和 signal 数都不直接代表变化事项数量。
+- user_intent_signals：fact 提炼阶段给出的待核验变化线索列表，不是已成立的观察或更新结论。每项有独立整数 signal_id 及其 existing_intents；user_intent_anchor 帮助定位原事项，user_role 提示本人角色，assertion_source、evidence_basis 及实际提供的来源原话帮助审查归属。signal 的 confidence 只是前一阶段的估计，不代表完成程度；即使 subject_entity=用户本人，也必须用所属 fact 核验。
 - fact：本条变化观察和旧事项更新的直接证据。summary 保存陈述及语境，event_time 是事实所述事件时间，dialogue_time 是对话记录时间。必须分清描述谁、谁承担什么，以及动作发生、被报告和原先安排的时间。
-- existing_intents：仅为当前 signal 召回的已有事项，不是已确认匹配。id 是可引用的目标 ID；summary 描述事项及本人责任，status 表示阶段，current_progress 是已知进展快照，time_start、time_end 和 details 保存安排、条件及补充信息。只能选择本条列表中的目标，不引用其他 case 的 ID。
-- activity_contexts：在独立区域提供的共享背景，每项仅含 activity_id、activity_text。activity 描述采集窗口内用户本人参与了什么；本条 activity_context_ids 限定可读取哪些背景。它不是另一份独立的变化证据。
+- existing_intents：嵌套于每条 signal，仅为该 signal 召回的已有事项，不是已确认匹配。id 是可引用的目标 ID；summary 描述事项及本人责任，status 表示阶段，current_progress 是已知进展快照，time_start、time_end 和 details 保存安排、条件及补充信息。为该 signal 返回 decision 时只能选择其自身列表中的目标，即使同一 fact 中其他 signal 提供了不同目标，也不得交叉引用。
+- activity_contexts：在独立区域提供的共享背景，每项仅含 activity_id、activity_text。activity 描述采集窗口内用户本人参与了什么；所属 fact case 的 activity_context_ids 限定可读取哪些背景。它不是另一份独立的变化证据。
 - reference_timestamp：本次业务评估时点，不是意图开始、截止、完成或变更发生的默认时间。缺失字段表示未知或未提供，不代表相关约束不存在。
 
 三、共同的证据与责任边界
-1. 每条 signal 独立核验。核心变化、本人责任及更新值必须由本条 fact 支持，不借用其他 case 的事实或未引用的 activity。不照搬 signal 的结论，也不把本轮拟生成的 observation 当作另一份独立证据。
+1. 先通读完整 fact，理解原事项、实际变化、本人责任、否定及先后关系，再综合其 signals 核验观察、匹配和更新。不能只读取 anchor 对应短语而丢掉事实已有的背景、条件或履行范围。逐 signal 返回结果用于定位和记录处理进度，不要求割裂同一 fact 的上下文；核心变化、本人责任及更新值仍必须由所属 fact 支持，不借用其他 fact case 的事实或未引用的 activity，不照搬 signal 的结论，也不把本轮拟生成的 observation 当作另一份独立证据。
 2. 先确认“变化描述谁、指向哪项本人事项”，再判断“本人履行到哪一步”。self_statement 只说明谁在陈述，不证明谁执行；user_role、事实标签、交付物或 deadline 也不能替代本人归属证据。
 3. 区分本人追求的结果、本人参与的安排、本人承担的动作，以及对项目或他人工作的说明。主持会议、讲解方案、确认需求、认可技术方向、介绍产品路线图或使用“我们”，均不自动表示本人开始执行、完成实现、测试或交付。本人目标可以通过协作实现，但不能因此把他人的执行责任转给本人。
 4. 安排他人执行不等于本人执行；只有旧 intent 的本人责任就是安排、协调或审核，且 fact 证明该责任已实际履行时，才按该范围判断进展。也不能要求本人亲自完成他人工作，才承认本人已经履行自己的责任。
@@ -832,7 +832,7 @@ intent_lifecycle_observation 只包含：
 
 五、匹配已有事项并裁决更新
 （一）确认事项身份
-target_intent_id 只能是当前 case 的 existing_intents 中某个已有对象的正整数 ID，无可靠目标时为 null。每条 decision 至多匹配一个目标，不输出 relation 或关系列表。
+target_intent_id 只能是当前 decision 对应 signal 自身的 existing_intents 中某个已有对象的正整数 ID，无可靠目标时为 null。每条 decision 至多匹配一个目标，不输出 relation 或关系列表。
 1. 核验是否指向同一本人期望结果、具体安排或责任事项／交付物，同时比较本人责任范围、相关参与人和时间。
 2. canonical_key、主题、关键词、地点、同一项目或相近日期只能帮助定位，不能证明同一性。不同日期的类似会议、不同交付物或独立的一次任务，不因名称相近就合并。
 3. 明确说明原安排改期时，新时间可以不同于旧时间；原安排时间、变化发生时间及改期后的时间不能混用。
@@ -880,7 +880,7 @@ observation.details.time_start/time_end 若构成旧事项的必要变化，写�
 较晚收到或记录的消息不一定描述较晚发生的变化，不能仅凭记录顺序或 updated_at 判定实际生效顺序。明确较早的证据不能覆盖更新的有效状态；时序或冲突无法裁决时保留可靠目标、不给更新，并说明不确定性。
 
 六、输出规则与一致性复核
-1. 每个输入 signal_id 恰好返回一条 decision，原样引用整数 ID，不遗漏、不重复、不新增 ID。每条只包含 signal_id、intent_lifecycle_observation、target_intent_id、existing_intent_update、reason。
+1. 对 fact_cases 中全部 user_intent_signals 的每个 signal_id 恰好返回一条 decision，原样引用整数 ID，不遗漏、不重复、不新增 ID。理解变化以完整 fact 为单位，结果仍以 signal_id 定位；每条只包含 signal_id、intent_lifecycle_observation、target_intent_id、existing_intent_update、reason。
 2. 按实际证据选择组合：
    - 没有有效变化观察：intent_lifecycle_observation=null、existing_intent_update=null；已有可靠匹配可保留 target_intent_id，否则为 null，属于正常结果。
    - 有效观察但没有可靠匹配：保留观察对象，target_intent_id=null、existing_intent_update=null；不补建 intent。
@@ -937,8 +937,8 @@ observation.details.time_start/time_end 若构成旧事项的必要变化，写�
 activity_contexts（独立共享背景；只读取本条 activity_context_ids 指定的项）：
 {activity_contexts}
 
-signal_cases（每个 signal case 单独一行）：
-{signal_cases}
+fact_cases（每个完整 fact 及其待处理 signals 单独一行）：
+{fact_cases}
 """
 
 

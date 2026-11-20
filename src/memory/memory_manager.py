@@ -2915,11 +2915,8 @@ class MemoryNodeManager:
         report: Dict[str, Any] = {
             "intent_event_ids": [], "completed_signal_ids": [], "failed_signal_ids": [],
         }
-        batch_size = max(1, int(self._memory_cfg.get("user_intent_signal_batch_size") or 8))
         facts_by_id = {item["fact_id"]: item["fact"] for item in signal_items}
-        for batch_start in range(0, len(signal_items), batch_size):
-            batch = signal_items[batch_start:batch_start + batch_size]
-            batch_index = batch_start // batch_size
+        for batch_index, batch in enumerate(self._iter_user_intent_signal_batches(signal_items)):
             phase = "signal_reconciliation"
             try:
                 cases = self._build_user_intent_signal_cases(batch, world_owner_id=world_owner_id)
@@ -2969,10 +2966,7 @@ class MemoryNodeManager:
         report: Dict[str, Any] = {
             "intent_event_ids": [], "completed_signal_ids": [], "failed_signal_ids": [],
         }
-        batch_size = max(1, int(self._memory_cfg.get("user_intent_signal_batch_size") or 8))
-        for batch_start in range(0, len(signal_items), batch_size):
-            batch = signal_items[batch_start:batch_start + batch_size]
-            batch_index = batch_start // batch_size
+        for batch_index, batch in enumerate(self._iter_user_intent_signal_batches(signal_items)):
             phase = "signal_reconciliation"
             try:
                 cases = self._build_user_intent_signal_cases(batch, world_owner_id=world_owner_id)
@@ -3014,19 +3008,48 @@ class MemoryNodeManager:
                 })
         return report
 
-    def _format_signal_view_for_user_intent_prompt(
+    def _iter_user_intent_signal_batches(
+        self, signal_items: Sequence[Dict[str, Any]],
+    ) -> Iterable[List[Dict[str, Any]]]:
+        """Keep each fact's signals together; the signal budget is a soft limit."""
+        batch_size = max(1, int(self._memory_cfg.get("user_intent_signal_batch_size") or 8))
+        signals_by_fact: Dict[int, List[Dict[str, Any]]] = {}
+        for item in signal_items:
+            signals_by_fact.setdefault(item["fact_id"], []).append(item)
+        batch: List[Dict[str, Any]] = []
+        for fact_signals in signals_by_fact.values():
+            if batch and len(batch) + len(fact_signals) > batch_size:
+                yield batch
+                batch = []
+            batch.extend(fact_signals)
+            if len(batch) >= batch_size:
+                yield batch
+                batch = []
+        if batch:
+            yield batch
+
+    def _format_fact_cases_for_user_intent_prompt(
         self,
         signal_items: Sequence[Dict[str, Any]],
     ) -> str:
-        """Render a signal batch as a JSON array with one complete item per line."""
+        """Render each fact once, with its selected signals and per-signal targets."""
         if not signal_items:
             return "[]"
-        lines = []
+        cases_by_fact: Dict[int, Dict[str, Any]] = {}
         for item in signal_items:
+            case = cases_by_fact.setdefault(item["fact_id"], {
+                "fact": self._format_fact_view_for_user_intent_prompt(item["fact"]),
+                "activity_context_ids": [],
+                "user_intent_signals": [],
+            })
+            for activity in item.get("activity_contexts") or []:
+                activity_id = int(activity["activity_id"])
+                if activity_id not in case["activity_context_ids"]:
+                    case["activity_context_ids"].append(activity_id)
             signal = item["signal"]
-            lines.append(json.dumps({
+            case["user_intent_signals"].append({
                 "signal_id": item["signal_id"],
-                "user_intent_signal": {
+                **{
                     key: signal.get(key)
                     for key in (
                         "signal_purpose", "subject_entity",
@@ -3034,15 +3057,14 @@ class MemoryNodeManager:
                         "evidence_basis", "confidence",
                     )
                 },
-                "fact": self._format_fact_view_for_user_intent_prompt(item["fact"]),
                 **({"existing_intents": [
                     self._intent_object_prompt_view(intent) for intent in item["existing_intents"]
                 ]} if "existing_intents" in item else {}),
-                "activity_context_ids": [
-                    int(activity["activity_id"]) for activity in item.get("activity_contexts") or []
-                ],
-            }, ensure_ascii=False, separators=(",", ":")))
-        return "[\n" + ",\n".join(lines) + "\n]"
+            })
+        return "[\n" + ",\n".join(
+            json.dumps(case, ensure_ascii=False, separators=(",", ":"))
+            for case in cases_by_fact.values()
+        ) + "\n]"
 
     def _build_user_intent_signal_cases(
         self, signal_items: Sequence[Dict[str, Any]], *, world_owner_id: int,
@@ -3132,7 +3154,7 @@ class MemoryNodeManager:
         self, cases: Sequence[Dict[str, Any]], *, purpose: str,
         prompt_language: str, reference_timestamp: Any,
     ) -> Dict[int, Dict[str, Any]]:
-        """One LLM request per purpose batch, with contexts separate from signal cases."""
+        """Assess fact-centered input, retaining one output decision per signal."""
         if purpose == "future_intent":
             template = (USER_INTENT_UPDATE_FROM_FUTURE_INTENT_SIGNALS_PROMPT_EN if prompt_language == "en"
                         else USER_INTENT_UPDATE_FROM_FUTURE_INTENT_SIGNALS_PROMPT_ZH)
@@ -3143,7 +3165,7 @@ class MemoryNodeManager:
             stage = "memory_intent_lifecycle_reconciliation"
         prompt = (template.replace("{reference_timestamp}", str(reference_timestamp))
                   .replace("{activity_contexts}", self._format_activity_contexts_for_signal_prompt(cases))
-                  .replace("{signal_cases}", self._format_signal_view_for_user_intent_prompt(cases)))
+                  .replace("{fact_cases}", self._format_fact_cases_for_user_intent_prompt(cases)))
         raw = self._llm_client.call_llm(prompt, stage_name=stage)
         parsed = self._llm_client.parse_json_object_from_llm_text(raw or "", stage_name=stage)
         if not isinstance(parsed, dict) or not isinstance(parsed.get("decisions"), list):
@@ -4716,13 +4738,14 @@ class MemoryNodeManager:
         signal_items: Sequence[Dict[str, Any]],
         reference_timestamp: Any,
     ) -> None:
-        """Log each intent signal together with the fact supporting its extraction."""
-        signal_views = json.loads(self._format_signal_view_for_user_intent_prompt(signal_items))
+        """Log signal-bearing facts once, keeping selected signal IDs visible."""
+        fact_views = json.loads(self._format_fact_cases_for_user_intent_prompt(signal_items))
         self._logger.log_json_format("memory_user_intent_update", "signals_loaded", {
             "signal_count": len(signal_items),
+            "fact_count": len(fact_views),
             "signal_ids": [item["signal_id"] for item in signal_items],
             "reference_timestamp": reference_timestamp,
-            "signal_items": [CompactLogValue(view) for view in signal_views],
+            "fact_cases": [CompactLogValue(view) for view in fact_views],
         })
 
     @staticmethod

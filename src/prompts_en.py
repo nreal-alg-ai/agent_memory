@@ -402,7 +402,7 @@ Current dialogue/transcript evidence batch (each new fact requires a substantive
 USER_INTENT_UPDATE_FROM_FUTURE_INTENT_SIGNALS_PROMPT_EN = """You are the user_intent update module of a personal world model.
 
 1. Goal and two responsibilities
-Maintain user self's intents in one assessment using each future_intent signal and its direct evidence:
+Maintain user self's intents in one assessment, using complete facts bearing future_intent signals as the basic input units, together with their signal leads and linked activity background:
 1. Create a new intent: when the evidence supports a valid, independent future matter of user self that does not require reusing an existing matter, return a complete new_intent.
 2. Update an existing intent: when the evidence concerns an existing matter, identify target_intent_id and relation, and return existing_intent_update only for necessary changes to that old matter.
 Reuse an existing intent for reaffirmation, supplementation or rescheduling of the same matter. When an explicitly new matter replaces an old one, separately return the new matter and any necessary update to the old one. Insufficient evidence, no creation and no update are normal outcomes; do not invent matters or changes to fill the output.
@@ -410,15 +410,15 @@ A user_intent is a future result user self pursues, an arrangement they will par
 Handle only signal_purpose=future_intent inputs and return evidence-supported creations and updates. Do not process other source tasks, predict behavior, generate user_state or perform database writes.
 
 2. Input data and meanings
-- signal_cases: each item centers on an independent integer signal_id and contains one user_intent_signal, its single source fact, its own existing_intents and activity_context_ids. A fact may recur under multiple signals but remains one piece of evidence.
-- user_intent_signal: an unverified lead from fact extraction, not an established intention. user_intent_anchor helps locate the matter; user_role suggests personal responsibility; assertion_source, evidence_basis and any supplied source quotations help verify attribution. Its confidence is a prior-stage estimate, not commitment strength. Even subject_entity=user self requires verification against the fact.
+- fact_cases: each item centers on one complete fact and contains fact, activity_context_ids and a user_intent_signals list, with one complete item per line. Show each fact only once per request; its list contains only signals selected for this task. One fact can contain several independent matters, and several signals can describe the same matter. Neither fact count nor signal count determines how many intents exist.
+- user_intent_signals: a list of unverified leads from fact extraction, not established intentions. Each element has its own integer signal_id and existing_intents. user_intent_anchor helps locate the matter; user_role suggests personal responsibility; assertion_source, evidence_basis and any supplied source quotations help verify attribution. Its confidence is a prior-stage estimate, not commitment strength. Even subject_entity=user self requires verification against the parent fact.
 - fact: direct evidence of this intention or a change to an old matter. summary preserves statements and context, event_time is the described event's time, and dialogue_time is the recording conversation's time. A fact may mix personal wishes, others' responsibilities, actions already taken and team discussion; distinguish who is being described and who undertakes what.
-- existing_intents: existing matters retrieved only for this signal, not confirmed matches. id is an available target ID; summary describes the matter and personal responsibility; status is its stage; current_progress is the known progress snapshot; time_start, time_end and details preserve arrangements, conditions and supplementary information. Select targets only from this item's list. Do not reference another case's IDs or treat an unstored new matter as an existing target.
-- activity_contexts: shared background supplied separately, each entry containing only activity_id and activity_text. An activity describes what user self participated in during a collection window. This item's activity_context_ids limits which backgrounds may be read. It is not another independent source of intention evidence.
+- existing_intents: nested under each signal, these are matters retrieved only for that signal, not confirmed matches. id is an available target ID; summary describes the matter and personal responsibility; status is its stage; current_progress is the known progress snapshot; time_start, time_end and details preserve arrangements, conditions and supplementary information. A signal's decision may select targets only from its own list, never a sibling signal's list even within the same fact. Do not treat an unstored new matter as an existing target.
+- activity_contexts: shared background supplied separately, each entry containing only activity_id and activity_text. An activity describes what user self participated in during a collection window. The parent fact case's activity_context_ids limit which backgrounds may be read. It is not another independent source of intention evidence.
 - reference_timestamp: this assessment's business reference time, not a default start, deadline, completion or change time. Omitted fields are unknown or not provided, not proof that a constraint does not exist.
 
 3. Shared evidence and personal responsibility boundaries
-1. Verify each signal independently. The core intention, personal responsibility and changes to old matters require this item's fact. Do not borrow other cases' facts or unreferenced activities, copy the signal's conclusion, or treat the description being generated as new evidence.
+1. Read the complete fact first to understand the matter, background, personal responsibility, tense and sequence, then assess creation or updating using its signals together. Signals locate matters to assess; do not extract only anchor phrases and omit objects, preconditions or responsibility boundaries already supplied by the fact. Per-signal output locates results and tracks processing; it does not split the parent fact's context. The core intention, personal responsibility and old-matter changes still require that parent fact. Do not borrow other fact cases' facts or unreferenced activities, copy a signal's conclusion, or treat the description being generated as new evidence.
 2. First establish whether the matter belongs to user self, then identify the particular matter and their actual scope of responsibility. self_statement identifies the speaker, not the executor. user_role, fact_type=commitment, a deliverable or a deadline cannot replace personal-attribution evidence.
 3. Distinguish personally pursued outcomes, personal participation arrangements and undertaken actions from descriptions of a project or others' work. Hosting a meeting, explaining a design, confirming requirements or P0/P1 scope, approving a technical direction, describing a roadmap or saying "we" does not automatically assign implementation, testing, delivery or coordination to user self. Personal goals may be achieved through collaboration, but that does not transfer others' execution duties to the user.
 4. Check what user self will pursue, participate in or fulfill next. Literal "I am responsible" is unnecessary; explicitly accepting a task assigned to oneself may qualify. Assigning execution to others does not mean personal execution or automatically create a personal follow-up or acceptance-review task. Retain only the particular arranging, coordination or review responsibility explicitly supported as still outstanding.
@@ -474,7 +474,7 @@ Do not interchange temporal meanings: availability is not a mandatory start, a t
 
 5. Responsibility two: update an existing intent
 5.1 Establish matter identity and relationship first
-target_intent_id must be the positive integer ID of an existing object in this case's existing_intents, or null without a reliable target. relation is one of same_intent, supersedes or conflicts, or null without a target; it is not an array.
+target_intent_id must be the positive integer ID of an existing object in the corresponding signal's own existing_intents, or null without a reliable target. relation is one of same_intent, supersedes or conflicts, or null without a target; it is not an array.
 - same_intent: this evidence and the old intent refer to the same real-world matter, including reaffirmation, additional details, rescheduling or another arrangement adjustment. new_intent must be null; do not create the same matter again.
 - supersedes: the evidence explicitly establishes that a new matter replaces an old one, not merely a different name, time or place. Creating a new matter and cancelling an old one each require evidence; the relationship label alone implies neither.
 - conflicts: the information conflicts with an identifiable old intent but does not establish replacement or current validity. Do not automatically create a duplicate, and use existing_intent_update=null without sufficient adjudication evidence.
@@ -507,7 +507,7 @@ Before returning, review the patch merged with the old matter. summary, status, 
 A later-received message need not describe a later real-world change. Clearly earlier evidence must not overwrite a newer valid state. If chronology or conflict cannot be adjudicated, retain a reliable target, return no update and explain uncertainty.
 
 6. Output rules and consistency checks
-1. Return exactly one decision per input signal_id, echoing its integer ID without omissions, duplicates or new IDs. Each decision contains only signal_id, new_intent, target_intent_id, relation, existing_intent_update and reason.
+1. Return exactly one decision for every signal_id in all user_intent_signals lists within fact_cases, echoing integer IDs without omissions, duplicates or new IDs. Understand and organize matters at the complete-fact level; signal_id still identifies each result. Each decision contains only signal_id, new_intent, target_intent_id, relation, existing_intent_update and reason.
 2. Express new matters only as new_intent objects; use JSON null when no creation is needed and no extra boolean. Express old matters through target_intent_id, relation and existing_intent_update, never by returning an edited old matter again in new_intent.
 3. Select evidence-supported combinations:
    - Independent new matter: a new_intent object, with null target, relation and old-matter update.
@@ -574,8 +574,8 @@ Business reference time: {reference_timestamp}
 activity_contexts (separate shared background; read only this item's activity_context_ids):
 {activity_contexts}
 
-signal_cases (one complete signal case per line):
-{signal_cases}
+fact_cases (one complete fact with its selected signals per line):
+{fact_cases}
 """
 
 
@@ -743,7 +743,7 @@ activity_cases (one complete item per line):
 USER_INTENT_UPDATE_FROM_INTENT_LIFECYCLE_OBSERVATIONS_PROMPT_EN = """You are the user_intent lifecycle update module of a personal world model.
 
 1. Goal and responsibilities
-Use each user_intent_signal with signal_purpose=lifecycle_update and its direct evidence to complete three assessments in one pass:
+Use complete facts bearing signal_purpose=lifecycle_update leads as the basic input units, together with their signals and linked activity background, to complete three assessments in one pass:
 1. Verify a change observation: return intent_lifecycle_observation when the current fact genuinely describes a subsequent change to user self's earlier intent; otherwise null.
 2. Match an existing matter: identify the observation's target_intent_id; use null without a reliable match. Never force a match just to preserve an observation.
 3. Update an existing intent: return existing_intent_update only when a match is established and current evidence supports a substantive change. A valid observation, a successful match and a necessary update are three distinct judgments; none automatically implies another.
@@ -751,15 +751,15 @@ A user_intent is a future result user self pursues, an arrangement they will par
 This module never creates intents, turns unmatched observations into new matters, predicts behavior, generates user_state or writes to the database. Insufficient evidence, no match and no necessary update are normal outcomes.
 
 2. Input data and meanings
-- signal_cases: each item centers on an independent integer signal_id and contains one user_intent_signal, its single corresponding fact, its own existing_intents and activity_context_ids. Multiple signals may repeat the same fact, which remains one piece of evidence.
-- user_intent_signal: a change lead from fact extraction that must be verified, not an established observation or update conclusion. user_intent_anchor helps locate the original matter; user_role suggests personal involvement; assertion_source, evidence_basis and any supplied source quotations help verify attribution. Signal confidence is an earlier estimate, not completion degree. Even subject_entity=user self requires fact verification.
+- fact_cases: each item centers on one complete fact and contains fact, activity_context_ids and a user_intent_signals list, with one complete item per line. Show each fact only once per request; its list contains only signals selected for this task. First understand the original matter and changes as a whole, then assess the signal leads. Neither fact count nor signal count determines how many changed matters exist.
+- user_intent_signals: a list of change leads from fact extraction that must be verified, not established observations or update conclusions. Each element has its own integer signal_id and existing_intents. user_intent_anchor helps locate the original matter; user_role suggests personal involvement; assertion_source, evidence_basis and any supplied source quotations help verify attribution. Signal confidence is an earlier estimate, not completion degree. Even subject_entity=user self requires verification against the parent fact.
 - fact: the direct evidence for this change observation and existing-matter update. summary preserves the statement and context; event_time is the event time described by the fact, while dialogue_time is the dialogue recording time. Distinguish who is described, who is responsible, and when actions occurred, were reported or were originally scheduled.
-- existing_intents: existing matters retrieved only for this signal, not confirmed matches. id is a referenceable target ID; summary describes the matter and personal responsibility; status is its stage; current_progress is the known progress snapshot; time_start, time_end and details describe arrangements, conditions and supplementary information. Select targets only from this item's list, never another case's IDs.
-- activity_contexts: shared background in a separate area, each containing only activity_id and activity_text. An activity describes what user self participated in during the collection window; this case's activity_context_ids limit which background may be read. It is not independent evidence of change.
+- existing_intents: nested under each signal, these are matters retrieved only for that signal, not confirmed matches. id is a referenceable target ID; summary describes the matter and personal responsibility; status is its stage; current_progress is the known progress snapshot; time_start, time_end and details describe arrangements, conditions and supplementary information. A signal's decision may select targets only from its own list, never a sibling signal's list even within the same fact.
+- activity_contexts: shared background in a separate area, each containing only activity_id and activity_text. An activity describes what user self participated in during the collection window; the parent fact case's activity_context_ids limit which background may be read. It is not independent evidence of change.
 - reference_timestamp: this business evaluation time, not a default intent start, deadline, completion or change time. Missing fields mean unknown or not supplied, not that associated constraints do not exist.
 
 3. Shared evidence and personal responsibility boundaries
-1. Verify each signal independently. This fact must support the core change, personal responsibility and updated values. Do not borrow another case's facts or unreferenced activities. Do not copy a signal's conclusion or treat the observation being generated as additional independent evidence.
+1. Read the complete fact first to understand the original matter, actual change, personal responsibility, negation and sequence, then assess observations, matching and updating using its signals together. Do not read only anchor phrases and lose background, conditions or fulfillment scope already supplied by the fact. Per-signal output locates results and tracks processing; it does not split the parent fact's context. The core change, personal responsibility and updated values still require that parent fact. Do not borrow other fact cases' facts or unreferenced activities, copy a signal's conclusion, or treat the observation being generated as additional independent evidence.
 2. First establish whose change is described and which personal matter it concerns, then assess how far the user has fulfilled it. self_statement identifies the speaker, not the executor. user_role, fact labels, deliverables and deadlines do not replace evidence of personal attribution.
 3. Distinguish the user's desired results, their participation in arrangements, their own actions and descriptions of projects or others' work. Hosting a meeting, explaining a solution, confirming requirements, endorsing a technical direction, presenting a product roadmap or saying "we" does not automatically establish personal execution or completed implementation, testing or delivery. Collaboration may achieve a personal goal without transferring others' execution duties to the user.
 4. Assigning others does not mean personally executing their work. Assess progress within an arranging, coordinating or reviewing duty only when that is the user's responsibility in the existing intent and the fact proves it was actually fulfilled. Conversely, do not require the user to execute others' work before recognizing fulfillment of their own responsibility.
@@ -801,7 +801,7 @@ An existing matter having already absorbed a fact does not invalidate its observ
 
 5. Match existing matters and adjudicate updates
 5.1 Establish matter identity
-target_intent_id must be a positive integer ID from this case's existing_intents, or null without a reliable target. Each decision matches at most one target; do not output relation or a relationship array.
+target_intent_id must be a positive integer ID from the corresponding signal's own existing_intents, or null without a reliable target. Each decision matches at most one target; do not output relation or a relationship array.
 1. Verify the same personal desired result, specific arrangement or responsibility/deliverable, comparing personal responsibility scope, relevant participants and time.
 2. canonical_key, topics, keywords, places, a shared project and nearby dates are locating clues, not identity proof. Do not merge similar meetings on different dates, different deliverables or independent task instances because their names are similar.
 3. Explicit rescheduling of the original arrangement may produce a different time. Do not confuse original schedule, change occurrence and rescheduled time.
@@ -849,7 +849,7 @@ Before returning, review the patch merged with the old matter: summary, status, 
 Later receipt or recording does not necessarily mean a later real-world change. Recording order or updated_at alone cannot establish effective chronology. Clearly earlier evidence must not override a newer valid state. When chronology or conflict cannot be resolved, retain a reliable target but return no update and explain the uncertainty.
 
 6. Output rules and consistency checks
-1. Return exactly one decision per input signal_id, echoing its integer ID without omissions, duplicates or new IDs. Each decision contains only signal_id, intent_lifecycle_observation, target_intent_id, existing_intent_update and reason.
+1. Return exactly one decision for every signal_id in all user_intent_signals lists within fact_cases, echoing integer IDs without omissions, duplicates or new IDs. Understand changes at the complete-fact level; signal_id still identifies each result. Each decision contains only signal_id, intent_lifecycle_observation, target_intent_id, existing_intent_update and reason.
 2. Choose the combination supported by evidence:
    - No valid change observation: intent_lifecycle_observation=null and existing_intent_update=null. Retain target_intent_id only for a reliable match, otherwise null. This is a normal result.
    - Valid observation without a reliable match: retain the observation, with target_intent_id=null and existing_intent_update=null. Do not create an intent.
@@ -906,8 +906,8 @@ Business reference time: {reference_timestamp}
 activity_contexts (separate shared background; read only items referenced by this case's activity_context_ids):
 {activity_contexts}
 
-signal_cases (one complete signal case per line):
-{signal_cases}
+fact_cases (one complete fact with its selected signals per line):
+{fact_cases}
 """
 
 
