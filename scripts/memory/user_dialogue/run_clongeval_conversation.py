@@ -682,12 +682,12 @@ def process_context_group(
         memory_operation_report = operation_reporter.snapshot()
         operation_counts = memory_operation_report.get("counts") or {}
         store_operation_report = operation_counts.get("memory_fact_extraction") or {}
-        user_claim_operation_report = (
-            operation_counts.get("memory_user_claim_update") or {}
+        fact_state_operation_report = (
+            operation_counts.get("user_state_update_from_claim_signals") or {}
         )
         replay_stats["store_batches"] = int(store_operation_report.get("succeeded") or 0)
-        replay_stats["user_claim_runs"] = int(
-            user_claim_operation_report.get("submitted") or 0
+        replay_stats["fact_state_runs"] = int(
+            fact_state_operation_report.get("submitted") or 0
         )
         replay_stats["store_flushes"] = int(store_operation_report.get("submitted") or 0)
 
@@ -732,14 +732,14 @@ def process_context_group(
                     or ("ok" if recall_context else "empty")
                 ),
                 "store_total_elapsed_ms": float(store_operation_report.get("total_elapsed_ms") or 0.0),
-                "user_claim_total_elapsed_ms": float(
-                    user_claim_operation_report.get("total_elapsed_ms") or 0.0
+                "fact_state_total_elapsed_ms": float(
+                    fact_state_operation_report.get("total_elapsed_ms") or 0.0
                 ),
                 "recall_total_elapsed_ms": recall_total_elapsed_ms,
                 "memory_total_elapsed_ms": round(
                     float(store_operation_report.get("total_elapsed_ms") or 0.0)
                     + float(
-                        user_claim_operation_report.get("total_elapsed_ms") or 0.0
+                        fact_state_operation_report.get("total_elapsed_ms") or 0.0
                     )
                     + recall_total_elapsed_ms,
                     2,

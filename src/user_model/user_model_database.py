@@ -96,7 +96,7 @@ class UserModelDB:
                 operation TEXT NOT NULL,
                 previous_payload TEXT NOT NULL DEFAULT '{}',
                 new_payload TEXT NOT NULL DEFAULT '{}',
-                trigger_claim_ids TEXT NOT NULL DEFAULT '[]',
+                trigger_fact_ids TEXT NOT NULL DEFAULT '[]',
                 trigger_intent_objects TEXT NOT NULL DEFAULT '[]',
                 effective_at TEXT NOT NULL DEFAULT '',
                 decision_source TEXT NOT NULL DEFAULT '',
@@ -204,7 +204,7 @@ class UserModelDB:
             ON user_states(state_domain, state_type, status, updated_at DESC);
             CREATE INDEX IF NOT EXISTS idx_user_state_evidence_state
             ON user_state_evidence(state_id, role, evidence_type);
-            CREATE INDEX IF NOT EXISTS idx_user_state_evidence_claim
+            CREATE INDEX IF NOT EXISTS idx_user_state_evidence_source
             ON user_state_evidence(evidence_type, evidence_id, role, state_id);
             CREATE INDEX IF NOT EXISTS idx_user_state_events_state
             ON user_state_events(state_id, effective_at DESC, id DESC);
@@ -936,13 +936,13 @@ class UserModelDB:
             state['evidence_items'] = evidence_by_state.get(int(state['id']), [])
         return states
 
-    def replace_user_state_claim_evidence(
+    def replace_user_state_fact_evidence(
         self, *, state_id: int, evidence: Sequence[Dict[str, Any]],
         reference_timestamp: Any = None,
     ) -> None:
-        """Replace claim evidence after a full claim-only state resolution."""
+        """Replace the merged fact-evidence subset; preserve evidence of other types."""
         self._conn.execute(
-            "DELETE FROM user_state_evidence WHERE state_id = ? AND evidence_type = 'user_claim'",
+            "DELETE FROM user_state_evidence WHERE state_id = ? AND evidence_type = 'fact'",
             (int(state_id),),
         )
         self.upsert_user_state_evidence([
@@ -1092,7 +1092,7 @@ class UserModelDB:
         operation: str,
         previous_payload: Optional[Dict[str, Any]],
         new_payload: Optional[Dict[str, Any]],
-        trigger_claim_ids: Sequence[int],
+        trigger_fact_ids: Sequence[int],
         trigger_intent_objects: Sequence[Dict[str, Any]],
         effective_at: str,
         decision_source: str,
@@ -1101,26 +1101,26 @@ class UserModelDB:
         reference_timestamp: Any = None,
     ) -> int:
         now = local_now_text() if reference_timestamp is None else normalize_reference_timestamp(reference_timestamp)
-        normalized_claim_ids: List[int] = []
-        for value in trigger_claim_ids or []:
+        normalized_fact_ids: List[int] = []
+        for value in trigger_fact_ids or []:
             try:
-                claim_id = int(value)
+                fact_id = int(value)
             except (TypeError, ValueError):
                 continue
-            if claim_id > 0:
-                normalized_claim_ids.append(claim_id)
+            if fact_id > 0:
+                normalized_fact_ids.append(fact_id)
         cur = self._conn.execute(
             """
             INSERT INTO user_state_events (
                 state_id, operation, previous_payload, new_payload,
-                trigger_claim_ids, trigger_intent_objects, effective_at,
+                trigger_fact_ids, trigger_intent_objects, effective_at,
                 decision_source, confidence, reason, created_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 int(state_id), str(operation), json_dumps(previous_payload or {}),
                 json_dumps(new_payload or {}),
-                json_dumps(sorted(set(normalized_claim_ids))),
+                json_dumps(sorted(set(normalized_fact_ids))),
                 json_dumps(list(trigger_intent_objects or [])), str(effective_at or ""),
                 str(decision_source or ""), float(confidence), str(reason or ""),
                 now,

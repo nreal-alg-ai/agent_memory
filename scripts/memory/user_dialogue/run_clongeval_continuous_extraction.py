@@ -51,7 +51,7 @@ MEMORY_COUNT_TABLES = (
     "memory_source_segments",
     "memory_facts",
     "memory_user_activity_items",
-    "memory_user_claims",
+    "memory_user_claim_signals",
     "memory_user_observed_patterns",
     "memory_user_intent_items",
 )
@@ -333,20 +333,11 @@ def replay_context(
         raise RuntimeError(f"Finalization rejected for {context_id}: {finalization}")
     if not pwm.wait_for_memory_tasks():
         raise RuntimeError(f"Memory task queue did not drain for {context_id}")
-    # Explicitly drain all claim-state batches at the benchmark context boundary.
-    state_drain = pwm.drain_pending_user_state_claims()
-    if state_drain.get("reason") in {
-        "worker_queue_full", "worker_shutdown", "task_handler_not_registered",
-    }:
-        raise RuntimeError(f"Claim-state drain rejected for {context_id}: {state_drain}")
-    if not pwm.wait_for_memory_tasks():
-        raise RuntimeError(f"State task queue did not drain for {context_id}")
     return {
         "parsed_days": day_count,
         "turn_pairs": turns,
         "last_turn_timestamp": last_timestamp.isoformat() if last_timestamp else None,
         "finalization": finalization,
-        "claim_state_tick": state_drain,
     }
 
 
@@ -456,10 +447,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 ])
             logging.info(
                 "Context completed index=%s/%s id=%s turns=%s facts=%s "
-                "claims=%s states=%s skipped_tasks=%s failures=%s",
+                "claim_signals=%s states=%s skipped_tasks=%s failures=%s",
                 index, len(contexts), context_item["context_id"],
                 replay["turn_pairs"], result["table_counts"]["memory_facts"],
-                result["table_counts"]["memory_user_claims"],
+                result["table_counts"]["memory_user_claim_signals"],
                 result["table_counts"]["user_states"], skipped_tasks, failures,
             )
             if failures:

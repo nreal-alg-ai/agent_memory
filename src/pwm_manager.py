@@ -264,10 +264,6 @@ class PersonWorldModel:
     def wait_for_memory_tasks(self, timeout: Optional[float] = None) -> bool:
         return self._task_scheduler.flush(timeout=timeout)
 
-    def trigger_user_state_update(self) -> Dict[str, Any]:
-        """Check persisted claims on a host signal and enqueue their state update."""
-        return self._task_scheduler.trigger_user_state_update()
-
     def trigger_user_prediction_time_tick(
         self, *, reference_timestamp: Optional[Any] = None,
     ) -> Dict[str, Any]:
@@ -275,9 +271,6 @@ class PersonWorldModel:
         return self._task_scheduler.trigger_user_prediction_time_tick(
             reference_timestamp=reference_timestamp,
         )
-
-    def drain_pending_user_state_claims(self) -> Dict[str, Any]:
-        return self._task_scheduler.drain_pending_user_state_claims()
 
     def get_user_states(
         self,
@@ -312,8 +305,8 @@ class PersonWorldModel:
         be the user's actual words; execution_result is JSON-compatible Agent/
         tool output, while agent_note is interpretation, not memory evidence.
         A failed memory_status does not discard the recorded raw feedback.
-        Follow-up claim/intent/state work remains asynchronous and follows the
-        existing scheduler thresholds. No dialogue deduplication is performed.
+        Follow-up intent/state work remains asynchronous and follows activity
+        windows or final signal flushes. No dialogue deduplication is performed.
         """
         if self._closed:
             raise RuntimeError("PWM is closed")

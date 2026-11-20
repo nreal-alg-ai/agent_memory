@@ -6,7 +6,7 @@ internal model is deliberately unified:
 
 1. Submitted source units become narrative `memory_facts`.
 2. Longer source windows and their facts yield grounded user-activity observations.
-3. Explicit and derived propositions live in user claims; repeated action patterns live separately.
+3. Signal-bearing facts directly support user states; repeated action patterns live separately.
 4. User intents share one schema for future intentions and evidence-backed
    lifecycle changes.
 
@@ -52,11 +52,8 @@ from pwm_logging import CompactLogValue, as_pwm_logger
 from .user_thread_updater import UserThreadUpdater
 from task_scheduler import TaskScheduler
 from prompts_en import (
-    DERIVED_USER_CLAIM_EXTRACTION_PROMPT_EN,
     USER_OBSERVED_PATTERN_RECONCILIATION_PROMPT_EN,
     USER_OBSERVED_PATTERN_SIGNAL_CLUSTER_RELATION_PROMPT_EN,
-    USER_CLAIM_RECONCILIATION_PROMPT_EN,
-    EXPLICIT_USER_CLAIM_EXTRACTION_PROMPT_EN,
     USER_OBSERVED_PATTERN_EXTRACTION_PROMPT_EN,
     USER_INTENT_UPDATE_FROM_FUTURE_INTENT_SIGNALS_PROMPT_EN,
     USER_INTENT_UPDATE_FROM_INTENT_LIFECYCLE_OBSERVATIONS_PROMPT_EN,
@@ -69,11 +66,8 @@ from prompts_en import (
     PROACTIVE_SERVICE_FEEDBACK_EXTRACTION_GUIDANCE_EN,
 )
 from prompts_zh import (
-    DERIVED_USER_CLAIM_EXTRACTION_PROMPT_ZH,
     USER_OBSERVED_PATTERN_RECONCILIATION_PROMPT_ZH,
     USER_OBSERVED_PATTERN_SIGNAL_CLUSTER_RELATION_PROMPT_ZH,
-    USER_CLAIM_RECONCILIATION_PROMPT_ZH,
-    EXPLICIT_USER_CLAIM_EXTRACTION_PROMPT_ZH,
     USER_OBSERVED_PATTERN_EXTRACTION_PROMPT_ZH,
     USER_INTENT_UPDATE_FROM_FUTURE_INTENT_SIGNALS_PROMPT_ZH,
     USER_INTENT_UPDATE_FROM_INTENT_LIFECYCLE_OBSERVATIONS_PROMPT_ZH,
@@ -224,18 +218,6 @@ class MemoryNodeManager:
         self._world_owner_entity_name = (
             configured_world_owner_name or "用户本人"
         )
-        self._user_claim_explicit_min_confidence = self._clamp_float(
-            self._memory_cfg.get("user_claim_explicit_min_confidence"),
-            0.0,
-            1.0,
-            0.72,
-        )
-        self._user_claim_derived_min_confidence = self._clamp_float(
-            self._memory_cfg.get("user_claim_derived_min_confidence"),
-            0.0,
-            1.0,
-            0.75,
-        )
         self._user_observed_pattern_min_activities = max(
             2, int(self._memory_cfg.get("user_observed_pattern_min_activities") or 2),
         )
@@ -260,9 +242,6 @@ class MemoryNodeManager:
         )
         self._task_scheduler.register_handler(
             "memory_user_thread_update", self._process_memory_user_thread_update_task,
-        )
-        self._task_scheduler.register_handler(
-            "memory_user_claim_update", self._process_memory_user_claim_update_task,
         )
         self._task_scheduler.register_handler(
             "memory_user_observed_pattern_update",
@@ -2574,69 +2553,6 @@ class MemoryNodeManager:
         self._logger.log_json_format("memory_user_observed_pattern_update", "finish", report)
         return report
 
-    def _process_memory_user_claim_update_task(
-        self,
-        reference_timestamp: Optional[Any] = None,
-        signal_ids: Optional[Sequence[int]] = None,
-        **kwargs: Any,
-    ) -> Dict[str, Any]:
-        """Project new facts into user claims."""
-        update_started_at = time.monotonic()
-        selected_signal_ids = list(dict.fromkeys(
-            int(value) for value in signal_ids or [] if int(value) > 0
-        ))
-        if reference_timestamp is None:
-            reference_timestamp = kwargs.get("timestamp") or _now_text()
-        self._logger.log_json_format("memory_user_claim", "start", {
-            "timestamp": reference_timestamp,
-            "user_claim_signal_count": len(selected_signal_ids),
-        })
-        claim_report = self._update_memory_user_claims(
-            signal_ids=selected_signal_ids,
-            reference_timestamp=reference_timestamp,
-        )
-        new_claim_ids = list(claim_report.get("new_claim_ids") or [])
-        claim_relations = list(claim_report.get("claim_relations") or [])
-        self._logger.log_json_format("memory_user_claim", "user_claim_update_finish", claim_report)
-        explicit_failed_count = int(
-            claim_report.get("explicit", {}).get("failed_signal_count") or 0
-        )
-        completed_signal_count = len(
-            claim_report.get("_completed_signal_ids") or []
-        )
-        failed_derived_seed_claim_ids = list(
-            claim_report.get("derived", {}).get("failed_seed_claim_ids") or []
-        )
-        has_failures = explicit_failed_count > 0 or bool(failed_derived_seed_claim_ids)
-        report = {
-            "status": (
-                "partial" if has_failures and completed_signal_count
-                else "failed" if has_failures
-                else "ok" if completed_signal_count else "empty"
-            ),
-            "explicit_failed_signal_count": explicit_failed_count,
-            "failed_derived_seed_claim_ids": failed_derived_seed_claim_ids,
-            "derived_failures": list(claim_report.get("derived", {}).get("failures") or []),
-            "explicit_claims_updated": int(
-                claim_report.get("explicit", {}).get("updated", 0) or 0
-            ),
-            "derived_claims_updated": int(
-                claim_report.get("derived", {}).get("updated", 0) or 0
-            ),
-            "total_elapsed_ms": round(
-                (time.monotonic() - update_started_at) * 1000,
-                2,
-            ),
-        }
-        report["new_claim_ids"] = new_claim_ids
-        report["claim_relations"] = claim_relations
-        report["reference_timestamp"] = reference_timestamp
-        report["_completed_signal_ids"] = claim_report.get(
-            "_completed_signal_ids", [],
-        )
-        self._logger.log_json_format("memory_user_claim", "finish", report)
-        return report
-
     def _build_activity_intent_lifecycle_cases(
         self, activities: Sequence[Dict[str, Any]], *, world_owner_id: int,
     ) -> Tuple[List[Dict[str, Any]], List[int]]:
@@ -3847,112 +3763,6 @@ class MemoryNodeManager:
             "constraint", "behavior_pattern",
         }
 
-    def _update_memory_user_claims(
-        self,
-        *,
-        signal_ids: Sequence[int],
-        reference_timestamp: Any = None,
-    ) -> Dict[str, Any]:
-        """Review selected claim signals against their facts and persist claims."""
-        signals = self._db.get_user_signals_by_ids(
-            "claim", signal_ids,
-        )
-        explicit_facts = self._db.get_memory_facts_by_ids(sorted({
-            int(signal["source_id"]) for signal in signals if signal["source_type"] == "fact"
-        }))
-        facts_by_id = {int(fact["id"]): fact for fact in explicit_facts}
-        activity_contexts_by_fact = self._db.get_user_activity_contexts_for_facts(
-            list(facts_by_id),
-        )
-        signal_items = [
-            {"signal_id": int(row["signal_id"]), "fact": facts_by_id[int(row["source_id"])],
-             "signal": row, "activity_contexts": activity_contexts_by_fact.get(int(row["source_id"]), [])}
-            for row in signals
-            if row["source_type"] == "fact" and int(row["source_id"]) in facts_by_id
-        ]
-        # Commit explicit results independently: a later derivation failure must
-        # neither roll them back nor make their source signals pending again.
-        with self._db.transaction():
-            explicit_report = self._update_explicit_user_claims_from_signals(signal_items, reference_timestamp=reference_timestamp)
-        missing_signal_count = len(signals) - len(signal_items)
-        if missing_signal_count:
-            explicit_report["failed_signal_count"] += missing_signal_count
-            explicit_report["completed"] = False
-        explicit_report.pop("completed", None)
-        processed_signal_ids = explicit_report.pop("processed_signal_ids", [])
-        new_claim_ids = list(explicit_report.get("new_claim_ids") or [])
-        derived_report = self._update_derived_user_claims_from_explicit_claims(
-            new_explicit_claim_ids=new_claim_ids,
-            reference_timestamp=reference_timestamp,
-        )
-        all_new_claim_ids = sorted(
-            set(new_claim_ids) | set(derived_report.get("new_claim_ids") or [])
-        )
-        all_claim_relations = {
-            int(relation["relation_event_id"]): relation
-            for source_report in (explicit_report, derived_report)
-            for relation in source_report.get("claim_relations") or []
-            if int(relation.get("relation_event_id") or 0) > 0
-        }
-        return {
-            "explicit": explicit_report,
-            "derived": derived_report,
-            "new_claim_ids": all_new_claim_ids,
-            "claim_relations": [
-                all_claim_relations[event_id] for event_id in sorted(all_claim_relations)
-            ],
-            "_completed_signal_ids": processed_signal_ids,
-        }
-
-    def _format_fact_view_for_explicit_claim_prompt(self, fact: Dict[str, Any]) -> Dict[str, Any]:
-        metadata = fact.get("metadata") if isinstance(fact.get("metadata"), dict) else {}
-        entities = list(fact.get("entities") or [])
-        has_world_owner = bool(
-            (metadata.get("has_world_owner_speaker") or metadata.get("has_world_owner_alias_reference"))
-            and any(
-                _compact_whitespace(entity).lower()
-                == self._world_owner_entity_name.lower()
-                for entity in entities
-            )
-        )
-        prompt_view = {
-            "fact_id": fact.get("id"),
-            "summary": fact.get("summary") or "",
-            "fact_type": fact.get("fact_type") or "",
-            "world_owner_entity": (
-                self._world_owner_entity_name if has_world_owner else ""
-            ),
-            "event_time": fact.get("event_time_key") or "",
-            "dialogue_time": fact.get("dialogue_time_key") or "",
-        }
-        return prompt_view
-
-    def _format_signal_view_for_explicit_claim_prompt(
-        self,
-        signal_items: Sequence[Dict[str, Any]],
-    ) -> str:
-        """Render a signal batch as a JSON array with one complete item per line."""
-        if not signal_items:
-            return "[]"
-        lines = []
-        for item in signal_items:
-            signal = item["signal"]
-            lines.append(json.dumps({
-                "signal_id": item["signal_id"],
-                "user_claim_signal": {
-                    "subject_entity": _compact_whitespace(signal.get("subject") or ""),
-                    "claim_type_hint": str(signal.get("claim_type_hint") or ""),
-                    "claim_anchor": str(signal.get("claim_anchor") or ""),
-                    "evidence_basis": str(signal.get("evidence_basis") or ""),
-                    "confidence": float(signal.get("confidence") or 0.0),
-                },
-                "fact": self._format_fact_view_for_explicit_claim_prompt(item["fact"]),
-                "activity_context_ids": [
-                    int(activity["activity_id"]) for activity in item.get("activity_contexts") or []
-                ],
-            }, ensure_ascii=False, separators=(",", ":")))
-        return "[\n" + ",\n".join(lines) + "\n]"
-
     @staticmethod
     def _format_activity_contexts_for_signal_prompt(
         signal_items: Sequence[Dict[str, Any]],
@@ -3971,1319 +3781,6 @@ class MemoryNodeManager:
             json.dumps(contexts[key], ensure_ascii=False, separators=(",", ":"))
             for key in sorted(contexts)
         ) + "\n]"
-
-    def _sync_user_claim_recall_documents(
-        self,
-        claim_ids: Sequence[int],
-        *, reference_timestamp: Any = None,
-    ) -> None:
-        """Refresh projections for claims created, merged, or transitioned."""
-        claims = self._db.get_user_claims_by_ids(claim_ids)
-        entity_ids = [
-            int(entity_id)
-            for claim in claims
-            for entity_id in (
-                claim.get("subject_entity_id"),
-                claim.get("object_entity_id"),
-                claim.get("source_actor_entity_id"),
-            )
-            if str(entity_id or "").strip().isdigit() and int(entity_id) > 0
-        ]
-        names_by_id = self._db.get_entity_names_by_ids(entity_ids)
-        for claim in claims:
-            subject_id = int(claim.get("subject_entity_id") or 0)
-            object_id = int(claim.get("object_entity_id") or 0)
-            source_actor_id = int(claim.get("source_actor_entity_id") or 0)
-            claim_entity_ids = [
-                entity_id for entity_id in (subject_id, object_id, source_actor_id)
-                if entity_id > 0
-            ]
-            self._upsert_memory_recall_document(
-                object_type="user_claim",
-                object_id=int(claim["id"]),
-                title=_compact_whitespace(claim.get("claim_text") or "")[:120],
-                summary=_compact_whitespace(claim.get("claim_text") or ""),
-                identity_lines=[
-                    f"subject: {names_by_id.get(subject_id, '')}",
-                    f"claim: {_compact_whitespace(claim.get('claim_text') or '')}",
-                    f"predicate: {claim.get('predicate') or ''}",
-                    f"object: {names_by_id.get(object_id, '')}",
-                    f"claim_type: {claim.get('claim_type') or ''}",
-                    f"primary_domain: {claim.get('primary_domain') or ''}",
-                    f"claim_origin: {claim.get('claim_origin') or ''}",
-                    f"status: {claim.get('status') or ''}",
-                ],
-                entity_ids=claim_entity_ids,
-                topic_keys=[
-                    str(claim.get("claim_type") or ""),
-                    str(claim.get("predicate") or ""),
-                ],
-                time_start=str(claim.get("valid_from") or ""),
-                time_end=str(claim.get("valid_to") or ""),
-                status=str(claim.get("status") or ""),
-                confidence=float(claim.get("confidence") or 0.0),
-                importance=0.65,
-                metadata={
-                    "claim_origin": str(claim.get("claim_origin") or ""),
-                    "claim_type": str(claim.get("claim_type") or ""),
-                    "primary_domain": str(claim.get("primary_domain") or ""),
-                    "predicate": str(claim.get("predicate") or ""),
-                    "projection_version": "v1",
-                },
-                reference_timestamp=reference_timestamp,
-            )
-
-    @staticmethod
-    def _user_claim_origin_priority(origin: Any) -> int:
-        """Return a deterministic ordering hint for claim-relation retrieval."""
-        return {"explicit": 2, "derived": 1}.get(
-            str(origin or "").strip().lower(),
-            0,
-        )
-
-    @staticmethod
-    def _user_claim_storage_payload(candidate: Dict[str, Any]) -> Dict[str, Any]:
-        return {
-            key: value
-            for key, value in candidate.items()
-            if key not in {
-                "evidence_fact_ids", "support_fact_ids", "premise_claim_ids",
-            }
-        }
-
-    @staticmethod
-    def _get_user_claim_support_fact_ids(
-        candidate: Dict[str, Any],
-    ) -> List[int]:
-        support_ids = candidate.get("support_fact_ids")
-        if support_ids is None:
-            support_ids = candidate.get("evidence_fact_ids") or []
-        return [int(value) for value in support_ids if str(value).strip().isdigit()]
-
-    def _retrieve_related_user_claims(
-        self,
-        candidate: Dict[str, Any],
-    ) -> List[Dict[str, Any]]:
-        """Retrieve text-related claims before using metadata as tie-breakers."""
-        ignored_terms = _STOPWORDS | {
-            "用户", "本人", "认为", "表示", "说明", "指出", "主张", "提出",
-            "觉得", "希望", "倾向", "关于", "针对", "当前", "本次", "这个",
-            "那个", "这些", "那些", "可以", "需要", "应该", "比较",
-            "user", "self", "think", "thinks", "believe", "believes",
-            "say", "says", "said", "state", "states", "stated", "prefer", "prefers",
-        }
-
-        def content_terms(text: Any) -> set[str]:
-            clean = re.sub(
-                r"speaker_用户本人|用户本人|\buser[ _]self\b|\bthe user\b",
-                " ", str(text or ""), flags=re.IGNORECASE,
-            )
-            return {
-                term for term in self._lexical_search_terms_for_text(
-                    clean, limit=max(32, len(clean)), preserve_phrase=False,
-                )
-                if len(term) > 1 and term not in ignored_terms and not term.isdecimal()
-            }
-
-        candidate_terms = content_terms(candidate.get("claim_text"))
-        if not candidate_terms:
-            return []
-        rows = self._db.get_user_claims(
-            subject_entity_id=int(candidate["subject_entity_id"]),
-            claim_type=str(candidate["claim_type"]),
-            statuses=["active", "candidate", "weakened", "superseded"],
-            limit=80,
-        )
-        predicate = str(candidate.get("predicate") or "")
-        object_entity_id = int(candidate.get("object_entity_id") or 0)
-        ranked: List[Tuple[float, Dict[str, Any]]] = []
-        for row in rows:
-            existing_terms = content_terms(row.get("claim_text"))
-            shared_count = len(candidate_terms & existing_terms)
-            if not shared_count:
-                continue
-            # A short claim may refine one part of a longer claim. Require
-            # overlap within the shorter text, not similarity of full lengths.
-            if shared_count / min(len(candidate_terms), len(existing_terms)) < 0.2:
-                continue
-            text_score = 2.0 * shared_count / (len(candidate_terms) + len(existing_terms))
-            ranked.append((text_score, row))
-        ranked.sort(
-            key=lambda pair: (
-                -pair[0],
-                str(pair[1].get("predicate") or "") != predicate,
-                int(pair[1].get("object_entity_id") or 0) != object_entity_id,
-                -self._user_claim_origin_priority(pair[1].get("claim_origin")),
-                -float(pair[1].get("confidence") or 0.0),
-            )
-        )
-        return [row for _, row in ranked[:24]]
-
-    def _classify_user_claim_relations(
-        self,
-        candidates: Sequence[Dict[str, Any]],
-        related_by_index: Dict[int, List[Dict[str, Any]]],
-    ) -> List[List[Dict[str, Any]]]:
-        if not any(related_by_index.values()):
-            return [[] for _candidate in candidates]
-        language = self._resolve_prompt_language_from_text(
-            "\n".join(str(candidate.get("claim_text") or "") for candidate in candidates)
-        )
-        prompt_template = (
-            USER_CLAIM_RECONCILIATION_PROMPT_EN
-            if language == "en" else USER_CLAIM_RECONCILIATION_PROMPT_ZH
-        )
-        candidate_claim_groups = [
-            {
-                "candidate_claim_index": index,
-                "candidate_claim": {
-                    "claim_type": candidate["claim_type"],
-                    "claim_text": candidate.get("claim_text") or "",
-                },
-                "related_existing_claims": [
-                    {
-                        "id": claim.get("id"),
-                        "claim_text": claim.get("claim_text") or "",
-                    }
-                    for claim in related_by_index.get(index, [])
-                ],
-            }
-            for index, candidate in enumerate(candidates)
-        ]
-        prompt = prompt_template.replace("{candidate_claim_groups}", "[\n" + ",\n".join(
-            json.dumps(group, ensure_ascii=False, separators=(",", ":"))
-            for group in candidate_claim_groups
-        ) + "\n]")
-        raw = self._llm_client.call_llm(
-            prompt, stage_name='memory_user_claim_reconciliation',
-        )
-        parsed = self._llm_client.parse_json_object_from_llm_text(raw or "", stage_name='memory_user_claim_reconciliation')
-        if not parsed or not isinstance(parsed.get("decisions"), list):
-            return [[] for _candidate in candidates]
-        else:
-            semantic_resolved: List[List[Dict[str, Any]]] = [
-                [] for _candidate in candidates
-            ]
-            for raw_decision in parsed["decisions"]:
-                if not isinstance(raw_decision, dict):
-                    continue
-                try:
-                    index = int(raw_decision.get("candidate_claim_index"))
-                except (TypeError, ValueError):
-                    continue
-                if index < 0 or index >= len(candidates):
-                    continue
-                allowed_relations = {"contradicts", "refines", "supersedes"}
-                if candidates[index]["claim_type"] != "judgment":
-                    allowed_relations.update({"duplicate", "supports"})
-                raw_relations = raw_decision.get("relations")
-                if not isinstance(raw_relations, list):
-                    continue
-                allowed_ids = {
-                    int(claim["id"])
-                    for claim in related_by_index.get(index, [])
-                    if str(claim.get("id") or "").strip().isdigit()
-                }
-                parsed_by_id: Dict[int, Dict[str, Any]] = {}
-                for raw_relation in raw_relations:
-                    if not isinstance(raw_relation, dict):
-                        continue
-                    try:
-                        target_id = int(raw_relation.get("existing_claim_id"))
-                    except (TypeError, ValueError):
-                        continue
-                    relation = str(
-                        raw_relation.get("semantic_relation") or ""
-                    ).strip().lower()
-                    if target_id not in allowed_ids or relation not in allowed_relations:
-                        continue
-                    parsed_by_id[target_id] = {
-                        "existing_claim_id": target_id,
-                        "semantic_relation": relation,
-                        "confidence": self._clamp_float(
-                            raw_relation.get("confidence"), 0.0, 1.0, 0.7,
-                        ),
-                        "reason": _compact_whitespace(
-                            raw_relation.get("reason") or ""
-                        )[:240],
-                    }
-                semantic_resolved[index] = list(parsed_by_id.values())
-        return semantic_resolved
-
-    def _write_user_claim_evidence(
-        self,
-        *,
-        claim_id: int,
-        support_ids: Sequence[int],
-        facts_by_id: Dict[int, Dict[str, Any]],
-        confidence: float,
-        reference_timestamp: Any = None,
-    ) -> None:
-        evidence: List[Dict[str, Any]] = []
-        for fact_id in support_ids:
-            fact = facts_by_id.get(int(fact_id))
-            if not fact:
-                continue
-            evidence.append({
-                "claim_id": claim_id,
-                "evidence_type": "fact",
-                "evidence_id": int(fact_id),
-                "role": "support",
-                "weight": confidence,
-                "observed_at": fact.get("event_time_key")
-                or fact.get("dialogue_time_key") or "",
-            })
-        self._db.upsert_user_claim_evidence(evidence, reference_timestamp=reference_timestamp)
-
-    @staticmethod
-    def _user_claim_transition_effective_at(
-        candidate: Dict[str, Any],
-        *,
-        support_ids: Sequence[int],
-        facts_by_id: Dict[int, Dict[str, Any]],
-    ) -> str:
-        """Use the candidate's own temporal assertion, then its newest fact."""
-        valid_from = _compact_whitespace(candidate.get("valid_from") or "")
-        if valid_from:
-            return valid_from
-        observed_at = [
-            _compact_whitespace(
-                fact.get("event_time_key") or fact.get("dialogue_time_key") or ""
-            )
-            for fact_id in support_ids
-            for fact in [facts_by_id.get(int(fact_id))]
-            if fact
-        ]
-        return max((value for value in observed_at if value), default="")
-
-    def _record_user_claim_relation(
-        self,
-        *,
-        target: Dict[str, Any],
-        trigger_claim_id: int,
-        candidate: Dict[str, Any],
-        decision: Dict[str, Any],
-        effective_at: str,
-        reference_timestamp: Any = None,
-    ) -> Optional[int]:
-        """Persist semantic claim history without resolving effective state."""
-        details = {
-            "trigger_claim_snapshot": {
-                "claim_text": candidate.get("claim_text") or "",
-                "claim_origin": candidate.get("claim_origin") or "",
-                "claim_type": candidate.get("claim_type") or "",
-                "confidence": candidate.get("confidence"),
-            },
-            "target_claim_snapshot": {
-                "claim_text": target.get("claim_text") or "",
-                "claim_origin": target.get("claim_origin") or "",
-                "claim_type": target.get("claim_type") or "",
-                "confidence": target.get("confidence"),
-            },
-        }
-        return self._db.record_user_claim_relation(
-            target_claim_id=int(target["id"]),
-            trigger_claim_id=trigger_claim_id,
-            semantic_relation=str(decision.get("semantic_relation") or ""),
-            effective_at=effective_at,
-            decision_source="user_claim_reconciliation_v2:llm_semantics",
-            semantic_confidence=self._clamp_float(
-                decision.get("confidence"), 0.0, 1.0, 0.0,
-            ),
-            semantic_reason=_compact_whitespace(decision.get("reason") or "")[:240],
-            details=details,
-            reference_timestamp=reference_timestamp,
-        )
-
-    def _reconcile_user_claims(
-        self,
-        candidates: Sequence[Dict[str, Any]],
-        *,
-        facts_by_id: Dict[int, Dict[str, Any]],
-        reference_timestamp: Any = None,
-    ) -> List[Dict[str, Any]]:
-        """Save claims with their own facts and record relations without changing old evidence."""
-        candidate_subject_ids = [
-            candidate.get("subject_entity_id") for candidate in candidates or []
-        ]
-        subject_names = self._db.get_entity_names_by_ids(candidate_subject_ids)
-        unique_candidates: List[Dict[str, Any]] = []
-        seen: set[Tuple[Any, ...]] = set()
-        for candidate in candidates:
-            subject_id = int(candidate.get("subject_entity_id") or 0)
-            if _compact_whitespace(subject_names.get(subject_id) or "").lower() != (
-                self._world_owner_entity_name.lower()
-            ):
-                continue
-            key = (
-                candidate.get("subject_entity_id"), candidate.get("claim_type"),
-                candidate.get("predicate"), candidate.get("object_entity_id") or 0,
-                candidate.get("claim_text"), candidate.get("claim_origin"),
-            )
-            if key in seen:
-                continue
-            seen.add(key)
-            unique_candidates.append(candidate)
-        related_by_index = {
-            index: self._retrieve_related_user_claims(candidate)
-            for index, candidate in enumerate(unique_candidates)
-        }
-        decisions = self._classify_user_claim_relations(
-            unique_candidates, related_by_index,
-        )
-        applied: List[Dict[str, Any]] = []
-        for index, candidate in enumerate(unique_candidates):
-            candidate_decisions = decisions[index]
-            candidate_origin = str(candidate.get("claim_origin") or "")
-            support_ids = self._get_user_claim_support_fact_ids(candidate)
-            effective_at = self._user_claim_transition_effective_at(
-                candidate,
-                support_ids=support_ids,
-                facts_by_id=facts_by_id,
-            )
-
-            def target_for(decision: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-                target_id = decision.get("existing_claim_id")
-                return next(
-                    (
-                        item for item in related_by_index[index]
-                        if int(item.get("id") or 0) == int(target_id or 0)
-                    ),
-                    None,
-                )
-
-            storage_payload = self._user_claim_storage_payload(candidate)
-            claim_id, created = self._db.upsert_user_claim(**storage_payload, reference_timestamp=reference_timestamp)
-            self._write_user_claim_evidence(
-                claim_id=claim_id,
-                support_ids=support_ids,
-                facts_by_id=facts_by_id,
-                confidence=float(candidate.get("confidence") or 0.0),
-                reference_timestamp=reference_timestamp,
-            )
-            persisted_relations: List[Dict[str, Any]] = []
-            for decision in candidate_decisions:
-                target = target_for(decision)
-                if not target:
-                    continue
-                relation_event_id = self._record_user_claim_relation(
-                    target=target,
-                    trigger_claim_id=claim_id,
-                    candidate=candidate,
-                    decision=decision,
-                    effective_at=effective_at,
-                    reference_timestamp=reference_timestamp,
-                )
-                if relation_event_id:
-                    persisted_relations.append({
-                        **decision,
-                        "relation_event_id": int(relation_event_id),
-                    })
-            applied.append({
-                "claim": candidate, "claim_id": claim_id, "created": created,
-                "effective_origin": candidate_origin,
-                "relations": persisted_relations,
-                "merged": False,
-            })
-        self._logger.log_json_format("memory_user_claim", "user_claim_reconciled", {
-            "candidate_count": len(unique_candidates),
-            "applied_count": len(applied),
-            "relations": [
-                {
-                    "claim_id": item["claim_id"], "origin": item["claim"].get("claim_origin"),
-                    "relations": [
-                        {
-                            "existing_claim_id": decision.get("existing_claim_id"),
-                            "semantic_relation": decision.get("semantic_relation"),
-                        }
-                        for decision in item["relations"]
-                    ],
-                    "merged": item["merged"],
-                }
-                for item in applied
-            ],
-        })
-        recall_document_claim_ids = {
-            int(item["claim_id"])
-            for item in applied
-            if int(item.get("claim_id") or 0) > 0
-        }
-        recall_document_claim_ids.update(
-            int(decision["existing_claim_id"])
-            for item in applied
-            for decision in item.get("relations") or []
-            if str(decision.get("existing_claim_id") or "").strip().isdigit()
-            and int(decision["existing_claim_id"]) > 0
-        )
-        # Temporarily disable claim recall projection while recall is out of scope.
-        # self._sync_user_claim_recall_documents(
-        #     sorted(recall_document_claim_ids)
-        # )
-        return applied
-
-    def _update_explicit_user_claims_from_signals(
-        self,
-        signal_items: Sequence[Dict[str, Any]],
-        *, reference_timestamp: Any = None,
-    ) -> Dict[str, Any]:
-        """Review each signal against its own fact before reconciling claims."""
-        report: Dict[str, Any] = {
-            "enabled": 1,
-            "signal_count": len(signal_items),
-            "fact_count": len({int(item["fact"]["id"]) for item in signal_items}),
-            "signal_batch_count": 0,
-            "failed_signal_count": 0,
-            "claim_count": 0,
-            "updated": 0,
-            "created": 0,
-            "merged": 0,
-            "new_claim_ids": [],
-            "claim_relations": [],
-            "processed_signal_ids": [],
-            "completed": True,
-        }
-        if not signal_items:
-            return report
-        extraction_claim_info = self._extract_explicit_user_claims_from_signals_using_llm(signal_items)
-        report.update({
-            "signal_batch_count": extraction_claim_info["signal_batch_count"],
-            "failed_signal_count": extraction_claim_info["failed_signal_count"],
-            "claim_count": extraction_claim_info["claim_count"],
-            "processed_signal_ids": extraction_claim_info["processed_signal_ids"],
-        })
-        claim_candidates = extraction_claim_info["claim_candidates"]
-        facts_by_id = {int(item["fact"]["id"]): item["fact"] for item in signal_items}
-        applied = self._reconcile_user_claims(
-            claim_candidates, facts_by_id=facts_by_id,
-            reference_timestamp=reference_timestamp,
-        ) if claim_candidates else []
-        report["updated"] = len(applied)
-        report["created"] = sum(int(item["created"]) for item in applied)
-        report["merged"] = sum(int(item["merged"]) for item in applied)
-        new_claim_ids: set[int] = set()
-        claim_relations: Dict[Tuple[int, int, str], Dict[str, Any]] = {}
-        for applied_item in applied:
-            claim_id = int(applied_item["claim_id"])
-            new_claim_ids.add(claim_id)
-            for decision in applied_item.get("relations") or []:
-                existing_claim_id = int(decision.get("existing_claim_id") or 0)
-                if existing_claim_id <= 0 or existing_claim_id == claim_id:
-                    continue
-                semantic_relation = str(decision.get("semantic_relation") or "")
-                key = (claim_id, existing_claim_id, semantic_relation)
-                claim_relations[key] = {
-                    "relation_event_id": int(decision["relation_event_id"]),
-                    "new_claim_id": claim_id,
-                    "existing_claim_id": existing_claim_id,
-                    "semantic_relation": semantic_relation,
-                    "confidence": float(decision.get("confidence") or 0.0),
-                    "reason": str(decision.get("reason") or ""),
-                }
-        report["new_claim_ids"] = sorted(new_claim_ids)
-        report["claim_relations"] = [
-            claim_relations[key] for key in sorted(claim_relations)
-        ]
-        report["completed"] = report["failed_signal_count"] == 0
-        return report
-
-    def _extract_explicit_user_claims_from_signals_using_llm(
-        self,
-        signal_items: Sequence[Dict[str, Any]],
-    ) -> Dict[str, Any]:
-        """Extract all signal batches and merge duplicate claims across batches."""
-        result: Dict[str, Any] = {
-            "signal_batch_count": 0,
-            "failed_signal_count": 0,
-            "claim_count": 0,
-            "processed_signal_ids": [],
-            "claim_candidates": [],
-        }
-        unique_claim_candidates: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
-        batch_size = max(
-            1, int(self._memory_cfg.get("user_claim_signal_batch_size") or 8),
-        )
-        for batch_start in range(0, len(signal_items), batch_size):
-            batch_signal_items = signal_items[batch_start:batch_start + batch_size]
-            result["signal_batch_count"] += 1
-            prompt_language = self._resolve_prompt_language_from_text(
-                "\n".join(str(item["fact"].get("summary") or "") for item in batch_signal_items)
-            )
-            prompt_template = (
-                EXPLICIT_USER_CLAIM_EXTRACTION_PROMPT_EN
-                if prompt_language == "en" else EXPLICIT_USER_CLAIM_EXTRACTION_PROMPT_ZH
-            )
-            try:
-                activity_ids_by_signal = {
-                    item["signal_id"]: [int(activity["activity_id"])
-                                        for activity in item.get("activity_contexts") or []]
-                    for item in batch_signal_items
-                }
-                self._logger.log_json_format("memory_user_claim", "explicit_claim_activity_contexts", {
-                    "signal_activity_context_ids": activity_ids_by_signal,
-                })
-                prompt = prompt_template.replace(
-                    "{activity_contexts}",
-                    self._format_activity_contexts_for_signal_prompt(batch_signal_items),
-                ).replace(
-                    "{signal_items}",
-                    self._format_signal_view_for_explicit_claim_prompt(batch_signal_items),
-                )
-                raw = self._llm_client.call_llm(
-                    prompt, stage_name='memory_explicit_user_claim_extraction',
-                )
-                parsed = self._llm_client.parse_json_object_from_llm_text(raw or "", stage_name='memory_explicit_user_claim_extraction')
-            except Exception as exc:
-                parsed = None
-                self._logger.log_json_format("memory_user_claim", "signal_batch_error", {
-                    "signal_ids": [item["signal_id"] for item in batch_signal_items],
-                    "error": str(exc),
-                })
-            if not isinstance(parsed, dict) or not isinstance(parsed.get("results"), list):
-                result["failed_signal_count"] += len(batch_signal_items)
-                continue
-
-            results_by_id: Dict[int, List[Dict[str, Any]]] = {}
-            for raw_result in parsed["results"]:
-                if not isinstance(raw_result, dict):
-                    continue
-                try:
-                    signal_id = int(raw_result.get("signal_id"))
-                except (TypeError, ValueError):
-                    continue
-                results_by_id.setdefault(signal_id, []).append(raw_result)
-
-            for item in batch_signal_items:
-                signal_id = int(item["signal_id"])
-                results = results_by_id.get(signal_id) or []
-                if len(results) != 1 or not isinstance(results[0].get("claims"), list):
-                    result["failed_signal_count"] += 1
-                    continue
-                fact = item["fact"]
-                fact_id = int(fact["id"])
-                entity_ids_by_name = {
-                    _compact_whitespace(name): int(entity_id)
-                    for name, entity_id in zip(
-                        fact.get("entities") or [], fact.get("entity_ids") or [],
-                    )
-                    if _compact_whitespace(name) and str(entity_id).isdigit()
-                    and int(entity_id) > 0
-                }
-                signal_candidates: List[Dict[str, Any]] = []
-                valid = True
-                for raw_claim in results[0]["claims"]:
-                    if (
-                        not isinstance(raw_claim, dict)
-                        or raw_claim.get("evidence_fact_ids") != [fact_id]
-                    ):
-                        valid = False
-                        break
-                    claim = self._normalize_explicit_user_claim(
-                        raw_claim,
-                        facts_by_id={fact_id: fact},
-                        entity_ids=entity_ids_by_name,
-                    )
-                    if claim is None:
-                        valid = False
-                        break
-                    signal_candidates.append(claim)
-                if not valid:
-                    result["failed_signal_count"] += 1
-                    continue
-                result["claim_count"] += len(signal_candidates)
-                result["processed_signal_ids"].append(signal_id)
-
-                # Merge equivalent claims across every batch before reconciliation.
-                for candidate in signal_candidates:
-                    key = (
-                        candidate["subject_entity_id"], candidate["claim_type"],
-                        candidate["predicate"], candidate.get("object_entity_id") or 0,
-                        candidate["claim_text"], candidate["claim_origin"],
-                    )
-                    existing = unique_claim_candidates.get(key)
-                    if existing is None:
-                        unique_claim_candidates[key] = candidate
-                        continue
-                    existing["evidence_fact_ids"] = list(dict.fromkeys(
-                        [*existing["evidence_fact_ids"], *candidate["evidence_fact_ids"]]
-                    ))
-                    existing["metadata"]["source_fact_count"] = len(existing["evidence_fact_ids"])
-                    existing["confidence"] = max(existing["confidence"], candidate["confidence"])
-                    if candidate["status"] == "active":
-                        existing["status"] = "active"
-        result["claim_candidates"] = list(unique_claim_candidates.values())
-        return result
-
-    def _normalize_explicit_user_claim(
-        self,
-        raw: Any,
-        *,
-        facts_by_id: Dict[int, Dict[str, Any]],
-        entity_ids: Dict[str, int],
-    ) -> Optional[Dict[str, Any]]:
-        if not isinstance(raw, dict):
-            return None
-        claim_type = str(raw.get("claim_type") or "").strip().lower()
-        if claim_type not in self._user_claim_types():
-            return None
-        evidence_ids = list(dict.fromkeys(
-            int(value) for value in (raw.get("evidence_fact_ids") or [])
-            if str(value).strip().isdigit() and int(value) in facts_by_id
-        ))[:12]
-        if not evidence_ids:
-            return None
-        subject = _compact_whitespace(raw.get("subject_entity") or "")
-        if self._is_world_owner_entity_reference(subject):
-            subject = self._world_owner_entity_name
-        if subject.lower() != self._world_owner_entity_name.lower():
-            return None
-        # A claim can only be grounded in facts whose source metadata
-        # explicitly identifies the wearer, and whose normalized entities
-        # retain that exact subject.
-        if not all(
-            isinstance(facts_by_id[fact_id].get("metadata"), dict)
-            and bool(
-                facts_by_id[fact_id]["metadata"].get("has_world_owner_speaker")
-                or facts_by_id[fact_id]["metadata"].get("has_world_owner_alias_reference")
-            )
-            and subject in (facts_by_id[fact_id].get("entities") or [])
-            for fact_id in evidence_ids
-        ):
-            return None
-        subject_id = entity_ids.get(subject)
-        primary_domain = self._normalize_primary_domain(raw.get("primary_domain"))
-        predicate = re.sub(r"[^a-z0-9_]+", "_", str(raw.get("predicate") or "").lower()).strip("_")
-        if not subject_id or not predicate or not primary_domain:
-            return None
-        object_name = _compact_whitespace(raw.get("object_entity") or "")
-        object_id = entity_ids.get(object_name) if object_name else None
-        raw_claim_text = _compact_whitespace(raw.get("claim_text") or "")
-        if not object_id and not raw_claim_text:
-            return None
-        confidence = self._clamp_float(raw.get("confidence"), 0.0, 1.0, 0.7)
-        has_wearer_evidence = any(
-            facts_by_id[fact_id]["metadata"].get("has_world_owner_speaker")
-            for fact_id in evidence_ids
-        )
-        if not has_wearer_evidence:
-            confidence = min(confidence, 0.65)
-        claim_text = self._normalize_user_claim_text(
-            raw_claim_text,
-            subject=subject,
-            predicate=predicate,
-            object_name=object_name,
-        )
-        if not claim_text:
-            return None
-        return {
-            "subject_entity_id": subject_id,
-            "predicate": predicate,
-            "object_entity_id": object_id,
-            "claim_text": claim_text,
-            "claim_type": claim_type,
-            "claim_origin": "explicit",
-            "primary_domain": primary_domain,
-            "status": (
-                "active"
-                if has_wearer_evidence and confidence >= self._user_claim_explicit_min_confidence
-                else "candidate"
-            ),
-            "confidence": confidence,
-            "valid_from": _compact_whitespace(raw.get("valid_from") or ""),
-            "valid_to": _compact_whitespace(raw.get("valid_to") or ""),
-            "extractor_version": "user_claim_explicit_v1",
-            "prompt_version": "v1",
-            "metadata": {"source_fact_count": len(evidence_ids)},
-            "evidence_fact_ids": evidence_ids,
-        }
-
-    def _update_derived_user_claims_from_explicit_claims(
-        self,
-        *,
-        new_explicit_claim_ids: Sequence[int],
-        reference_timestamp: Any = None,
-    ) -> Dict[str, Any]:
-        """Derive local conclusions from this batch's explicit-claim changes.
-
-        The LLM proposes only premise-linked conclusions. Entity IDs,
-        premise membership, fact traceability, and writes remain deterministic
-        program responsibilities.
-        """
-        explicit_claim_ids = list(dict.fromkeys(
-            int(value)
-            for value in new_explicit_claim_ids or []
-            if str(value).strip().isdigit() and int(value) > 0
-        ))
-        report: Dict[str, Any] = {
-            "enabled": 1,
-            "input_explicit_claim_count": len(explicit_claim_ids),
-            "seed_claim_count": 0,
-            "processed_seed_claim_count": 0,
-            "successful_seed_claim_count": 0,
-            "batch_count": 0,
-            "successful_batch_count": 0,
-            "failed_batch_count": 0,
-            "input_claim_count": 0,
-            "input_prompt_chars": 0,
-            "candidate_count": 0,
-            "updated": 0,
-            "created": 0,
-            "suppressed": 0,
-            "new_claim_ids": [],
-            "claim_relations": [],
-            "failed_seed_claim_ids": [],
-            "failures": [],
-            "completed": True,
-        }
-        if not explicit_claim_ids:
-            return report
-        changed_claims = self._db.get_user_claims_by_ids(explicit_claim_ids)
-        world_owner_entity_id = self._intent_world_owner_entity_id(reference_timestamp=reference_timestamp)
-        seed_claims = [
-            claim
-            for claim in changed_claims
-            if claim.get("claim_origin") == "explicit"
-            and claim.get("status") == "active"
-            and int(claim.get("subject_entity_id") or 0) == world_owner_entity_id
-        ]
-        report["seed_claim_count"] = len(seed_claims)
-        if not seed_claims:
-            return report
-
-        new_derived_claim_ids: set[int] = set()
-        claim_relations: Dict[Tuple[int, int, str], Dict[str, Any]] = {}
-        for changed_claims, related_claims, prompt_chars in self._iter_derived_user_claim_batches(
-            seed_claims, world_owner_entity_id=world_owner_entity_id,
-        ):
-            batch_claim_ids = [int(claim["id"]) for claim in changed_claims]
-            report["batch_count"] += 1
-            report["processed_seed_claim_count"] += len(changed_claims)
-            report["input_claim_count"] += len(changed_claims) + len(related_claims)
-            report["input_prompt_chars"] += prompt_chars
-            batch_info = {
-                "batch_index": report["batch_count"],
-                "seed_claim_ids": batch_claim_ids,
-                "related_claim_count": len(related_claims),
-                "prompt_chars": prompt_chars,
-            }
-            self._logger.log_json_format("memory_user_claim", "derived_batch_start", batch_info)
-            failure: Dict[str, Any] = {}
-            claim_report: Dict[str, Any] = {}
-            try:
-                outcome = self._extract_derived_user_claims(
-                    changed_claims=changed_claims,
-                    related_claims=related_claims,
-                )
-                if outcome is None:
-                    failure = {"reason": "invalid_llm_derived_claim_response"}
-                elif outcome:
-                    with self._db.transaction():
-                        claim_report = self._apply_derived_user_claim_candidates(
-                            raw_candidates=outcome,
-                            changed_claims=changed_claims,
-                            related_claims=related_claims,
-                            reference_timestamp=reference_timestamp,
-                        )
-            except sqlite3.Error:
-                # Storage/infrastructure failures are not invalid LLM outputs.
-                raise
-            except Exception as exc:
-                failure = {
-                    "reason": "derived_claim_processing_error",
-                    "error_type": type(exc).__name__,
-                }
-                self._logger.exception(
-                    "Derived user claim processing failed seed_claim_ids=%s", batch_claim_ids,
-                )
-            if failure:
-                report["completed"] = False
-                report["failed_batch_count"] += 1
-                report["failed_seed_claim_ids"].extend(batch_claim_ids)
-                failure.update(batch_info)
-                report["failures"].append(failure)
-                self._logger.log_json_format("memory_user_claim", "derived_batch_failed", failure)
-                continue
-            report["successful_batch_count"] += 1
-            report["successful_seed_claim_count"] += len(changed_claims)
-            report["candidate_count"] += len(outcome)
-            self._logger.log_json_format("memory_user_claim", "derived_batch_finish", {
-                **batch_info, "candidate_count": len(outcome),
-            })
-            if not outcome:
-                continue
-            for key in ("updated", "created", "suppressed"):
-                report[key] += int(claim_report[key])
-            new_derived_claim_ids.update(
-                int(value)
-                for value in claim_report.get("new_claim_ids") or []
-                if int(value) > 0
-            )
-            for relation in claim_report.get("claim_relations") or []:
-                key = (
-                    int(relation["new_claim_id"]),
-                    int(relation["existing_claim_id"]),
-                    str(relation["semantic_relation"]),
-                )
-                claim_relations[key] = relation
-        report["new_claim_ids"] = sorted(new_derived_claim_ids)
-        report["claim_relations"] = [
-            claim_relations[key] for key in sorted(claim_relations)
-        ]
-        return report
-
-    def _iter_derived_user_claim_batches(
-        self,
-        seed_claims: Sequence[Dict[str, Any]],
-        *,
-        world_owner_entity_id: int,
-    ) -> Iterable[Tuple[List[Dict[str, Any]], List[Dict[str, Any]], int]]:
-        """Pack new claims with deduplicated related premises, without dropping evidence.
-
-        The character budget includes the rendered prompt. A single seed and
-        its premises are atomic: keep an oversized singleton intact and log it
-        rather than silently clipping text or discarding necessary premises.
-        """
-        batch_size = max(1, int(self._memory_cfg.get("user_claim_derived_batch_size") or 16))
-        char_budget = max(1, int(
-            self._memory_cfg.get("user_claim_derived_prompt_char_budget") or 24000
-        ))
-        changed: List[Dict[str, Any]] = []
-        history: Dict[int, Dict[str, Any]] = {}
-        prompt_chars = 0
-        for seed in seed_claims:
-            seed_history = {
-                int(claim["id"]): claim
-                for claim in self._retrieve_related_derived_explicit_claims(
-                    seed_claim=seed, batch_seed_claims=seed_claims,
-                    world_owner_entity_id=world_owner_entity_id,
-                )
-                if int(claim["id"]) != int(seed["id"])
-            }
-            next_changed = [*changed, seed]
-            next_changed_ids = {int(claim["id"]) for claim in next_changed}
-            next_history = {
-                claim_id: claim for claim_id, claim in {**history, **seed_history}.items()
-                if claim_id not in next_changed_ids
-            }
-            next_prompt_chars = len(self._build_derived_user_claim_prompt(
-                changed_claims=next_changed, related_claims=list(next_history.values()),
-            ))
-            if changed and (len(next_changed) > batch_size or next_prompt_chars > char_budget):
-                yield changed, list(history.values()), prompt_chars
-                next_changed, next_history = [seed], seed_history
-                next_prompt_chars = len(self._build_derived_user_claim_prompt(
-                    changed_claims=next_changed, related_claims=list(next_history.values()),
-                ))
-            changed, history, prompt_chars = next_changed, next_history, next_prompt_chars
-            if len(changed) == 1 and prompt_chars > char_budget:
-                self._logger.log_json_format("memory_user_claim", "derived_batch_over_budget", {
-                    "seed_claim_ids": [int(seed["id"])], "prompt_chars": prompt_chars,
-                    "prompt_char_budget": char_budget, "reason": "indivisible_seed_and_premises",
-                }, level=logging.WARNING)
-        if changed:
-            yield changed, list(history.values()), prompt_chars
-
-    def _retrieve_related_derived_explicit_claims(
-        self,
-        *,
-        seed_claim: Dict[str, Any],
-        batch_seed_claims: Sequence[Dict[str, Any]],
-        world_owner_entity_id: int,
-    ) -> List[Dict[str, Any]]:
-        """Find premises for one new claim without grouping by its subject."""
-        seed_claim_id = int(seed_claim["id"])
-        object_entity_id = int(seed_claim.get("object_entity_id") or 0)
-        primary_domain = str(seed_claim.get("primary_domain") or "")
-        predicate = str(seed_claim.get("predicate") or "")
-        claims_by_id: Dict[int, Dict[str, Any]] = {}
-        batch_claim_ids = {int(claim["id"]) for claim in batch_seed_claims}
-
-        def add_claims(claims: Sequence[Dict[str, Any]]) -> None:
-            for claim in claims:
-                claim_id = int(claim["id"])
-                if (
-                    claim_id != seed_claim_id
-                    and claim.get("claim_origin") == "explicit"
-                    and claim.get("status") == "active"
-                    and int(claim.get("subject_entity_id") or 0)
-                    == world_owner_entity_id
-                ):
-                    claims_by_id[claim_id] = claim
-
-        # Other claims created in the same batch may be necessary premises
-        # even when they refer to different objects.
-        add_claims(batch_seed_claims)
-        search_filters: List[Dict[str, Any]] = []
-        if object_entity_id and object_entity_id != world_owner_entity_id:
-            search_filters.append({"entity_id": object_entity_id})
-        if primary_domain and primary_domain != "general":
-            search_filters.append({"primary_domain": primary_domain})
-        if predicate:
-            search_filters.append({"predicate": predicate})
-        # Keep a small recent owner-wide pool for cross-object and
-        # cross-predicate deductions that the narrower filters cannot find.
-        search_filters.append({})
-        for filters in search_filters:
-            add_claims(self._db.get_user_claims(
-                subject_entity_id=world_owner_entity_id,
-                claim_origin="explicit",
-                statuses=["active"],
-                limit=64,
-                **filters,
-            ))
-
-        def relevance(claim: Dict[str, Any]) -> Tuple[bool, bool, bool, bool, bool, str, int]:
-            claim_object_id = int(claim.get("object_entity_id") or 0)
-            return (
-                bool(object_entity_id and claim_object_id == object_entity_id),
-                bool(predicate and claim.get("predicate") == predicate),
-                bool(primary_domain and claim.get("primary_domain") == primary_domain),
-                claim.get("claim_type") == seed_claim.get("claim_type"),
-                int(claim["id"]) in batch_claim_ids,
-                str(claim.get("updated_at") or ""),
-                int(claim["id"]),
-            )
-
-        batch_related = sorted(
-            (claim for claim in claims_by_id.values() if int(claim["id"]) in batch_claim_ids),
-            key=relevance,
-            reverse=True,
-        )[:8]
-        historical_related = sorted(
-            (claim for claim in claims_by_id.values() if int(claim["id"]) not in batch_claim_ids),
-            key=relevance,
-            reverse=True,
-        )[:32 - len(batch_related)]
-        return [*batch_related, *historical_related]
-
-    def _apply_derived_user_claim_candidates(
-        self,
-        *,
-        raw_candidates: Sequence[Dict[str, Any]],
-        changed_claims: Sequence[Dict[str, Any]],
-        related_claims: Sequence[Dict[str, Any]],
-        reference_timestamp: Any = None,
-    ) -> Dict[str, Any]:
-        """Validate, deduplicate, reconcile, and record a batch's conclusions."""
-        report: Dict[str, Any] = {
-            "updated": 0, "created": 0, "suppressed": 0,
-            "new_claim_ids": [], "claim_relations": [],
-        }
-        input_claims = [*changed_claims, *related_claims]
-        input_by_id = {int(claim["id"]): claim for claim in input_claims}
-        changed_claim_ids = {int(claim["id"]) for claim in changed_claims}
-        entity_ids = {
-            int(entity_id)
-            for claim in input_claims
-            for entity_id in (
-                claim.get("subject_entity_id"), claim.get("object_entity_id"),
-            )
-            if str(entity_id or "").strip().isdigit() and int(entity_id) > 0
-        }
-        entity_names = self._db.get_entity_names_by_ids(sorted(entity_ids))
-        unique_candidates: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
-        for raw_claim in raw_candidates:
-            candidate = self._normalize_derived_user_claim(
-                raw_claim,
-                input_claims_by_id=input_by_id,
-                new_claim_ids=changed_claim_ids,
-                entity_ids=entity_ids,
-                entity_names=entity_names,
-            )
-            if candidate is None:
-                continue
-            key = tuple(candidate.get(field) for field in (
-                "subject_entity_id", "object_entity_id", "claim_type", "predicate",
-                "primary_domain", "claim_text", "valid_from", "valid_to",
-            ))
-            existing = unique_candidates.get(key)
-            if existing is None or candidate["confidence"] > existing["confidence"]:
-                # Keep one complete proof; merging premise sets could change
-                # scope, validity, and confidence of the conclusion.
-                unique_candidates[key] = candidate
-        candidates = list(unique_candidates.values())
-        if not candidates:
-            return report
-        evidence_fact_ids = sorted({
-            fact_id
-            for candidate in candidates
-            for fact_id in candidate["support_fact_ids"]
-        })
-        facts_by_id = {
-            int(fact["id"]): fact
-            for fact in self._db.get_memory_facts_by_ids(evidence_fact_ids)
-            if str(fact.get("id") or "").strip().isdigit()
-        }
-        applied = self._reconcile_user_claims(candidates, facts_by_id=facts_by_id, reference_timestamp=reference_timestamp)
-        persisted_claims = {
-            int(claim["id"]): claim
-            for item in applied
-            for claim in self._db.get_user_claims_by_ids([item["claim_id"]])
-            if str(claim.get("id") or "").strip().isdigit()
-        }
-        persisted_derived_ids: List[int] = []
-        for item in applied:
-            claim_id = int(item.get("claim_id") or 0)
-            stored_claim = persisted_claims.get(claim_id)
-            if not stored_claim or stored_claim.get("claim_origin") != "derived":
-                report["suppressed"] += 1
-                continue
-            candidate = item["claim"]
-            premise_ids = list(candidate["premise_claim_ids"])
-            derivation_id = self._db.upsert_user_claim_derivation(
-                claim_id=claim_id,
-                rule_id="llm_direct_entailment",
-                rule_version="v1",
-                derivation_key=(
-                    f"llm_direct_entailment:v1:{claim_id}:"
-                    + ",".join(str(value) for value in premise_ids)
-                ),
-                metadata={
-                    "prompt_version": "v1",
-                    "premise_claim_ids": premise_ids,
-                    "generator": "derived_user_claim_extraction",
-                },
-                reference_timestamp=reference_timestamp,
-            )
-            self._db.replace_user_claim_derivation_premises(
-                derivation_id=derivation_id,
-                premise_claim_ids=premise_ids,
-                reference_timestamp=reference_timestamp,
-            )
-            persisted_derived_ids.append(claim_id)
-            report["new_claim_ids"].append(claim_id)
-            for decision in item.get("relations") or []:
-                existing_claim_id = int(decision.get("existing_claim_id") or 0)
-                if existing_claim_id <= 0 or existing_claim_id == claim_id:
-                    continue
-                report["claim_relations"].append({
-                    "relation_event_id": int(decision["relation_event_id"]),
-                    "new_claim_id": claim_id,
-                    "existing_claim_id": existing_claim_id,
-                    "semantic_relation": str(decision.get("semantic_relation") or ""),
-                    "confidence": float(decision.get("confidence") or 0.0),
-                    "reason": str(decision.get("reason") or ""),
-                })
-            report["created"] += int(item.get("created") or 0)
-            report["updated"] += 1
-        # Temporarily disable claim recall projection while recall is out of scope.
-        # if persisted_derived_ids:
-        #     self._sync_user_claim_recall_documents(
-        #         sorted(set(persisted_derived_ids))
-        #     )
-        report["new_claim_ids"] = sorted(set(report["new_claim_ids"]))
-        return report
-
-    def _format_claims_view_for_derived_user_claim_prompt(
-        self,
-        claims: Sequence[Dict[str, Any]],
-        *,
-        entity_names: Dict[int, str],
-    ) -> str:
-        """Render premise claims as a JSON array with one complete claim per line."""
-        if not claims:
-            return "[]"
-        lines = []
-        for claim in claims:
-            subject_id = int(claim.get("subject_entity_id") or 0)
-            object_id = int(claim.get("object_entity_id") or 0)
-            lines.append(json.dumps({
-                "id": int(claim["id"]),
-                "subject_entity_id": subject_id,
-                "subject_entity": entity_names.get(subject_id, ""),
-                "predicate": claim.get("predicate") or "",
-                "object_entity_id": object_id,
-                "object_entity": entity_names.get(object_id, ""),
-                "claim_type": claim.get("claim_type") or "",
-                "primary_domain": claim.get("primary_domain") or "",
-                "claim_text": claim.get("claim_text") or "",
-                "valid_from": claim.get("valid_from") or "",
-                "valid_to": claim.get("valid_to") or "",
-                "confidence": float(claim.get("confidence") or 0.0),
-            }, ensure_ascii=False, separators=(",", ":")))
-        return "[\n" + ",\n".join(lines) + "\n]"
-
-    def _build_derived_user_claim_prompt(
-        self,
-        *,
-        changed_claims: Sequence[Dict[str, Any]],
-        related_claims: Sequence[Dict[str, Any]],
-    ) -> str:
-        input_claims = [*changed_claims, *related_claims]
-        entity_ids = {
-            int(entity_id)
-            for claim in input_claims
-            for entity_id in (
-                claim.get("subject_entity_id"), claim.get("object_entity_id"),
-            )
-            if str(entity_id or "").strip().isdigit() and int(entity_id) > 0
-        }
-        entity_names = self._db.get_entity_names_by_ids(sorted(entity_ids))
-        language = self._resolve_prompt_language_from_text(
-            "\n".join(str(claim.get("claim_text") or "") for claim in input_claims)
-        )
-        prompt_template = (
-            DERIVED_USER_CLAIM_EXTRACTION_PROMPT_EN
-            if language == "en" else DERIVED_USER_CLAIM_EXTRACTION_PROMPT_ZH
-        )
-        return prompt_template.replace(
-            "{changed_claims}",
-            self._format_claims_view_for_derived_user_claim_prompt(
-                changed_claims,
-                entity_names=entity_names,
-            ),
-        ).replace(
-            "{related_claims}",
-            self._format_claims_view_for_derived_user_claim_prompt(
-                related_claims,
-                entity_names=entity_names,
-            ),
-        )
-
-    def _extract_derived_user_claims(
-        self,
-        *,
-        changed_claims: Sequence[Dict[str, Any]],
-        related_claims: Sequence[Dict[str, Any]],
-    ) -> Optional[List[Dict[str, Any]]]:
-        prompt = self._build_derived_user_claim_prompt(
-            changed_claims=changed_claims, related_claims=related_claims,
-        )
-        raw = self._llm_client.call_llm(
-            prompt, stage_name='memory_derived_user_claim_extraction',
-        )
-        parsed = self._llm_client.parse_json_object_from_llm_text(raw or "", stage_name='memory_derived_user_claim_extraction')
-        if parsed is None or not isinstance(parsed.get("claims"), list):
-            return None
-        if not all(isinstance(item, dict) for item in parsed["claims"]):
-            return None
-        return parsed["claims"]
-
-    def _normalize_derived_user_claim(
-        self,
-        raw: Dict[str, Any],
-        *,
-        input_claims_by_id: Dict[int, Dict[str, Any]],
-        new_claim_ids: set[int],
-        entity_ids: set[int],
-        entity_names: Dict[int, str],
-    ) -> Optional[Dict[str, Any]]:
-        try:
-            subject_entity_id = int(raw.get("subject_entity_id") or 0)
-            object_entity_id = int(raw.get("object_entity_id") or 0)
-        except (TypeError, ValueError):
-            return None
-        if subject_entity_id not in entity_ids or (
-            object_entity_id and object_entity_id not in entity_ids
-        ):
-            return None
-        if _compact_whitespace(
-            entity_names.get(subject_entity_id) or ""
-        ).lower() != self._world_owner_entity_name.lower():
-            return None
-        claim_type = str(raw.get("claim_type") or "").strip().lower()
-        if claim_type not in {"affiliation", "relationship", "constraint"}:
-            return None
-        primary_domain = self._normalize_primary_domain(raw.get("primary_domain"))
-        if not primary_domain:
-            return None
-        predicate = re.sub(
-            r"[^a-z0-9_]+", "_", str(raw.get("predicate") or "").lower(),
-        ).strip("_")
-        if not predicate:
-            return None
-        premise_ids = list(dict.fromkeys(
-            int(value)
-            for value in (raw.get("premise_claim_ids") or [])
-            if str(value).strip().isdigit() and int(value) in input_claims_by_id
-        ))[:8]
-        if not premise_ids or not any(value in new_claim_ids for value in premise_ids):
-            return None
-        premises = [input_claims_by_id[value] for value in premise_ids]
-        if not all(
-            claim.get("claim_origin") == "explicit" and claim.get("status") == "active"
-            for claim in premises
-        ):
-            return None
-        conclusion_tuple = (
-            subject_entity_id, predicate, object_entity_id, claim_type,
-        )
-        if any(
-            conclusion_tuple == (
-                int(claim.get("subject_entity_id") or 0),
-                str(claim.get("predicate") or ""),
-                int(claim.get("object_entity_id") or 0),
-                str(claim.get("claim_type") or ""),
-            )
-            for claim in premises
-        ):
-            return None
-        premise_confidence = min(
-            float(claim.get("confidence") or 0.0) for claim in premises
-        )
-        confidence = min(
-            self._clamp_float(raw.get("confidence"), 0.0, 1.0, 0.7),
-            premise_confidence,
-        )
-        if confidence < self._user_claim_derived_min_confidence:
-            return None
-        valid_from, valid_to = self._derived_claim_validity_bounds(premises)
-        if valid_from and valid_to and valid_from > valid_to:
-            return None
-        support_fact_ids = sorted({
-            fact_id
-            for premise_id in premise_ids
-            for fact_id in self._db.get_user_claim_evidence_fact_ids([premise_id]).get(
-                premise_id, []
-            )
-        })
-        if not support_fact_ids:
-            return None
-        claim_text = self._normalize_user_claim_text(
-            raw.get("claim_text") or "",
-            subject=entity_names.get(subject_entity_id, ""),
-            predicate=predicate,
-            object_name=entity_names.get(object_entity_id, ""),
-        )
-        if not claim_text:
-            return None
-        return {
-            "subject_entity_id": subject_entity_id,
-            "predicate": predicate,
-            "object_entity_id": object_entity_id or None,
-            "claim_text": claim_text,
-            "claim_type": claim_type,
-            "claim_origin": "derived",
-            "primary_domain": primary_domain,
-            "status": "active",
-            "confidence": confidence,
-            "valid_from": valid_from,
-            "valid_to": valid_to,
-            "extractor_version": "user_claim_derived_v1",
-            "prompt_version": "v1",
-            "metadata": {
-                "derivation_type": "llm_direct_entailment",
-                "premise_claim_ids": premise_ids,
-            },
-            "premise_claim_ids": premise_ids,
-            "support_fact_ids": support_fact_ids,
-        }
-
-    @staticmethod
-    def _derived_claim_validity_bounds(
-        premises: Sequence[Dict[str, Any]],
-    ) -> Tuple[str, str]:
-        """Use the intersection of premise validity without inventing time."""
-        starts = sorted({
-            _compact_whitespace(claim.get("valid_from") or "")
-            for claim in premises
-            if _compact_whitespace(claim.get("valid_from") or "")
-        })
-        ends = sorted({
-            _compact_whitespace(claim.get("valid_to") or "")
-            for claim in premises
-            if _compact_whitespace(claim.get("valid_to") or "")
-        })
-        return (starts[-1] if starts else "", ends[0] if ends else "")
 
     def _update_user_observed_patterns_from_action_signals(
         self, signal_ids: Sequence[int],
@@ -6213,21 +4710,6 @@ class MemoryNodeManager:
                 "reason": _compact_whitespace(item.get("reason") or "")[:240],
             })
         return result
-
-    @staticmethod
-    def _normalize_user_claim_text(
-        value: Any,
-        *,
-        subject: str,
-        predicate: str,
-        object_name: str = "",
-    ) -> str:
-        """Return the claim's complete, reader-facing semantic proposition."""
-        text = _compact_whitespace(value or "")[:480]
-        if text:
-            return text
-        target = _compact_whitespace(object_name)
-        return _compact_whitespace(f"{subject} {predicate} {target}")[:480]
 
     def _log_user_intent_signals_loaded(
         self,
@@ -7239,7 +5721,7 @@ class MemoryNodeManager:
             str(value or "").strip().lower()
             for value in direct_object_types or []
             if str(value or "").strip().lower()
-            in {"fact", "user_claim", "user_intent"}
+            in {"fact", "user_intent"}
         ))
         db = database or self._db
         is_prospective_time_slot_query = bool(
@@ -7305,7 +5787,7 @@ class MemoryNodeManager:
         normalized_type = str(object_type or "").strip().lower()
         if normalized_type in {"user_intent"}:
             return tuple(sorted(ACTIVE_USER_INTENT_STATUSES))
-        return ("active",) if normalized_type == "user_claim" else ()
+        return ()
 
     @staticmethod
     def _recall_stage1_query_modes(
@@ -7506,7 +5988,7 @@ class MemoryNodeManager:
         modes = set(query_modes or [])
         object_types = ["fact"]
         if "knowledge" in modes:
-            object_types.append("user_claim")
+            object_types.append("fact")
         if "prospective" in modes:
             object_types.append("user_intent")
         return object_types
@@ -7515,7 +5997,7 @@ class MemoryNodeManager:
     def _normalize_recall_object_types(value: Any) -> List[str]:
         """Normalize LLM-routed Stage 2 object types without excluding facts."""
         allowed_types = {
-            "fact", "user_claim", "user_intent",
+            "fact", "user_intent",
         }
         raw_values = value if isinstance(value, (list, tuple, set)) else []
         object_types = ["fact"]
@@ -7722,7 +6204,6 @@ class MemoryNodeManager:
     ) -> Dict[str, int]:
         counts = {
             "fact": 0,
-            "user_claim": 0,
             "user_intent": 0,
         }
         for candidate in candidates or []:
@@ -7911,7 +6392,7 @@ class MemoryNodeManager:
     ) -> List[Dict[str, Any]]:
         """Retrieve all fact associations for accepted direct candidates.
 
-        Claim and intent candidates expand only to their mapped fact evidence.
+        Intent candidates expand only to their mapped fact evidence.
         """
         db = database or self._db
         document_evidence_candidates = (
@@ -7930,35 +6411,13 @@ class MemoryNodeManager:
         candidate_source_prefix: str,
         database: UserMemoryDB,
     ) -> List[Dict[str, Any]]:
-        """Expand claim/prospective candidates to their mapped fact evidence."""
-        claim_candidates = [
-            candidate for candidate in direct_candidates or []
-            if str(candidate.get("index_level") or "") == "user_claim"
-        ]
+        """Expand intent candidates to their mapped fact evidence."""
         user_intent_candidates = [
             candidate for candidate in direct_candidates or []
             if str(candidate.get("index_level") or "")
             in {"user_intent"}
         ]
         evidence_by_fact_id: Dict[int, Tuple[str, float]] = {}
-
-        claim_evidence = database.get_user_claim_evidence_fact_ids(
-            [candidate.get("target_id") for candidate in claim_candidates],
-            limit=max(24, len(claim_candidates) * 4),
-        )
-        for candidate in claim_candidates:
-            claim_id = int(candidate.get("target_id") or 0)
-            propagated_score = round(
-                self._clamp_float(candidate.get("_recall_score"), 0.0, 1.0, 0.0)
-                * 0.90,
-                4,
-            )
-            for fact_id in claim_evidence.get(claim_id, [])[:3]:
-                existing = evidence_by_fact_id.get(fact_id)
-                if existing is None or propagated_score > existing[1]:
-                    evidence_by_fact_id[fact_id] = (
-                        "claim_evidence", propagated_score,
-                    )
 
         intent_evidence = database.get_intent_evidence_fact_ids(
             [int(candidate.get("target_id") or 0) for candidate in user_intent_candidates],
@@ -8041,12 +6500,10 @@ class MemoryNodeManager:
             # Stage 1 latency or candidate pool for contextual wording.
             "seed_limits": {
                 "fact": seed_per_level_limit,
-                "user_claim": max(4, min(12, k)),
                 "user_intent": max(4, min(10, k)),
             },
             "selected_limits": {
                 "fact": k,
-                "user_claim": max(2, min(4, k)),
                 "user_intent": max(2, min(3, k)),
             },
         }
@@ -8602,22 +7059,12 @@ class MemoryNodeManager:
         )
         query_entity_coverage_sufficient = not missing_high_value_entities
         modes = set(query_modes or [])
-        direct_claim_candidates = [
-            candidate for candidate in candidates or []
-            if str(candidate.get("index_level") or "") == "user_claim"
-            and not candidate.get("_recall_association_relation")
-        ]
         direct_user_intent_candidates = [
             candidate for candidate in candidates or []
             if str(candidate.get("index_level") or "")
             in {"user_intent"}
             and not candidate.get("_recall_association_relation")
         ]
-        claim_evidence_count = sum(
-            1 for candidate in candidates or []
-            if str(candidate.get("_recall_association_relation") or "")
-            == "claim_evidence"
-        )
         intent_evidence_count = sum(
             1 for candidate in candidates or []
             if str(candidate.get("_recall_association_relation") or "")
@@ -8647,7 +7094,6 @@ class MemoryNodeManager:
         )
         knowledge_evidence_sufficient = (
             "knowledge" not in modes
-            or bool(direct_claim_candidates and claim_evidence_count)
         )
         user_intent_evidence_sufficient = (
             "prospective" not in modes
@@ -8686,8 +7132,6 @@ class MemoryNodeManager:
             "entity_coverage": round(entity_coverage, 4),
             "query_entity_coverage_sufficient": query_entity_coverage_sufficient,
             "query_modes": sorted(modes),
-            "direct_user_claim_count": len(direct_claim_candidates),
-            "claim_evidence_count": claim_evidence_count,
             "knowledge_evidence_sufficient": knowledge_evidence_sufficient,
             "direct_user_intent_count": len(direct_user_intent_candidates),
             "intent_evidence_count": intent_evidence_count,
@@ -9290,7 +7734,7 @@ class MemoryNodeManager:
             str(value or "").strip().lower()
             for value in direct_object_types or []
             if str(value or "").strip().lower()
-            in {"fact", "user_claim", "user_intent"}
+            in {"fact", "user_intent"}
         ))
         db = database or self._db
         candidates: List[Dict[str, Any]] = []
@@ -9726,7 +8170,6 @@ class MemoryNodeManager:
             }
 
         target_table_by_type = {
-            "user_claim": "memory_user_claims",
             "user_intent": "memory_user_intent_items",
         }
         target_table = target_table_by_type.get(object_type)
@@ -9736,22 +8179,6 @@ class MemoryNodeManager:
             target_id = int(row.get("object_id"))
         except (TypeError, ValueError):
             return None
-        if object_type == "user_claim":
-            if database is None:
-                return None
-            stored_claims = database.get_user_claims_by_ids([target_id])
-            if not stored_claims:
-                return None
-            subject_id = int(stored_claims[0].get("subject_entity_id") or 0)
-            subject_name = database.get_entity_names_by_ids([subject_id]).get(
-                subject_id, ""
-            )
-            # Ignore legacy rows outside the user-self claim scope without
-            # destructively rewriting a user's existing database.
-            if _compact_whitespace(subject_name).lower() != (
-                self._world_owner_entity_name.lower()
-            ):
-                return None
         if object_type in {"user_intent"}:
             if database is None:
                 return None
@@ -10418,8 +8845,6 @@ class MemoryNodeManager:
                 "event_time": "event_time",
                 "summary": "summary",
                 "fact_topic": "fact_topic",
-                "claim": "claim",
-                "claim_origin": "claim_origin",
                 "status": "status",
                 "time": "time",
                 "action": "action",
@@ -10431,8 +8856,6 @@ class MemoryNodeManager:
                 "event_time": "事件时间",
                 "summary": "摘要",
                 "fact_topic": "事实主题",
-                "claim": "主张",
-                "claim_origin": "来源",
                 "status": "状态",
                 "time": "时间",
                 "action": "行动",
@@ -10468,14 +8891,6 @@ class MemoryNodeManager:
                         f"   {labels['event_time']}: {event_time}",
                         f"   {labels['summary']}: {raw.get('summary') or entry.get('summary_for_retrieval') or ''}",
                         f"   {labels['fact_topic']}: {raw.get('fact_topic') or ''}",
-                    ]
-                elif group_key == "user_claim":
-                    block_lines = [
-                        f"{index}. {labels['claim']}",
-                        f"   {labels['summary']}: {raw.get('summary') or entry.get('summary_for_retrieval') or ''}",
-                        f"   predicate: {raw.get('metadata', {}).get('predicate') or ''}",
-                        f"   {labels['claim_origin']}: {raw.get('metadata', {}).get('claim_origin') or ''}",
-                        f"   {labels['status']}: {raw.get('status') or ''}",
                     ]
                 else:
                     time_value = raw.get("time_end") or raw.get("time_start") or ""
@@ -10738,7 +9153,6 @@ class MemoryNodeManager:
         seed_per_channel_limit = max(6, min(16, int(math.ceil(k * 1.5))))
         seed_limits = {
             "fact": seed_per_channel_limit,
-            "user_claim": max(4, min(10, k)),
             "user_intent": max(4, min(8, k)),
         }
         return {

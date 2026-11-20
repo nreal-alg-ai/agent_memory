@@ -41,7 +41,7 @@ MEMORY_COUNT_TABLES = (
     "memory_source_segments",
     "memory_facts",
     "memory_user_activity_items",
-    "memory_user_claims",
+    "memory_user_claim_signals",
     "memory_user_observed_patterns",
     "memory_user_intent_items",
 )
@@ -251,14 +251,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 raise RuntimeError(f"Finalization rejected for {path.name}: {finalization}")
             if not pwm.wait_for_memory_tasks():
                 raise RuntimeError(f"Memory tasks did not drain for {path.name}")
-            state_drain = pwm.drain_pending_user_state_claims()
-            if state_drain.get("reason") in {
-                "worker_queue_full", "worker_shutdown", "task_handler_not_registered",
-            }:
-                raise RuntimeError(f"State drain rejected for {path.name}: {state_drain}")
-            if not pwm.wait_for_memory_tasks():
-                raise RuntimeError(f"State tasks did not drain for {path.name}")
-
             end_time = next_start + timedelta(
                 seconds=max(item.end_s for item in source_segments)
             )
@@ -274,17 +266,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "synthetic_session_end": end_time.isoformat(),
                 "input_report": input_report,
                 "finalization": finalization,
-                "state_tick": state_drain,
                 "table_counts": table_counts(pwm),
                 "operation_delta": delta,
             }
             results.append(result)
             write_json(output_dir / "file_progress.json", results)
             logging.info(
-                "File completed index=%s/%s name=%s facts=%s claims=%s states=%s",
+                "File completed index=%s/%s name=%s facts=%s claim_signals=%s states=%s",
                 file_index, len(files), path.name,
                 result["table_counts"]["memory_facts"],
-                result["table_counts"]["memory_user_claims"],
+                result["table_counts"]["memory_user_claim_signals"],
                 result["table_counts"]["user_states"],
             )
             failures = {kind: counts for kind, counts in delta.items() if counts["failed"]}

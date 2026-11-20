@@ -212,9 +212,9 @@ def main() -> None:
     )
     followup_tasks = followup_dispatch_result.get("signal_update_tasks") or {}
     store_operation_report = operation_reporter.operation_report("memory_fact_extraction")
-    user_claim_result = (
-        operation_reporter.latest_report("memory_user_claim_update")
-        or followup_tasks.get("memory_user_claim_update") or {}
+    fact_state_result = (
+        operation_reporter.latest_report("user_state_update_from_claim_signals")
+        or followup_tasks.get("user_state_update_from_claim_signals") or {}
     )
     user_intent_result = (
         operation_reporter.latest_report("memory_user_intent_update")
@@ -223,7 +223,7 @@ def main() -> None:
     user_state_results = {
         task_kind: operation_reporter.latest_report(task_kind)
         for task_kind in (
-            "user_state_update_from_user_claims",
+            "user_state_update_from_claim_signals",
             "user_state_update_from_user_threads",
             "user_state_update_from_user_observed_patterns",
         )
@@ -251,7 +251,7 @@ def main() -> None:
         "ambient_recording_enabled": True,
         "session_start": session_start.isoformat(),
         "user_activity_result": user_activity_result,
-        "user_claim_result": user_claim_result,
+        "fact_state_result": fact_state_result,
         "user_intent_result": user_intent_result,
         "user_state_results": user_state_results,
     }

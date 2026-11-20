@@ -629,14 +629,8 @@ class AgentMemoryRuntime:
         owner_id = _clean(params.get("ownerId"), 240)
         if not owner_id:
             raise ValueError("ownerId must be non-empty")
-        # Resolve the owner even before their first conversation after restart,
-        # so persisted claims from a previous application session are included.
-        holder = self._owner_runtime(owner_id)
-        result = holder.pwm.trigger_user_state_update()
-        self._logger.info("periodic task signal owner=%s task=%s queued=%s reason=%s",
-                          _owner_key(owner_id)[:12], task_id,
-                          bool(result.get("queued")), result.get("reason") or "")
-        return {"supported": True, "taskId": task_id, **result}
+        return {"supported": False, "taskId": task_id, "queued": False,
+                "status": "skipped", "reason": "state_updates_are_activity_driven"}
 
     def health(self, _params: Dict[str, Any]) -> Dict[str, Any]:
         return {"ok": True, "activeOwners": len(self._owners)}

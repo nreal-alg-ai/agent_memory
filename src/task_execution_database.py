@@ -46,7 +46,7 @@ class TaskExecutionDB:
     _SIGNAL_BATCHES = {
         "user_claim_signal": (
             "user_claim_signal_consolidation_task_info",
-            "pending_user_claim_signal_ids", "processed_explicit_user_claim",
+            "pending_user_claim_signal_ids", "processed_user_state",
         ),
         "user_intent_signal": (
             "user_intent_signal_consolidation_task_info",
@@ -74,7 +74,6 @@ class TaskExecutionDB:
             ("user_claim_signal_consolidation_task_info", "signal_ids"),
             ("user_intent_signal_consolidation_task_info", "signal_ids"),
             ("user_action_signal_consolidation_task_info", "signal_ids"),
-            ("user_claim_consolidation_task_info", "relation_event_refs"),
         ):
             exists = self._conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
@@ -116,14 +115,14 @@ class TaskExecutionDB:
                 source_task_id TEXT NOT NULL UNIQUE,
                 signal_ids TEXT NOT NULL DEFAULT '[]',
                 pending_user_claim_signal_ids TEXT NOT NULL DEFAULT '[]',
-                processed_explicit_user_claim INTEGER NOT NULL DEFAULT 0,
+                processed_user_state INTEGER NOT NULL DEFAULT 0,
                 source_time_end TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_claim_signal_batches_pending
             ON user_claim_signal_consolidation_task_info(
-                processed_explicit_user_claim, batch_id
+                processed_user_state, batch_id
             );
             CREATE TABLE IF NOT EXISTS user_intent_signal_consolidation_task_info (
                 batch_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -152,19 +151,6 @@ class TaskExecutionDB:
             ON user_action_signal_consolidation_task_info(
                 processed_user_action, batch_id
             );
-            CREATE TABLE IF NOT EXISTS user_claim_consolidation_task_info (
-                batch_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                source_task_id TEXT NOT NULL UNIQUE,
-                claim_ids TEXT NOT NULL DEFAULT '[]',
-                relation_event_refs TEXT NOT NULL DEFAULT '[]',
-                pending_user_state_claim_ids TEXT NOT NULL DEFAULT '[]',
-                processed_user_state INTEGER NOT NULL DEFAULT 0,
-                reference_timestamp TEXT NOT NULL DEFAULT '',
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_claim_batches_pending
-            ON user_claim_consolidation_task_info(processed_user_state, batch_id);
         """)
         # Queued tasks are process-local. Restore unfinished reservations after
         # a restart; rows with no pending IDs remain processed.
@@ -314,13 +300,13 @@ class TaskExecutionDB:
         if target == "user_claim_signal":
             if existing:
                 all_ids = _ids(existing["signal_ids"]) + new_ids
-                explicit = _ids(existing["pending_user_claim_signal_ids"]) + new_ids
+                pending = _ids(existing["pending_user_claim_signal_ids"]) + new_ids
                 self._conn.execute(
                     f"""UPDATE {table} SET signal_ids=?,
                         pending_user_claim_signal_ids=?,
-                        processed_explicit_user_claim=0, updated_at=?
+                        processed_user_state=0, updated_at=?
                         WHERE batch_id=?""",
-                    (json.dumps(all_ids), json.dumps(explicit), now, existing["batch_id"]),
+                    (json.dumps(all_ids), json.dumps(pending), now, existing["batch_id"]),
                 )
             else:
                 values = json.dumps(new_ids)
@@ -514,122 +500,3 @@ class TaskExecutionDB:
                     (json.dumps(remaining), int(not remaining), _now(), row["batch_id"]),
                 )
         return sorted(changed)
-
-    @_locked
-    def record_pending_user_state_claims(
-        self,
-        claim_ids: Sequence[int],
-        *,
-        claim_relations: Sequence[Dict[str, Any]] = (),
-        reference_timestamp: Any = None,
-        source_task_id: str = "",
-    ) -> int:
-        ids = sorted(_ids(claim_ids))
-        if not ids:
-            return 0
-        selected_ids = set(ids)
-        if any(
-            int(relation.get("new_claim_id") or 0) not in selected_ids
-            or int(relation.get("relation_event_id") or 0) <= 0
-            for relation in claim_relations
-        ):
-            raise ValueError("Claim relation references must belong to the selected claims")
-        relation_refs = sorted({
-            (int(relation["new_claim_id"]), int(relation["relation_event_id"]))
-            for relation in claim_relations
-        })
-        source = self._source_reference(source_task_id or uuid.uuid4().hex)
-        now = _now()
-        with self._conn:
-            existing = self._conn.execute(
-                "SELECT batch_id FROM user_claim_consolidation_task_info "
-                "WHERE source_task_id=?", (source,),
-            ).fetchone()
-            if existing:
-                return 0
-            values = json.dumps(ids)
-            self._conn.execute(
-                """INSERT INTO user_claim_consolidation_task_info
-                   (source_task_id, claim_ids, relation_event_refs,
-                    pending_user_state_claim_ids,
-                    reference_timestamp, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (source, values, json.dumps(relation_refs), values,
-                 str(reference_timestamp or ""), now, now),
-            )
-        return len(ids)
-
-    @_locked
-    def get_pending_user_state_claims(self, *, limit: int = 80) -> Dict[str, Any]:
-        by_claim: Dict[int, Dict[str, Any]] = {}
-        relation_refs: set[Tuple[int, int]] = set()
-        for row in self._conn.execute(
-            """SELECT batch_id, pending_user_state_claim_ids, relation_event_refs,
-                      reference_timestamp,
-                      created_at
-               FROM user_claim_consolidation_task_info
-               WHERE processed_user_state=0 ORDER BY batch_id"""
-        ):
-            pending_ids = set(_ids(row["pending_user_state_claim_ids"]))
-            for claim_id in pending_ids:
-                item = by_claim.setdefault(claim_id, {
-                    "claim_id": claim_id,
-                    "generation": int(row["batch_id"]),
-                    "first_detected_at": str(row["created_at"]),
-                    "last_detected_at": str(row["created_at"]),
-                    "reference_timestamp": str(row["reference_timestamp"] or ""),
-                })
-                item["generation"] = int(row["batch_id"])
-                item["last_detected_at"] = str(row["created_at"])
-                item["reference_timestamp"] = str(row["reference_timestamp"] or "")
-            relation_refs.update(
-                (int(claim_id), int(event_id))
-                for claim_id, event_id in json.loads(row["relation_event_refs"] or "[]")
-                if int(claim_id) in pending_ids
-            )
-        ordered = sorted(
-            by_claim.values(), key=lambda item: (item["first_detected_at"], item["claim_id"]),
-        )
-        selected = ordered[:max(1, int(limit or 80))]
-        selected_ids = {int(item["claim_id"]) for item in selected}
-        return {
-            "pending_count": len(ordered),
-            "first_detected_at": ordered[0]["first_detected_at"] if ordered else "",
-            "items": selected,
-            "claim_relations": [
-                {"new_claim_id": claim_id, "relation_event_id": event_id}
-                for claim_id, event_id in sorted(relation_refs)
-                if claim_id in selected_ids
-            ],
-        }
-
-    @_locked
-    def acknowledge_user_state_claims(
-        self, versions: Sequence[Tuple[int, int]],
-    ) -> int:
-        limits = {int(claim_id): int(generation) for claim_id, generation in versions}
-        if not limits:
-            return 0
-        changed: set[int] = set()
-        with self._conn:
-            for row in self._conn.execute(
-                """SELECT batch_id, pending_user_state_claim_ids
-                   FROM user_claim_consolidation_task_info
-                   WHERE processed_user_state=0 ORDER BY batch_id"""
-            ).fetchall():
-                pending = _ids(row["pending_user_state_claim_ids"])
-                matched = {
-                    claim_id for claim_id in pending
-                    if claim_id in limits and row["batch_id"] <= limits[claim_id]
-                }
-                if not matched:
-                    continue
-                changed.update(matched)
-                remaining = [claim_id for claim_id in pending if claim_id not in matched]
-                self._conn.execute(
-                    """UPDATE user_claim_consolidation_task_info
-                       SET pending_user_state_claim_ids=?, processed_user_state=?,
-                           updated_at=? WHERE batch_id=?""",
-                    (json.dumps(remaining), int(not remaining), _now(), row["batch_id"]),
-                )
-        return len(changed)

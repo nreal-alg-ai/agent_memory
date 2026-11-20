@@ -649,9 +649,8 @@ def main() -> int:
     post_store_reports = [
         operation_counts.get(kind) or {}
         for kind in (
-            "memory_user_claim_update",
             "memory_user_intent_update",
-            "user_state_update_from_user_claims",
+            "user_state_update_from_claim_signals",
             "user_state_update_from_user_threads",
             "user_state_update_from_user_observed_patterns",
         )

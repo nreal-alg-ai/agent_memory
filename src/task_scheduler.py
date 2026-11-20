@@ -12,7 +12,6 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence
 
 from task_execution_database import TaskExecutionDB
-from storage_utils import latest_timestamp
 
 if TYPE_CHECKING:
     from memory.memory_database import UserMemoryDB
@@ -244,11 +243,10 @@ class TaskOperationReporter:
             "memory_flush_signal_updates",
             "memory_user_activity_extraction",
             "memory_user_thread_update",
-            "memory_user_claim_update",
+            "user_state_update_from_claim_signals",
             "memory_user_observed_pattern_update",
             "memory_user_intent_update",
             "memory_user_intent_update_from_activities",
-            "user_state_update_from_user_claims",
             "user_state_update_from_user_threads",
             "user_state_update_from_user_observed_patterns",
             "user_prediction_update_from_intent_events",
@@ -303,12 +301,12 @@ class TaskScheduler:
     """Own queued tasks on one worker, with FIFO within each priority."""
 
     _SIGNAL_UPDATE_TASK_KINDS = (
-        "memory_user_claim_update",
+        "user_state_update_from_claim_signals",
         "memory_user_observed_pattern_update",
         "memory_user_intent_update",
     )
     _SIGNAL_TASK_TARGETS = {
-        "memory_user_claim_update": "user_claim_signal",
+        "user_state_update_from_claim_signals": "user_claim_signal",
         "memory_user_observed_pattern_update": "user_action_signal",
         "memory_user_intent_update": "user_intent_signal",
     }
@@ -356,9 +354,7 @@ class TaskScheduler:
             "memory_user_thread_update": self._config_bool(
                 settings.get("enable_memory_user_thread_update"), True,
             ),
-            "memory_user_claim_update": self._config_bool(
-                settings.get("enable_memory_user_claim_update"), True,
-            ),
+            "user_state_update_from_claim_signals": user_state_updates_enabled,
             "memory_user_observed_pattern_update": self._config_bool(
                 settings.get("enable_memory_user_observed_pattern_update"), True,
             ),
@@ -369,7 +365,6 @@ class TaskScheduler:
                 settings.get("enable_memory_user_intent_update_from_activities"),
                 self._config_bool(settings.get("enable_memory_user_intent_update"), True),
             ),
-            "user_state_update_from_user_claims": user_state_updates_enabled,
             "user_state_update_from_user_threads": user_state_updates_enabled,
             "user_state_update_from_user_observed_patterns": user_state_updates_enabled,
             "user_prediction_update_from_intent_events": self._config_bool(
@@ -416,12 +411,6 @@ class TaskScheduler:
             except Exception:
                 self._task_execution_db.close()
                 raise
-        self._claim_state_batch_limit = max(
-            1, int(settings.get("user_state_claim_batch_limit", 80) or 80),
-        )
-        self._claim_state_lock = threading.Lock()
-        self._claim_state_task_pending = False
-        self._claim_state_force_requested = False
         self._latest_input_time_end = ""
         self.register_handler(
             "memory_flush_signal_updates",
@@ -479,12 +468,12 @@ class TaskScheduler:
     ) -> Dict[str, Any]:
         """Freeze pending signal IDs; task handlers enforce their own limits."""
         prepared = dict(payload)
-        if task_kind in {"memory_user_claim_update", "memory_user_intent_update"}:
+        if task_kind in {"user_state_update_from_claim_signals", "memory_user_intent_update"}:
             prepared["reference_timestamp"] = (
                 prepared.get("reference_timestamp") or self._latest_input_time_end
                 or datetime.now().astimezone().isoformat()
             )
-        if task_kind == "memory_user_claim_update":
+        if task_kind == "user_state_update_from_claim_signals":
             if "signal_ids" not in prepared:
                 prepared["signal_ids"] = self._select_pending_signal_ids(
                     "user_claim_signal",
@@ -520,21 +509,6 @@ class TaskScheduler:
         )
         if isinstance(result, dict):
             result["signals_marked_processed"] = len(completed)
-
-    def record_pending_user_state_claims(
-        self, claim_ids: List[int], *,
-        claim_relations: Sequence[Dict[str, Any]] = (),
-        reference_timestamp: Any = None,
-        source_task_id: str = "",
-    ) -> int:
-        if self._task_execution_db is None:
-            return 0
-        return self._task_execution_db.record_pending_user_state_claims(
-            claim_ids,
-            claim_relations=claim_relations,
-            reference_timestamp=reference_timestamp,
-            source_task_id=source_task_id,
-        )
 
     def register_handler(self, task_kind: str, handler: TaskHandler) -> None:
         """Register a domain handler before its first task is submitted."""
@@ -963,95 +937,6 @@ class TaskScheduler:
         self._logger.info("prediction time tick reference_timestamp=%s report=%s", reference.isoformat(), report)
         return report
 
-    def trigger_user_state_update(self, *, drain: bool = False) -> Dict[str, Any]:
-        """Inspect persisted claims now and enqueue only the actual state update.
-
-        TaskExecutionDB owns a separate connection and lock. Do not acquire
-        _execution_lock here or wait for model calls / future claim results.
-        Timing and cadence are exclusively owned by the application host.
-        """
-        self._logger.info(
-            "trigger_user_state_update received drain=%s batch_limit=%s queue_depth=%s",
-            drain, self._claim_state_batch_limit, self._queue.qsize(),
-        )
-        if self._task_execution_db is None:
-            self._logger.warning(
-                "trigger_user_state_update skipped drain=%s queued=False "
-                "reason=task_execution_database_unavailable", drain,
-            )
-            return {"queued": False, "reason": "task_execution_database_unavailable"}
-        with self._claim_state_lock:
-            if self._claim_state_task_pending:
-                if drain:
-                    self._claim_state_force_requested = True
-                self._logger.info(
-                    "trigger_user_state_update skipped drain=%s queued=False "
-                    "reason=claim_state_task_pending drain_requested=%s",
-                    drain, self._claim_state_force_requested,
-                )
-                return {"queued": False, "reason": "claim_state_task_pending"}
-            self._claim_state_task_pending = True
-        queued = False
-        try:
-            pending = self._task_execution_db.get_pending_user_state_claims(
-                limit=self._claim_state_batch_limit,
-            )
-            items = pending["items"]
-            if not items:
-                self._logger.info(
-                    "trigger_user_state_update skipped drain=%s pending_claims=0 "
-                    "selected_claims=0 queued=False reason=no_changed_claims", drain,
-                )
-                return {"status": "empty", "queued": False, "reason": "no_changed_claims"}
-            versions = [(int(item["claim_id"]), int(item["generation"])) for item in items]
-            with self._worker_lock:
-                latest_input_time_end = self._latest_input_time_end
-            # This is evidence time, not the time the host sent its signal.
-            reference_timestamp = latest_timestamp(
-                item["reference_timestamp"] for item in items
-            ) or latest_input_time_end or None
-            self._logger.info(
-                "trigger_user_state_update submitting drain=%s pending_claims=%s "
-                "selected_claims=%s relation_events=%s",
-                drain, pending["pending_count"], len(versions), len(pending["claim_relations"]),
-            )
-            report = self.submit(
-                "user_state_update_from_user_claims",
-                {"new_claim_ids": [claim_id for claim_id, _ in versions],
-                 "claim_relations": pending["claim_relations"],
-                 "reference_timestamp": reference_timestamp},
-                completion_context={"claim_state_window_versions": versions,
-                                    "claim_state_final_flush": drain},
-                report_payload={
-                    "new_claim_ids": [claim_id for claim_id, _ in versions],
-                    "relation_event_count": len(pending["claim_relations"]),
-                    "reference_timestamp": reference_timestamp,
-                },
-            )
-            queued = bool(report.get("queued"))
-            self._logger.info(
-                "trigger_user_state_update evaluated drain=%s pending_claims=%s "
-                "selected_claims=%s queued=%s task_id=%s reason=%s",
-                drain, pending["pending_count"], len(versions), queued,
-                report.get("task_id") or "", report.get("reason") or "",
-            )
-            return {**report, "pending_claim_count": pending["pending_count"],
-                    "selected_claim_count": len(versions)}
-        except Exception:
-            self._logger.exception(
-                "trigger_user_state_update failed drain=%s queued=%s", drain, queued,
-            )
-            raise
-        finally:
-            if not queued:
-                with self._claim_state_lock:
-                    self._claim_state_task_pending = False
-                    self._claim_state_force_requested = False
-
-    def drain_pending_user_state_claims(self) -> Dict[str, Any]:
-        """Explicitly process successive batches; never start a periodic clock."""
-        return self.trigger_user_state_update(drain=True)
-
     def submit_flush_signal_update_tasks(self) -> Dict[str, Any]:
         """Queue a normal-priority boundary; resolve signals when it executes."""
         return self.submit("memory_flush_signal_updates", {})
@@ -1066,9 +951,9 @@ class TaskScheduler:
             and report.get("reason") not in {"no_pending_signals", "task_disabled"}
         ]
         self._logger.info(
-            "final signal updates submitted claim_queued=%s "
+            "final signal updates submitted fact_state_queued=%s "
             "observed_pattern_queued=%s intent_queued=%s",
-            bool(signal_reports["memory_user_claim_update"].get("queued")),
+            bool(signal_reports["user_state_update_from_claim_signals"].get("queued")),
             bool(signal_reports["memory_user_observed_pattern_update"].get("queued")),
             bool(signal_reports["memory_user_intent_update"].get("queued")),
         )
@@ -1099,12 +984,9 @@ class TaskScheduler:
             "proactive_service_feedback": self._postprocess_fact_extraction_task,
             "memory_user_activity_extraction": self._postprocess_user_activity_task,
             "memory_user_thread_update": self._postprocess_user_thread_update_task,
-            "memory_user_claim_update": self._postprocess_user_claim_update_task,
+            "user_state_update_from_claim_signals": self._postprocess_signal_update_task,
             "memory_user_observed_pattern_update": self._postprocess_signal_update_task,
             "memory_user_intent_update": self._postprocess_signal_update_task,
-            "user_state_update_from_user_claims": (
-                self._postprocess_user_state_update_from_user_claims_task
-            ),
             "user_prediction_update_from_intent_events": self._postprocess_user_prediction_task,
             "user_prediction_reassessment": self._postprocess_prediction_reassessment_task,
             "user_prediction_window_expiration": self._postprocess_prediction_window_expiration_task,
@@ -1128,9 +1010,6 @@ class TaskScheduler:
             ),
             "memory_user_intent_update": self._schedule_after_user_intent_update_task,
             "memory_user_intent_update_from_activities": self._schedule_after_user_intent_update_task,
-            "user_state_update_from_user_claims": (
-                self._schedule_after_user_state_update_from_user_claims_task
-            ),
         }
         schedule = schedulers.get(task_kind)
         if schedule is None:
@@ -1289,54 +1168,6 @@ class TaskScheduler:
             finally:
                 self._prediction_reassessment_pending = False
 
-    def _postprocess_user_state_update_from_user_claims_task(
-        self, event: Dict[str, Any],
-    ) -> Dict[str, Any]:
-        context = event.get("completion_context") or {}
-        versions = context.get("claim_state_window_versions")
-        if not isinstance(versions, list):
-            return {"completed_successfully": False, "force_requested": False}
-        completed_successfully = False
-        try:
-            result = event.get("result")
-            result_status = str(
-                (result or {}).get("status")
-                if isinstance(result, dict) else ""
-            ).strip().lower()
-            if event.get("succeeded") and result_status in {"ok", "empty"}:
-                with self._execution_lock:
-                    acknowledged = self._task_execution_db.acknowledge_user_state_claims(
-                        versions,
-                    )
-                completed_successfully = True
-                self._logger.info(
-                    "claim state window completed task_id=%s acknowledged_claims=%s",
-                    event.get("task_id"), acknowledged,
-                )
-            else:
-                self._logger.warning(
-                    "claim state window retained pending claims task_id=%s status=%s",
-                    event.get("task_id"), result_status or "error",
-                )
-        finally:
-            with self._claim_state_lock:
-                self._claim_state_task_pending = False
-                force_requested = self._claim_state_force_requested
-                self._claim_state_force_requested = False
-        return {
-            "completed_successfully": completed_successfully,
-            "force_requested": force_requested,
-        }
-
-    def _schedule_after_user_state_update_from_user_claims_task(
-        self, event: Dict[str, Any], completion: Dict[str, Any],
-    ) -> None:
-        context = event.get("completion_context") or {}
-        if (completion.get("completed_successfully") and (
-                context.get("claim_state_final_flush")
-                or completion.get("force_requested"))):
-            self.drain_pending_user_state_claims()
-
     def _postprocess_signal_update_task(
         self, event: Dict[str, Any],
     ) -> None:
@@ -1346,25 +1177,6 @@ class TaskScheduler:
         self._complete_signal_task_result(
             task_kind, event.get("payload") or {}, result,
         )
-
-    def _postprocess_user_claim_update_task(
-        self, event: Dict[str, Any],
-    ) -> None:
-        result = event.get("result")
-        try:
-            if event.get("succeeded") and isinstance(result, dict):
-                self.record_pending_user_state_claims(
-                    list(result.get("new_claim_ids") or []),
-                    claim_relations=result.get("claim_relations") or [],
-                    reference_timestamp=result.get("reference_timestamp"),
-                    source_task_id=str(event.get("task_id") or ""),
-                )
-        except Exception:
-            if isinstance(result, dict):
-                result["_completed_signal_ids"] = []
-            raise
-        finally:
-            self._postprocess_signal_update_task(event)
 
     def _schedule_after_user_observed_pattern_update_task(
         self, event: Dict[str, Any], completion: Dict[str, Any],
@@ -1419,7 +1231,7 @@ class TaskScheduler:
         context = dict(completion_context) if isinstance(completion_context, dict) else {}
         contains_interaction = bool(context.get("contains_interaction_turn"))
         signal_stats = {
-            "memory_user_claim_update": {
+            "user_state_update_from_claim_signals": {
                 "signal_count": int(result.get("user_claim_signal_count") or 0),
                 "signal_fact_count": int(result.get("user_claim_signal_fact_count") or 0),
             },
@@ -1438,8 +1250,8 @@ class TaskScheduler:
             "user_intent_signal_facts=%s user_action_signals=%s "
             "user_action_signal_facts=%s contains_interaction_turn=%s input_time_end=%s",
             int(result.get("new_fact_count") or 0),
-            signal_stats["memory_user_claim_update"]["signal_count"],
-            signal_stats["memory_user_claim_update"]["signal_fact_count"],
+            signal_stats["user_state_update_from_claim_signals"]["signal_count"],
+            signal_stats["user_state_update_from_claim_signals"]["signal_fact_count"],
             signal_stats["memory_user_intent_update"]["signal_count"],
             signal_stats["memory_user_intent_update"]["signal_fact_count"],
             signal_stats["memory_user_observed_pattern_update"]["signal_count"],
@@ -1459,7 +1271,7 @@ class TaskScheduler:
         )
         reference_timestamp = result.get("reference_timestamp") or self._latest_input_time_end or None
         signal_keys = {
-            "memory_user_claim_update": "claim_signal_ids",
+            "user_state_update_from_claim_signals": "claim_signal_ids",
             "memory_user_observed_pattern_update": "action_signal_ids",
             "memory_user_intent_update": "intent_signal_ids",
         }

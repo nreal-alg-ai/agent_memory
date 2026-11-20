@@ -177,10 +177,6 @@ class FeishuMeetingImports:
             self._accepted(pwm.finalize_memory_session(reason='feishu_meeting_complete', tags=tags))
             if not pwm.wait_for_memory_tasks():
                 raise RuntimeError('meeting extraction tasks did not drain')
-            self._update(directory, job, phase='updating_states')
-            self._accepted(pwm.drain_pending_user_state_claims())
-            if not pwm.wait_for_memory_tasks():
-                raise RuntimeError('meeting state tasks did not drain')
             after = reporter.snapshot()
             previous_ids = {item['task_id'] for item in before['recent_tasks']}
             failed = sum(max(0, values.get('failed', 0) - before['counts'].get(kind, {}).get('failed', 0))

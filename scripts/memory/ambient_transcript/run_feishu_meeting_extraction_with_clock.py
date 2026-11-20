@@ -25,7 +25,7 @@ not measured speech durations: ends are estimated from text length and capped
 at the next start. The estimate and its rate are recorded in metadata/report;
 use --speech-rate-chars-per-second to change the default engineering assumption.
 Replay a fixed-step logical clock without real-time sleeps. Deliver only finished speech,
-finalize at each meeting end, then wait for memory, due state updates, prediction
+finalize at each meeting end, then wait for memory/state updates, prediction
 maintenance, and proactive evaluation in that order. Between meetings and during
 the configurable post-roll, time keeps advancing without fabricated input.
 Proactive availability is explicitly simulated only outside meetings; no Agent
@@ -73,8 +73,8 @@ from memory.feishu_transcript import (
 )
 MEMORY_TABLES = (
     "memory_source_segments", "memory_facts", "memory_user_activity_items",
-    "memory_user_claims", "memory_user_observed_patterns", "memory_user_intent_items",
-    "memory_user_threads", "memory_user_claim_signals",
+    "memory_user_claim_signals", "memory_user_observed_patterns", "memory_user_intent_items",
+    "memory_user_threads",
     "memory_user_intent_signals", "memory_user_action_signals",
 )
 
@@ -169,8 +169,6 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--parse-only", action="store_true", help="Export normalized inputs only; no models or databases")
     parser.add_argument("--clock-step-minutes", type=int, default=5,
                         help="Fixed logical clock step; exact meeting boundaries are also visited (default: 5)")
-    parser.add_argument("--state-interval-minutes", type=int, default=30,
-                        help="Periodic claim-to-state check interval; 0 disables (default: 30)")
     parser.add_argument("--prediction-interval-minutes", type=int, default=5,
                         help="Prediction expiration/defer tick interval; 0 disables (default: 5)")
     parser.add_argument("--proactive-interval-minutes", type=int, default=15,
@@ -191,7 +189,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         parser.error("--segment-limit must be nonnegative")
     if args.clock_step_minutes <= 0:
         parser.error("--clock-step-minutes must be positive")
-    for name in ("state_interval_minutes", "prediction_interval_minutes", "proactive_interval_minutes"):
+    for name in ("prediction_interval_minutes", "proactive_interval_minutes"):
         if getattr(args, name) < 0:
             parser.error(f"--{name.replace('_', '-')} must be nonnegative")
     if not math.isfinite(args.post_roll_hours) or args.post_roll_hours < 0:
@@ -241,7 +239,6 @@ def replay_clock_settings(args: argparse.Namespace, meetings: Sequence[Dict[str,
     return {
         "start": start.isoformat(), "end": end.isoformat(),
         "clock_step_minutes": args.clock_step_minutes,
-        "state_interval_minutes": args.state_interval_minutes,
         "prediction_interval_minutes": args.prediction_interval_minutes,
         "proactive_interval_minutes": args.proactive_interval_minutes,
         "post_roll_hours": args.post_roll_hours if not args.clock_end else None,
@@ -253,7 +250,7 @@ def replay_clock_settings(args: argparse.Namespace, meetings: Sequence[Dict[str,
                 "submitted_tasks", "completed_tasks", "failed_tasks", "partial_tasks",
                 "checks_with_lifecycle_count_changes",
             )}
-            for name in ("state", "prediction", "proactive")
+            for name in ("prediction", "proactive")
         },
     }
 
@@ -269,7 +266,6 @@ def iter_replay_clock(
     """
     start, end = replay_datetime(settings["start"]), replay_datetime(settings["end"])
     intervals = {
-        "state": settings["state_interval_minutes"],
         "prediction": settings["prediction_interval_minutes"],
         "proactive": settings["proactive_interval_minutes"],
     }
@@ -288,7 +284,7 @@ def iter_replay_clock(
             candidates.append(boundaries[boundary_index])
         current = min(candidates)
         checks = {}
-        for name in ("state", "prediction", "proactive"):
+        for name in ("prediction", "proactive"):
             scheduled = next_times.get(name)
             due = scheduled is not None and current >= scheduled
             check = {"enabled": scheduled is not None, "due": due}
@@ -391,10 +387,7 @@ def evaluate_proactive_services(pwm: PersonWorldModel, reference_timestamp: str)
 def trigger_periodic_task(pwm: PersonWorldModel, kind: str, reference_timestamp: str) -> Dict[str, Any]:
     """Wait at each phase boundary, without sleeping for simulated time."""
     try:
-        if kind == "state":
-            result = pwm.trigger_user_state_update()
-        else:
-            result = pwm.trigger_user_prediction_time_tick(reference_timestamp=reference_timestamp)
+        result = pwm.trigger_user_prediction_time_tick(reference_timestamp=reference_timestamp)
         if not isinstance(result, dict):
             raise ValueError(f"Invalid {kind} tick result: {result!r}")
     except Exception as exc:
@@ -528,7 +521,7 @@ def replay_meetings(
                     if replay_datetime(meeting["session_start"]) <= current
                     < replay_datetime(meeting["last_utterance_end"])
                 ]
-                for kind in ("state", "prediction", "proactive"):
+                for kind in ("prediction", "proactive"):
                     if kind not in event["due"]:
                         continue
                     phase = run_periodic_check(
@@ -539,7 +532,7 @@ def replay_meetings(
                     result_key = ("proactive_service_evaluation" if kind == "proactive" else f"{kind}_tick")
                     event[result_key] = phase["result"]
                 event.update(operation_changes(reporter, before))
-                direct_results = [event.get("state_tick", {}), event.get("prediction_tick", {}),
+                direct_results = [event.get("prediction_tick", {}),
                                   event.get("proactive_service_evaluation", {}).get("result", {})]
                 failed = (has_task_failures(event)
                           or any(result.get("status") in {"partial", "error", "failed"} for result in direct_results))

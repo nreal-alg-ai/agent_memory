@@ -218,7 +218,6 @@ personal_world_model:
     user_prediction_reassessment_retry_seconds: 300
     # Each completed activity source window submits its unprocessed claim,
     # action and intent signals; no additional batch/fact-count thresholds.
-    enable_memory_user_claim_update: true
     enable_memory_user_observed_pattern_update: true
     enable_memory_user_intent_update: true
     # New activities can observe progress of existing intents; no intent-triggered activity backscan.
@@ -231,14 +230,11 @@ personal_world_model:
     enable_memory_user_state_update: true
     # 接收并处理外部 Agent 的服务执行和用户反馈（共享任务队列）
     enable_proactive_service_feedback: true
-    # The host supplies periodic signals; PWM only checks and processes pending claims.
-    user_state_claim_batch_limit: 80
 
   memory_manager:
     memory_enabled: true
     memory_prompt_language_mode: zh
     user_memory_database_path: 
-    user_claim_signal_batch_size: 8
     user_intent_signal_batch_size: 8
     activity_intent_batch_size: 4
     activity_intent_candidate_limit: 8
@@ -246,11 +242,6 @@ personal_world_model:
     user_thread_activity_batch_size: 8
     user_thread_candidate_limit: 12
     user_thread_event_context_limit: 16
-    user_claim_explicit_min_confidence: 0.72
-    user_claim_derived_min_confidence: 0.75
-    user_claim_derived_batch_size: 16
-    # Rendered prompt target; keep an indivisible oversized seed + premises intact and log it.
-    user_claim_derived_prompt_char_budget: 24000
     user_claim_signal_max_per_fact: 3
     # Discovery gate only; activity windows do not prove independent occurrences.
     user_observed_pattern_min_activities: 2
@@ -285,5 +276,7 @@ personal_world_model:
   user_state:
     user_model_database_path: 
     user_state_update_limit: 80
+    # Fact-centered state evaluation after each completed activity source window.
+    fact_batch_size: 8
     prompt_language_mode: zh
 

@@ -27,7 +27,6 @@ SOURCE_PAGE_SIZE = 6
 SECTION_ALIASES = {
     "user_intents": "intents", "user_activity": "activities", "user_states": "states",
 }
-CLAIM_STATUSES = {"candidate", "active", "weakened", "superseded", "expired", "retracted"}
 
 
 def _json(value: Any, fallback: Any) -> Any:
@@ -99,7 +98,7 @@ class MemoryInspector:
         section = params.get("section")
         if not isinstance(section, str):
             raise ValueError("invalid section")
-        if section in {"user_claims", "user_thread", "user_observed_pattern"}:
+        if section in {"user_thread", "user_observed_pattern"}:
             return self._objects(params)
         result = self._existing_sections({**params, "section": SECTION_ALIASES.get(section, section)})
         result["section"] = section
@@ -313,13 +312,13 @@ class MemoryInspector:
             for field in ("previous_payload", "new_payload"):
                 event[field] = _json(event.get(field), {})
             # Payloads contain domain fields, never embeddings or raw model prompts.
-            for field in ("trigger_claim_ids", "trigger_intent_objects"):
+            for field in ("trigger_fact_ids", "trigger_intent_objects"):
                 if field in event:
                     event[field] = _json(event[field], [])
 
     def _resolve_evidence(self, connection, items, *, include_sources=True):
         specs = {
-            "fact": ("memory_facts", "summary"), "user_claim": ("memory_user_claims", "claim_text"),
+            "fact": ("memory_facts", "summary"),
             "user_activity": ("memory_user_activity_items", "activity_text"),
             "user_thread": ("memory_user_threads", "current_summary"),
             "user_thread_event": ("memory_user_thread_events", "summary"),
@@ -341,8 +340,6 @@ class MemoryInspector:
                 continue
             row = dict(row)
             evidence.update(resolved=True, text=_bounded(row.get(spec[1])), occurred_at=row.get("event_time_key") or row.get("last_observed_at") or row.get("updated_at") or "")
-            if kind == "user_claim":
-                evidence.update(status=row.get("status"), claim_origin=row.get("claim_origin"))
             if kind == "user_action_signal":
                 evidence.update({field: row.get(field) for field in (
                     "source_type", "source_id", "action_kind", "event_ended_at", "confidence",
@@ -363,10 +360,6 @@ class MemoryInspector:
                     if activity:
                         facts.extend(_reference_ids(activity["evidence_fact_ids"]))
                         segments.extend(_reference_ids(activity["source_segment_ids"]))
-            if kind == "user_claim" and _table(connection, "memory_user_claim_evidence"):
-                facts = [item[0] for item in connection.execute(
-                    "SELECT evidence_id FROM memory_user_claim_evidence WHERE claim_id=? AND evidence_type='fact' LIMIT 10", (key,),
-                )]
             if kind == "user_observed_pattern" and _table(connection, "memory_user_observed_pattern_signals") and _table(connection, "memory_user_action_signals"):
                 facts = [item[0] for item in connection.execute(
                     "SELECT s.source_id FROM memory_user_observed_pattern_signals p JOIN memory_user_action_signals s ON s.signal_id=p.signal_id WHERE p.pattern_id=? AND s.source_type='fact' LIMIT 10", (key,),
@@ -395,7 +388,6 @@ class MemoryInspector:
     def _objects(self, params):
         section = params['section']
         table = {
-            'user_claims': 'memory_user_claims',
             'user_thread': 'memory_user_threads',
             'user_observed_pattern': 'memory_user_observed_patterns',
         }[section]
@@ -403,13 +395,10 @@ class MemoryInspector:
         size = _positive(params.get('pageSize', 20), 'pageSize', 100)
         item_id = _positive(params['id'], 'id', 2**53 - 1) if params.get('id') is not None else None
         pages = {key: _positive(params.get(key, 1), key) for key in (
-            'evidencePage', 'historyPage', 'derivationPage', 'premisePage',
+            'evidencePage', 'historyPage',
         )}
-        pages['premiseDerivationId'] = (_positive(params['premiseDerivationId'], 'premiseDerivationId', 2**53 - 1)
-                                        if params.get('premiseDerivationId') is not None else None)
         filters = {}
-        fields = {'user_claims': ('status', 'domain', 'claimType', 'origin', 'subjectId'),
-                  'user_thread': ('status',),
+        fields = {'user_thread': ('status',),
                   'user_observed_pattern': ('domain', 'subjectId')}[section]
         for field in fields:
             value = params.get(field, '')
@@ -419,11 +408,9 @@ class MemoryInspector:
                 raise ValueError(f'invalid {field}')
             elif value:
                 filters[field] = value
-        statuses = CLAIM_STATUSES if section == 'user_claims' else {'active', 'closed'}
+        statuses = {'active', 'closed'}
         if filters.get('status') and filters['status'] not in statuses:
             raise ValueError('invalid status')
-        if filters.get('origin') and filters['origin'] not in {'explicit', 'derived'}:
-            raise ValueError('invalid origin')
         result = {'supported': True, 'available': False, 'section': section,
                   'fetchedAt': datetime.now().astimezone().isoformat(),
                   'page': page, 'pageSize': size, 'total': 0, 'items': []}
@@ -439,8 +426,7 @@ class MemoryInspector:
                 clauses.append('id=?')
                 values.append(item_id)
             else:
-                columns = {'status': 'status', 'domain': 'primary_domain', 'claimType': 'claim_type',
-                           'origin': 'claim_origin', 'subjectId': 'subject_entity_id'}
+                columns = {'status': 'status', 'domain': 'primary_domain', 'subjectId': 'subject_entity_id'}
                 for key, value in filters.items():
                     clauses.append(f'{columns[key]}=?')
                     values.append(value)
@@ -457,9 +443,7 @@ class MemoryInspector:
             result.pop('items')
             result['item'] = self._object_record(connection, dict(row), section) if row else None
             if row:
-                if section == 'user_claims':
-                    self._claim_detail(connection, result, item_id, pages)
-                elif section == 'user_thread':
+                if section == 'user_thread':
                     self._thread_detail(connection, result, item_id, pages)
                 else:
                     self._pattern_detail(connection, result, item_id, pages)
@@ -474,9 +458,6 @@ class MemoryInspector:
 
     def _object_record(self, connection, row, section):
         fields = {
-            'user_claims': ('subject_entity_id', 'predicate', 'object_entity_id', 'claim_text',
-                            'claim_type', 'claim_origin', 'primary_domain', 'status', 'confidence',
-                            'valid_from', 'valid_to', 'source_actor_entity_id'),
             'user_thread': ('title', 'identity_description', 'current_summary', 'status'),
             'user_observed_pattern': ('subject_entity_id', 'pattern_text', 'condition_text',
                                       'primary_domain', 'confidence'),
@@ -487,30 +468,6 @@ class MemoryInspector:
             if f'{key}_entity_id' in item:
                 item[f'{key}_name'] = self._entity_name(connection, item[f'{key}_entity_id'])
         return item
-
-    def _claim_detail(self, connection, result, item_id, pages):
-        result['evidence'] = self._page(connection, 'memory_user_claim_evidence', 'claim_id=?', (item_id,), pages['evidencePage'])
-        self._resolve_evidence(connection, result['evidence']['items'])
-        result['history'] = self._page(connection, 'memory_user_claim_events', 'target_claim_id=?', (item_id,), pages['historyPage'])
-        result['history']['items'] = [{
-            'id': row['id'], 'event_type': row['event_type'],
-            'previous_payload': {'status': row['previous_status']},
-            'new_payload': {'status': row['new_status']},
-            'semantic_relation': row.get('semantic_relation'),
-            'reason': _bounded(row.get('semantic_reason') or row.get('policy_reason')),
-            'effective_at': row.get('effective_at'), 'created_at': row['created_at'],
-        } for row in result['history']['items']]
-        derivations = self._page(connection, 'memory_user_claim_derivations', 'claim_id=?', (item_id,), pages['derivationPage'])
-        result['derivations'] = {**derivations, 'items': []}
-        for row in derivations['items']:
-            derivation = {key: row.get(key) for key in ('id', 'rule_id', 'rule_version', 'status', 'derived_at', 'invalidated_at')}
-            premise_page = pages['premisePage'] if row['id'] == pages['premiseDerivationId'] else 1
-            premises = self._page(connection, 'memory_user_claim_premises', 'derivation_id=?', (row['id'],), premise_page)
-            items = [{'evidence_type': 'user_claim', 'evidence_id': premise['premise_claim_id'],
-                      'role': premise['premise_role']} for premise in premises['items']]
-            self._resolve_evidence(connection, items)
-            derivation['premises'] = {**premises, 'items': items}
-            result['derivations']['items'].append(derivation)
 
     def _thread_detail(self, connection, result, item_id, pages):
         links = self._page(connection, 'memory_user_thread_links', 'thread_id=?', (item_id,), pages['evidencePage'])

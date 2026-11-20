@@ -4,7 +4,7 @@
 The schema defines the current unified memory line:
 
     memory_source_segments + memory_facts -> memory_user_activity_items
-                           memory_facts -> user_claims / user-intent items
+                           memory_facts -> user signals / user-intent items
 
 `memory_recall_documents` is a derived retrieval projection. Every retrievable
 memory object writes one document there; source tables retain only domain data.
@@ -475,87 +475,6 @@ class UserMemoryDB:
                 FOREIGN KEY(entity_id) REFERENCES memory_entity_nodes(id) ON DELETE CASCADE
             );
 
-            CREATE TABLE IF NOT EXISTS memory_user_claims (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                subject_entity_id INTEGER NOT NULL,
-                predicate TEXT NOT NULL,
-                object_entity_id INTEGER NOT NULL DEFAULT 0,
-                claim_text TEXT NOT NULL DEFAULT '',
-                claim_type TEXT NOT NULL,
-                claim_origin TEXT NOT NULL CHECK(claim_origin IN ('explicit', 'derived')),
-                primary_domain TEXT NOT NULL DEFAULT '',
-                status TEXT NOT NULL DEFAULT 'candidate',
-                confidence REAL NOT NULL DEFAULT 0.7,
-                valid_from TEXT NOT NULL DEFAULT '',
-                valid_to TEXT NOT NULL DEFAULT '',
-                source_actor_entity_id INTEGER,
-                extractor_version TEXT NOT NULL DEFAULT '',
-                prompt_version TEXT NOT NULL DEFAULT '',
-                metadata TEXT NOT NULL DEFAULT '{}',
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                FOREIGN KEY(subject_entity_id) REFERENCES memory_entity_nodes(id) ON DELETE CASCADE,
-                FOREIGN KEY(source_actor_entity_id) REFERENCES memory_entity_nodes(id) ON DELETE SET NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS memory_user_claim_evidence (
-                claim_id INTEGER NOT NULL,
-                evidence_type TEXT NOT NULL,
-                evidence_id INTEGER NOT NULL,
-                role TEXT NOT NULL DEFAULT 'support',
-                weight REAL NOT NULL DEFAULT 1.0,
-                observed_at TEXT NOT NULL DEFAULT '',
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                PRIMARY KEY(claim_id, evidence_type, evidence_id, role),
-                FOREIGN KEY(claim_id) REFERENCES memory_user_claims(id) ON DELETE CASCADE
-            );
-
-            CREATE TABLE IF NOT EXISTS memory_user_claim_derivations (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                claim_id INTEGER NOT NULL,
-                rule_id TEXT NOT NULL,
-                rule_version TEXT NOT NULL DEFAULT '',
-                derivation_key TEXT NOT NULL UNIQUE,
-                status TEXT NOT NULL DEFAULT 'active',
-                derived_at TEXT NOT NULL DEFAULT '',
-                invalidated_at TEXT NOT NULL DEFAULT '',
-                metadata TEXT NOT NULL DEFAULT '{}',
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                FOREIGN KEY(claim_id) REFERENCES memory_user_claims(id) ON DELETE CASCADE
-            );
-
-            CREATE TABLE IF NOT EXISTS memory_user_claim_premises (
-                derivation_id INTEGER NOT NULL,
-                premise_claim_id INTEGER NOT NULL,
-                premise_role TEXT NOT NULL DEFAULT 'support',
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                PRIMARY KEY(derivation_id, premise_claim_id, premise_role),
-                FOREIGN KEY(derivation_id) REFERENCES memory_user_claim_derivations(id) ON DELETE CASCADE,
-                FOREIGN KEY(premise_claim_id) REFERENCES memory_user_claims(id) ON DELETE CASCADE
-            );
-
-            CREATE TABLE IF NOT EXISTS memory_user_claim_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                target_claim_id INTEGER NOT NULL,
-                trigger_claim_id INTEGER,
-                event_type TEXT NOT NULL DEFAULT 'status_transition',
-                previous_status TEXT NOT NULL,
-                new_status TEXT NOT NULL,
-                semantic_relation TEXT NOT NULL DEFAULT '',
-                effective_at TEXT NOT NULL DEFAULT '',
-                decision_source TEXT NOT NULL DEFAULT '',
-                semantic_confidence REAL,
-                semantic_reason TEXT NOT NULL DEFAULT '',
-                policy_reason TEXT NOT NULL DEFAULT '',
-                details TEXT NOT NULL DEFAULT '{}',
-                created_at TEXT NOT NULL,
-                FOREIGN KEY(target_claim_id) REFERENCES memory_user_claims(id) ON DELETE CASCADE,
-                FOREIGN KEY(trigger_claim_id) REFERENCES memory_user_claims(id) ON DELETE SET NULL
-            );
-
             CREATE TABLE IF NOT EXISTS memory_user_observed_patterns (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 subject_entity_id INTEGER NOT NULL,
@@ -688,8 +607,6 @@ class UserMemoryDB:
             ON memory_source_segments(processed_for_user_activity, id);
             CREATE INDEX IF NOT EXISTS idx_memory_fact_source_segment
             ON memory_fact_source_mapping(source_segment_id, fact_id);
-            CREATE INDEX IF NOT EXISTS idx_memory_user_claims_subject
-            ON memory_user_claims(subject_entity_id, claim_type, claim_origin, status);
             CREATE INDEX IF NOT EXISTS idx_memory_user_observed_patterns_subject
             ON memory_user_observed_patterns(subject_entity_id, primary_domain, updated_at);
             CREATE INDEX IF NOT EXISTS idx_memory_user_observed_pattern_signals_signal
@@ -698,12 +615,6 @@ class UserMemoryDB:
             ON memory_user_observed_pattern_events(target_pattern_id, id DESC);
             CREATE INDEX IF NOT EXISTS idx_memory_owner_entity_aliases_name
             ON memory_owner_entity_aliases(alias_key, status);
-            CREATE INDEX IF NOT EXISTS idx_memory_user_claim_evidence_claim
-            ON memory_user_claim_evidence(claim_id, role, evidence_type);
-            CREATE INDEX IF NOT EXISTS idx_memory_user_claim_derivations_claim
-            ON memory_user_claim_derivations(claim_id, status, updated_at);
-            CREATE INDEX IF NOT EXISTS idx_memory_user_claim_premises_claim
-            ON memory_user_claim_premises(premise_claim_id, derivation_id);
             CREATE INDEX IF NOT EXISTS idx_memory_user_claim_signals_group
             ON memory_user_claim_signals(
                 subject_entity_id, claim_type_hint, claim_anchor_key, source_type, source_id
@@ -714,10 +625,6 @@ class UserMemoryDB:
             ON memory_user_intent_signals(
                 subject_entity_id, user_intent_anchor_key, signal_purpose, source_type, source_id
             );
-            CREATE INDEX IF NOT EXISTS idx_memory_user_claim_events_target
-            ON memory_user_claim_events(target_claim_id, effective_at DESC, id DESC);
-            CREATE INDEX IF NOT EXISTS idx_memory_user_claim_events_trigger
-            ON memory_user_claim_events(trigger_claim_id, id DESC);
             CREATE INDEX IF NOT EXISTS idx_memory_user_intent_items_owner_status
             ON memory_user_intent_items(world_owner_entity_id, status, updated_at DESC);
             CREATE INDEX IF NOT EXISTS idx_memory_user_intent_items_primary_time
@@ -1660,7 +1567,7 @@ class UserMemoryDB:
         mappings: Sequence[Dict[str, Any]],
         *, reference_timestamp: Any = None,
     ) -> int:
-        """Persist fact-level signals for explicit user-claim extraction."""
+        """Persist fact-level personal evidence leads for direct state assessment."""
         sources = [self._validate_user_signal_source("claim", mapping) for mapping in mappings or []]
         now = local_now_text() if reference_timestamp is None else normalize_reference_timestamp(reference_timestamp)
         changed = 0
@@ -1903,81 +1810,6 @@ class UserMemoryDB:
                 observations.append(item)
         return observations
 
-    def upsert_user_claim(
-        self,
-        *,
-        subject_entity_id: int,
-        predicate: str,
-        object_entity_id: Optional[int] = None,
-        claim_text: str = "",
-        claim_type: str,
-        claim_origin: str,
-        primary_domain: str = "",
-        status: str = "candidate",
-        confidence: float = 0.7,
-        valid_from: str = "",
-        valid_to: str = "",
-        source_actor_entity_id: Optional[int] = None,
-        extractor_version: str = "",
-        prompt_version: str = "",
-        metadata: Optional[Dict[str, Any]] = None,
-        reference_timestamp: Any = None,
-    ) -> tuple[int, bool]:
-        """Insert a semantic claim or refresh its confidence and payload."""
-        now = local_now_text() if reference_timestamp is None else normalize_reference_timestamp(reference_timestamp)
-        object_id = int(object_entity_id or 0)
-        subject_id = int(subject_entity_id)
-        origin = str(claim_origin or "").strip().lower()
-        if origin not in {"explicit", "derived"}:
-            raise ValueError("claim_origin must be explicit or derived")
-        predicate = str(predicate or "").strip()
-        claim_text = re.sub(r"\s+", " ", str(claim_text or "")).strip()
-        existing = self._conn.execute(
-            """
-            SELECT id, confidence, status FROM memory_user_claims
-            WHERE subject_entity_id = ? AND predicate = ? AND object_entity_id = ?
-              AND claim_text = ? AND claim_type = ? AND claim_origin = ?
-            """,
-            (subject_id, predicate, object_id, claim_text, claim_type, origin),
-        ).fetchone()
-        if existing:
-            claim_id = int(existing["id"])
-            self._conn.execute(
-                """
-                UPDATE memory_user_claims
-                SET claim_text = ?, primary_domain = ?, confidence = ?, valid_from = ?, valid_to = ?,
-                    source_actor_entity_id = ?, extractor_version = ?, prompt_version = ?,
-                    metadata = ?, updated_at = ?
-                WHERE id = ?
-                """,
-                (
-                    claim_text, str(primary_domain or ""),
-                    max(float(existing["confidence"] or 0.0), float(confidence or 0.0)),
-                    valid_from, valid_to, source_actor_entity_id, extractor_version,
-                    prompt_version, json_dumps(metadata or {}), now, claim_id,
-                ),
-            )
-            self._commit_if_needed()
-            return claim_id, False
-        cur = self._conn.execute(
-            """
-            INSERT INTO memory_user_claims (
-                subject_entity_id, predicate, object_entity_id, claim_text,
-                claim_type, claim_origin, primary_domain, status, confidence, valid_from, valid_to,
-                source_actor_entity_id, extractor_version, prompt_version, metadata,
-                created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                subject_id, predicate, object_id, claim_text,
-                claim_type, origin, str(primary_domain or ""), status, float(confidence or 0.0),
-                valid_from, valid_to, source_actor_entity_id, extractor_version,
-                prompt_version, json_dumps(metadata or {}), now, now,
-            ),
-        )
-        self._commit_if_needed()
-        return int(cur.lastrowid), True
-
     def upsert_user_observed_pattern(
         self, *, subject_entity_id: int, pattern_key: str, pattern_text: str,
         condition_text: str = "", primary_domain: str = "",
@@ -2205,75 +2037,6 @@ class UserMemoryDB:
                 )
                 events.append(event)
         return sorted(events, key=lambda event: int(event["id"]))
-
-    def record_user_claim_relation(
-        self,
-        *,
-        target_claim_id: int,
-        trigger_claim_id: int,
-        semantic_relation: str,
-        effective_at: str = "",
-        decision_source: str = "",
-        semantic_confidence: Optional[float] = None,
-        semantic_reason: str = "",
-        details: Optional[Dict[str, Any]] = None,
-        reference_timestamp: Any = None,
-    ) -> Optional[int]:
-        """Return the persisted relation event ID without changing claim status."""
-        now = local_now_text() if reference_timestamp is None else normalize_reference_timestamp(reference_timestamp)
-        target_id = int(target_claim_id)
-        trigger_id = int(trigger_claim_id)
-        if target_id <= 0 or trigger_id <= 0 or target_id == trigger_id:
-            return None
-        relation = str(semantic_relation or "").strip().lower()
-        if not relation or relation == "unrelated":
-            return None
-        occurred_at = str(effective_at or "")
-        existing = self._conn.execute(
-            """
-            SELECT id FROM memory_user_claim_events
-            WHERE target_claim_id = ? AND trigger_claim_id = ?
-              AND event_type = 'relation_observed' AND semantic_relation = ?
-              AND effective_at = ?
-            LIMIT 1
-            """,
-            (target_id, trigger_id, relation, occurred_at),
-        ).fetchone()
-        if existing:
-            return int(existing["id"])
-        row = self._conn.execute(
-            "SELECT status FROM memory_user_claims WHERE id = ?",
-            (target_id,),
-        ).fetchone()
-        if not row:
-            return None
-        status = str(row["status"] or "")
-        cur = self._conn.execute(
-            """
-            INSERT INTO memory_user_claim_events (
-                target_claim_id, trigger_claim_id, event_type,
-                previous_status, new_status, semantic_relation, effective_at,
-                decision_source, semantic_confidence, semantic_reason,
-                policy_reason, details, created_at
-            ) VALUES (?, ?, 'relation_observed', ?, ?, ?, ?, ?, ?, ?, '', ?, ?)
-            """,
-            (
-                target_id,
-                trigger_id,
-                status,
-                status,
-                relation,
-                occurred_at,
-                str(decision_source or ""),
-                float(semantic_confidence) if semantic_confidence is not None else None,
-                str(semantic_reason or ""),
-                json_dumps(details or {}),
-                now,
-            ),
-        )
-        self._commit_if_needed()
-        return int(cur.lastrowid)
-
 
     @staticmethod
     def _intent_payload_to_row(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -2558,137 +2321,6 @@ class UserMemoryDB:
         self._commit_if_needed()
         return changed
 
-    def get_user_claim_events(
-        self,
-        claim_id: int,
-        *,
-        limit: int = 100,
-    ) -> List[Dict[str, Any]]:
-        """Return status-history events for one claim, newest event first."""
-        rows = self._conn.execute(
-            """
-            SELECT * FROM memory_user_claim_events
-            WHERE target_claim_id = ?
-            ORDER BY effective_at DESC, id DESC
-            LIMIT ?
-            """,
-            (int(claim_id), max(1, int(limit or 100))),
-        ).fetchall()
-        return [self._row_to_dict(row) for row in rows]
-
-    def get_user_claim_events_for_claim_ids(
-        self,
-        claim_ids: Sequence[int],
-        *,
-        limit: int = 400,
-    ) -> Dict[int, List[Dict[str, Any]]]:
-        """Return transition history grouped by target claim for state resolution."""
-        ids = list(dict.fromkeys(
-            int(value)
-            for value in claim_ids or []
-            if str(value).strip().isdigit() and int(value) > 0
-        ))
-        if not ids:
-            return {}
-        placeholders = ",".join("?" for _ in ids)
-        rows = self._conn.execute(
-            f"""
-            SELECT * FROM memory_user_claim_events
-            WHERE target_claim_id IN ({placeholders})
-            ORDER BY target_claim_id ASC, effective_at DESC, id DESC
-            LIMIT ?
-            """,
-            (*ids, max(1, int(limit or 400))),
-        ).fetchall()
-        result: Dict[int, List[Dict[str, Any]]] = {claim_id: [] for claim_id in ids}
-        for row in rows:
-            event = self._row_to_dict(row)
-            result.setdefault(int(event["target_claim_id"]), []).append(event)
-        return result
-
-    def get_user_claim_relation_events_by_ids(
-        self, event_ids: Sequence[int],
-    ) -> List[Dict[str, Any]]:
-        """Load the exact relation events referenced by a state-update batch."""
-        ids = list(dict.fromkeys(
-            int(value) for value in event_ids or []
-            if str(value).strip().isdigit() and int(value) > 0
-        ))
-        if not ids:
-            return []
-        rows_by_id: Dict[int, Dict[str, Any]] = {}
-        for start in range(0, len(ids), 400):
-            chunk = ids[start:start + 400]
-            placeholders = ",".join("?" for _ in chunk)
-            rows = self._conn.execute(
-                f"SELECT * FROM memory_user_claim_events "
-                f"WHERE event_type = 'relation_observed' AND id IN ({placeholders})",
-                chunk,
-            ).fetchall()
-            rows_by_id.update(
-                (int(row["id"]), self._row_to_dict(row)) for row in rows
-            )
-        return [rows_by_id[event_id] for event_id in ids if event_id in rows_by_id]
-
-    def get_user_claims(
-        self,
-        *,
-        entity_id: Optional[int] = None,
-        subject_entity_id: Optional[int] = None,
-        primary_domain: Optional[str] = None,
-        claim_type: Optional[str] = None,
-        claim_origin: Optional[str] = None,
-        predicate: Optional[str] = None,
-        statuses: Optional[Sequence[str]] = None,
-        limit: int = 200,
-    ) -> List[Dict[str, Any]]:
-        clauses: List[str] = []
-        params: List[Any] = []
-        if entity_id is not None:
-            clauses.append("(subject_entity_id = ? OR object_entity_id = ?)")
-            params.extend((int(entity_id), int(entity_id)))
-        for column, value in (
-            ("subject_entity_id", subject_entity_id),
-            ("primary_domain", primary_domain),
-            ("claim_type", claim_type),
-            ("claim_origin", claim_origin),
-            ("predicate", predicate),
-        ):
-            if value is not None:
-                clauses.append(f"{column} = ?")
-                params.append(value)
-        if statuses:
-            placeholders = ",".join("?" for _ in statuses)
-            clauses.append(f"status IN ({placeholders})")
-            params.extend(str(value) for value in statuses)
-        where = " WHERE " + " AND ".join(clauses) if clauses else ""
-        rows = self._conn.execute(
-            f"SELECT * FROM memory_user_claims{where} ORDER BY updated_at DESC, id DESC LIMIT ?",
-            (*params, max(1, int(limit or 200))),
-        ).fetchall()
-        return [self._row_to_dict(row) for row in rows]
-
-    def get_user_claims_by_ids(
-        self,
-        claim_ids: Sequence[int],
-    ) -> List[Dict[str, Any]]:
-        """Load claims in caller-specified order for projection refreshes."""
-        ids = list(dict.fromkeys(
-            int(value)
-            for value in claim_ids or []
-            if str(value).strip().isdigit() and int(value) > 0
-        ))
-        if not ids:
-            return []
-        placeholders = ",".join("?" for _ in ids)
-        rows = self._conn.execute(
-            f"SELECT * FROM memory_user_claims WHERE id IN ({placeholders})",
-            ids,
-        ).fetchall()
-        by_id = {int(row["id"]): self._row_to_dict(row) for row in rows}
-        return [by_id[claim_id] for claim_id in ids if claim_id in by_id]
-
-
     def get_entity_names_by_ids(
         self,
         entity_ids: Sequence[int],
@@ -2904,41 +2536,6 @@ class UserMemoryDB:
             result.append(item)
         return result
 
-    def get_user_claim_evidence_fact_ids(
-        self,
-        claim_ids: Sequence[int],
-        *,
-        limit: int = 120,
-    ) -> Dict[int, List[int]]:
-        """Return support-fact IDs for bounded claim candidates."""
-        ids = list(dict.fromkeys(
-            int(value)
-            for value in claim_ids or []
-            if str(value).strip().isdigit() and int(value) > 0
-        ))
-        if not ids:
-            return {}
-        placeholders = ",".join("?" for _ in ids)
-        rows = self._conn.execute(
-            f"""
-            SELECT claim_id, evidence_id
-            FROM memory_user_claim_evidence
-            WHERE claim_id IN ({placeholders})
-              AND evidence_type = 'fact'
-              AND role = 'support'
-            ORDER BY claim_id ASC, weight DESC, observed_at DESC, evidence_id DESC
-            LIMIT ?
-            """,
-            (*ids, max(1, int(limit or 120))),
-        ).fetchall()
-        result: Dict[int, List[int]] = {claim_id: [] for claim_id in ids}
-        for row in rows:
-            claim_id = int(row["claim_id"])
-            fact_id = int(row["evidence_id"])
-            if fact_id not in result.setdefault(claim_id, []):
-                result[claim_id].append(fact_id)
-        return result
-
     def get_intent_ids_created_from_facts(self, fact_ids: Sequence[int]) -> List[int]:
         """Find intents whose creation evidence includes any supplied fact."""
         ids = sorted({int(value) for value in fact_ids if int(value) > 0})
@@ -2968,192 +2565,6 @@ class UserMemoryDB:
             if row["evidence_id"] not in result[row["intent_id"]]:
                 result[row["intent_id"]].append(row["evidence_id"])
         return result
-
-    def upsert_user_claim_evidence(self, evidence: Sequence[Dict[str, Any]], *, reference_timestamp: Any = None) -> int:
-        now = local_now_text() if reference_timestamp is None else normalize_reference_timestamp(reference_timestamp)
-        changed = 0
-        for item in evidence or []:
-            try:
-                claim_id = int(item["claim_id"])
-                evidence_id = int(item["evidence_id"])
-            except (KeyError, TypeError, ValueError):
-                continue
-            evidence_type = str(item.get("evidence_type") or "fact")
-            role = str(item.get("role") or "support")
-            if claim_id <= 0 or evidence_id <= 0 or evidence_type != "fact":
-                continue
-            self._conn.execute(
-                """
-                INSERT INTO memory_user_claim_evidence (
-                    claim_id, evidence_type, evidence_id, role, weight, observed_at,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(claim_id, evidence_type, evidence_id, role) DO UPDATE SET
-                    weight = MAX(memory_user_claim_evidence.weight, excluded.weight),
-                    observed_at = excluded.observed_at, updated_at = excluded.updated_at
-                """,
-                (claim_id, evidence_type, evidence_id, role, float(item.get("weight") or 1.0),
-                 str(item.get("observed_at") or ""), now, now),
-            )
-            changed += 1
-        self._commit_if_needed()
-        return changed
-
-    def upsert_user_claim_derivation(
-        self,
-        *,
-        claim_id: int,
-        rule_id: str,
-        rule_version: str,
-        derivation_key: str,
-        metadata: Optional[Dict[str, Any]] = None,
-        reference_timestamp: Any = None,
-    ) -> int:
-        """Create or reactivate one auditable proof for a derived claim."""
-        now = local_now_text() if reference_timestamp is None else normalize_reference_timestamp(reference_timestamp)
-        self._conn.execute(
-            """
-            INSERT INTO memory_user_claim_derivations (
-                claim_id, rule_id, rule_version, derivation_key, status,
-                derived_at, invalidated_at, metadata, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, 'active', ?, '', ?, ?, ?)
-            ON CONFLICT(derivation_key) DO UPDATE SET
-                claim_id = excluded.claim_id,
-                rule_id = excluded.rule_id,
-                rule_version = excluded.rule_version,
-                status = 'active',
-                derived_at = excluded.derived_at,
-                invalidated_at = '',
-                metadata = excluded.metadata,
-                updated_at = excluded.updated_at
-            """,
-            (
-                int(claim_id), str(rule_id or ""), str(rule_version or ""),
-                str(derivation_key or ""), now, json_dumps(metadata or {}),
-                now, now,
-            ),
-        )
-        row = self._conn.execute(
-            "SELECT id FROM memory_user_claim_derivations WHERE derivation_key = ?",
-            (str(derivation_key or ""),),
-        ).fetchone()
-        derivation_id = int(row["id"]) if row else 0
-        self._commit_if_needed()
-        return derivation_id
-
-    def replace_user_claim_derivation_premises(
-        self,
-        *,
-        derivation_id: int,
-        premise_claim_ids: Sequence[int],
-        premise_role: str = "support",
-        reference_timestamp: Any = None,
-    ) -> int:
-        """Replace one derivation's exact premise set atomically."""
-        normalized = list(dict.fromkeys(
-            int(value)
-            for value in premise_claim_ids or []
-            if str(value).strip().isdigit() and int(value) > 0
-        ))
-        if int(derivation_id or 0) <= 0:
-            return 0
-        now = local_now_text() if reference_timestamp is None else normalize_reference_timestamp(reference_timestamp)
-        self._conn.execute(
-            "DELETE FROM memory_user_claim_premises WHERE derivation_id = ?",
-            (int(derivation_id),),
-        )
-        self._conn.executemany(
-            """
-            INSERT INTO memory_user_claim_premises (
-                derivation_id, premise_claim_id, premise_role, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?)
-            """,
-            [
-                (int(derivation_id), premise_id, str(premise_role or "support"), now, now)
-                for premise_id in normalized
-            ],
-        )
-        self._commit_if_needed()
-        return len(normalized)
-
-    def invalidate_user_claim_derivations_for_premises(
-        self,
-        premise_claim_ids: Sequence[int],
-        *, reference_timestamp: Any = None,
-    ) -> List[int]:
-        """Invalidate proofs whose changed premise is no longer active.
-
-        The caller owns the consequential derived-claim status transition, since
-        it needs to preserve the existing claim-event audit trail.
-        """
-        premise_ids = list(dict.fromkeys(
-            int(value)
-            for value in premise_claim_ids or []
-            if str(value).strip().isdigit() and int(value) > 0
-        ))
-        if not premise_ids:
-            return []
-        placeholders = ",".join("?" for _ in premise_ids)
-        rows = self._conn.execute(
-            f"""
-            SELECT DISTINCT derivation.id, derivation.claim_id
-            FROM memory_user_claim_derivations AS derivation
-            JOIN memory_user_claim_premises AS premise
-              ON premise.derivation_id = derivation.id
-            JOIN memory_user_claims AS premise_claim
-              ON premise_claim.id = premise.premise_claim_id
-            WHERE derivation.status = 'active'
-              AND premise.premise_claim_id IN ({placeholders})
-              AND premise_claim.status != 'active'
-            """,
-            premise_ids,
-        ).fetchall()
-        if not rows:
-            return []
-        now = local_now_text() if reference_timestamp is None else normalize_reference_timestamp(reference_timestamp)
-        derivation_ids = [int(row["id"]) for row in rows]
-        derivation_placeholders = ",".join("?" for _ in derivation_ids)
-        self._conn.execute(
-            f"""
-            UPDATE memory_user_claim_derivations
-            SET status = 'invalidated', invalidated_at = ?, updated_at = ?
-            WHERE id IN ({derivation_placeholders})
-            """,
-            (now, now, *derivation_ids),
-        )
-        self._commit_if_needed()
-        return list(dict.fromkeys(int(row["claim_id"]) for row in rows))
-
-    def get_user_claim_ids_without_active_derivations(
-        self,
-        claim_ids: Sequence[int],
-    ) -> List[int]:
-        """Return derived-claim IDs for which every stored proof is inactive."""
-        ids = list(dict.fromkeys(
-            int(value)
-            for value in claim_ids or []
-            if str(value).strip().isdigit() and int(value) > 0
-        ))
-        if not ids:
-            return []
-        placeholders = ",".join("?" for _ in ids)
-        rows = self._conn.execute(
-            f"""
-            SELECT claim.id
-            FROM memory_user_claims AS claim
-            WHERE claim.id IN ({placeholders})
-              AND claim.claim_origin = 'derived'
-              AND claim.status = 'active'
-              AND NOT EXISTS (
-                  SELECT 1
-                  FROM memory_user_claim_derivations AS derivation
-                  WHERE derivation.claim_id = claim.id
-                    AND derivation.status = 'active'
-              )
-            """,
-            ids,
-        ).fetchall()
-        return [int(row["id"]) for row in rows]
 
     def insert_fact(
         self,

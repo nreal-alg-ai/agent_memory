@@ -66,8 +66,8 @@ from memory.feishu_transcript import (
 )
 MEMORY_TABLES = (
     "memory_source_segments", "memory_facts", "memory_user_activity_items",
-    "memory_user_claims", "memory_user_observed_patterns", "memory_user_intent_items",
-    "memory_user_threads", "memory_user_claim_signals",
+    "memory_user_claim_signals", "memory_user_observed_patterns", "memory_user_intent_items",
+    "memory_user_threads",
     "memory_user_intent_signals", "memory_user_action_signals",
 )
 
@@ -244,10 +244,6 @@ def extract_meeting(
         raise RuntimeError(f"Meeting finalization rejected: {report['finalization']}")
     if not pwm.wait_for_memory_tasks():
         raise RuntimeError("Memory extraction tasks did not drain")
-    # Drain every pending batch using the timestamps persisted with its claims.
-    report["state_tick"] = pwm.drain_pending_user_state_claims()
-    if not pwm.wait_for_memory_tasks():
-        raise RuntimeError("User state tasks did not drain")
     # Wait for this meeting's predictions and states before the high-priority
     # service task can evaluate them. No prediction time tick or Agent dispatch.
     report["proactive_service_evaluation"] = evaluate_post_meeting_proactive_services(pwm, meeting)
@@ -380,7 +376,7 @@ def run_extraction(args: argparse.Namespace, meetings: Sequence[Dict[str, Any]],
         finally:
             if len(meetings) == 1:
                 for key in (
-                    "input_report", "finalization", "state_tick", "table_counts",
+                    "input_report", "finalization", "table_counts",
                     "operation_delta", "failed_tasks", "partial_tasks", "unexpected_rejections",
                     "proactive_service_evaluation",
                 ):
