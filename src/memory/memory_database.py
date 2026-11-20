@@ -280,8 +280,6 @@ class UserMemoryDB:
                 confidence REAL NOT NULL DEFAULT 0.0 CHECK(confidence BETWEEN 0.0 AND 1.0),
                 started_at TEXT,
                 ended_at TEXT,
-                evidence_fact_ids TEXT NOT NULL DEFAULT '[]',
-                source_segment_ids TEXT NOT NULL DEFAULT '[]',
                 metadata TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
@@ -351,10 +349,16 @@ class UserMemoryDB:
                 updated_at TEXT NOT NULL
             );
 
-            CREATE TABLE IF NOT EXISTS memory_fact_source_mapping (
-                fact_id INTEGER NOT NULL,
-                source_segment_id INTEGER NOT NULL,
-                PRIMARY KEY(fact_id, source_segment_id),
+            CREATE TABLE IF NOT EXISTS memory_source_mapping (
+                id INTEGER PRIMARY KEY,
+                activity_id INTEGER,
+                fact_id INTEGER,
+                source_segment_id INTEGER,
+                CHECK (
+                    (activity_id IS NOT NULL) + (fact_id IS NOT NULL)
+                    + (source_segment_id IS NOT NULL) = 2
+                ),
+                FOREIGN KEY(activity_id) REFERENCES memory_user_activity_items(id) ON DELETE CASCADE,
                 FOREIGN KEY(fact_id) REFERENCES memory_facts(id) ON DELETE CASCADE,
                 FOREIGN KEY(source_segment_id) REFERENCES memory_source_segments(id) ON DELETE CASCADE
             );
@@ -605,8 +609,18 @@ class UserMemoryDB:
             ON memory_recall_documents(object_type, status, time_end, updated_at);
             CREATE INDEX IF NOT EXISTS idx_memory_source_segments_activity
             ON memory_source_segments(processed_for_user_activity, id);
-            CREATE INDEX IF NOT EXISTS idx_memory_fact_source_segment
-            ON memory_fact_source_mapping(source_segment_id, fact_id);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_source_mapping_fact_source
+            ON memory_source_mapping(fact_id, source_segment_id) WHERE activity_id IS NULL;
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_source_mapping_activity_source
+            ON memory_source_mapping(activity_id, source_segment_id) WHERE fact_id IS NULL;
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_source_mapping_activity_fact
+            ON memory_source_mapping(activity_id, fact_id) WHERE source_segment_id IS NULL;
+            CREATE INDEX IF NOT EXISTS idx_memory_source_mapping_source_fact
+            ON memory_source_mapping(source_segment_id, fact_id) WHERE activity_id IS NULL;
+            CREATE INDEX IF NOT EXISTS idx_memory_source_mapping_source_activity
+            ON memory_source_mapping(source_segment_id, activity_id) WHERE fact_id IS NULL;
+            CREATE INDEX IF NOT EXISTS idx_memory_source_mapping_fact_activity
+            ON memory_source_mapping(fact_id, activity_id) WHERE source_segment_id IS NULL;
             CREATE INDEX IF NOT EXISTS idx_memory_user_observed_patterns_subject
             ON memory_user_observed_patterns(subject_entity_id, primary_domain, updated_at);
             CREATE INDEX IF NOT EXISTS idx_memory_user_observed_pattern_signals_signal
@@ -843,29 +857,27 @@ class UserMemoryDB:
         reference_timestamp: Any = None,
     ) -> int:
         now = local_now_text() if reference_timestamp is None else normalize_reference_timestamp(reference_timestamp)
-        cur = self._conn.execute(
-            """
-            INSERT INTO memory_user_activity_items (
-                activity_text, user_role, confidence, started_at, ended_at,
-                evidence_fact_ids, source_segment_ids,
-                metadata, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                activity_text,
-                user_role,
-                float(confidence),
-                started_at,
-                ended_at,
-                json_dumps(list(evidence_fact_ids)),
-                json_dumps(list(source_segment_ids)),
-                json_dumps(metadata or {}),
-                now,
-                now,
-            ),
-        )
-        self._commit_if_needed()
-        return int(cur.lastrowid)
+        with self.transaction():
+            cur = self._conn.execute(
+                """
+                INSERT INTO memory_user_activity_items (
+                    activity_text, user_role, confidence, started_at, ended_at,
+                    metadata, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    activity_text, user_role, float(confidence), started_at, ended_at,
+                    json_dumps(metadata or {}), now, now,
+                ),
+            )
+            activity_id = int(cur.lastrowid)
+            self.insert_source_mappings(
+                activity_ids=[activity_id], source_segment_ids=source_segment_ids,
+            )
+            self.insert_source_mappings(
+                activity_ids=[activity_id], fact_ids=evidence_fact_ids,
+            )
+        return activity_id
 
     def get_user_activity_contexts_for_facts(
         self, fact_ids: Sequence[int],
@@ -881,19 +893,26 @@ class UserMemoryDB:
             )
             SELECT requested.fact_id, activity.id AS activity_id, activity.activity_text,
                    EXISTS (
-                       SELECT 1 FROM json_each(activity.evidence_fact_ids) AS evidence
-                       WHERE evidence.value = requested.fact_id
+                       SELECT 1 FROM memory_source_mapping AS evidence
+                       WHERE evidence.activity_id = activity.id
+                         AND evidence.fact_id = requested.fact_id
+                         AND evidence.source_segment_id IS NULL
                    ) AS direct_match
             FROM requested_facts AS requested
             JOIN memory_user_activity_items AS activity ON
                 EXISTS (
-                    SELECT 1 FROM json_each(activity.evidence_fact_ids) AS evidence
-                    WHERE evidence.value = requested.fact_id
+                    SELECT 1 FROM memory_source_mapping AS evidence
+                    WHERE evidence.activity_id = activity.id
+                      AND evidence.fact_id = requested.fact_id
+                      AND evidence.source_segment_id IS NULL
                 ) OR EXISTS (
-                    SELECT 1 FROM memory_fact_source_mapping AS mapping
-                    JOIN json_each(activity.source_segment_ids) AS source
-                      ON source.value = mapping.source_segment_id
+                    SELECT 1 FROM memory_source_mapping AS mapping
+                    JOIN memory_source_mapping AS source
+                      ON source.source_segment_id = mapping.source_segment_id
                     WHERE mapping.fact_id = requested.fact_id
+                      AND mapping.activity_id IS NULL
+                      AND source.activity_id = activity.id
+                      AND source.fact_id IS NULL
                 )
             WHERE TRIM(activity.activity_text) <> ''
             ORDER BY requested.fact_id, activity.id
@@ -927,15 +946,27 @@ class UserMemoryDB:
             ids,
         ).fetchall()
         by_id = {int(row["id"]): self._row_to_dict(row) for row in rows}
+        for item in by_id.values():
+            item["evidence_fact_ids"] = []
+            item["source_segment_ids"] = []
+        for row in self._conn.execute(
+            f"SELECT activity_id, fact_id, source_segment_id FROM memory_source_mapping "
+            f"WHERE activity_id IN ({placeholders}) "
+            "ORDER BY activity_id, fact_id, source_segment_id",
+            ids,
+        ):
+            item = by_id.get(int(row["activity_id"]))
+            if item is None:
+                continue
+            if row["fact_id"] is not None:
+                item["evidence_fact_ids"].append(int(row["fact_id"]))
+            else:
+                item["source_segment_ids"].append(int(row["source_segment_id"]))
         result: List[Dict[str, Any]] = []
         for activity_id in ids:
             item = by_id.get(activity_id)
             if item is None:
                 continue
-            if not isinstance(item.get("evidence_fact_ids"), list):
-                item["evidence_fact_ids"] = []
-            if not isinstance(item.get("source_segment_ids"), list):
-                item["source_segment_ids"] = []
             if not isinstance(item.get("metadata"), dict):
                 item["metadata"] = {}
             result.append(item)
@@ -1296,18 +1327,34 @@ class UserMemoryDB:
         self._commit_if_needed()
         return int(cur.rowcount or 0)
 
-    def insert_fact_source_mappings(
-        self, *, fact_ids: Sequence[int], source_segment_ids: Sequence[int]
+    def insert_source_mappings(
+        self, *, activity_ids: Sequence[int] = (), fact_ids: Sequence[int] = (),
+        source_segment_ids: Sequence[int] = (),
     ) -> None:
-        pairs = [
-            (int(fact_id), int(source_id))
-            for fact_id in fact_ids for source_id in source_segment_ids
-        ]
-        self._conn.executemany(
-            "INSERT OR IGNORE INTO memory_fact_source_mapping (fact_id, source_segment_id) VALUES (?, ?)",
-            pairs,
+        """Store one kind of pairwise link; shared windows never imply activity–fact links."""
+        activities, facts, sources = (
+            sorted({int(value) for value in values if int(value) > 0})
+            for values in (activity_ids, fact_ids, source_segment_ids)
         )
-        self._commit_if_needed()
+        sides = sum(bool(values) for values in (activities, facts, sources))
+        if sides > 2:
+            raise ValueError("Source mappings require exactly two populated ID groups")
+        if sides < 2:
+            return
+        if activities:
+            mappings = (
+                [(activity_id, fact_id, None) for activity_id in activities for fact_id in facts]
+                if facts else
+                [(activity_id, None, source_id) for activity_id in activities for source_id in sources]
+            )
+        else:
+            mappings = [(None, fact_id, source_id) for fact_id in facts for source_id in sources]
+        with self.transaction():
+            self._conn.executemany(
+                "INSERT OR IGNORE INTO memory_source_mapping "
+                "(activity_id, fact_id, source_segment_id) VALUES (?, ?, ?)",
+                mappings,
+            )
 
     def get_memory_facts_for_source_segments(
         self, *, source_segment_ids: Sequence[int], limit: int = 240
@@ -1318,8 +1365,8 @@ class UserMemoryDB:
         placeholders = ",".join("?" for _ in ids)
         rows = self._conn.execute(
             f"""SELECT DISTINCT fact.* FROM memory_facts AS fact
-                JOIN memory_fact_source_mapping AS mapping ON mapping.fact_id = fact.id
-                WHERE mapping.source_segment_id IN ({placeholders})
+                JOIN memory_source_mapping AS mapping ON mapping.fact_id = fact.id
+                WHERE mapping.activity_id IS NULL AND mapping.source_segment_id IN ({placeholders})
                 ORDER BY fact.dialogue_time_key ASC, fact.id ASC LIMIT ?""",
             (*ids, max(1, int(limit))),
         ).fetchall()
@@ -1381,8 +1428,8 @@ class UserMemoryDB:
             chunk = source_ids[offset:offset + 500]
             placeholders = ",".join("?" for _ in chunk)
             fact_ids.update(int(row[0]) for row in self._conn.execute(
-                "SELECT DISTINCT fact_id FROM memory_fact_source_mapping "
-                f"WHERE source_segment_id IN ({placeholders})", chunk,
+                "SELECT DISTINCT fact_id FROM memory_source_mapping "
+                f"WHERE activity_id IS NULL AND source_segment_id IN ({placeholders})", chunk,
             ))
         signals = {"claim_signal_ids": [], "intent_signal_ids": [], "action_signal_ids": []}
         ordered_fact_ids = sorted(fact_ids)

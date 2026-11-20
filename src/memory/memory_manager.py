@@ -765,7 +765,7 @@ class MemoryNodeManager:
                 tags=tags,
                 reference_timestamp=reference_timestamp,
             )
-            self._db.insert_fact_source_mappings(
+            self._db.insert_source_mappings(
                 fact_ids=save_fact_info.get("fact_ids") or [],
                 source_segment_ids=source_unit_row_ids,
             )

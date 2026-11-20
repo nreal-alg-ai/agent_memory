@@ -205,6 +205,8 @@ class MemoryInspector:
             result["available"] = True
             if item_id is not None:
                 row = connection.execute("SELECT * FROM memory_user_activity_items WHERE id=?", (item_id,)).fetchone()
+                if row:
+                    row = {**dict(row), **self._activity_source_ids(connection, item_id)}
                 result["item"] = self._activity_record(dict(row)) if row else None
                 result.pop("items")
                 if row:
@@ -229,8 +231,26 @@ class MemoryInspector:
                 f"SELECT * FROM memory_user_activity_items{where} ORDER BY {start} DESC,id DESC LIMIT ? OFFSET ?",
                 (*values, size, (page - 1) * size),
             ).fetchall()
-            result["items"] = [self._activity_record(dict(row)) for row in rows]
+            result["items"] = [self._activity_record({
+                **dict(row), **self._activity_source_ids(connection, row["id"]),
+            }) for row in rows]
             return result
+
+    @staticmethod
+    def _activity_source_ids(connection, activity_id):
+        """Read direct activity evidence separately from its collection window."""
+        references = {"evidence_fact_ids": [], "source_segment_ids": []}
+        if not _table(connection, "memory_source_mapping"):
+            return references
+        for row in connection.execute(
+            "SELECT fact_id, source_segment_id FROM memory_source_mapping "
+            "WHERE activity_id=? ORDER BY fact_id, source_segment_id", (activity_id,),
+        ):
+            if row["fact_id"] is not None:
+                references["evidence_fact_ids"].append(row["fact_id"])
+            else:
+                references["source_segment_ids"].append(row["source_segment_id"])
+        return references
 
     @staticmethod
     def _activity_record(row: dict[str, Any]) -> dict[str, Any]:
@@ -339,6 +359,8 @@ class MemoryInspector:
             if row is None:
                 continue
             row = dict(row)
+            if kind == "user_activity":
+                row.update(self._activity_source_ids(connection, key))
             evidence.update(resolved=True, text=_bounded(row.get(spec[1])), occurred_at=row.get("event_time_key") or row.get("last_observed_at") or row.get("updated_at") or "")
             if kind == "user_action_signal":
                 evidence.update({field: row.get(field) for field in (
@@ -356,10 +378,9 @@ class MemoryInspector:
                 facts = [row["source_id"]] if row["source_type"] == "fact" else []
                 segments.extend(ref.get("source_unit_row_id") for ref in _json(row.get("source_unit_refs"), []) if isinstance(ref, dict))
                 if row.get("source_type") == "user_activity" and _table(connection, "memory_user_activity_items"):
-                    activity = connection.execute("SELECT evidence_fact_ids,source_segment_ids FROM memory_user_activity_items WHERE id=?", (row["source_id"],)).fetchone()
-                    if activity:
-                        facts.extend(_reference_ids(activity["evidence_fact_ids"]))
-                        segments.extend(_reference_ids(activity["source_segment_ids"]))
+                    activity_sources = self._activity_source_ids(connection, row["source_id"])
+                    facts.extend(activity_sources["evidence_fact_ids"])
+                    segments.extend(activity_sources["source_segment_ids"])
             if kind == "user_observed_pattern" and _table(connection, "memory_user_observed_pattern_signals") and _table(connection, "memory_user_action_signals"):
                 facts = [item[0] for item in connection.execute(
                     "SELECT s.source_id FROM memory_user_observed_pattern_signals p JOIN memory_user_action_signals s ON s.signal_id=p.signal_id WHERE p.pattern_id=? AND s.source_type='fact' LIMIT 10", (key,),
@@ -373,10 +394,11 @@ class MemoryInspector:
                     "SELECT evidence_id FROM memory_user_intent_evidence WHERE intent_id=? AND evidence_type='fact' LIMIT 10", (key,),
                 )]
             facts = [value for value in facts if type(value) is int and value > 0][:10]
-            if facts and _table(connection, "memory_fact_source_mapping"):
+            if facts and _table(connection, "memory_source_mapping"):
                 placeholders = ",".join("?" for _ in facts)
                 segments.extend(item[0] for item in connection.execute(
-                    f"SELECT DISTINCT source_segment_id FROM memory_fact_source_mapping WHERE fact_id IN ({placeholders}) LIMIT 6", facts,
+                    "SELECT DISTINCT source_segment_id FROM memory_source_mapping "
+                    f"WHERE activity_id IS NULL AND fact_id IN ({placeholders}) LIMIT 6", facts,
                 ))
             segments = sorted({value for value in segments if type(value) is int and value > 0})[:6]
             if segments and _table(connection, "memory_source_segments"):
