@@ -232,7 +232,7 @@ class MemoryNodeManager:
             event_context_limit=self._memory_cfg.get("user_thread_event_context_limit", 16),
         )
         self._task_scheduler.register_handler(
-            "memory_embedding_cache_refresh", self._rebuild_embedding_cache,
+            "memory_embedding_cache_refresh", self._generate_memory_recall_document_embeddings,
         )
         self._task_scheduler.register_handler(
             "memory_fact_extraction", self._process_memory_fact_extraction_task,
@@ -566,30 +566,59 @@ class MemoryNodeManager:
         changed = self._db.ensure_embedding_profile(client.model_signature)
         self._logger.info("PWM embedding cache profile_changed=%s", changed)
         if self._db.recall_documents_needing_embeddings(limit=1):
-            self._task_scheduler.submit("memory_embedding_cache_refresh", {})
+            self._task_scheduler.submit("memory_embedding_cache_refresh", {"force": True})
 
-    def _rebuild_embedding_cache(self) -> Dict[str, Any]:
-        """Rebuild derived caches on the writer worker; recall remains read-only."""
+    def _generate_memory_recall_document_embeddings(
+        self, *, force: bool = False,
+    ) -> Dict[str, Any]:
+        """Batch-fill committed documents across types, leaving short tails pending.
+
+        Each missing document is attempted at most once per invocation. Failed
+        vectors remain NULL for later refreshes without replaying domain tasks.
+        """
+        if self._db._conn.in_transaction:
+            raise RuntimeError("Recall embeddings must be generated outside a write transaction")
+        if not self._embedding_cfg.get("enabled", True):
+            return {"status": "empty", "reason": "embedding_disabled", "rebuilt": 0}
+        self._ensure_embedding_client()
         client = self._embedding_client
         after_id = 0
+        requested = 0
         rebuilt = 0
+        failed = 0
+        started_at = time.monotonic()
         while True:
             rows = self._db.recall_documents_needing_embeddings(
                 after_id=after_id, limit=client.batch_size,
             )
-            if not rows:
+            if not rows or (not force and len(rows) < client.batch_size):
                 break
-            vectors = client.embed_batch(row["identity_text"] for row in rows)
-            updates = [(row["id"], vector) for row, vector in zip(rows, vectors)
-                       if vector is not None]
+            requested += len(rows)
+            try:
+                vectors = client.embed_batch([row["identity_text"] for row in rows])
+                if len(vectors) != len(rows):
+                    raise ValueError("Recall embedding batch result length mismatch")
+            except Exception:
+                self._logger.warning("Recall document batch embedding failed", exc_info=True)
+                vectors = [None] * len(rows)
+            updates = [
+                (row["id"], row["identity_text"], vector)
+                for row, vector in zip(rows, vectors) if vector is not None
+            ]
+            failed += len(rows) - len(updates)
             if updates:
-                self._db.set_recall_document_embeddings(updates)
-                rebuilt += len(updates)
+                rebuilt += self._db.set_recall_document_embeddings(updates)
             after_id = rows[-1]["id"]
-            if not updates:
-                break  # Retry unfilled caches on the next runtime start.
-        self._logger.info("PWM embedding cache rebuilt=%s", rebuilt)
-        return {"status": "ok", "rebuilt": rebuilt}
+        pending = bool(self._db.recall_documents_needing_embeddings(limit=1))
+        report = {
+            "status": "partial" if failed else ("ok" if requested else "empty"),
+            "force": force, "requested_count": requested, "rebuilt": rebuilt,
+            "missing_count": failed, "has_pending": pending,
+            "batch_size": client.batch_size,
+            "elapsed_ms": round((time.monotonic() - started_at) * 1000, 2),
+        }
+        self._logger.log_json_format("memory_recall_document_embeddings", "finish", report)
+        return report
 
     def _process_memory_user_thread_update_task(
         self, *, activity_ids: List[int], reference_timestamp: Any = None,
@@ -664,9 +693,14 @@ class MemoryNodeManager:
                          "subject_entity_id": owner_entity_id}
                         for signal in item["user_action_signals"]
                     ], reference_timestamp=reference_timestamp)
+            self._upsert_memory_user_activities_into_recall_document_table(
+                activity_ids, reference_timestamp=reference_timestamp,
+            )
             processed_rows = self._db.mark_memory_source_segments_processed_for_user_activity(
                 source_segment_ids=source_row_ids,
             )
+        if activity_ids:
+            self._generate_memory_recall_document_embeddings()
         report = {
             "status": "ok",
             "new_user_activity_count": len(activity_ids),
@@ -757,11 +791,9 @@ class MemoryNodeManager:
                     )},
                 })
         self._log_extracted_fact_info(facts=facts)
-        # Remote requests must finish before opening the fact write transaction.
-        prepared_facts = self._prepare_memory_fact_recall_documents(facts)
         with self._db.transaction():
             save_fact_info = self._store_extracted_memory_facts_into_db(
-                prepared_facts=prepared_facts,
+                facts=facts,
                 tags=tags,
                 reference_timestamp=reference_timestamp,
             )
@@ -769,6 +801,7 @@ class MemoryNodeManager:
                 fact_ids=save_fact_info.get("fact_ids") or [],
                 source_segment_ids=source_unit_row_ids,
             )
+        self._generate_memory_recall_document_embeddings()
         report = {
             "status": fact_info["status"],
             "reason": fact_info["reason"],
@@ -880,7 +913,6 @@ class MemoryNodeManager:
             object_type=object_type,
             object_id=object_id,
             identity_text=identity_text,
-            identity_text_embedding=self._generate_embedding_vector(identity_text),
             title=title,
             summary=summary,
             entity_ids=entity_ids,
@@ -902,85 +934,51 @@ class MemoryNodeManager:
             if _compact_whitespace(line)
         )
 
-    def _prepare_memory_fact_recall_documents(
-        self,
-        facts: Sequence[Dict[str, Any]],
-    ) -> List[Dict[str, Any]]:
-        """Normalize once and batch-embed task-local projections before DB writes.
-
-        Missing vectors keep their positions and remain NULL in storage. Never
-        retry these items through the single-document embedding path.
-        """
-        prepared_facts: List[Dict[str, Any]] = []
-        for source_fact in facts:
-            fact = dict(source_fact)
-            keywords = self._normalize_string_list(fact.get("keywords"), limit=18)
-            if not keywords:
-                keywords = self._keywords(fact.get("summary") or "", limit=18)
-            fact_topic = self._normalize_topic_name(fact.get("fact_topic"))
-            if not fact_topic:
-                fallback_topics = self._topic_candidates(fact["summary"])
-                fact_topic = self._normalize_topic_name(
-                    fallback_topics[0] if fallback_topics else ""
-                ) or "general"
-            fact["keywords"] = keywords
-            fact["fact_topic"] = fact_topic
-            identity_text = self._format_recall_document_identity_text([
-                f"summary: {_compact_whitespace(fact['summary'])}",
-                f"keywords: {' '.join(str(value) for value in keywords if value)}",
-                f"entities: {', '.join(fact.get('entities') or [])}",
-                f"fact_topic: {fact_topic}",
-            ])
+    def _upsert_memory_facts_into_recall_document_table(
+        self, fact_ids: Sequence[int], *, reference_timestamp: Any = None,
+    ) -> None:
+        """Project persisted facts into lexical documents; vectors are filled later."""
+        for fact in self._db.get_memory_facts_by_ids(fact_ids):
+            fact_topic = fact["fact_topic"]
             time_key = fact.get("event_time_key") or fact.get("dialogue_time_key") or ""
-            prepared_facts.append({
-                "fact": fact,
-                "recall_document": {
-                    "object_type": "fact",
-                    "identity_text": identity_text,
-                    "identity_text_embedding": None,
-                    "title": _compact_whitespace(fact["summary"])[:120],
-                    "summary": fact["summary"],
-                    "topic_keys": [fact_topic],
-                    "time_start": time_key,
-                    "time_end": time_key,
-                    "confidence": float(fact["confidence"]),
-                    "importance": float(fact["importance"]),
-                    "metadata": {"projection_version": "v1"},
-                },
-            })
-        if not prepared_facts:
-            return []
+            self._upsert_memory_recall_document(
+                object_type="fact", object_id=fact["id"],
+                identity_lines=[
+                    f"summary: {_compact_whitespace(fact['summary'])}",
+                    f"keywords: {' '.join(str(value) for value in fact['keywords'] if value)}",
+                    f"entities: {', '.join(fact.get('entities') or [])}",
+                    f"fact_topic: {fact_topic}",
+                ],
+                title=_compact_whitespace(fact["summary"])[:120], summary=fact["summary"],
+                entity_ids=fact.get("entity_ids") or [], topic_keys=[fact_topic],
+                time_start=time_key, time_end=time_key,
+                confidence=float(fact["confidence"]), importance=float(fact["importance"]),
+                metadata={"projection_version": "v1"}, reference_timestamp=reference_timestamp,
+            )
 
-        embedding_started_at = time.monotonic()
-        client = None
-        vectors = [None] * len(prepared_facts)
-        error_type = ""
-        try:
-            if self._ensure_embedding_client():
-                client = self._embedding_client
-            if client is not None:
-                batch_vectors = client.embed_batch([
-                    item["recall_document"]["identity_text"] for item in prepared_facts
-                ])
-                if len(batch_vectors) != len(prepared_facts):
-                    raise ValueError("Fact recall embedding batch result length mismatch")
-                vectors = batch_vectors
-        except Exception as exc:
-            # Facts and lexical search remain usable even when embeddings fail.
-            error_type = type(exc).__name__
-            self._logger.warning("Fact recall batch embedding failed: %s", exc)
-        for item, vector in zip(prepared_facts, vectors):
-            item["recall_document"]["identity_text_embedding"] = vector
-        success_count = sum(vector is not None for vector in vectors)
-        self._logger.log_json_format("memory_fact_extraction", "recall_document_embeddings", {
-            "requested_count": len(prepared_facts),
-            "success_count": success_count,
-            "missing_count": len(prepared_facts) - success_count,
-            "batch_size": client.batch_size if client is not None else 0,
-            "embedding_elapsed_ms": round((time.monotonic() - embedding_started_at) * 1000, 2),
-            "error_type": error_type,
-        })
-        return prepared_facts
+    def _upsert_memory_user_activities_into_recall_document_table(
+        self, activity_ids: Sequence[int], *, reference_timestamp: Any = None,
+    ) -> None:
+        """Project stored activities without expanding their facts or raw sources."""
+        activities = self._db.get_user_activity_items_by_ids(activity_ids)
+        if not activities:
+            return
+        owner_entity_id = self._intent_world_owner_entity_id(reference_timestamp=reference_timestamp)
+        for activity in activities:
+            self._upsert_memory_recall_document(
+                object_type="user_activity", object_id=activity["id"],
+                identity_lines=[
+                    f"activity_text: {activity['activity_text']}",
+                    f"user_role: {activity['user_role']}",
+                ],
+                title=_compact_whitespace(activity["activity_text"])[:120],
+                summary=activity["activity_text"], entity_ids=[owner_entity_id],
+                time_start=activity.get("started_at") or "",
+                time_end=activity.get("ended_at") or "",
+                confidence=float(activity["confidence"]),
+                metadata={"projection_version": "v1", "user_role": activity["user_role"]},
+                reference_timestamp=reference_timestamp,
+            )
 
     def _log_extracted_fact_info(
         self,
@@ -2376,7 +2374,7 @@ class MemoryNodeManager:
     def _store_extracted_memory_facts_into_db(
         self,
         *,
-        prepared_facts: Sequence[Dict[str, Any]],
+        facts: Sequence[Dict[str, Any]],
         tags: List[str],
         reference_timestamp: Any = None,
     ) -> Dict[str, Any]:
@@ -2394,15 +2392,21 @@ class MemoryNodeManager:
                 owner_entity_id, status="confirmed", limit=4096,
             )
         }
-        for prepared in prepared_facts:
-            fact = prepared["fact"]
-            keywords = fact["keywords"]
+        for fact in facts:
+            keywords = self._normalize_string_list(fact.get("keywords"), limit=18)
+            if not keywords:
+                keywords = self._keywords(fact.get("summary") or "", limit=18)
             fact_entities = list(fact.get("entities") or [])
             entity_descriptors = list(fact.get("entity_descriptors") or [])
             raw_metadata = fact.get("metadata")
             metadata = dict(raw_metadata) if isinstance(raw_metadata, dict) else {}
             resolved_world_owner_aliases = list(fact["resolved_world_owner_aliases"])
-            fact_topic = fact["fact_topic"]
+            fact_topic = self._normalize_topic_name(fact.get("fact_topic"))
+            if not fact_topic:
+                fallback_topics = self._topic_candidates(fact["summary"])
+                fact_topic = self._normalize_topic_name(
+                    fallback_topics[0] if fallback_topics else ""
+                ) or "general"
             owner_alias_keys = {
                 self._db.normalize_owner_alias_key(alias)
                 for alias in resolved_world_owner_aliases
@@ -2465,12 +2469,6 @@ class MemoryNodeManager:
                     reference_timestamp=reference_timestamp,
                 )
                 stored_confirmed_alias_keys.add(alias_key)
-            self._db.upsert_memory_recall_document(
-                **prepared["recall_document"],
-                object_id=fact_id,
-                entity_ids=entity_ids,
-                reference_timestamp=reference_timestamp,
-            )
             fact_ids.append(fact_id)
             user_claim_updates = (
                 self._fact_user_claim_signal_mapping_updates(fact_id, fact, reference_timestamp=reference_timestamp)
@@ -2500,6 +2498,9 @@ class MemoryNodeManager:
         self._db.upsert_user_intent_signals(
             user_intent_signal_mapping_updates,
             reference_timestamp=reference_timestamp,
+        )
+        self._upsert_memory_facts_into_recall_document_table(
+            fact_ids, reference_timestamp=reference_timestamp,
         )
         return {
             "fact_ids": fact_ids,

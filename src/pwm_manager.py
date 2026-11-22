@@ -229,6 +229,14 @@ class PersonWorldModel:
             reason=reason,
             tags=tags,
         )
+        if report.get("accepted"):
+            # Queue behind the tail fact writes, never embed on the caller thread.
+            embedding_report = self._task_scheduler.submit(
+                "memory_embedding_cache_refresh", {"force": True},
+            )
+            report["recall_document_embeddings"] = embedding_report
+            if not embedding_report.get("queued"):
+                report["accepted"] = False
         input_flush = report.get("input_flush") or {}
         subreports = [
             input_flush,
@@ -419,6 +427,16 @@ class PersonWorldModel:
                 )
                 if not self._task_scheduler.flush(timeout=None):
                     raise RuntimeError("PWM task worker stopped with pending tasks")
+            # Work spawned during draining may also have written documents.
+            if self.memory_manager.enabled:
+                report = self._task_scheduler.submit(
+                    "memory_embedding_cache_refresh", {"force": True},
+                )
+                if not report.get("queued"):
+                    raise RuntimeError("Final recall embedding refresh could not be submitted")
+                if not self._task_scheduler.flush(timeout=timeout):
+                    if not self._task_scheduler.flush(timeout=None):
+                        raise RuntimeError("PWM embedding task worker stopped with pending tasks")
             stopped = self._task_scheduler.shutdown(wait=True, timeout=timeout)
             if not stopped:
                 stopped = self._task_scheduler.shutdown(wait=True, timeout=None)

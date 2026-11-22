@@ -196,14 +196,18 @@ class UserMemoryDB:
             "ORDER BY id LIMIT ?", (after_id, limit),
         ).fetchall()]
 
-    def set_recall_document_embeddings(self, embeddings) -> None:
+    def set_recall_document_embeddings(self, embeddings) -> int:
+        """Fill vectors only while their requested text is still current."""
+        updated = 0
         with self.transaction():
-            for document_id, embedding in embeddings:
-                self._conn.execute(
+            for document_id, identity_text, embedding in embeddings:
+                cursor = self._conn.execute(
                     "UPDATE memory_recall_documents SET identity_text_embedding=? "
-                    "WHERE id=? AND identity_text_embedding IS NULL",
-                    (_embedding_to_blob(embedding), int(document_id)),
+                    "WHERE id=? AND identity_text=? AND identity_text_embedding IS NULL",
+                    (_embedding_to_blob(embedding), int(document_id), identity_text),
                 )
+                updated += cursor.rowcount
+        return updated
 
     def close(self) -> None:
         self._conn.close()
@@ -607,6 +611,9 @@ class UserMemoryDB:
             ON memory_recall_documents(object_type, object_id);
             CREATE INDEX IF NOT EXISTS idx_memory_recall_documents_type_status_time
             ON memory_recall_documents(object_type, status, time_end, updated_at);
+            CREATE INDEX IF NOT EXISTS idx_memory_recall_documents_pending_embeddings
+            ON memory_recall_documents(id)
+            WHERE identity_text_embedding IS NULL AND trim(identity_text)!='';
             CREATE INDEX IF NOT EXISTS idx_memory_source_segments_activity
             ON memory_source_segments(processed_for_user_activity, id);
             CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_source_mapping_fact_source
@@ -719,7 +726,7 @@ class UserMemoryDB:
         object_type: str,
         object_id: int,
         identity_text: str,
-        identity_text_embedding: Optional[np.ndarray],
+        identity_text_embedding: Optional[np.ndarray] = None,
         title: str = "",
         summary: str = "",
         entity_ids: Optional[Sequence[int]] = None,
@@ -737,7 +744,8 @@ class UserMemoryDB:
         ``object_type`` and ``object_id`` identify the authoritative row in a
         domain table. This projection deliberately has no foreign key because
         it spans several source tables; callers own its lifecycle alongside
-        the corresponding source-object write.
+        the corresponding source-object write. An unchanged identity keeps its
+        cached vector; changed text invalidates it unless a new vector is given.
         """
         normalized_type = str(object_type or "").strip().lower()
         normalized_id = int(object_id or 0)
@@ -766,7 +774,12 @@ class UserMemoryDB:
                 title = excluded.title,
                 summary = excluded.summary,
                 identity_text = excluded.identity_text,
-                identity_text_embedding = excluded.identity_text_embedding,
+                identity_text_embedding = CASE
+                    WHEN memory_recall_documents.identity_text = excluded.identity_text
+                    THEN COALESCE(excluded.identity_text_embedding,
+                                  memory_recall_documents.identity_text_embedding)
+                    ELSE excluded.identity_text_embedding
+                END,
                 entity_ids = excluded.entity_ids,
                 topic_keys = excluded.topic_keys,
                 time_start = excluded.time_start,
