@@ -980,6 +980,39 @@ class MemoryNodeManager:
                 reference_timestamp=reference_timestamp,
             )
 
+    def _upsert_memory_user_intents_into_recall_document_table(
+        self, intent_ids: Sequence[int], *, reference_timestamp: Any = None,
+    ) -> None:
+        """Project current persisted intents; history remains in intent events."""
+        for intent in self._db.get_user_intent_items_by_ids(intent_ids):
+            details = intent["details"]
+            identity_lines = [f"summary: {intent['summary']}"]
+            if details.get("user_role"):
+                identity_lines.append(f"user_role: {details['user_role']}")
+            if intent.get("current_progress"):
+                identity_lines.append(f"current_progress: {intent['current_progress']}")
+            for key in ("completion_condition", "location_text"):
+                if details.get(key):
+                    identity_lines.append(f"{key}: {details[key]}")
+            if details.get("participants"):
+                identity_lines.append(f"participants: {', '.join(details['participants'])}")
+            self._upsert_memory_recall_document(
+                object_type="user_intent", object_id=intent["id"],
+                identity_lines=identity_lines,
+                title=_compact_whitespace(intent["summary"])[:120], summary=intent["summary"],
+                entity_ids=[intent["world_owner_entity_id"]], status=intent["status"],
+                time_start=intent.get("time_start") or "",
+                time_end=intent.get("time_end") or "",
+                confidence=float(intent["confidence"]),
+                metadata={
+                    "projection_version": "v1", "primary_domain": intent["primary_domain"],
+                    **{key: details[key] for key in (
+                        "time_precision", "time_start_meaning", "time_end_meaning",
+                    ) if details.get(key)},
+                },
+                reference_timestamp=reference_timestamp,
+            )
+
     def _log_extracted_fact_info(
         self,
         *,
@@ -2811,6 +2844,7 @@ class MemoryNodeManager:
             report["status"] = "partial" if completed or report["intent_event_ids"] else "failed"
         elif report["intent_event_ids"]:
             report["status"] = "ok"
+        self._generate_memory_recall_document_embeddings()
         self._logger.log_json_format(scope, "finish", report)
         return report
 
@@ -2904,6 +2938,7 @@ class MemoryNodeManager:
             "partial" if report["failed_signal_ids"] and report["_completed_signal_ids"]
             else "failed" if report["failed_signal_ids"] else "ok"
         )
+        self._generate_memory_recall_document_embeddings()
         self._logger.log_json_format("memory_user_intent_update", "finish", report)
         return report
 
@@ -3646,6 +3681,10 @@ class MemoryNodeManager:
                                 "role": observation["lifecycle_evidence"],
                                 "observed_at": observation.get("observed_at") or "",
                             }], reference_timestamp=reference_timestamp)
+                    if event_id is not None:
+                        self._upsert_memory_user_intents_into_recall_document_table(
+                            [target_id], reference_timestamp=reference_timestamp,
+                        )
             except Exception as exc:
                 report[failed_key].append(source_id)
                 self._logger.log_json_format(scope, "signal_error", {
@@ -3700,6 +3739,7 @@ class MemoryNodeManager:
 
                 target_id = decision["target_intent_id"]
                 update = decision["existing_intent_update"]
+                changed_intent_ids: List[int] = []
                 with self._db.transaction():
                     target = self._db.get_intent_object(
                         intent_id=target_id,
@@ -3730,6 +3770,7 @@ class MemoryNodeManager:
                             source_signal_id=signal_id,
                             reference_timestamp=reference_timestamp,
                         ))
+                        changed_intent_ids.append(object_id)
                     if target:
                         if update:
                             patch = update["field_updates"]
@@ -3757,11 +3798,16 @@ class MemoryNodeManager:
                                     effective_at=update["effective_at"],
                                     reference_timestamp=reference_timestamp,
                                 ))
+                                changed_intent_ids.append(target_id)
                         self._db.upsert_intent_evidence([{
                             "intent_id": target_id,
                             "evidence_type": "fact", "evidence_id": fact_id,
                             "role": decision["relation"], "observed_at": observed_at,
                         } for fact_id in candidate["evidence_fact_ids"]], reference_timestamp=reference_timestamp)
+                    if changed_intent_ids:
+                        self._upsert_memory_user_intents_into_recall_document_table(
+                            changed_intent_ids, reference_timestamp=reference_timestamp,
+                        )
             except Exception as exc:
                 report["failed_signal_ids"].append(signal_id)
                 self._logger.log_json_format("memory_user_intent_update", "signal_error", {
