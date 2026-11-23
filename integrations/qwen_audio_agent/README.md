@@ -53,8 +53,8 @@ PWM 各模块的详细日志已独立存放在
 2. Sidecar 通过 `PersonWorldModel.accept_memory_input()` 接收输入；
 3. `flush()` 提交缓冲内容并由共享 scheduler 安排后续提炼；
 4. `query()` 调用 `PersonWorldModel.trigger_memory_recall()`，结合可选的短期 `context`
-   和 `referenceTimestamp` 规划 fact、activity、intent、observed pattern 和 user state
-   五类数据的检索，分别读取记忆库和用户模型库中最新已提交的快照。
+   和 `referenceTimestamp` 规划 fact、activity、intent、observed pattern、user state
+   和 user thread 六类数据的检索，分别读取记忆库和用户模型库中最新已提交的快照。
 
 因此 recall 不会等待后台提炼队列完成。Provider 同时维护 Qwen 所需的有界
 `user` / `memory` Markdown 快照，以保持显式读取和编辑工具的兼容；自动提炼与语义召回

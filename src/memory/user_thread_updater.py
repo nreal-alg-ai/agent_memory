@@ -25,12 +25,14 @@ class UserThreadUpdater:
     def __init__(
         self, *, memory_db: UserMemoryDB, llm_client: Any,
         resolve_language: Callable[[str], str], log: Callable[..., None],
+        sync_recall_documents: Callable[..., None],
         batch_size: int = 8, candidate_limit: int = 12, event_context_limit: int = 16,
     ) -> None:
         self._db = memory_db
         self._llm_client = llm_client
         self._resolve_language = resolve_language
         self._log = log
+        self._sync_recall_documents = sync_recall_documents
         self._batch_size = max(1, int(batch_size))
         self._candidate_limit = max(1, int(candidate_limit))
         self._event_context_limit = max(1, int(event_context_limit))
@@ -291,6 +293,9 @@ class UserThreadUpdater:
                         'evidence_fact_ids': facts,
                         'reference_time': known_at,
                     })
+            saved_ids = sorted(set(report['new_thread_ids'] + report['updated_thread_ids']))
+            if saved_ids:
+                self._sync_recall_documents(saved_ids, reference_timestamp=reference_timestamp)
         return report
 
     def process_update_task(

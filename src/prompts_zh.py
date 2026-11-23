@@ -1748,6 +1748,13 @@ RECALL_QUERY_ANALYSIS_PROMPT_ZH = """目标：结合短期对话 context、当�
    - state_kind 随 state_type 选择：enduring_state 使用 communication_style、decision_style、value_priority、risk_preference、privacy_preference、time_preference、work_style、lifestyle_preference、long_term_constraint；recurring_state 使用 daily_routine、weekly_routine、work_routine、health_routine、social_routine、conditional_behavior；situational_state 使用 current_focus、current_constraint、current_availability、current_energy、current_stress、current_social_engagement、current_preparation。没有明确匹配时省略 state_kind，不编造其他值。
    - statuses 取 active、weakened、expired。默认检索 active 和 weakened，保留真实状态与置信度；只有明确询问已失效状态时才加入 expired。系统使用 reference_timestamp 检查 active/weakened 状态已知的有效时间，未知时间不编造；不需要为 state 输出 time_start/time_end 或 time_field。
 
+6. user_thread
+   - 含义：用户本人参与的项目、长期任务或持续工作事项的当前视图，不是单次活动、单条待办或个人状态。
+   - 核心字段：title 为事项名称；identity_description 描述事项身份与用户本人的关联；current_summary 为最新推进情况、阻塞与关键下一步；status 为 active 或 closed。
+   - 适用问题：某个持续事项是什么、用户本人在其中参与什么、事项目前推进到哪里。具体行动安排优先考虑 user_intent；具体发生或讨论的细节考虑 fact/user_activity；用户本人当前处境考虑 user_state。
+   - 允许的 filters：只有 statuses，取 active、closed，省略时两者都可检索。询问当前正在推进的事项时选择 active；询问已结束或历史事项时允许 closed。关闭不等于删除记忆。
+   - 返回事项的最新视图，不展开历史事件或关联证据，也不还原任意过去时点的完整事项状态。没有可靠的事项起止时间，不输出 time_start、time_end、time_field 或 primary_domain，不把创建或更新时间当作事项发生时间。
+
 primary_domain 仅用于 user_intent 和 user_observed_pattern，state_domain 仅用于 user_state；两者均取 general|health|work|life|information|finance|family|learning|social|interest|travel。仅当范围明确时使用，避免把不确定的领域猜测变成硬过滤。
 
 三、检索计划生成规则
@@ -1762,7 +1769,7 @@ primary_domain 仅用于 user_intent 和 user_observed_pattern，state_domain �
 - 只返回 JSON，顶层只包含 resolved_query 和 requests。
 - resolved_query：忠实表达结合必要背景补全后的 query，不扩展为 context 中的其他话题。
 - requests：最多 8 个 request，顺序表示希望优先呈现的类型；无需个人记忆时允许为空列表。
-- 每个 request 只包含 data_type、search_query、filters。data_type 只能是上述五类，search_query 和 filters 遵循前面的规则。
+- 每个 request 只包含 data_type、search_query、filters。data_type 只能是上述六类，search_query 和 filters 遵循前面的规则。
 - 不提供对象 ID、排序分数或额外字段，不输出 SQL、工具调用或证据扩展要求。
 下例仅展示结构，不是当前用户的查询条件：
 {

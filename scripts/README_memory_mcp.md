@@ -47,12 +47,18 @@ The MCP server exposes three tools:
 - `trigger_memory_recall`: searches the latest committed memory snapshot using
   a `query`, with optional recent-dialogue `context`, evaluation clock
   `reference_timestamp`, and `tags`. One LLM call plans which direct types to
-  retrieve: `fact`, `user_activity`, `user_intent`, `user_observed_pattern`, or
-  `user_state`. States use `user_model.db`'s local `recall_documents` index;
+  retrieve: `fact`, `user_activity`, `user_intent`, `user_observed_pattern`,
+  `user_state`, or `user_thread`. States use `user_model.db`'s local `recall_documents` index;
   the other types use `memory.db`. By default, state retrieval selects
   active/weakened states whose known validity bounds cover the evaluation time.
+  Threads return their latest identity and progress summary; active and closed
+  matters are searchable by default, with optional `statuses` filtering.
   The response contains `memory_context`, bounded direct `items`, the validated
-  `retrieval_plan`, status, and timing. It does not expand supporting evidence.
+  `retrieval_plan`, status, and timing. `memory_context` includes meanings of the
+  returned types, their general business relationships, then JSON-lines records.
+  The context budget applies only to the records; guidance is added afterward
+  and is excluded from that budget. These explanations do not assert links between
+  individual records. It does not expand supporting evidence.
 
 `process_audio_file`, transcript ingestion, reflection, and pending-queue
 operations are internal implementation steps of the `process_audio_files` job;

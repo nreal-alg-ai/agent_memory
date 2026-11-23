@@ -37,6 +37,8 @@ _IDENTITY_FTS_TABLES = {
     "memory_recall_documents": "memory_recall_documents_identity_fts",
 }
 
+USER_THREAD_STATUSES = {"active", "closed"}
+
 
 def _coerce_reference_datetime(value: Any) -> datetime:
     if isinstance(value, datetime):
@@ -2297,13 +2299,18 @@ class UserMemoryDB(RecallDocumentStore):
         source times do not match; future schedules are not capped at now.
         """
         tables = {"fact": "memory_facts", "user_activity": "memory_user_activity_items",
-                  "user_intent": "memory_user_intent_items", "user_observed_pattern": "memory_user_observed_patterns"}
+                  "user_intent": "memory_user_intent_items", "user_observed_pattern": "memory_user_observed_patterns",
+                  "user_thread": "memory_user_threads"}
         if object_type not in tables:
             raise ValueError("Unsupported recall document type")
+        if object_type == "user_thread" and set(filters) - {"statuses"}:
+            raise ValueError("Thread recall supports only statuses")
         clauses, params = ["document.object_type = ?"], [object_type]
         if "statuses" in filters:
-            if object_type != "user_intent" or not filters["statuses"]:
-                raise ValueError("Only intent recall supports nonempty statuses")
+            allowed_statuses = {"user_intent": USER_INTENT_STATUSES, "user_thread": USER_THREAD_STATUSES}.get(object_type)
+            if (allowed_statuses is None or not isinstance(filters["statuses"], list) or not filters["statuses"]
+                    or any(not isinstance(value, str) or value not in allowed_statuses for value in filters["statuses"])):
+                raise ValueError("Invalid recall statuses for this type")
             clauses.append("source.status IN (" + ",".join("?" for _ in filters["statuses"]) + ")")
             params.extend(filters["statuses"])
         if "primary_domain" in filters:

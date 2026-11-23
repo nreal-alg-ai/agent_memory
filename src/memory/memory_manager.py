@@ -195,6 +195,7 @@ class MemoryNodeManager:
             memory_db=self._db, llm_client=self._llm_client,
             resolve_language=self._resolve_prompt_language_from_text,
             log=lambda scope, event, payload: self._logger.log_json_format(scope, event, payload),
+            sync_recall_documents=self._upsert_memory_user_threads_into_recall_document_table,
             batch_size=self._memory_cfg.get("user_thread_activity_batch_size", 8),
             candidate_limit=self._memory_cfg.get("user_thread_candidate_limit", 12),
             event_context_limit=self._memory_cfg.get("user_thread_event_context_limit", 16),
@@ -289,9 +290,12 @@ class MemoryNodeManager:
         self, *, activity_ids: List[int], reference_timestamp: Any = None,
     ) -> Dict[str, Any]:
         """Resolve activity membership first, then incrementally update matters."""
-        return self._user_thread_updater.process_update_task(
+        report = self._user_thread_updater.process_update_task(
             activity_ids=activity_ids, reference_timestamp=reference_timestamp,
         )
+        if report.get("new_thread_ids") or report.get("updated_thread_ids"):
+            self._generate_memory_recall_document_embeddings()
+        return report
 
     def _process_memory_user_activity_extraction_task(
         self,
@@ -676,6 +680,27 @@ class MemoryNodeManager:
                     ) if details.get(key)},
                 },
                 reference_timestamp=reference_timestamp,
+            )
+
+    def _upsert_memory_user_threads_into_recall_document_table(
+        self, thread_ids: Sequence[int], *, reference_timestamp: Any = None,
+    ) -> None:
+        """Index the persisted current view; events and evidence stay in source tables."""
+        threads = self._db.get_user_threads_by_ids(thread_ids)
+        if not threads:
+            return
+        owner_entity_id = self._intent_world_owner_entity_id(reference_timestamp=reference_timestamp)
+        for thread in threads:
+            self._upsert_memory_recall_document(
+                object_type="user_thread", object_id=thread["id"],
+                identity_lines=[
+                    f"title: {thread['title']}",
+                    f"identity_description: {thread['identity_description']}",
+                    f"current_summary: {thread['current_summary']}",
+                ],
+                title=thread["title"], summary=thread["current_summary"],
+                entity_ids=[owner_entity_id], status=thread["status"],
+                metadata={"projection_version": "v1"}, reference_timestamp=reference_timestamp,
             )
 
     def _upsert_memory_user_observed_patterns_into_recall_document_table(
