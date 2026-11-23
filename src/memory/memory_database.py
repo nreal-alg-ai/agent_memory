@@ -30,87 +30,12 @@ from intent_lifecycle import (
     normalize_user_intent_details,
 )
 from .memory_types import MemoryUnit
+from recall_document_store import RecallDocumentStore, _lexical_index_text, _embedding_to_blob, _blob_to_embedding
 
-try:
-    import jieba
-except ImportError:  # pragma: no cover - exercised only in minimal installs
-    jieba = None
 
 _IDENTITY_FTS_TABLES = {
     "memory_recall_documents": "memory_recall_documents_identity_fts",
 }
-
-_LEXICAL_DATE_PATTERNS = (
-    re.compile(r"(?<!\d)\d{4}[-/.年]\d{1,2}[-/.月]\d{1,2}(?:日)?(?!\d)"),
-    re.compile(r"(?<!\d)\d{1,2}月\d{1,2}日?(?!\d)"),
-)
-
-
-def _lexical_index_text(identity_text: Any) -> str:
-    """Convert display identity text into deterministic FTS search tokens.
-
-    Recall documents keep the original ``identity_text`` for embeddings and
-    display. FTS receives a separate token stream so Chinese text can be
-    searched by words instead of relying on SQLite's default tokenizer.
-    Dates are excluded here because fact time is filtered through structured
-    time columns rather than lexical coincidence.
-    """
-    text_lines: List[str] = []
-    for line in str(identity_text or "").splitlines():
-        clean_line = line.strip()
-        colon_positions = [
-            position
-            for position in (clean_line.find(":"), clean_line.find("："))
-            if position >= 0
-        ]
-        if colon_positions:
-            # identity_text is formatted as one ``field: value`` per line.
-            # Index only the value so labels such as ``summary`` and
-            # ``entities`` do not become searchable memory content.
-            clean_line = clean_line[min(colon_positions) + 1 :].strip()
-        if clean_line:
-            text_lines.append(clean_line)
-    text = "\n".join(text_lines)
-    for pattern in _LEXICAL_DATE_PATTERNS:
-        text = pattern.sub(" ", text)
-    if not text.strip():
-        return ""
-
-    if jieba is not None:
-        # Search mode keeps useful sub-tokens for Chinese compounds while the
-        # regular cut preserves the complete domain phrase when available.
-        raw_tokens = [
-            *jieba.lcut(text, HMM=False),
-            *jieba.cut_for_search(text, HMM=False),
-        ]
-    else:
-        # Keep the database usable in minimal environments. This fallback is
-        # deliberately simple; production installs should include jieba.
-        raw_tokens = []
-        for match in re.findall(
-            r"[A-Za-z][A-Za-z0-9_.$'-]*|\d+(?:/\d+)?|[\u4e00-\u9fff]+",
-            text,
-        ):
-            if re.fullmatch(r"[\u4e00-\u9fff]+", match):
-                raw_tokens.append(match)
-                raw_tokens.extend(match)
-                raw_tokens.extend(
-                    match[index : index + 2]
-                    for index in range(len(match) - 1)
-                )
-            else:
-                raw_tokens.append(match)
-
-    tokens: List[str] = []
-    seen: set[str] = set()
-    for raw_token in raw_tokens:
-        token = re.sub(r"\s+", "", str(raw_token or "")).strip()
-        if not token or re.fullmatch(r"[^\w\u4e00-\u9fff]+", token):
-            continue
-        if token not in seen:
-            seen.add(token)
-            tokens.append(token)
-    return " ".join(tokens)
 
 
 def _coerce_reference_datetime(value: Any) -> datetime:
@@ -130,25 +55,12 @@ def _coerce_reference_datetime(value: Any) -> datetime:
     return dt
 
 
-def _embedding_to_blob(embedding: Optional[np.ndarray]) -> Optional[bytes]:
-    if embedding is None:
-        return None
-    vector = np.asarray(embedding, dtype=np.float32).reshape(-1)
-    return vector.tobytes()
-
-
-def _blob_to_embedding(value: Any) -> Optional[np.ndarray]:
-    if value is None:
-        return None
-    try:
-        vector = np.frombuffer(bytes(value), dtype=np.float32)
-    except Exception:
-        return None
-    return vector.reshape(1, -1).astype(np.float32)
-
-
-class UserMemoryDB:
+class UserMemoryDB(RecallDocumentStore):
     """SQLite facade for the current memory schema and its derived indexes."""
+
+    RECALL_DOCUMENT_TABLE = "memory_recall_documents"
+    EMBEDDING_PROFILE_TABLE = "memory_embedding_profile"
+    EXTRA_EMBEDDING_COLUMNS = (("memory_user_action_signals", "action_text_embedding"),)
 
     def __init__(self, db_path: Path | str) -> None:
         self.db_path = Path(db_path)
@@ -165,81 +77,10 @@ class UserMemoryDB:
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._init_schema()
 
-    def ensure_embedding_profile(self, signature: str) -> bool:
-        """Invalidate only derived vectors when the configured space changes.
-
-        Legacy vectors without a recorded profile are rebuilt once as their
-        generating model cannot be established safely.
-        """
-        with self.transaction():
-            self._conn.execute(
-                "CREATE TABLE IF NOT EXISTS memory_embedding_profile "
-                "(id INTEGER PRIMARY KEY CHECK(id=1), signature TEXT NOT NULL)"
-            )
-            row = self._conn.execute(
-                "SELECT signature FROM memory_embedding_profile WHERE id=1"
-            ).fetchone()
-            if row is not None and row["signature"] == signature:
-                return False
-            self._conn.execute("UPDATE memory_recall_documents SET identity_text_embedding=NULL")
-            self._conn.execute("UPDATE memory_user_action_signals SET action_text_embedding=NULL")
-            self._conn.execute(
-                "INSERT INTO memory_embedding_profile(id, signature) VALUES(1, ?) "
-                "ON CONFLICT(id) DO UPDATE SET signature=excluded.signature", (signature,),
-            )
-        return True
-
-    def recall_documents_needing_embeddings(self, *, after_id: int = 0, limit: int = 32):
-        return [dict(row) for row in self._conn.execute(
-            "SELECT id, identity_text FROM memory_recall_documents "
-            "WHERE id>? AND identity_text_embedding IS NULL AND trim(identity_text)!='' "
-            "ORDER BY id LIMIT ?", (after_id, limit),
-        ).fetchall()]
-
-    def set_recall_document_embeddings(self, embeddings) -> int:
-        """Fill vectors only while their requested text is still current."""
-        updated = 0
-        with self.transaction():
-            for document_id, identity_text, embedding in embeddings:
-                cursor = self._conn.execute(
-                    "UPDATE memory_recall_documents SET identity_text_embedding=? "
-                    "WHERE id=? AND identity_text=? AND identity_text_embedding IS NULL",
-                    (_embedding_to_blob(embedding), int(document_id), identity_text),
-                )
-                updated += cursor.rowcount
-        return updated
 
     def close(self) -> None:
         self._conn.close()
 
-    def open_reader(self) -> "UserMemoryDB":
-        """Open a query-only connection without running schema initialization."""
-        reader = object.__new__(UserMemoryDB)
-        reader.db_path = self.db_path
-        reader._conn = sqlite3.connect(
-            str(self.db_path),
-            check_same_thread=False,
-            timeout=30.0,
-        )
-        reader._conn.row_factory = sqlite3.Row
-        reader._transaction_depth = 0
-        reader._conn.execute("PRAGMA query_only=ON")
-        reader._conn.execute("PRAGMA foreign_keys=ON")
-        reader._conn.execute("PRAGMA busy_timeout=30000")
-        return reader
-
-    @contextmanager
-    def reader_transaction(self):
-        """Read one committed SQLite snapshot and close its connection."""
-        reader = self.open_reader()
-        try:
-            reader._conn.execute("BEGIN")
-            yield reader
-        finally:
-            try:
-                reader._conn.rollback()
-            finally:
-                reader.close()
 
     @contextmanager
     def transaction(self):
@@ -275,6 +116,7 @@ class UserMemoryDB:
                 "Observed-pattern evidence uses action signal IDs now; "
                 "back up the retired database and use a fresh path"
             )
+        self._init_recall_document_schema()
         self._conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS memory_user_activity_items (
@@ -365,27 +207,6 @@ class UserMemoryDB:
                 FOREIGN KEY(activity_id) REFERENCES memory_user_activity_items(id) ON DELETE CASCADE,
                 FOREIGN KEY(fact_id) REFERENCES memory_facts(id) ON DELETE CASCADE,
                 FOREIGN KEY(source_segment_id) REFERENCES memory_source_segments(id) ON DELETE CASCADE
-            );
-
-            CREATE TABLE IF NOT EXISTS memory_recall_documents (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                object_type TEXT NOT NULL,
-                object_id INTEGER NOT NULL,
-                title TEXT NOT NULL DEFAULT '',
-                summary TEXT NOT NULL DEFAULT '',
-                identity_text TEXT NOT NULL DEFAULT '',
-                identity_text_embedding BLOB,
-                entity_ids TEXT NOT NULL DEFAULT '[]',
-                topic_keys TEXT NOT NULL DEFAULT '[]',
-                time_start TEXT NOT NULL DEFAULT '',
-                time_end TEXT NOT NULL DEFAULT '',
-                status TEXT NOT NULL DEFAULT '',
-                confidence REAL NOT NULL DEFAULT 0.0,
-                importance REAL NOT NULL DEFAULT 0.0,
-                metadata TEXT NOT NULL DEFAULT '{}',
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                UNIQUE(object_type, object_id)
             );
 
             CREATE TABLE IF NOT EXISTS memory_entity_nodes (
@@ -609,11 +430,6 @@ class UserMemoryDB:
             CREATE INDEX IF NOT EXISTS idx_memory_facts_dialogue_time ON memory_facts(dialogue_time_key);
             CREATE INDEX IF NOT EXISTS idx_memory_recall_documents_object
             ON memory_recall_documents(object_type, object_id);
-            CREATE INDEX IF NOT EXISTS idx_memory_recall_documents_type_status_time
-            ON memory_recall_documents(object_type, status, time_end, updated_at);
-            CREATE INDEX IF NOT EXISTS idx_memory_recall_documents_pending_embeddings
-            ON memory_recall_documents(id)
-            WHERE identity_text_embedding IS NULL AND trim(identity_text)!='';
             CREATE INDEX IF NOT EXISTS idx_memory_source_segments_activity
             ON memory_source_segments(processed_for_user_activity, id);
             CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_source_mapping_fact_source
@@ -671,54 +487,8 @@ class UserMemoryDB:
         )
         # These tables belonged to the abandoned read-time user-state snapshot
         # prototype.  User states are now incrementally updated durable objects.
-        self._init_identity_fts()
         self._commit_if_needed()
 
-    def _init_identity_fts(self) -> None:
-        """Create and populate the tokenized BM25 index for recall documents."""
-        for source_table, fts_table in _IDENTITY_FTS_TABLES.items():
-            self._conn.execute(
-                f"""
-                CREATE VIRTUAL TABLE IF NOT EXISTS {fts_table} USING fts5(
-                    lexical_index_text
-                )
-                """
-            )
-            existing_ids = {
-                int(row["rowid"])
-                for row in self._conn.execute(
-                    f"SELECT rowid FROM {fts_table}"
-                ).fetchall()
-            }
-            source_rows = self._conn.execute(
-                f"SELECT id, identity_text FROM {source_table}"
-            ).fetchall()
-            for row in source_rows:
-                row_id = int(row["id"])
-                if row_id in existing_ids:
-                    continue
-                self._conn.execute(
-                    f"INSERT INTO {fts_table} (rowid, lexical_index_text) VALUES (?, ?)",
-                    (row_id, _lexical_index_text(row["identity_text"])),
-                )
-
-    def _sync_identity_fts(
-        self,
-        *,
-        source_table: str,
-        row_id: int,
-        identity_text: str,
-    ) -> None:
-        """Keep the tokenized BM25 document synchronized with its source row."""
-        fts_table = _IDENTITY_FTS_TABLES[source_table]
-        self._conn.execute(
-            f"DELETE FROM {fts_table} WHERE rowid = ?",
-            (int(row_id),),
-        )
-        self._conn.execute(
-            f"INSERT INTO {fts_table} (rowid, lexical_index_text) VALUES (?, ?)",
-            (int(row_id), _lexical_index_text(identity_text)),
-        )
 
     def upsert_memory_recall_document(
         self,
@@ -739,104 +509,24 @@ class UserMemoryDB:
         metadata: Optional[Dict[str, Any]] = None,
         reference_timestamp: Any = None,
     ) -> int:
-        """Create or refresh one derived retrieval document.
-
-        ``object_type`` and ``object_id`` identify the authoritative row in a
-        domain table. This projection deliberately has no foreign key because
-        it spans several source tables; callers own its lifecycle alongside
-        the corresponding source-object write. An unchanged identity keeps its
-        cached vector; changed text invalidates it unless a new vector is given.
-        """
-        normalized_type = str(object_type or "").strip().lower()
-        normalized_id = int(object_id or 0)
-        if not normalized_type or normalized_id <= 0:
-            raise ValueError("object_type and a positive object_id are required")
-        now = local_now_text() if reference_timestamp is None else normalize_reference_timestamp(reference_timestamp)
-        normalized_entity_ids = list(dict.fromkeys(
-            int(value)
-            for value in entity_ids or []
-            if str(value).strip().isdigit() and int(value) > 0
-        ))
-        normalized_topic_keys = list(dict.fromkeys(
-            str(value).strip()
-            for value in topic_keys or []
-            if str(value).strip()
-        ))
-        self._conn.execute(
-            """
-            INSERT INTO memory_recall_documents (
-                object_type, object_id, title, summary,
-                identity_text, identity_text_embedding, entity_ids, topic_keys,
-                time_start, time_end, status, confidence, importance, metadata,
-                created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(object_type, object_id) DO UPDATE SET
-                title = excluded.title,
-                summary = excluded.summary,
-                identity_text = excluded.identity_text,
-                identity_text_embedding = CASE
-                    WHEN memory_recall_documents.identity_text = excluded.identity_text
-                    THEN COALESCE(excluded.identity_text_embedding,
-                                  memory_recall_documents.identity_text_embedding)
-                    ELSE excluded.identity_text_embedding
-                END,
-                entity_ids = excluded.entity_ids,
-                topic_keys = excluded.topic_keys,
-                time_start = excluded.time_start,
-                time_end = excluded.time_end,
-                status = excluded.status,
-                confidence = excluded.confidence,
-                importance = excluded.importance,
-                metadata = excluded.metadata,
-                updated_at = excluded.updated_at
-            """,
-            (
-                normalized_type,
-                normalized_id,
-                str(title or ""),
-                str(summary or ""),
-                str(identity_text or ""),
-                _embedding_to_blob(identity_text_embedding),
-                json_dumps(normalized_entity_ids),
-                json_dumps(normalized_topic_keys),
-                str(time_start or ""),
-                str(time_end or ""),
-                str(status or ""),
-                float(confidence or 0.0),
-                float(importance or 0.0),
-                json_dumps(metadata or {}),
-                now,
-                now,
-            ),
+        """Write a memory projection through the shared recall-document store."""
+        return self.upsert_recall_document(
+            object_type=object_type,
+            object_id=object_id,
+            identity_text=identity_text,
+            identity_text_embedding=identity_text_embedding,
+            title=title,
+            summary=summary,
+            entity_ids=entity_ids,
+            topic_keys=topic_keys,
+            time_start=time_start,
+            time_end=time_end,
+            status=status,
+            confidence=confidence,
+            importance=importance,
+            metadata=metadata,
+            reference_timestamp=reference_timestamp,
         )
-        row = self._conn.execute(
-            """
-            SELECT id FROM memory_recall_documents
-            WHERE object_type = ? AND object_id = ?
-            """,
-            (normalized_type, normalized_id),
-        ).fetchone()
-        assert row is not None
-        document_id = int(row["id"])
-        self._sync_identity_fts(
-            source_table="memory_recall_documents",
-            row_id=document_id,
-            identity_text=str(identity_text or ""),
-        )
-        self._commit_if_needed()
-        return document_id
-
-    @staticmethod
-    def _terms_to_fts_query(terms: Sequence[str]) -> str:
-        quoted: List[str] = []
-        for term in terms or []:
-            clean = re.sub(r"\s+", " ", str(term or "").strip())
-            clean = clean.replace('"', '""')
-            if clean:
-                quoted.append(f'"{clean}"')
-            if len(quoted) >= 12:
-                break
-        return " OR ".join(quoted)
 
     @staticmethod
     def _normalize_search_terms(terms: Optional[Sequence[str]]) -> List[str]:
@@ -2622,19 +2312,7 @@ class UserMemoryDB:
             clauses.append("source.primary_domain = ?")
             params.append(filters["primary_domain"])
         if filters.get("time_start") or filters.get("time_end"):
-            reference = normalize_reference_timestamp(reference_timestamp or local_now_text())
-            default_zone = datetime.fromisoformat(reference).tzinfo
-
-            def timestamp(value: Any) -> Optional[float]:
-                if not value:
-                    return None
-                try:
-                    parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-                    return (parsed if parsed.tzinfo else parsed.replace(tzinfo=default_zone)).timestamp()
-                except (ValueError, TypeError, OverflowError):
-                    return None
-
-            self._conn.create_function("recall_timestamp", 1, timestamp, deterministic=True)
+            self._register_recall_timestamp(reference_timestamp)
             if object_type == "fact":
                 field = filters.get("time_field", "event_time")
                 columns = {"event_time": ["event_time_key"], "dialogue_time": ["dialogue_time_key"],
@@ -2661,30 +2339,10 @@ class UserMemoryDB:
                     params.append(filters["time_end"])
                 alternatives.append("(" + " AND ".join(bounds) + ")")
             clauses.append("(" + " OR ".join(alternatives) + ")")
-        table = tables[object_type]
-        joined = f"memory_recall_documents AS document JOIN {table} AS source ON source.id=document.object_id"
-        if embeddings_only:
-            clauses.append("document.identity_text_embedding IS NOT NULL")
-            rows = self._conn.execute(
-                f"SELECT document.* FROM {joined} WHERE {' AND '.join(clauses)} ORDER BY document.id", params,
-            ).fetchall()
-        elif terms:
-            fts = _IDENTITY_FTS_TABLES["memory_recall_documents"]
-            match_query = self._terms_to_fts_query(self._normalize_search_terms(terms))
-            if not match_query:
-                return []
-            rows = self._conn.execute(
-                f"SELECT document.* FROM {joined} JOIN {fts} ON {fts}.rowid=document.id "
-                f"WHERE {' AND '.join(clauses)} AND {fts} MATCH ? "
-                f"ORDER BY bm25({fts}),document.updated_at DESC,document.id DESC LIMIT ?",
-                [*params, match_query, max(1, int(limit))],
-            ).fetchall()
-        else:
-            rows = self._conn.execute(
-                f"SELECT document.* FROM {joined} WHERE {' AND '.join(clauses)} "
-                "ORDER BY document.updated_at DESC,document.id DESC LIMIT ?", [*params, max(1, int(limit))],
-            ).fetchall()
-        return [self._row_to_dict(row) for row in rows]
+        return self._query_recall_documents(
+            source_table=tables[object_type], clauses=clauses, params=params,
+            terms=terms, limit=limit, embeddings_only=embeddings_only,
+        )
 
     def get_intent_ids_created_from_facts(self, fact_ids: Sequence[int]) -> List[int]:
         """Find intents whose creation evidence includes any supplied fact."""

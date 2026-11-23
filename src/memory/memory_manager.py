@@ -35,6 +35,7 @@ except ImportError:  # pragma: no cover - exercised only in minimal installs
     jieba = None
 
 from embedding_client import EmbeddingClient
+from recall_embeddings import RecallEmbeddingIndexer
 from llm_client import LLMClient
 from intent_lifecycle import (
     USER_INTENT_FIELDS,
@@ -189,6 +190,7 @@ class MemoryNodeManager:
             2, int(self._memory_cfg.get("user_observed_pattern_min_activities") or 2),
         )
         self._embedding_client: Optional[EmbeddingClient] = None
+        self._recall_embedding_indexer: Optional[RecallEmbeddingIndexer] = None
         self._user_thread_updater = UserThreadUpdater(
             memory_db=self._db, llm_client=self._llm_client,
             resolve_language=self._resolve_prompt_language_from_text,
@@ -265,67 +267,23 @@ class MemoryNodeManager:
         return self._embedding_client
 
     def initialize_embedding_cache(self) -> None:
-        """Invalidate incompatible caches before readers and workers start."""
-        self._ensure_embedding_client()
-        client = self._embedding_client
-        if not isinstance(client, EmbeddingClient) or not isinstance(self._db, UserMemoryDB):
-            return
-        changed = self._db.ensure_embedding_profile(client.model_signature)
-        self._logger.info("PWM embedding cache profile_changed=%s", changed)
-        if self._db.recall_documents_needing_embeddings(limit=1):
+        """Invalidate incompatible profiles before readers and workers start."""
+        if self._get_recall_embedding_indexer().initialize():
             self._task_scheduler.submit("memory_embedding_cache_refresh", {"force": True})
 
-    def _generate_memory_recall_document_embeddings(
-        self, *, force: bool = False,
-    ) -> Dict[str, Any]:
-        """Batch-fill committed documents across types, leaving short tails pending.
+    def _generate_memory_recall_document_embeddings(self, *, force: bool = False) -> Dict[str, Any]:
+        return self._get_recall_embedding_indexer().generate(force=force)
 
-        Each missing document is attempted at most once per invocation. Failed
-        vectors remain NULL for later refreshes without replaying domain tasks.
-        """
-        if self._db._conn.in_transaction:
-            raise RuntimeError("Recall embeddings must be generated outside a write transaction")
-        if not self._embedding_cfg.get("enabled", True):
-            return {"status": "empty", "reason": "embedding_disabled", "rebuilt": 0}
-        self._ensure_embedding_client()
-        client = self._embedding_client
-        after_id = 0
-        requested = 0
-        rebuilt = 0
-        failed = 0
-        started_at = time.monotonic()
-        while True:
-            rows = self._db.recall_documents_needing_embeddings(
-                after_id=after_id, limit=client.batch_size,
+    def set_recall_embedding_indexer(self, indexer: RecallEmbeddingIndexer) -> None:
+        self._recall_embedding_indexer = indexer
+
+    def _get_recall_embedding_indexer(self) -> RecallEmbeddingIndexer:
+        if self._recall_embedding_indexer is None:
+            self._recall_embedding_indexer = RecallEmbeddingIndexer(
+                databases=[self._db], client_provider=self.get_embedding_client,
+                enabled=self._embedding_cfg.get("enabled", True), logger=self._logger,
             )
-            if not rows or (not force and len(rows) < client.batch_size):
-                break
-            requested += len(rows)
-            try:
-                vectors = client.embed_batch([row["identity_text"] for row in rows])
-                if len(vectors) != len(rows):
-                    raise ValueError("Recall embedding batch result length mismatch")
-            except Exception:
-                self._logger.warning("Recall document batch embedding failed", exc_info=True)
-                vectors = [None] * len(rows)
-            updates = [
-                (row["id"], row["identity_text"], vector)
-                for row, vector in zip(rows, vectors) if vector is not None
-            ]
-            failed += len(rows) - len(updates)
-            if updates:
-                rebuilt += self._db.set_recall_document_embeddings(updates)
-            after_id = rows[-1]["id"]
-        pending = bool(self._db.recall_documents_needing_embeddings(limit=1))
-        report = {
-            "status": "partial" if failed else ("ok" if requested else "empty"),
-            "force": force, "requested_count": requested, "rebuilt": rebuilt,
-            "missing_count": failed, "has_pending": pending,
-            "batch_size": client.batch_size,
-            "elapsed_ms": round((time.monotonic() - started_at) * 1000, 2),
-        }
-        self._logger.log_json_format("memory_recall_document_embeddings", "finish", report)
-        return report
+        return self._recall_embedding_indexer
 
     def _process_memory_user_thread_update_task(
         self, *, activity_ids: List[int], reference_timestamp: Any = None,

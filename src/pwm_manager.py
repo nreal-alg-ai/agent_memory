@@ -14,6 +14,7 @@ from memory.memory_database import UserMemoryDB
 from memory.memory_manager import MemoryNodeManager
 from memory.memory_runtime import MemoryRuntime
 from memory_recall import MemoryRecall
+from recall_embeddings import RecallEmbeddingIndexer
 from task_scheduler import TaskOperationReporter, TaskScheduler
 from user_model.user_model_database import UserModelDB
 from user_model.user_prediction import UserPrediction
@@ -92,8 +93,16 @@ class PersonWorldModel:
                 logger=self._logging_manager.get_logger("memory_runtime"),
                 memory_manager_logger=self._logging_manager.get_logger("memory_manager"),
             )
+            self._recall_embedding_indexer = RecallEmbeddingIndexer(
+                databases=[self._user_memory_database, self._user_model_database],
+                client_provider=self._memory_runtime.manager.get_embedding_client,
+                enabled=embedding_config.get("enabled", True),
+                logger=self._logging_manager.get_logger("recall_embeddings"),
+            )
+            self._memory_runtime.manager.set_recall_embedding_indexer(self._recall_embedding_indexer)
             self._memory_recall = MemoryRecall(
                 memory_db=self._user_memory_database, llm_client=self._llm_client,
+                model_db=self._user_model_database,
                 embedding_client=(self._memory_runtime.manager.get_embedding_client()
                                   if embedding_config.get("enabled", True) else None),
                 config=manager_config.get("recall"),
@@ -108,6 +117,7 @@ class PersonWorldModel:
                 task_scheduler=self._task_scheduler,
                 llm_client=self._llm_client,
                 user_state_config=user_state_config,
+                recall_embedding_indexer=self._recall_embedding_indexer,
                 world_owner_entity_name=(
                     self._memory_runtime.manager.world_owner_entity_name
                 ),

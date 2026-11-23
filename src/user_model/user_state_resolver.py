@@ -14,6 +14,8 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Sequence
 
 from semantic_domains import SEMANTIC_DOMAINS
+from .user_state_schema import USER_STATE_TYPES, USER_STATE_KINDS_BY_TYPE
+from recall_embeddings import RecallEmbeddingIndexer
 from storage_utils import local_now_text
 from prompts_en import (
     USER_STATE_UPDATE_FROM_USER_THREAD_PROMPT_EN,
@@ -38,38 +40,9 @@ class UserStateResolver:
 
     RESOLVER_VERSION = "user_state_incremental_v1"
     FACT_RESOLVER_VERSION = "fact_claim_signal_state_v1"
-    STATE_TYPES = {"enduring_state", "recurring_state", "situational_state"}
+    STATE_TYPES = USER_STATE_TYPES
     STATE_DOMAINS = SEMANTIC_DOMAINS
-    STATE_KINDS_BY_TYPE = {
-        "enduring_state": {
-            "communication_style",
-            "decision_style",
-            "value_priority",
-            "risk_preference",
-            "privacy_preference",
-            "time_preference",
-            "work_style",
-            "lifestyle_preference",
-            "long_term_constraint",
-        },
-        "recurring_state": {
-            "daily_routine",
-            "weekly_routine",
-            "work_routine",
-            "health_routine",
-            "social_routine",
-            "conditional_behavior",
-        },
-        "situational_state": {
-            "current_focus",
-            "current_constraint",
-            "current_availability",
-            "current_energy",
-            "current_stress",
-            "current_social_engagement",
-            "current_preparation",
-        },
-    }
+    STATE_KINDS_BY_TYPE = USER_STATE_KINDS_BY_TYPE
     OPERATIONS = {"create", "reinforce", "revise", "weaken", "expire"}
     EVIDENCE_TYPES = {
         "user_intent", "user_activity", "fact",
@@ -90,11 +63,13 @@ class UserStateResolver:
         llm_client: "LLMClient",
         user_state_config: Optional[Mapping[str, Any]] = None,
         world_owner_entity_name: str = "用户本人",
+        recall_embedding_indexer: Optional[RecallEmbeddingIndexer] = None,
         logger: Optional[logging.Logger] = None,
     ) -> None:
         self._user_memory_db = memory_db
         self._user_model_db = model_db
         self._llm_client = llm_client
+        self._recall_embedding_indexer = recall_embedding_indexer
         self._world_owner_entity_name = str(world_owner_entity_name or "用户本人").strip()
         self._logger = logger or logging.getLogger(__name__)
         self._world_owner_entity_id = int(self._user_memory_db.add_entity_names(
@@ -452,6 +427,7 @@ class UserStateResolver:
                         decision_source="user_thread_situational_state_v1",
                         reference_timestamp=reference_timestamp,
                     ))
+        self._refresh_recall_embeddings(report)
         self._log_update(report, task_kind=task_kind)
         return report
 
@@ -626,6 +602,7 @@ class UserStateResolver:
             "error" if failed == len(domains) and domains
             else "partial" if failed else "ok" if domains else "empty"
         )
+        self._refresh_recall_embeddings(report)
         self._log_update(report, task_kind=self.USER_STATE_UPDATE_FROM_USER_OBSERVED_PATTERNS_TASK_KIND)
         return report
 
@@ -1105,8 +1082,33 @@ class UserStateResolver:
             report["status"] = "partial" if report["_completed_signal_ids"] else "error"
         elif selected_ids:
             report["status"] = "ok" if report["operation_count"] else "empty"
+        self._refresh_recall_embeddings(report)
         self._log_update(report, task_kind=self.USER_STATE_UPDATE_FROM_CLAIM_SIGNALS_TASK_KIND)
         return report
+
+    def _upsert_user_states_into_recall_document_table(
+        self, state_ids: Sequence[int], *, reference_timestamp: Any = None,
+    ) -> None:
+        """Index the final persisted state, including weakened and expired rows."""
+        for state in self._user_model_db.get_user_states_by_ids(state_ids):
+            lines = [f"state: {state['state_text']}"]
+            if state["conditions"]:
+                lines.append("conditions: " + json.dumps(
+                    state["conditions"], ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+                ))
+            self._user_model_db.upsert_recall_document(
+                object_type="user_state", object_id=state["id"], identity_text="\n".join(lines),
+                title=state["state_topic"], summary=state["state_text"],
+                entity_ids=[self._world_owner_entity_id], status=state["status"], confidence=state["confidence"],
+                time_start=state["valid_from"], time_end=state["valid_to"],
+                metadata={"projection_version": "v1", **{key: state[key] for key in (
+                    "state_domain", "state_type", "state_kind", "state_topic",
+                )}}, reference_timestamp=reference_timestamp,
+            )
+
+    def _refresh_recall_embeddings(self, report: Mapping[str, Any]) -> None:
+        if report.get("state_ids") and self._recall_embedding_indexer is not None:
+            self._recall_embedding_indexer.generate()
 
     def save_user_state_update_operations(
         self,
@@ -1128,89 +1130,93 @@ class UserStateResolver:
             "expired": 0,
             "state_ids": [],
         }
-        for operation in operations:
-            action = str(operation.get("operation") or "")
-            target_id = int(operation.get("target_state_id") or 0)
-            previous_fact_evidence = (
-                self._user_model_db.get_user_state_evidence_items(
-                    [target_id], evidence_type="fact", limit=None,
+        with self._user_model_db.transaction():
+            for operation in operations:
+                action = str(operation.get("operation") or "")
+                target_id = int(operation.get("target_state_id") or 0)
+                previous_fact_evidence = (
+                    self._user_model_db.get_user_state_evidence_items(
+                        [target_id], evidence_type="fact", limit=None,
+                    )
+                    if merge_fact_evidence and target_id else []
                 )
-                if merge_fact_evidence and target_id else []
-            )
-            state_id, created, previous = self._user_model_db.upsert_user_state(
-                target_state_id=target_id or None,
-                state_domain=str(operation["state_domain"]),
-                state_type=str(operation["state_type"]),
-                state_kind=str(operation["state_kind"]),
-                state_topic=str(operation["state_topic"]),
-                state_text=str(operation["state_text"]),
-                status=str(operation["status"]),
-                confidence=float(operation["confidence"]),
-                conditions=dict(operation.get("conditions") or {}),
-                valid_from=str(operation.get("valid_from") or ""),
-                valid_to=str(operation.get("valid_to") or ""),
-                last_observed_at=effective_at,
-                metadata={
-                    "resolver_version": decision_source or self.RESOLVER_VERSION,
-                    "last_operation": action,
-                    "state_domain": str(operation["state_domain"]),
-                },
-                reference_timestamp=reference_timestamp,
-            )
-            current = self._user_model_db.get_user_states_by_ids([state_id])[0]
-            evidence = [
-                {**item, "state_id": state_id, "observed_at": effective_at}
-                for item in operation.get("evidence") or []
-            ]
-            if merge_fact_evidence:
-                fact_evidence = self._merge_fact_state_evidence(
-                    previous_fact_evidence, evidence,
-                )
-                self._user_model_db.replace_user_state_fact_evidence(
-                    state_id=state_id, evidence=fact_evidence,
+                state_id, created, previous = self._user_model_db.upsert_user_state(
+                    target_state_id=target_id or None,
+                    state_domain=str(operation["state_domain"]),
+                    state_type=str(operation["state_type"]),
+                    state_kind=str(operation["state_kind"]),
+                    state_topic=str(operation["state_topic"]),
+                    state_text=str(operation["state_text"]),
+                    status=str(operation["status"]),
+                    confidence=float(operation["confidence"]),
+                    conditions=dict(operation.get("conditions") or {}),
+                    valid_from=str(operation.get("valid_from") or ""),
+                    valid_to=str(operation.get("valid_to") or ""),
+                    last_observed_at=effective_at,
+                    metadata={
+                        "resolver_version": decision_source or self.RESOLVER_VERSION,
+                        "last_operation": action,
+                        "state_domain": str(operation["state_domain"]),
+                    },
                     reference_timestamp=reference_timestamp,
                 )
-            else:
-                self._user_model_db.upsert_user_state_evidence(evidence, reference_timestamp=reference_timestamp)
-            self._user_model_db.record_user_state_event(
-                state_id=state_id,
-                operation=action,
-                previous_payload={
-                    **(previous or {}),
-                    "fact_evidence": previous_fact_evidence,
-                } if merge_fact_evidence else previous or {},
-                new_payload={
-                    **current,
-                    "fact_evidence": fact_evidence,
-                } if merge_fact_evidence else {**current, "evidence": evidence},
-                trigger_fact_ids=[
-                    item["evidence_id"] for item in evidence
-                    if item["evidence_type"] == "fact"
-                ],
-                trigger_intent_objects=[
-                    {"object_type": item["evidence_type"], "object_id": item["evidence_id"]}
-                    for item in evidence
-                    if item["evidence_type"] in {"user_intent"}
-                ],
-                effective_at=effective_at,
-                decision_source=decision_source or self.RESOLVER_VERSION,
-                confidence=float(operation["confidence"]),
-                reason=str(operation.get("reason") or ""),
-                reference_timestamp=reference_timestamp,
+                current = self._user_model_db.get_user_states_by_ids([state_id])[0]
+                evidence = [
+                    {**item, "state_id": state_id, "observed_at": effective_at}
+                    for item in operation.get("evidence") or []
+                ]
+                if merge_fact_evidence:
+                    fact_evidence = self._merge_fact_state_evidence(
+                        previous_fact_evidence, evidence,
+                    )
+                    self._user_model_db.replace_user_state_fact_evidence(
+                        state_id=state_id, evidence=fact_evidence,
+                        reference_timestamp=reference_timestamp,
+                    )
+                else:
+                    self._user_model_db.upsert_user_state_evidence(evidence, reference_timestamp=reference_timestamp)
+                self._user_model_db.record_user_state_event(
+                    state_id=state_id,
+                    operation=action,
+                    previous_payload={
+                        **(previous or {}),
+                        "fact_evidence": previous_fact_evidence,
+                    } if merge_fact_evidence else previous or {},
+                    new_payload={
+                        **current,
+                        "fact_evidence": fact_evidence,
+                    } if merge_fact_evidence else {**current, "evidence": evidence},
+                    trigger_fact_ids=[
+                        item["evidence_id"] for item in evidence
+                        if item["evidence_type"] == "fact"
+                    ],
+                    trigger_intent_objects=[
+                        {"object_type": item["evidence_type"], "object_id": item["evidence_id"]}
+                        for item in evidence
+                        if item["evidence_type"] in {"user_intent"}
+                    ],
+                    effective_at=effective_at,
+                    decision_source=decision_source or self.RESOLVER_VERSION,
+                    confidence=float(operation["confidence"]),
+                    reason=str(operation.get("reason") or ""),
+                    reference_timestamp=reference_timestamp,
+                )
+                report["operation_count"] += 1
+                report["state_ids"].append(state_id)
+                if created:
+                    report["created"] += 1
+                elif action == "reinforce":
+                    report["reinforced"] += 1
+                elif action == "revise":
+                    report["revised"] += 1
+                elif action == "weaken":
+                    report["weakened"] += 1
+                elif action == "expire":
+                    report["expired"] += 1
+            report["state_ids"] = sorted(set(report["state_ids"]))
+            self._upsert_user_states_into_recall_document_table(
+                report["state_ids"], reference_timestamp=reference_timestamp,
             )
-            report["operation_count"] += 1
-            report["state_ids"].append(state_id)
-            if created:
-                report["created"] += 1
-            elif action == "reinforce":
-                report["reinforced"] += 1
-            elif action == "revise":
-                report["revised"] += 1
-            elif action == "weaken":
-                report["weakened"] += 1
-            elif action == "expire":
-                report["expired"] += 1
-        report["state_ids"] = sorted(set(report["state_ids"]))
         return report
 
     @staticmethod

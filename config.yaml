@@ -155,6 +155,8 @@ personal_world_model:
         level: DEBUG  # 暂时启用 intent normalization 字段级诊断
       memory_recall:
         filename: memory_recall.log
+      recall_embeddings:
+        filename: recall_embeddings.log
       user_state:
         filename: user_state.log
       user_prediction:

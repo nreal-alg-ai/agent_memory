@@ -47,7 +47,10 @@ The MCP server exposes three tools:
 - `trigger_memory_recall`: searches the latest committed memory snapshot using
   a `query`, with optional recent-dialogue `context`, evaluation clock
   `reference_timestamp`, and `tags`. One LLM call plans which direct types to
-  retrieve: `fact`, `user_activity`, `user_intent`, or `user_observed_pattern`.
+  retrieve: `fact`, `user_activity`, `user_intent`, `user_observed_pattern`, or
+  `user_state`. States use `user_model.db`'s local `recall_documents` index;
+  the other types use `memory.db`. By default, state retrieval selects
+  active/weakened states whose known validity bounds cover the evaluation time.
   The response contains `memory_context`, bounded direct `items`, the validated
   `retrieval_plan`, status, and timing. It does not expand supporting evidence.
 

@@ -74,7 +74,7 @@ class PWMLoggingManager:
     """Create module loggers without changing root or application-owned handlers."""
 
     MODULES = (
-        "pwm", "memory_runtime", "memory_manager", "memory_recall", "user_state",
+        "pwm", "memory_runtime", "memory_manager", "memory_recall", "recall_embeddings", "user_state",
         "user_prediction", "user_proactive_service", "task_scheduler", "llm_client",
     )
 

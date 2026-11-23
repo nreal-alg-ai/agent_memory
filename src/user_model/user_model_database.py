@@ -12,9 +12,11 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from storage_utils import local_now_text, normalize_reference_timestamp, json_dumps, json_loads
+from recall_document_store import RecallDocumentStore
+from .user_state_schema import USER_STATE_STATUSES
 
 
-class UserModelDB:
+class UserModelDB(RecallDocumentStore):
     """Own user-state and prediction projections, separately from memory.db."""
 
     def __init__(self, db_path: Path | str) -> None:
@@ -58,6 +60,7 @@ class UserModelDB:
         return dict(row)
 
     def _init_schema(self) -> None:
+        self._init_recall_document_schema()
         self._conn.executescript("""
             CREATE TABLE IF NOT EXISTS user_states (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -77,6 +80,10 @@ class UserModelDB:
                 updated_at TEXT NOT NULL,
                 UNIQUE(state_domain, state_type, state_kind, state_topic)
             );
+            CREATE TRIGGER IF NOT EXISTS delete_user_state_recall_document
+            AFTER DELETE ON user_states BEGIN
+                DELETE FROM recall_documents WHERE object_type='user_state' AND object_id=OLD.id;
+            END;
             CREATE TABLE IF NOT EXISTS user_state_evidence (
                 state_id INTEGER NOT NULL,
                 evidence_type TEXT NOT NULL,
@@ -783,6 +790,37 @@ class UserModelDB:
                 [status, str(reason), evaluation_time, evaluation_time, *params],
             )
         return [int(row["id"]) for row in rows]
+
+    def retrieve_recall_documents(
+        self, *, object_type: str, filters: Dict[str, Any], terms: Sequence[str] = (),
+        limit: int = 40, embeddings_only: bool = False, reference_timestamp: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Retrieve latest state rows, with authoritative identity/status and validity filters."""
+        if object_type != "user_state" or set(filters) - {"state_domain", "state_type", "state_kind", "statuses"}:
+            raise ValueError("Unsupported user-model recall type or filter")
+        statuses = filters.get("statuses", ["active", "weakened"])
+        if (not isinstance(statuses, list) or not statuses
+                or any(not isinstance(s, str) or s not in USER_STATE_STATUSES for s in statuses)):
+            raise ValueError("Invalid state recall statuses")
+        clauses = ["document.object_type='user_state'", "source.status IN (" + ",".join("?" for _ in statuses) + ")"]
+        params = list(statuses)
+        for key in ("state_domain", "state_type", "state_kind"):
+            if key in filters:
+                clauses.append(f"source.{key}=?")
+                params.append(filters[key])
+        reference = normalize_reference_timestamp(reference_timestamp or local_now_text())
+        self._register_recall_timestamp(reference)
+        # An explicit expired-state query can inspect its last stored form.
+        # Active/weakened rows with known bounds must be valid at evaluation.
+        # Unknown/unparseable bounds remain unknown, rather than invented dates.
+        clauses.append("(source.status='expired' OR ("
+                       "COALESCE(recall_timestamp(source.valid_from),-1e20)<=recall_timestamp(?) AND "
+                       "COALESCE(recall_timestamp(source.valid_to),1e20)>recall_timestamp(?)))")
+        params.extend([reference, reference])
+        return self._query_recall_documents(
+            source_table="user_states", clauses=clauses, params=params, terms=terms,
+            limit=limit, embeddings_only=embeddings_only,
+        )
 
     def get_user_states(
         self,

@@ -1740,7 +1740,15 @@ RECALL_QUERY_ANALYSIS_PROMPT_ZH = """目标：结合短期对话 context、当�
    - 适用问题：用户本人通常采取什么行为、在什么条件下重复做出某种选择。
    - 允许的 filters：只有 primary_domain，不按行为证据时间限制规律本身。
 
-primary_domain 仅用于 user_intent 和 user_observed_pattern，取 general|health|work|life|information|finance|family|learning|social|interest|travel。仅当范围明确时使用，避免把不确定的领域猜测变成硬过滤。
+5. user_state
+   - 含义：系统依据证据维护的、关于用户本人稳定倾向、重复行为和当前个人处境的最新状态判断，不是具体事项或谈话内容的完整汇总。必须保留其适用范围与不确定性。
+   - 核心字段：state_text 为状态正文；conditions 为适用条件；state_domain、state_type、state_kind、state_topic 标识状态身份；status 和 confidence 描述有效状态及置信度；valid_from/valid_to 为适用时间，last_observed_at 为最近观察时间，不能混同。
+   - 适用问题：当前有效的用户画像、沟通或决策倾向、生活习惯、个人约束、近期关注或准备状态。询问从行为中归纳出的具体规律时可选择 user_observed_pattern；询问具体发生或讨论了什么时选择 fact 或 user_activity，不把最新 state 当作某个过去时点的完整快照。
+   - 允许的 filters：state_domain、state_type、state_kind、statuses。state_type 取 enduring_state、recurring_state、situational_state。
+   - state_kind 随 state_type 选择：enduring_state 使用 communication_style、decision_style、value_priority、risk_preference、privacy_preference、time_preference、work_style、lifestyle_preference、long_term_constraint；recurring_state 使用 daily_routine、weekly_routine、work_routine、health_routine、social_routine、conditional_behavior；situational_state 使用 current_focus、current_constraint、current_availability、current_energy、current_stress、current_social_engagement、current_preparation。没有明确匹配时省略 state_kind，不编造其他值。
+   - statuses 取 active、weakened、expired。默认检索 active 和 weakened，保留真实状态与置信度；只有明确询问已失效状态时才加入 expired。系统使用 reference_timestamp 检查 active/weakened 状态已知的有效时间，未知时间不编造；不需要为 state 输出 time_start/time_end 或 time_field。
+
+primary_domain 仅用于 user_intent 和 user_observed_pattern，state_domain 仅用于 user_state；两者均取 general|health|work|life|information|finance|family|learning|social|interest|travel。仅当范围明确时使用，避免把不确定的领域猜测变成硬过滤。
 
 三、检索计划生成规则
 1. 先结合 context 明确 query 的实际需求，再根据上述数据含义选择真正需要的类型。不强制检索 fact，不对所有类型默认宽检索；必要时可选择多个类型。
@@ -1754,7 +1762,7 @@ primary_domain 仅用于 user_intent 和 user_observed_pattern，取 general|hea
 - 只返回 JSON，顶层只包含 resolved_query 和 requests。
 - resolved_query：忠实表达结合必要背景补全后的 query，不扩展为 context 中的其他话题。
 - requests：最多 8 个 request，顺序表示希望优先呈现的类型；无需个人记忆时允许为空列表。
-- 每个 request 只包含 data_type、search_query、filters。data_type 只能是上述四类，search_query 和 filters 遵循前面的规则。
+- 每个 request 只包含 data_type、search_query、filters。data_type 只能是上述五类，search_query 和 filters 遵循前面的规则。
 - 不提供对象 ID、排序分数或额外字段，不输出 SQL、工具调用或证据扩展要求。
 下例仅展示结构，不是当前用户的查询条件：
 {

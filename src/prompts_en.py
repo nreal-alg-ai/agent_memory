@@ -1703,7 +1703,15 @@ The following describes the available data catalog; it does not mean concrete me
    - Suitable questions: which actions user self usually takes, or under which conditions user self repeatedly makes a particular choice.
    - Allowed filters: primary_domain only; do not filter a pattern by its supporting actions' event dates.
 
-primary_domain applies only to user_intent and user_observed_pattern: general|health|work|life|information|finance|family|learning|social|interest|travel. Use it only when scope is clear; do not convert uncertain domain guesses into hard filters.
+5. user_state
+   - Meaning: the latest evidence-based judgment maintained about user self's stable tendencies, recurring behavior, or current personal circumstances, not a comprehensive summary of matters or conversations. Preserve applicability and uncertainty.
+   - Core fields: state_text states the judgment; conditions qualifies applicability; state_domain, state_type, state_kind, and state_topic identify the state; status and confidence describe its validity status and confidence; valid_from/valid_to describe applicability time, whereas last_observed_at is observation time. Do not conflate these times.
+   - Suitable questions: the currently effective personal profile, communication or decision tendencies, routines, personal constraints, or recent focus/preparation. Select user_observed_pattern for a concrete pattern inferred from behavior; select fact or user_activity for specific events or discussions. The latest state is not a complete snapshot of an arbitrary historical instant.
+   - Allowed filters: state_domain, state_type, state_kind, statuses. state_type is enduring_state, recurring_state, or situational_state.
+   - Select state_kind according to state_type: enduring_state allows communication_style, decision_style, value_priority, risk_preference, privacy_preference, time_preference, work_style, lifestyle_preference, long_term_constraint; recurring_state allows daily_routine, weekly_routine, work_routine, health_routine, social_routine, conditional_behavior; situational_state allows current_focus, current_constraint, current_availability, current_energy, current_stress, current_social_engagement, current_preparation. Omit state_kind when no clear match exists; do not invent values.
+   - statuses is active, weakened, or expired. Retrieval defaults to active and weakened, retaining actual status and confidence; include expired only when explicitly requested. The system checks known applicability bounds of active/weakened states against reference_timestamp, without inventing unknown times. Do not output time_start/time_end or time_field for states.
+
+primary_domain applies only to user_intent and user_observed_pattern; state_domain applies only to user_state. Both use general|health|work|life|information|finance|family|learning|social|interest|travel. Use them only when scope is clear; do not convert uncertain domain guesses into hard filters.
 
 3. Retrieval planning rules
 1. First resolve the actual query need using context, then select necessary types according to the meanings above. Do not always include fact or search all types; multiple types are allowed when necessary.
@@ -1717,7 +1725,7 @@ primary_domain applies only to user_intent and user_observed_pattern: general|he
 - Return JSON only, with exactly resolved_query and requests at the top level.
 - resolved_query: faithfully express the query resolved with necessary background, without expanding into other context topics.
 - requests: at most 8 requests, ordered by preferred type presentation. An empty list is allowed when no personal memory is needed.
-- Each request contains exactly data_type, search_query, and filters. data_type must be one of the four types above; search_query and filters follow the preceding rules.
+- Each request contains exactly data_type, search_query, and filters. data_type must be one of the five types above; search_query and filters follow the preceding rules.
 - Do not output object IDs, ranking scores, extra fields, SQL, tool calls, or evidence-expansion instructions.
 This example illustrates structure, not the current query's conditions:
 {
