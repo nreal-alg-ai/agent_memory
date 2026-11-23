@@ -166,30 +166,6 @@ def parse_args() -> argparse.Namespace:
         help="Recall traversal budget passed to the memory runtime.",
     )
     parser.add_argument(
-        "--recall-mode",
-        default=None,
-        choices=["stage1", "stage2", "normal"],
-        help="Recall path passed to the memory runtime.",
-    )
-    parser.add_argument(
-        "--recall-gate-mode",
-        default="force",
-        choices=["auto", "force"],
-        help=(
-            "Recall gate behavior passed to MemoryNodeManager. "
-            "'auto' uses gate analysis; 'force' always attempts recall. Defaults to config.yaml."
-        ),
-    )
-    parser.add_argument(
-        "--recall-memory-source",
-        action="append",
-        choices=["assistant_wakeup", "allday_recording"],
-        help=(
-            "Force memory recall to search the specified memory source. "
-            "Can be passed multiple times. When omitted, recall uses LLM source analysis."
-        ),
-    )
-    parser.add_argument(
         "--enable-feedback-analysis",
         action="store_true",
         help=(
@@ -347,9 +323,6 @@ def resolve_llm_args(args: argparse.Namespace) -> None:
     )
     args.recall_top_k = args.recall_top_k or int(
         recall_config.get("recall_top_k") or 8
-    )
-    args.recall_mode = args.recall_mode or str(
-        recall_config.get("recall_mode") or "normal"
     )
 
     args.reader_model = (
@@ -606,9 +579,6 @@ def prepare_runtime_configs(
     )
     recall_config["recall_budget"] = str(
         args.recall_budget or recall_config.get("recall_budget") or "mid"
-    )
-    recall_config["recall_mode"] = str(
-        args.recall_mode or recall_config.get("recall_mode") or "normal"
     )
     memory_input_config = memory_runtime_config.setdefault(
         "memory_context_manager",
@@ -1149,7 +1119,7 @@ def build_instance_memory_context(
             counts = db_counts(db)
             recall_report = pwm.trigger_memory_recall(
                 question,
-                time_end=effective_question_date_text,
+                reference_timestamp=effective_question_date_text,
             )
             memory_context = str(recall_report.get("memory_context") or "")
             memory_operation_report = operation_reporter.snapshot()
@@ -1199,13 +1169,8 @@ def build_instance_memory_context(
                 "db_counts": counts,
                 "recall_context_chars": len(memory_context or ""),
                 "recall_context": memory_context,
-                "recall_memory_source_override": list(args.recall_memory_source or []),
-                "recall_mode": str(args.recall_mode),
-                "requested_recall_mode": str(
-                    recall_report.get("requested_recall_mode") or args.recall_mode
-                ),
-                "actual_recall_mode": str(
-                    recall_report.get("actual_recall_mode") or "unknown"
+                "retrieval_strategy": str(
+                    recall_report.get("retrieval_strategy") or "unknown"
                 ),
                 "recall_status": str(
                     recall_report.get("status")
@@ -1571,7 +1536,6 @@ def main() -> int:
         "workers": workers,
         "recall_top_k": args.recall_top_k,
         "recall_budget": args.recall_budget,
-        "recall_memory_source_override": list(args.recall_memory_source or []),
         "feedback_analysis_enabled": args.enable_feedback_analysis,
         "fact_extraction_interval": args.fact_extraction_interval,
     }

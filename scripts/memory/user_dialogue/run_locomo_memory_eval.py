@@ -109,17 +109,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--recall-top-k", type=int, default=None)
     parser.add_argument("--recall-budget", choices=("low", "mid", "high"), default=None)
     parser.add_argument(
-        "--recall-mode", choices=("stage1", "stage2", "normal"), default=None
-    )
-    parser.add_argument(
-        "--recall-gate-mode", choices=("auto", "force"), default=None
-    )
-    parser.add_argument(
-        "--recall-memory-source",
-        action="append",
-        choices=("assistant_wakeup", "allday_recording"),
-    )
-    parser.add_argument(
         "--fact-extraction-interval",
         type=int,
         default=None,
@@ -214,9 +203,6 @@ def resolve_runtime_args(args: argparse.Namespace) -> None:
     args.recall_top_k = args.recall_top_k or int(
         recall_config.get("recall_top_k") or 8
     )
-    args.recall_mode = args.recall_mode or str(
-        recall_config.get("recall_mode") or "normal"
-    )
     args.reader_model = args.reader_model or str(chat_config.get("llm_name") or args.llm_model)
     args.reader_base_url = args.reader_base_url or str(chat_config.get("llm_base_url") or args.llm_base_url)
     if args.reader_base_url.rstrip("/") == "https://api.deepseek.com":
@@ -237,9 +223,6 @@ def prepare_runtime_configs(
     )
     recall_config["recall_budget"] = str(
         args.recall_budget or recall_config.get("recall_budget") or "mid"
-    )
-    recall_config["recall_mode"] = str(
-        args.recall_mode or recall_config.get("recall_mode") or "normal"
     )
     memory_input_config = memory_runtime_config.setdefault(
         "memory_context_manager",
@@ -517,7 +500,7 @@ def build_sample_memory_context(
                 recall_report = pwm.trigger_memory_recall(
                     question,
                     tags=["locomo", f"sample_id:{sample_id}"],
-                    time_end=recall_time_end,
+                    reference_timestamp=recall_time_end,
                 )
                 memory_context = str(recall_report.get("memory_context") or "")
                 recall_operation_report = operation_reporter.latest_report("recall")
@@ -539,8 +522,7 @@ def build_sample_memory_context(
                     "db_counts": counts,
                     "recall_context": memory_context,
                     "recall_context_chars": len(memory_context),
-                    "requested_recall_mode": recall_report.get("requested_recall_mode", args.recall_mode),
-                    "actual_recall_mode": recall_report.get("actual_recall_mode", "unknown"),
+                    "retrieval_strategy": recall_report.get("retrieval_strategy", "unknown"),
                     "recall_status": recall_report.get("status", "empty"),
                     "recall_total_elapsed_ms": recall_elapsed_ms,
                 })
@@ -823,7 +805,7 @@ def main() -> int:
     reader_success, reader_failures = generate_reader_answers(args, outputs, detail_rows)
     write_json(output_path, outputs)
     write_json(detail_path, detail_rows)
-    summary = {"input": str(args.input), "output": str(output_path), "detail_output": str(detail_path), "state_dir": str(args.state_dir), "samples_requested": len(samples), "samples_succeeded": len(samples) - len(errors), "samples_failed": len(errors), "reader_answers_succeeded": reader_success, "reader_answers_failed": reader_failures, "workers": workers, "recall_mode": args.recall_mode, "fact_extraction_interval": args.fact_extraction_interval}
+    summary = {"input": str(args.input), "output": str(output_path), "detail_output": str(detail_path), "state_dir": str(args.state_dir), "samples_requested": len(samples), "samples_succeeded": len(samples) - len(errors), "samples_failed": len(errors), "reader_answers_succeeded": reader_success, "reader_answers_failed": reader_failures, "workers": workers, "fact_extraction_interval": args.fact_extraction_interval}
     logging.info("LoCoMo evaluation complete: %s", json.dumps(summary, ensure_ascii=False))
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     return 0 if not errors else 1

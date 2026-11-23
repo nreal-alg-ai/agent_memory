@@ -2596,6 +2596,96 @@ class UserMemoryDB:
             result.append(item)
         return result
 
+    def retrieve_recall_documents(
+        self, *, object_type: str, filters: Dict[str, Any],
+        terms: Sequence[str] = (), limit: int = 40, embeddings_only: bool = False,
+        reference_timestamp: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Retrieve one planned type, applying filters to its authoritative row.
+
+        Time bounds are hard filters with an exclusive upper bound. Missing
+        source times do not match; future schedules are not capped at now.
+        """
+        tables = {"fact": "memory_facts", "user_activity": "memory_user_activity_items",
+                  "user_intent": "memory_user_intent_items", "user_observed_pattern": "memory_user_observed_patterns"}
+        if object_type not in tables:
+            raise ValueError("Unsupported recall document type")
+        clauses, params = ["document.object_type = ?"], [object_type]
+        if "statuses" in filters:
+            if object_type != "user_intent" or not filters["statuses"]:
+                raise ValueError("Only intent recall supports nonempty statuses")
+            clauses.append("source.status IN (" + ",".join("?" for _ in filters["statuses"]) + ")")
+            params.extend(filters["statuses"])
+        if "primary_domain" in filters:
+            if object_type not in {"user_intent", "user_observed_pattern"}:
+                raise ValueError("This recall type has no primary_domain")
+            clauses.append("source.primary_domain = ?")
+            params.append(filters["primary_domain"])
+        if filters.get("time_start") or filters.get("time_end"):
+            reference = normalize_reference_timestamp(reference_timestamp or local_now_text())
+            default_zone = datetime.fromisoformat(reference).tzinfo
+
+            def timestamp(value: Any) -> Optional[float]:
+                if not value:
+                    return None
+                try:
+                    parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+                    return (parsed if parsed.tzinfo else parsed.replace(tzinfo=default_zone)).timestamp()
+                except (ValueError, TypeError, OverflowError):
+                    return None
+
+            self._conn.create_function("recall_timestamp", 1, timestamp, deterministic=True)
+            if object_type == "fact":
+                field = filters.get("time_field", "event_time")
+                columns = {"event_time": ["event_time_key"], "dialogue_time": ["dialogue_time_key"],
+                           "both": ["event_time_key", "dialogue_time_key"]}.get(field)
+                if columns is None:
+                    raise ValueError("Invalid fact time field")
+                intervals = [(f"source.{column}", f"source.{column}") for column in columns]
+            elif object_type == "user_activity":
+                intervals = [("COALESCE(NULLIF(source.started_at,''),source.ended_at)",
+                              "COALESCE(NULLIF(source.ended_at,''),source.started_at)")]
+            elif object_type == "user_intent":
+                intervals = [("COALESCE(NULLIF(source.time_start,''),source.time_end)",
+                              "COALESCE(NULLIF(source.time_end,''),source.time_start)")]
+            else:
+                raise ValueError("Observed patterns have no event time range")
+            alternatives = []
+            for start, end in intervals:
+                bounds = []
+                if filters.get("time_start"):
+                    bounds.append(f"recall_timestamp({end}) >= recall_timestamp(?)")
+                    params.append(filters["time_start"])
+                if filters.get("time_end"):
+                    bounds.append(f"recall_timestamp({start}) < recall_timestamp(?)")
+                    params.append(filters["time_end"])
+                alternatives.append("(" + " AND ".join(bounds) + ")")
+            clauses.append("(" + " OR ".join(alternatives) + ")")
+        table = tables[object_type]
+        joined = f"memory_recall_documents AS document JOIN {table} AS source ON source.id=document.object_id"
+        if embeddings_only:
+            clauses.append("document.identity_text_embedding IS NOT NULL")
+            rows = self._conn.execute(
+                f"SELECT document.* FROM {joined} WHERE {' AND '.join(clauses)} ORDER BY document.id", params,
+            ).fetchall()
+        elif terms:
+            fts = _IDENTITY_FTS_TABLES["memory_recall_documents"]
+            match_query = self._terms_to_fts_query(self._normalize_search_terms(terms))
+            if not match_query:
+                return []
+            rows = self._conn.execute(
+                f"SELECT document.* FROM {joined} JOIN {fts} ON {fts}.rowid=document.id "
+                f"WHERE {' AND '.join(clauses)} AND {fts} MATCH ? "
+                f"ORDER BY bm25({fts}),document.updated_at DESC,document.id DESC LIMIT ?",
+                [*params, match_query, max(1, int(limit))],
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                f"SELECT document.* FROM {joined} WHERE {' AND '.join(clauses)} "
+                "ORDER BY document.updated_at DESC,document.id DESC LIMIT ?", [*params, max(1, int(limit))],
+            ).fetchall()
+        return [self._row_to_dict(row) for row in rows]
+
     def get_intent_ids_created_from_facts(self, fact_ids: Sequence[int]) -> List[int]:
         """Find intents whose creation evidence includes any supplied fact."""
         ids = sorted({int(value) for value in fact_ids if int(value) > 0})

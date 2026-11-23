@@ -508,16 +508,18 @@ class MemoryMCPService:
         self,
         *,
         query: str,
+        context: Optional[str] = None,
+        reference_timestamp: Optional[str] = None,
         tags: Optional[List[str]] = None,
-        time_end: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Run immediate recall and return memory context plus metadata."""
         if not str(query or "").strip():
             raise ValueError("query must be non-empty")
         report = self.person_world_model.trigger_memory_recall(
             str(query),
+            context=context,
+            reference_timestamp=reference_timestamp,
             tags=tags,
-            time_end=time_end,
         )
         return _json_compatible(report)
 
@@ -606,14 +608,15 @@ TOOLS: List[Dict[str, Any]] = [
         "name": "trigger_memory_recall",
         "description": (
             "Search committed memory immediately and return memory_context, "
-            "recall path metadata, and timing information."
+            "the validated retrieval plan, direct items, and timing information."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "query": {"type": "string"},
+                "context": {"type": "string"},
+                "reference_timestamp": {"type": "string"},
                 "tags": {"type": "array", "items": {"type": "string"}},
-                "time_end": {"type": "string"},
             },
             "required": ["query"],
             "additionalProperties": False,
@@ -782,8 +785,9 @@ class StdioMCPServer:
         elif name == "trigger_memory_recall":
             result = self.service.trigger_memory_recall(
                 query=str(arguments.get("query") or ""),
+                context=_optional_string(arguments.get("context")),
+                reference_timestamp=_optional_string(arguments.get("reference_timestamp")),
                 tags=_string_list(arguments.get("tags"), "tags"),
-                time_end=_optional_string(arguments.get("time_end")),
             )
         else:
             raise ValueError(f"Unknown tool: {name}")

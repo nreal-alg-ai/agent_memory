@@ -1,12 +1,5 @@
 """Chinese prompt templates for the unified memory prototype."""
 
-MEMORY_RETRIEVED_FORMAT_PROMPT_ZH = """[统一记忆]
-系统说明：召回结果可包含可追溯的 fact 证据及当前有效的 user_intent。未来意图由 facts 支撑，不得将其表述为已经发生的新事实。
-时间字段说明：对于 fact，dialogue_time 表示对话/转写讨论该 fact 的时间；event_time 表示 fact 描述的现实事件发生时间。二者含义不同；event_time 未知时，不要用 dialogue_time 推断它。
-{memory_sections}"""
-
-MEMORY_RETRIEVED_SECTION_SPECS_ZH = (('[检索事实]', '直接检索的有价值事实。', 'fact'), ('[用户意图]', '用户本人当前有效的意图，注意责任、时间、进度与状态。', 'user_intent'))
-
 USER_THREAD_MEMBERSHIP_PROMPT_ZH = """你是个人世界模型的长期事项归属识别模块。
 目标：以每个 user_activity 为主体，判断它及关联 facts 是否提供了某个用户本人的长期事项（user_thread）的观察。
 “用户本人”专指这个个人世界模型所属的本人（AI 眼镜佩戴者），不是任意说话人、他人或讨论中的产品用户、目标消费者。
@@ -1712,42 +1705,71 @@ Agent 能力与授权：{agent_capabilities}
 """
 
 
-RECALL_QUERY_ANALYSIS_PROMPT_ZH = """你是 AI 眼镜长期记忆系统中的 recall query 分析器。
+RECALL_QUERY_ANALYSIS_PROMPT_ZH = """目标：结合短期对话 context、当前 query 和 reference_timestamp，制定一次直接记忆检索计划。只规划需要检索的内容，不回答用户问题，不生成新记忆。
 
-请先理解当前记忆结构，再分析用户查询的检索方式。
+一、输入数据的含义
+- context：最近的对话背景，仅用于消解指代、省略、项目范围和话题，不是数据库中的证据，不得据此虚构对象 ID、事实或日期。
+- query：本轮要解决的具体信息需求。结合必要的 context 理解它，不能把 context 中全部话题扩展为检索目标。
+- reference_timestamp：解释“最近、明天、上周”等相对时间的评估时点，不是所有记忆的截止上界。
 
-记忆结构：
-1. `fact`：从对话或环境转写中提炼出的、可追溯且自包含的 narrative evidence。它保留具体发生了什么、谁参与、时间、地点/场景、原因、观点变化、建议、接受/拒绝、约束、结论和未解决问题等证据。fact 通常带有 `summary`、`keywords`、`entities`、`fact_topic`、`event_time_key` 和 `dialogue_time_key`。
-3. `user_intent`：从 facts 中提炼出的未来导向对象，统一描述本人期望结果、未来安排或行动责任；其 status 和目标/开始/截止时间具有重要语义。
+二、当前可检索的记忆数据结构
+以下说明可检索的数据目录，不表示本次输入已经提供了具体记忆记录。
 
-判断准则：
-- 只有当 query 明确指向用户与助手的主动对话，才偏向 `assistant_wakeup`；明确指向全天录音、会议、旁听、多人数对话，才偏向 `allday_recording`；不确定时两者都保留。
-- `recall_object_types` 是本次可直接检索的对象类型。必须始终包含 `fact`；仅在 query 询问未来目标、安排、责任、截止、未完成事项或其状态变化时加入相应的 `user_intent`。user_activity 暂不参与召回。
-- 具体发生了什么、日期、地点、人名、原话语义、事件先后和可追溯证据，优先 `fact`。
-- 稳定偏好、长期约束、习惯/流程、关系画像或个人背景通过 `fact` 检索其直接证据。
-- 任务、承诺、未来安排、目标、截止与未完成事项，除 `fact` 外可加入对应 prospective object；仍需保留 `fact` 以提供证据。
-- 不确定时保持宽检索，漏掉证据比少取几个候选更糟。
-- `keywords` 输出 2-8 个短检索词，优先保留具体人物、组织、产品、项目、主题、动作、结果和约束；不要输出完整句子、寒暄、泛化词或普通时间表达。
-- `entities` 输出对语义检索有帮助的实体名称及类型。实体可以是人物、组织、地点、产品、项目、技术或具体概念；普通的“今天/昨天/上周”等时间表达不要作为实体。
-- `temporal_mode` 表示时间范围应该匹配哪一种 fact 时间：`event_time` 表示事实描述的现实事件时间，`dialogue_time` 表示对话/转写发生时间，`both` 表示任一时间命中即可，`none` 表示不做时间硬过滤。询问“做了什么/发生了什么/买过什么”优先使用 `event_time`；询问“讨论了什么/提到过什么/问过什么”优先使用 `dialogue_time`；无法判断时使用 `none`。
-- `temporal_bounds` 由你根据原始 query 和参考时间解析；`start` / `end` 使用 `YYYY-MM-DD HH:MM:SS` 或 `null`，至少提供一个边界。`end` 是排他上界。没有时间约束时输出 `null`。
-- `is_prospective_time_slot_query` 仅在用户询问自己在当前或未来某个时间窗口内“有什么安排/计划/待办/未完成事项”这类集合或状态时为 true。出行建议、天气新闻等外部信息、单一事实确认、纯预测，以及“提醒我/帮我创建日程”等即时指令均为 false。
+1. fact
+   - 含义：全体说话人提供的有价值、可追溯的具体事实、判断、观点、约束与结论。
+   - 核心字段：summary 为正文；event_time_key 是内容描述的事件时间；dialogue_time_key 是谈话时间。
+   - 适用问题：具体发生了什么、讨论了什么、表达了什么说法或判断。
+   - 允许的 filters：time_start、time_end、time_field。time_field 只能是 event_time、dialogue_time 或 both；问发生/执行时间用 event_time，问谈到/讨论时间用 dialogue_time，both 表示任一时间在范围内。
 
-只返回 JSON：
+2. user_activity
+   - 含义：一段采集窗口中用户本人实际参与了什么，不等同于用户在谈话中提到的全部行动。
+   - 核心字段：activity_text 为正文；started_at/ended_at 是观察窗口。
+   - 适用问题：用户本人在某段时间实际参与了什么活动。
+   - 允许的 filters：time_start、time_end、time_field="activity_time"。
+
+3. user_intent
+   - 含义：用户本人的未来事项，以及后续记录的进展与状态。
+   - 核心字段：summary 描述事项；current_progress 描述当前进展；details 保存角色、完成条件、地点和参与人等；time_start/time_end 是安排的时间，不能用创建时间代替。
+   - 适用问题：尚待完成的事情、未来安排、当前进展、已完成或已取消的事项。
+   - 允许的 filters：statuses、primary_domain、time_start、time_end、time_field="scheduled_time"。
+   - statuses 取 pending、in_progress、blocked、completed、cancelled。未完成/当前安排通常选前三种；询问已完成或取消事项时明确选择对应状态；询问历史或全部状态时显式列出需要的状态。省略 statuses 时系统仅检索前三种，不能因此遗漏明确的历史查询。
+
+4. user_observed_pattern
+   - 含义：从用户实际行为证据归纳的重复行为或选择规律，不等于用户明确自述，也不证明每次都如此。
+   - 核心字段：pattern_text 为规律正文；condition_text 是适用条件；primary_domain 是领域。
+   - 适用问题：用户本人通常采取什么行为、在什么条件下重复做出某种选择。
+   - 允许的 filters：只有 primary_domain，不按行为证据时间限制规律本身。
+
+primary_domain 仅用于 user_intent 和 user_observed_pattern，取 general|health|work|life|information|finance|family|learning|social|interest|travel。仅当范围明确时使用，避免把不确定的领域猜测变成硬过滤。
+
+三、检索计划生成规则
+1. 先结合 context 明确 query 的实际需求，再根据上述数据含义选择真正需要的类型。不强制检索 fact，不对所有类型默认宽检索；必要时可选择多个类型。
+2. 每个 request 独立组织 search_query 和 filters。search_query 是结合 context 消解指代后的、面向该类型的检索文字，保留必要的项目、人物、产品或动作限定，避免加入泛化的问句套话。
+3. filters 只使用对应类型允许的字段；未知或不需要的条件直接省略。
+4. 时间必须来自 query 或明确关联的 context；用 reference_timestamp 解析相对时间，输出 ISO 8601，保留时区。time_start 为包含下界，time_end 为排他上界，例如某一天用当日零点至次日零点。可以只有一个边界；没有约束则不输出时间条件。未来安排可以晚于 reference_timestamp。不能把安排截止日套作 fact 的谈话时间。
+5. search_query 可以为空，但必须存在有意义的结构化筛选，例如查询某日全部活动或当前未完成事项。不能用空字符串无条件遍历 facts。
+6. 纯即时生成、通用知识等无需个人记忆的请求可输出 requests=[]；不要为了凑结果检索无关信息。
+
+四、输出规则与 JSON 格式
+- 只返回 JSON，顶层只包含 resolved_query 和 requests。
+- resolved_query：忠实表达结合必要背景补全后的 query，不扩展为 context 中的其他话题。
+- requests：最多 8 个 request，顺序表示希望优先呈现的类型；无需个人记忆时允许为空列表。
+- 每个 request 只包含 data_type、search_query、filters。data_type 只能是上述四类，search_query 和 filters 遵循前面的规则。
+- 不提供对象 ID、排序分数或额外字段，不输出 SQL、工具调用或证据扩展要求。
+下例仅展示结构，不是当前用户的查询条件：
 {
-  "recall_object_types": ["fact"],
-  "needs_broad_evidence": false,
-  "query_rewrite": "面向统一记忆检索的改写",
-  "keywords": ["关键词1", "关键词2"],
-  "entities": [{"name": "实体名", "type": "PERSON|ORGANIZATION|LOCATION|PRODUCT|PROJECT|TECHNOLOGY|CONCEPT|OTHER"}],
-  "temporal_bounds": {"start": "YYYY-MM-DD HH:MM:SS|null", "end": "YYYY-MM-DD HH:MM:SS|null"},
-  "temporal_mode": "event_time|dialogue_time|both|none",
-  "is_prospective_time_slot_query": false
+  "resolved_query": "结合必要背景补全后的信息需求",
+  "requests": [
+    {
+      "data_type": "user_intent",
+      "search_query": "具体项目或事项",
+      "filters": {
+        "statuses": ["pending", "in_progress", "blocked"]
+      }
+    }
+  ]
 }
 
-原始用户查询：
-{query}
-
-解析相对时间表达时使用的参考时间：
-{reference_time}
+五、本次输入
+{recall_input}
 """

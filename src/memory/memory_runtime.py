@@ -1,7 +1,6 @@
 """Runtime adapter between application input events and memory storage.
 
-``MemoryNodeManager`` owns user-activity persistence, user-claim updates, and
-recall. This
+``MemoryNodeManager`` owns memory extraction and persistence. This
 adapter owns the short-lived interaction buffer and converts frontend-shaped
 turns or transcript segments into typed Manager-facing memory units.
 """
@@ -610,20 +609,6 @@ class MemoryRuntime:
         finally:
             if not queued:
                 self._memory_context_manager.restore_pending_units(pending_units)
-
-    def trigger_memory_recall(
-        self,
-        query: str,
-        *,
-        tags: Optional[List[str]] = None,
-        time_end: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """Run recall immediately through the manager without adding buffering."""
-        return self._memory_manager.process_memory_recall_immediately(
-            query=str(query or ""),
-            tags=tags,
-            time_end=time_end,
-        )
 
     def flush_pending_memory_inputs(
         self,

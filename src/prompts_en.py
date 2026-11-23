@@ -1,12 +1,5 @@
 """English prompt templates for the unified memory prototype."""
 
-MEMORY_RETRIEVED_FORMAT_PROMPT_EN = """[Unified Memory]
-System note: Recall may contain traceable facts and active user_intents. Future intentions are supported by facts; do not present them as events that have already occurred.
-System note: For facts, dialogue_time is when the conversation/transcript discussed the fact, while event_time is when the real-world event described by the fact occurred. They are different fields; an unknown event_time must not be inferred from dialogue_time.
-{memory_sections}"""
-
-MEMORY_RETRIEVED_SECTION_SPECS_EN = (('[Facts]', 'Directly retrieved valuable facts.', 'fact'), ('[User intentions]', 'Current user intentions; preserve role, timing, progress and lifecycle stage.', 'user_intent'))
-
 USER_THREAD_MEMBERSHIP_PROMPT_EN = """You identify membership in ongoing personal matters for a Personal World Model.
 Your goal is to determine, for each user_activity and its linked facts, whether they provide an observation about an ongoing matter of the user self.
 The user self is specifically the person this Personal World Model represents (the AI-glasses wearer), not an arbitrary speaker, another person, or a product user/target consumer mentioned in discussion.
@@ -1675,41 +1668,71 @@ Agent capabilities and authorization: {agent_capabilities}
 """
 
 
-RECALL_QUERY_ANALYSIS_PROMPT_EN = """You are the recall query analyzer for the AI-glasses long-term memory system.
+RECALL_QUERY_ANALYSIS_PROMPT_EN = """Goal: combine recent conversation context, the current query, and reference_timestamp into one direct-memory retrieval plan. Plan retrieval only; do not answer the question or create memories.
 
-Understand the memory structure before analyzing the query. 
+1. Input data meanings
+- context: recent dialogue for resolving references, omissions, project scope, and topic. It is not stored evidence; never invent object IDs, facts, or dates from it.
+- query: this round's actual information need. Use necessary context to understand it without turning every context topic into a retrieval target.
+- reference_timestamp: the evaluation time for resolving relative dates such as tomorrow or last week, not a universal upper bound on memories.
 
-Memory structure:
-1. `fact`: traceable, self-contained narrative evidence extracted from dialogue or ambient transcripts. It preserves what happened, participants, time, place or scene, reasons, viewpoint changes, suggestions, acceptance or rejection, constraints, conclusions, and unresolved questions. Facts usually include `summary`, `keywords`, `entities`, `fact_topic`, `event_time_key`, and `dialogue_time_key`.
-3. `user_intent`: future-oriented objects extracted from facts, describing a desired outcome, future arrangement or personally undertaken action without categories. Their status and target/start/due times are meaningful.
+2. Currently retrievable memory structures
+The following describes the available data catalog; it does not mean concrete memory records have been supplied in the current input.
 
-Guidance:
-- `recall_object_types` lists object types eligible for direct retrieval. It must always include `fact`; add the relevant `user_intent` only for future goals, arrangements, responsibilities, deadlines, unfinished work, or their lifecycle. user_activity is not retrieved in this version.
-- Prefer `fact` for what happened, dates, places, people, exact evidence, event order, and traceable details.
-- Retrieve direct `fact` evidence for stable preferences, durable constraints, routines, relationships, or profiles.
-- For tasks, commitments, future arrangements, goals, deadlines, or unfinished work, add the relevant prospective object alongside the supporting facts.
-- Keep the plan broad when unsure. Missing evidence is worse than retrieving a few extra candidates.
-- Extract 2-8 short retrieval keywords, prioritizing concrete people, organizations, products, projects, topics, actions, outcomes, and constraints. Do not output full sentences, pleasantries, generic words, or ordinary time expressions.
-- Extract useful semantic entities with names and types. Entities may be people, organizations, locations, products, projects, technologies, or concrete concepts; ordinary time expressions such as today, yesterday, or last week are not entities.
-- `temporal_mode` selects which fact timestamp should be used for a time range: `event_time` means the real-world event time described by the fact, `dialogue_time` means when the conversation/transcript occurred, `both` means either timestamp may match, and `none` means no hard time filter. Prefer `event_time` for queries asking what happened, was done, bought, or visited; prefer `dialogue_time` for queries asking what was discussed, mentioned, or asked; use `none` when the temporal intent is unclear.
-- Parse `temporal_bounds` from the original query using the reference time. Use `YYYY-MM-DD HH:MM:SS` or `null` for `start` / `end`, and provide at least one bound. `end` is exclusive. Output `null` when no time constraint applies.
-- Set `is_prospective_time_slot_query` to true only when the user asks for the set or status of their own current/future arrangements, plans, to-dos, or unfinished responsibilities in a time window. It is false for external information, advice, a single-fact confirmation, a prediction, or an immediate command such as creating a reminder.
+1. fact
+   - Meaning: valuable, traceable concrete facts, judgments, opinions, constraints, and conclusions from any speaker.
+   - Core fields: summary holds the content; event_time_key is the described event time; dialogue_time_key is the conversation time.
+   - Suitable questions: what happened, what was discussed, or what statements or judgments were expressed.
+   - Allowed filters: time_start, time_end, time_field. time_field is event_time, dialogue_time, or both. Use event_time for occurrences/execution, dialogue_time for discussions/mentions, and both when either time may match.
 
-Return JSON only:
+2. user_activity
+   - Meaning: what user self actually participated in during an observation window, rather than every action mentioned in conversation.
+   - Core fields: activity_text describes participation; started_at/ended_at bound the observation window.
+   - Suitable questions: what user self actually participated in during a period.
+   - Allowed filters: time_start, time_end, time_field="activity_time".
+
+3. user_intent
+   - Meaning: user self's future matter, including subsequently recorded progress and status.
+   - Core fields: summary describes the matter; current_progress describes progress; details holds role, completion condition, location, and participants; time_start/time_end describe the arrangement, not creation time.
+   - Suitable questions: unfinished matters, future arrangements, current progress, completed or cancelled matters.
+   - Allowed filters: statuses, primary_domain, time_start, time_end, time_field="scheduled_time".
+   - statuses: pending, in_progress, blocked, completed, cancelled. Current unfinished arrangements normally use the first three. Explicitly include completed/cancelled for corresponding historical questions, or all desired statuses for all-history queries. Omitting statuses defaults to the first three and must not hide requested historical records.
+
+4. user_observed_pattern
+   - Meaning: recurring actions or choices inferred from actual behavioral evidence, not an explicit self-report or proof of universal behavior.
+   - Core fields: pattern_text states the pattern; condition_text qualifies applicability; primary_domain identifies the domain.
+   - Suitable questions: which actions user self usually takes, or under which conditions user self repeatedly makes a particular choice.
+   - Allowed filters: primary_domain only; do not filter a pattern by its supporting actions' event dates.
+
+primary_domain applies only to user_intent and user_observed_pattern: general|health|work|life|information|finance|family|learning|social|interest|travel. Use it only when scope is clear; do not convert uncertain domain guesses into hard filters.
+
+3. Retrieval planning rules
+1. First resolve the actual query need using context, then select necessary types according to the meanings above. Do not always include fact or search all types; multiple types are allowed when necessary.
+2. Give each request its own search_query and filters. Resolve references using necessary context; retain project, person, product, or action scope while avoiding generic question phrasing.
+3. Use only filters allowed for the corresponding type; omit unknown or unnecessary conditions.
+4. Time constraints must come from the query or directly relevant context. Resolve relative dates against reference_timestamp and output ISO 8601 with timezone. time_start is inclusive, time_end exclusive; one calendar day spans its midnight to the next midnight. One-sided ranges are allowed. Omit time filters when unconstrained. Future arrangements can be later than reference_timestamp. Never apply an arrangement deadline as a fact's conversation time.
+5. search_query may be empty only with meaningful structured filters, such as a day's activities or current unfinished matters. Do not scan facts unconditionally.
+6. Immediate content generation or general-knowledge requests needing no personal memory may return requests=[]. Do not retrieve unrelated content merely to produce results.
+
+4. Output rules and JSON format
+- Return JSON only, with exactly resolved_query and requests at the top level.
+- resolved_query: faithfully express the query resolved with necessary background, without expanding into other context topics.
+- requests: at most 8 requests, ordered by preferred type presentation. An empty list is allowed when no personal memory is needed.
+- Each request contains exactly data_type, search_query, and filters. data_type must be one of the four types above; search_query and filters follow the preceding rules.
+- Do not output object IDs, ranking scores, extra fields, SQL, tool calls, or evidence-expansion instructions.
+This example illustrates structure, not the current query's conditions:
 {
-  "recall_object_types": ["fact"],
-  "needs_broad_evidence": false,
-  "query_rewrite": "retrieval-focused rewrite over the unified memory projection",
-  "keywords": ["keyword1", "keyword2"],
-  "entities": [{"name": "entity name", "type": "PERSON|ORGANIZATION|LOCATION|PRODUCT|PROJECT|TECHNOLOGY|CONCEPT|OTHER"}],
-  "temporal_bounds": {"start": "YYYY-MM-DD HH:MM:SS|null", "end": "YYYY-MM-DD HH:MM:SS|null"},
-  "temporal_mode": "event_time|dialogue_time|both|none",
-  "is_prospective_time_slot_query": false
+  "resolved_query": "information need resolved with necessary context",
+  "requests": [
+    {
+      "data_type": "user_intent",
+      "search_query": "specific project or matter",
+      "filters": {
+        "statuses": ["pending", "in_progress", "blocked"]
+      }
+    }
+  ]
 }
 
-Original user query:
-{query}
-
-Reference time for resolving relative time expressions:
-{reference_time}
+5. Current input
+{recall_input}
 """

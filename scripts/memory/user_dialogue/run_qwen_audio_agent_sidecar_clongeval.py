@@ -496,8 +496,8 @@ def run() -> int:
                     "recall_status": str(
                         report.get("status") or ("ok" if memory_context else "empty")
                     ),
-                    "actual_recall_mode": str(
-                        report.get("actual_recall_mode") or "unknown"
+                    "retrieval_strategy": str(
+                        report.get("retrieval_strategy") or "unknown"
                     ),
                     "recall_context_chars": len(memory_context),
                     "recall_context": memory_context,

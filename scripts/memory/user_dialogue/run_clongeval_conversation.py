@@ -128,15 +128,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-pending-interaction-tokens", type=int)
     parser.add_argument("--recall-top-k", type=int)
     parser.add_argument("--recall-budget")
-    parser.add_argument(
-        "--recall-mode",
-        choices=("stage1", "stage2", "normal"),
-        default=None,
-        help=(
-            "Override config.yaml recall_mode; when omitted, use the configured "
-            "recall path."
-        ),
-    )
     parser.add_argument("--skip-embedding-validation", action="store_true")
     parser.add_argument(
         "--run-reader",
@@ -275,6 +266,22 @@ def normalize_unique_timestamp(candidate: datetime, seen: set[str]) -> datetime:
         current += timedelta(seconds=1)
     seen.add(current.strftime("%Y-%m-%d %H:%M:%S"))
     return current
+
+
+def context_reference_timestamp(days: Sequence[Dict[str, Any]]) -> datetime:
+    """Use the latest valid turn time, with the same clock rules as replay."""
+    seen_timestamps: set[str] = set()
+    timestamps = [
+        normalize_unique_timestamp(
+            day["date"] + timedelta(seconds=pair_index * (120 if day.get("has_explicit_time") else 1)),
+            seen_timestamps,
+        )
+        for day in days
+        for pair_index in range(len(day["pairs"]))
+    ]
+    if not timestamps:
+        raise ValueError("Context has no valid conversation timestamp for recall")
+    return max(timestamps)
 
 
 def context_group_id(context: str, group_index: int) -> str:
@@ -486,11 +493,6 @@ def prepare_runtime(
     )
     recall_config["recall_top_k"] = args.recall_top_k
     recall_config["recall_budget"] = args.recall_budget
-    if args.recall_mode is not None:
-        recall_config["recall_mode"] = args.recall_mode
-    args.recall_mode = str(
-        recall_config.get("recall_mode", "normal") or "normal"
-    ).strip().lower()
     memory_input_config = memory_runtime_config.setdefault(
         "memory_context_manager",
         {},
@@ -628,7 +630,8 @@ def process_context_group(
         len(group_records),
         len(context),
     )
-    days = [] if reused_existing_db else parse_context_days(context)
+    days = parse_context_days(context)
+    recall_reference_timestamp = context_reference_timestamp(days)
     context_log_handler = add_context_log_handler(context_log_path)
     pwm: Optional[PersonWorldModel] = None
     results: List[Dict[str, Any]] = []
@@ -694,6 +697,7 @@ def process_context_group(
         for record_index, record in enumerate(group_records, 1):
             recall_report = pwm.trigger_memory_recall(
                 str(record["query"]),
+                reference_timestamp=recall_reference_timestamp,
             )
             recall_context = str(recall_report.get("memory_context") or "")
             covered = gold_answer_in_context(record.get("answer", ""), recall_context)
@@ -705,8 +709,8 @@ def process_context_group(
                     recall_context,
                     args.reader_max_context_chars,
                 )
-            actual_recall_mode = str(
-                recall_report.get("actual_recall_mode") or "unknown"
+            retrieval_strategy = str(
+                recall_report.get("retrieval_strategy") or "unknown"
             )
             memory_operation_report = operation_reporter.snapshot()
             operation_counts = memory_operation_report.get("counts") or {}
@@ -724,9 +728,7 @@ def process_context_group(
                 "answer": record.get("answer", ""),
                 "hypothesis": hypothesis,
                 "answer_in_recall_context": covered,
-                "recall_mode": args.recall_mode,
-                "requested_recall_mode": args.recall_mode,
-                "actual_recall_mode": actual_recall_mode,
+                "retrieval_strategy": retrieval_strategy,
                 "recall_status": str(
                     recall_report.get("status")
                     or ("ok" if recall_context else "empty")
@@ -753,7 +755,7 @@ def process_context_group(
             results.append(result)
             logging.info(
                 "[%s/%s] context_record=%s/%s id=%s group=%s recall_chars=%s "
-                "actual_recall_mode=%s answer_in_context=%s",
+                "retrieval_strategy=%s answer_in_context=%s",
                 group_index,
                 total_groups,
                 record_index,
@@ -761,7 +763,7 @@ def process_context_group(
                 record["id"],
                 group_id,
                 len(recall_context or ""),
-                actual_recall_mode,
+                retrieval_strategy,
                 covered,
             )
 
@@ -1028,16 +1030,15 @@ def main() -> int:
         "gold_answer_in_recall_context": gold_covered,
         "reader_answered": reader_answered,
         "gold_coverage_rate": gold_covered / result_count if result_count else 0.0,
-        "recall_mode": args.recall_mode,
         "reused_existing_db": bool(args.existing_state_dir),
-        "actual_recall_mode_counts": {
+        "retrieval_strategy_counts": {
             path: sum(
                 1
                 for item in results
-                if item.get("actual_recall_mode") == path
+                if item.get("retrieval_strategy") == path
             )
             for path in sorted(
-                {str(item.get("actual_recall_mode") or "unknown") for item in results}
+                {str(item.get("retrieval_strategy") or "unknown") for item in results}
             )
         },
         "group_summaries": group_summaries,

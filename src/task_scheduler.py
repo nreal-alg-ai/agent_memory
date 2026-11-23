@@ -171,7 +171,7 @@ class TaskOperationReporter:
                 "operation_type": "recall",
                 "task_id": f"recall-{counts['completed']}",
                 "status": recall_report.get("status"),
-                "actual_recall_mode": recall_report.get("actual_recall_mode"),
+                "retrieval_strategy": recall_report.get("retrieval_strategy"),
                 "elapsed_ms": elapsed_ms,
                 "timestamp": _report_now_text(),
             })

@@ -13,6 +13,7 @@ from pwm_logging import PWMLoggingManager
 from memory.memory_database import UserMemoryDB
 from memory.memory_manager import MemoryNodeManager
 from memory.memory_runtime import MemoryRuntime
+from memory_recall import MemoryRecall
 from task_scheduler import TaskOperationReporter, TaskScheduler
 from user_model.user_model_database import UserModelDB
 from user_model.user_prediction import UserPrediction
@@ -90,6 +91,16 @@ class PersonWorldModel:
                 embedding_config=embedding_config,
                 logger=self._logging_manager.get_logger("memory_runtime"),
                 memory_manager_logger=self._logging_manager.get_logger("memory_manager"),
+            )
+            self._memory_recall = MemoryRecall(
+                memory_db=self._user_memory_database, llm_client=self._llm_client,
+                embedding_client=(self._memory_runtime.manager.get_embedding_client()
+                                  if embedding_config.get("enabled", True) else None),
+                config=manager_config.get("recall"),
+                enabled=self._memory_runtime.manager.enabled,
+                prompt_language_mode=manager_config.get("memory_prompt_language_mode", "source"),
+                operation_reporter=self._operation_reporter,
+                logger=self._logging_manager.get_logger("memory_recall"),
             )
             self._user_state_resolver = UserStateResolver(
                 memory_db=self._user_memory_database,
@@ -258,15 +269,17 @@ class PersonWorldModel:
         self,
         query: str,
         *,
+        context: Optional[str] = None,
+        reference_timestamp: Optional[Any] = None,
         tags: Optional[List[str]] = None,
-        time_end: Optional[str] = None,
     ) -> Dict[str, Any]:
         if self._closed:
             raise RuntimeError("PWM is closed")
-        return self._memory_runtime.trigger_memory_recall(
+        return self._memory_recall.recall(
             query,
+            context=context,
+            reference_timestamp=reference_timestamp,
             tags=tags,
-            time_end=time_end,
         )
 
     def wait_for_memory_tasks(self, timeout: Optional[float] = None) -> bool:

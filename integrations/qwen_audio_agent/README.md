@@ -50,11 +50,12 @@ PWM 各模块的详细日志已独立存放在
 当前版本实现 qwen-audio-agent `MemoryProvider` v2 的 session-observation 路径：
 
 1. Gateway 断开会话时，把已确认的 user/assistant 对话交给 sidecar；
-2. Sidecar 调用统一的 `MemoryRuntime.accept_memory_input()`；
-3. `flush()` 提交缓冲内容并在同一串行队列中安排 entity-claim update；
-4. `query()` 直接调用 `MemoryRuntime.trigger_memory_recall()`，读取最新已提交快照。
+2. Sidecar 通过 `PersonWorldModel.accept_memory_input()` 接收输入；
+3. `flush()` 提交缓冲内容并由共享 scheduler 安排后续提炼；
+4. `query()` 调用 `PersonWorldModel.trigger_memory_recall()`，结合可选的短期 `context`
+   和 `referenceTimestamp` 规划四类记忆的检索，读取最新已提交快照。
 
-因此 recall 不会等待 store/entity-claim 队列完成。Provider 同时维护 Qwen 所需的有界
+因此 recall 不会等待后台提炼队列完成。Provider 同时维护 Qwen 所需的有界
 `user` / `memory` Markdown 快照，以保持显式读取和编辑工具的兼容；自动提炼与语义召回
 仍完全由 agent_memory 负责。
 

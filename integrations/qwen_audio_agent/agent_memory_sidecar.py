@@ -598,8 +598,9 @@ class AgentMemoryRuntime:
         tags = params.get("tags")
         result = holder.pwm.trigger_memory_recall(
             query,
+            context=_clean(params.get("context"), 4_000) or None,
             tags=[_clean(tag, 120) for tag in tags] if isinstance(tags, list) else None,
-            time_end=_clean(params.get("timeEnd"), 120) or None,
+            reference_timestamp=_clean(params.get("referenceTimestamp") or params.get("timeEnd"), 120) or None,
         )
         self._logger.info(
             "recall owner=%s query_chars=%s status=%s context_chars=%s",

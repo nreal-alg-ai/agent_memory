@@ -153,6 +153,8 @@ personal_world_model:
       memory_manager:
         filename: memory_manager.log
         level: DEBUG  # 暂时启用 intent normalization 字段级诊断
+      memory_recall:
+        filename: memory_recall.log
       user_state:
         filename: user_state.log
       user_prediction:
@@ -246,32 +248,14 @@ personal_world_model:
     # Discovery gate only; activity windows do not prove independent occurrences.
     user_observed_pattern_min_activities: 2
 
-    recall:  
+    recall:
       recall_top_k: 8
       recall_budget: mid
-      recall_mode: normal
-      recall_detailed_logging: true
-      recall_stage1:
-        recall_stage1_entity_matched_score: 0.30
-        recall_stage1_topic_overlap_score_weight: 0.54
-        recall_stage1_keyword_overlap_score_weight: 0.12
-        recall_stage1_time_score_weight: 0.12
-        recall_stage1_contextual_time_score_multiplier: 2.0
-        recall_stage1_actionable_min_importance: 0.75
-        recall_stage1_evidence_profile_min_term_coverage: 0.5
-      recall_stage2:
-        recall_stage2_fact_min_embedding_similarity: 0.30
-        recall_stage2_state_min_embedding_similarity: 0.25
-        recall_stage2_fact_strong_embedding_similarity: 0.45
-        recall_stage2_state_strong_embedding_similarity: 0.40
-        recall_stage2_strong_topic_pair_score: 0.90
-        recall_stage2_keyword_match_score_weight: 0.12
-        recall_stage2_bm25_score_weight: 0.2
-        recall_stage2_entity_matched_score: 0.20
-        recall_stage2_time_score_weight: 0.12
-        recall_stage2_contextual_time_score_multiplier: 2.0
-      recall_fact_time_score_half_life_seconds: 604800
-      recall_persistent_state_time_score_half_life_seconds: 7776000
+      recall_candidate_limit_per_type: 40
+      recall_min_embedding_similarity: 0.30
+      recall_input_context_max_chars: 4000
+      recall_entry_max_chars: 1200
+      # Optional recall_context_max_chars overrides the low/mid/high budget.
 
   user_state:
     user_model_database_path: 

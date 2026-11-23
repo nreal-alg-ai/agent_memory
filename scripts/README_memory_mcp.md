@@ -1,8 +1,8 @@
 # Agent Memory MCP Server
 
-`memory_mcp_server.py` exposes the existing `MemoryRuntime` through the MCP
-stdio transport. The server owns one `UserMemoryDB`, `MemoryNodeManager`, and
-`MemoryRuntime` for its entire process lifetime.
+`memory_mcp_server.py` exposes `PersonWorldModel` through the MCP stdio
+transport. The server owns one PWM instance with shared memory storage,
+background extraction tasks, and a plan-first recall coordinator.
 
 ## Start
 
@@ -45,8 +45,11 @@ The MCP server exposes three tools:
   status, progress fields, and the final per-file transcription/memory report
   once processing has finished.
 - `trigger_memory_recall`: searches the latest committed memory snapshot using
-  a `query`, with optional `tags` and `time_end`. The response contains the
-  assembled `memory_context`, recall-mode metadata, and timing information.
+  a `query`, with optional recent-dialogue `context`, evaluation clock
+  `reference_timestamp`, and `tags`. One LLM call plans which direct types to
+  retrieve: `fact`, `user_activity`, `user_intent`, or `user_observed_pattern`.
+  The response contains `memory_context`, bounded direct `items`, the validated
+  `retrieval_plan`, status, and timing. It does not expand supporting evidence.
 
 `process_audio_file`, transcript ingestion, reflection, and pending-queue
 operations are internal implementation steps of the `process_audio_files` job;
