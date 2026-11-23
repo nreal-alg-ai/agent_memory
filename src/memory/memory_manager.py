@@ -1013,6 +1013,24 @@ class MemoryNodeManager:
                 reference_timestamp=reference_timestamp,
             )
 
+    def _upsert_memory_user_observed_patterns_into_recall_document_table(
+        self, pattern_ids: Sequence[int], *, reference_timestamp: Any = None,
+    ) -> None:
+        """Project persisted patterns and their conditions without expanding evidence."""
+        for pattern in self._db.get_user_observed_patterns_by_ids(pattern_ids):
+            self._upsert_memory_recall_document(
+                object_type="user_observed_pattern", object_id=pattern["id"],
+                identity_lines=[
+                    f"pattern: {pattern['pattern_text']}",
+                    *([f"condition: {pattern['condition_text']}"] if pattern["condition_text"] else []),
+                ],
+                title=_compact_whitespace(pattern["pattern_text"])[:120],
+                summary=pattern["pattern_text"], entity_ids=[pattern["subject_entity_id"]],
+                confidence=float(pattern["confidence"]),
+                metadata={"projection_version": "v1", "primary_domain": pattern["primary_domain"]},
+                reference_timestamp=reference_timestamp,
+            )
+
     def _log_extracted_fact_info(
         self,
         *,
@@ -2584,6 +2602,7 @@ class MemoryNodeManager:
         }
         if update.get("error"):
             report["error"] = update["error"]
+        self._generate_memory_recall_document_embeddings()
         self._logger.log_json_format("memory_user_observed_pattern_update", "finish", report)
         return report
 
@@ -4098,6 +4117,10 @@ class MemoryNodeManager:
                 if event_id is not None:
                     result["relations_recorded"] += 1
                     result["pattern_event_ids"].append(event_id)
+            if result["updated_pattern_ids"]:
+                self._upsert_memory_user_observed_patterns_into_recall_document_table(
+                    sorted(result["updated_pattern_ids"]), reference_timestamp=reference_timestamp,
+                )
         return result
 
     def _user_action_vectors_for_signals(
@@ -4690,6 +4713,11 @@ class MemoryNodeManager:
                 if event_id is not None:
                     recorded_count += 1
                     pattern_event_ids.append(event_id)
+            recall_pattern_ids = updated_pattern_ids | ({candidate_id} if candidate_id is not None else set())
+            if recall_pattern_ids:
+                self._upsert_memory_user_observed_patterns_into_recall_document_table(
+                    sorted(recall_pattern_ids), reference_timestamp=reference_timestamp,
+                )
         return {"pattern_id": candidate_id, "created": created,
                 "updated_pattern_ids": sorted(updated_pattern_ids),
                 "pattern_event_ids": pattern_event_ids,
